@@ -2,20 +2,30 @@
 //! step 3, Switch wire 7.4.14): records and claims the lost service held, merged into what
 //! the new one holds, and the refusals of an upload.
 
+use pubky_switch::limits::Limits;
+use pubky_switch_client::app::DOC_CACHE_MS;
 use pubky_switch_client::app::{App, AppEvent, ClaimOp, ObligationDeadline, RecordTarget};
+use pubky_switch_client::client::{Credentials, SwitchClient};
+use pubky_switch_client::clock::Clock;
 use pubky_switch_client::testing::TestIdentity;
 use pubky_switch_core::claims::{Basis, ClaimView};
 use pubky_switch_signer::{Signer, UserConfirmed};
 use serde_json::json;
+use std::sync::Arc;
 
 use super::claim::view;
 use super::enrollment::enroll;
 use super::join::events;
 use super::messaging::{joined, joined_as};
 use super::records::{look, shown};
-use super::recovery::{RECOVERY_ORIGIN, follow_recovery, recovered, upload_of};
+use super::recovery::{
+    BOBS_FIRST_CALL, RECOVERY_ORIGIN, SENDERS_ORIGIN, ended, expect_answer, expect_staged,
+    expect_upload, follow_recovery, recovered, send, upload_of,
+};
 use super::{ORIGIN, STEP_MS};
-use crate::parties::{Asking, notes_collection, notes_protocol_with_records};
+use crate::parties::{
+    Asking, NOTES_READER, notes_collection, notes_protocol, notes_protocol_with_records,
+};
 use crate::{FlowResult, World};
 
 /// alice's service is lost, and her signer recovers at another.
@@ -503,4 +513,337 @@ pub async fn recovery_upload_claim(world: &World) -> FlowResult {
         return Err("the settled claim no longer reads as rebuilt".into());
     }
     Ok(())
+}
+
+/// An upload by an app that reads the lists and can't manage them. alice's wallet saved
+/// bob as a contact and blocked carol; her reader, an app holding `lists.read` alone, read
+/// the lists. After the recovery the reader follows first: its upload brings the deny
+/// list, which only restricts admission, and doesn't end the staged admission. bob and
+/// carol each write to alice and are held back alike, so the staging tells carol nothing.
+/// The wallet follows: its upload brings the contacts and ends the staged admission. bob
+/// tries again and is admitted; carol tries again and is refused.
+///
+/// Calls: `POST /v1/{id}/recovery/upload` with `lists.deny` alone, from an app holding
+/// `lists.read`; `GET /v1/{id}/apps` with `admission_staged` still true after it; `PUT
+/// /v1/{id}/peers` from a contact and from a denied sender while staged (`503 staged`)
+/// and after the upload that ended it (admitted, `403 not_admitted`).
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, the reader's upload ends
+/// the staged admission, or a sender is admitted or refused against what its step says.
+pub async fn recovery_upload_deny_only(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    let bob = world.identity("bob")?;
+    let carol = world.identity("carol")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    world.add_switch(SENDERS_ORIGIN, &[&bob, &carol]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let mut bob_signer = enroll(world, &bob, SENDERS_ORIGIN).await?;
+    let mut carol_signer = enroll(world, &carol, SENDERS_ORIGIN).await?;
+    let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    let asking = Asking::for_scope(world.app_keys(&alice, "reader")?, NOTES_READER)?;
+    let (mut reader, _) = joined_as(world, &alice, &mut signer, asking, notes_protocol()).await?;
+    let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
+    let (mut stall, _) = joined(world, &carol, &mut carol_signer, "stall").await?;
+
+    wallet.add_contact(&bob.public()).await?;
+    world.advance_ms(STEP_MS);
+    wallet.deny(&carol.public()).await?;
+    world.outcome(
+        "the wallet saved bob as a contact and blocked carol",
+        &json!({ "events": events(&wallet.take_events()) }),
+    );
+    world.advance_ms(STEP_MS);
+    look(world, &mut reader, "the reader followed the lists").await?;
+
+    lose_and_recover(world, &alice, &mut signer).await?;
+
+    // The reader first: a deny list, and no contacts.
+    follow_recovery(world, &mut reader, "reader", 1).await?;
+    expect_upload(world, "reader", true)?;
+    signer.run_due().await?;
+    world.outcome(
+        "alice's signer ran what is due, admission still staged",
+        &json!({ "requests": world.requests_sent() }),
+    );
+    expect_staged(world, true)?;
+
+    // The senders' copies of alice's `identity.json` are ten minutes old by now, so each
+    // reads it again and finds the new service (Switch spec 4.3).
+    world.advance_ms(DOC_CACHE_MS);
+    for (name, app, first_call) in [
+        ("bob's shop", &mut shop, BOBS_FIRST_CALL),
+        ("carol's stall", &mut stall, CAROLS_FIRST_CALL),
+    ] {
+        send(
+            world,
+            &format!("{name} wrote to alice while admission was staged"),
+            app,
+            Some(alice.public()),
+        )
+        .await?;
+        expect_answer(world, first_call, 503, "staged")?;
+    }
+
+    follow_recovery(world, &mut wallet, "wallet", 1).await?;
+    expect_upload(world, "wallet", true)?;
+    signer.run_due().await?;
+    world.outcome(
+        "alice's signer ran what is due, the admission ended by the wallet's upload",
+        &json!({ "requests": world.requests_sent() }),
+    );
+    expect_staged(world, false)?;
+
+    send(
+        world,
+        "bob's shop tried again once the wallet had uploaded",
+        &mut shop,
+        None,
+    )
+    .await?;
+    let admitted = world.last_fact("{bob/shop} POST /v1/{alice}/inbox", "status");
+    if admitted.as_deref() != Some("200") {
+        return Err(format!("bob's note was answered {admitted:?}").into());
+    }
+    send(
+        world,
+        "carol's stall tried again once the wallet had uploaded",
+        &mut stall,
+        None,
+    )
+    .await?;
+    expect_answer(world, CAROLS_FIRST_CALL, 403, "not_admitted")?;
+    Ok(())
+}
+
+/// carol's delivery of her `identity.json` to alice's switch, her first call when she
+/// writes to her.
+const CAROLS_FIRST_CALL: &str = "{carol/stall} PUT /v1/{alice}/peers";
+
+/// A client that sends requests as alice's app `name`, signed with the app's key, to the
+/// service `origin` whose key for her account is `service_key`: for an upload no app of
+/// the client crate would send.
+fn client_of(
+    world: &World,
+    alice: &TestIdentity,
+    name: &str,
+    app: &App,
+    origin: &str,
+    service_key: [u8; 32],
+) -> Result<SwitchClient, Box<dyn std::error::Error>> {
+    let credentials = Credentials::App {
+        identity: alice.public(),
+        keys: world.app_keys(alice, name)?,
+        cert: app.cert().clone(),
+    };
+    Ok(SwitchClient::new(
+        origin,
+        alice.public(),
+        credentials,
+        Some(service_key),
+        world.transport(),
+        world.clock().clone() as Arc<dyn Clock>,
+    )?)
+}
+
+/// A body that doesn't read as an upload: `records` isn't an array. It also carries
+/// contacts, which its sender may not send.
+const UNREADABLE: &str = r#"{"records":1,"lists":{"contacts":[]}}"#;
+
+/// An upload of contacts, none of them.
+const CONTACTS: &str = r#"{"lists":{"contacts":[]}}"#;
+
+/// An upload of nothing.
+const NOTHING: &str = "{}";
+
+/// `client` uploads `body`; the flow fails unless the switch answers `status`, with the
+/// error `code` when it refuses.
+async fn upload(
+    world: &World,
+    name: &str,
+    client: &SwitchClient,
+    app: &str,
+    body: &str,
+    status: u16,
+    code: Option<&str>,
+) -> FlowResult {
+    let path = format!(
+        "/v1/{}/recovery/upload",
+        pubky_switch_core::enc::pubky_id(&client.account())
+    );
+    let signed = client.sign_request("POST", &path, body.as_bytes().to_vec(), None)?;
+    let answered = client.send(signed).await;
+    world.outcome(
+        name,
+        &json!({
+            "status": answered.as_ref().ok().map(|answer| answer.status),
+            "ended": ended(&answered),
+        }),
+    );
+    world.advance_ms(STEP_MS);
+    match code {
+        Some(code) => expect_answer(world, &upload_of(app), status, code),
+        None => {
+            let was = world.last_fact(&upload_of(app), "status");
+            if was == Some(status.to_string()) {
+                Ok(())
+            } else {
+                Err(format!("{name}: answered {was:?}, not {status}").into())
+            }
+        }
+    }
+}
+
+/// The uploads the new service takes from one app in an hour, in [`recovery_upload_refused`].
+const UPLOADS_AN_HOUR: u32 = 3;
+
+/// An hour, the window of the upload limit.
+const HOUR_MS: u64 = 3_600_000;
+
+/// The refusals of an upload, in their order, and the hourly limit (Switch wire 7.4.14,
+/// 9.4). alice's reader holds `lists.read` alone. Its client sends uploads its app never
+/// would:
+///
+/// - at the service alice is enrolled at, before any loss: `404`, for a body that doesn't
+///   read too, since the account is in neither stage;
+/// - at the service she recovered at, once the reader has registered there and uploaded
+///   what it holds, a body that doesn't read and carries contacts: `400`, before the
+///   permission is looked at; contacts, which need `lists.manage`: `403
+///   permission_missing`;
+/// - the service takes three uploads an hour from one app, and each of those two took a
+///   slot, as the reader's own did: an upload of nothing, which the service would take, is
+///   `429 rate_limited`. Past the limit the refusals keep their order: the body that
+///   doesn't read is still `400`, the contacts still `403`;
+/// - in the next hour the upload of nothing is taken.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, or an upload is answered
+/// other than its step says.
+pub async fn recovery_upload_refused(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let asking = Asking::for_scope(world.app_keys(&alice, "reader")?, NOTES_READER)?;
+    let (mut reader, _) = joined_as(world, &alice, &mut signer, asking, notes_protocol()).await?;
+
+    let service_key = |signer: &Signer| -> Result<[u8; 32], Box<dyn std::error::Error>> {
+        let doc = signer
+            .identity_doc()?
+            .ok_or("the signer holds no document")?;
+        Ok(doc.inbox().service_key)
+    };
+    let before = client_of(
+        world,
+        &alice,
+        "reader",
+        &reader,
+        ORIGIN,
+        service_key(&signer)?,
+    )?;
+    upload(
+        world,
+        "an upload that doesn't read, at an account that lost no provider",
+        &before,
+        "reader",
+        UNREADABLE,
+        404,
+        Some("not_found"),
+    )
+    .await?;
+
+    world.lose_switch(ORIGIN);
+    let limits = Limits {
+        uploads_per_app_per_hour: UPLOADS_AN_HOUR,
+        ..Limits::default()
+    };
+    world
+        .add_switch_with(RECOVERY_ORIGIN, &[&alice], limits)
+        .await?;
+    let doc = signer
+        .declare_provider_loss(RECOVERY_ORIGIN, UserConfirmed::shown_and_confirmed())
+        .await?;
+    world.outcome(
+        "the signer declared the loss and recovered elsewhere",
+        &recovered(&doc, &signer)?,
+    );
+    // The start of an hour of the service's clock, so that every upload up to the limit
+    // falls in one window.
+    world.advance_ms(HOUR_MS - world.now_ms() % HOUR_MS);
+
+    let after = client_of(
+        world,
+        &alice,
+        "reader",
+        &reader,
+        RECOVERY_ORIGIN,
+        service_key(&signer)?,
+    )?;
+    // The reader registers, and uploads what it holds: the lost service's newest head.
+    let sent = uploads(world);
+    follow_recovery(world, &mut reader, "reader", 1).await?;
+    let own = uploads(world) - sent;
+    if own != 1 {
+        return Err(format!("the reader's follow sent {own} uploads, not 1").into());
+    }
+
+    let refusals: [(&str, &str, u16, &str); 5] = [
+        (
+            "an upload that doesn't read, with contacts",
+            UNREADABLE,
+            400,
+            "bad_request",
+        ),
+        (
+            "contacts from an app without lists.manage",
+            CONTACTS,
+            403,
+            "permission_missing",
+        ),
+        (
+            "an upload of nothing, the hour's uploads used up",
+            NOTHING,
+            429,
+            "rate_limited",
+        ),
+        (
+            "an upload that doesn't read, past the limit",
+            UNREADABLE,
+            400,
+            "bad_request",
+        ),
+        (
+            "contacts, past the limit",
+            CONTACTS,
+            403,
+            "permission_missing",
+        ),
+    ];
+    for (name, body, status, code) in refusals {
+        upload(world, name, &after, "reader", body, status, Some(code)).await?;
+    }
+
+    world.advance_ms(HOUR_MS);
+    upload(
+        world,
+        "an upload of nothing, in the next hour",
+        &after,
+        "reader",
+        NOTHING,
+        200,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+/// How many uploads the run has sent so far.
+fn uploads(world: &World) -> usize {
+    let trace = world.trace();
+    trace
+        .lines
+        .iter()
+        .filter(|line| line.label.ends_with("/recovery/upload"))
+        .count()
 }

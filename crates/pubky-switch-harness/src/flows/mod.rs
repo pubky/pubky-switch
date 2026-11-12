@@ -62,7 +62,10 @@ pub use retries::{
     app_retries, append_retry, claim_and_read_retries, claim_retries, removal_retries,
     signer_retries,
 };
-pub use upload::{recovery_upload_claim, recovery_upload_records};
+pub use upload::{
+    recovery_upload_claim, recovery_upload_deny_only, recovery_upload_records,
+    recovery_upload_refused,
+};
 pub use waiting::{waiting_read, waiting_read_erased};
 pub use watching::watching;
 
@@ -151,6 +154,12 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("recovery upload, records", |world| {
         Box::pin(recovery_upload_records(world))
+    }),
+    ("recovery upload, a deny list alone", |world| {
+        Box::pin(recovery_upload_deny_only(world))
+    }),
+    ("recovery upload, refused", |world| {
+        Box::pin(recovery_upload_refused(world))
     }),
 ];
 

@@ -1322,6 +1322,12 @@ impl ScriptedSwitch {
         self.lock().enroll_limits.quota_bytes = quota_bytes;
     }
 
+    /// Set `uploads_per_app_per_hour` (Switch wire 9.2): the recovery uploads the switch
+    /// takes from each app in an hour of its clock.
+    pub fn set_uploads_per_app_per_hour(&self, uploads: u32) {
+        self.lock().uploads_per_app_per_hour = uploads;
+    }
+
     /// A `missed` item: `entries` entries accepted from `from` until `until` were deleted
     /// while the app lagged (Switch wire 7.4.4). Returns its `seq`.
     pub fn push_missed(&self, entries: u64, from: u64, until: u64) -> u64 {
@@ -1719,12 +1725,21 @@ impl Inner {
             &server_time,
             &bytes,
         );
+        let mut headers = vec![
+            Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+            Header::new(header::SERVER_TIME, &server_time),
+        ];
+        // A `429` repeats its body's `retry_after` in `Retry-After` (Switch wire 7.1, 7.6).
+        if let Some(seconds) = body
+            .get("retry_after")
+            .and_then(Value::as_u64)
+            .filter(|_| status == 429)
+        {
+            headers.push(Header::new(header::RETRY_AFTER, &seconds.to_string()));
+        }
         Response {
             status,
-            headers: vec![
-                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
-                Header::new(header::SERVER_TIME, &server_time),
-            ],
+            headers,
             body: bytes,
         }
     }
@@ -2281,6 +2296,23 @@ impl Inner {
         cert: &AppCert,
         recovery_from: u64,
     ) -> Result<Answer, ScriptError> {
+        // The upload's slot of `uploads_per_app_per_hour`, in the hour of the switch's clock,
+        // is taken first: an upload refused for its body or its lists counts too (Switch
+        // wire 7.4.14, 9.4). One past the limit takes none.
+        let (now, hour_ms) = (self.now(), 3_600_000);
+        let hour = now / hour_ms;
+        let count = self.upload_counts.entry(app).or_insert((hour, 0));
+        if count.0 < hour {
+            *count = (hour, 0);
+        }
+        let limited = if count.1 >= self.uploads_per_app_per_hour {
+            let next = count.0.saturating_add(1).saturating_mul(hour_ms);
+            Some(next.saturating_sub(now).div_ceil(1000).max(1))
+        } else {
+            count.1 += 1;
+            None
+        };
+        // The refusals in the wire's order: the body, the caller's permission, the limit.
         let upload = match UploadBody::parse(body).and_then(|upload| {
             upload.check_permissions(cert)?;
             Ok(upload)
@@ -2288,21 +2320,11 @@ impl Inner {
             Ok(upload) => upload,
             Err(refusal) => return Ok(batch::refused(&refusal)),
         };
-        // Past `uploads_per_app_per_hour` in the hour of the switch's clock: `429`, with the
-        // seconds to the next hour (Switch wire 7.4.14, 9.4).
-        let (now, hour_ms) = (self.now(), 3_600_000);
-        let hour = now / hour_ms;
-        let count = self.upload_counts.entry(app).or_insert((hour, 0));
-        if count.0 < hour {
-            *count = (hour, 0);
-        }
-        if count.1 >= self.uploads_per_app_per_hour {
-            let next = count.0.saturating_add(1).saturating_mul(hour_ms);
+        if let Some(retry_after) = limited {
             let mut limited = bad(ErrorCode::RateLimited, "recovery uploads", json!(null));
-            limited.1["retry_after"] = json!(next.saturating_sub(now).div_ceil(1000).max(1));
+            limited.1["retry_after"] = json!(retry_after);
             return Ok(limited);
         }
-        count.1 += 1;
         let removed = self
             .doc
             .as_ref()

@@ -156,7 +156,8 @@ impl World {
 
     /// As [`World::add_switch`], the service running with `limits` (Switch wire 9.2) in
     /// place of its defaults, as an operator may configure it. The scripted switch takes the
-    /// inbox quota and the app limit of them, the two it has a setting for.
+    /// inbox quota, the app limit and the hourly limit of recovery uploads of them, the
+    /// three it has a setting for.
     ///
     /// # Errors
     ///
@@ -207,6 +208,7 @@ impl World {
                         quota_bytes: limits.quota_bytes,
                         ..pubky_switch_core::records::Limits::default()
                     });
+                    switch.set_uploads_per_app_per_hour(limits.uploads_per_app_per_hour);
                     accounts.push((identity.key().id(), switch.holding_transport()));
                     lock(&self.scripted).push(switch);
                 }
