@@ -2,13 +2,22 @@
 //! then publish", 3.13): the published copy put right, another document at the published
 //! version, an install put back to an older state, and a new install restored from the
 //! signer backup.
+//!
+//! In most of these the switch does nothing out of the ordinary: it answers the signer's
+//! reads of the apps and takes its deliveries, and what the flow is about is what the
+//! signer does with them, run at both switches. That holds for the published copy put
+//! right, another document at the version, records behind, a version never delivered, and
+//! all of a new install taking over but the version naming another signer. Clearing the
+//! alarm for another document delivers the signer's version again as a retry, which the
+//! switch answers as the delivery it already took. Only [`signer_two_installs_race`] has
+//! the switch refuse a delivery.
 
 use std::sync::Arc;
 
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::TestIdentity;
 use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc};
-use pubky_switch_signer::{Alert, CertChange, Signer, UserConfirmed};
+use pubky_switch_signer::{Alert, CertChange, Signer, SignerStatus, UserConfirmed};
 use serde_json::{Value, json};
 
 use super::enrollment::{enroll, status};
@@ -116,10 +125,13 @@ pub async fn publication_repaired(world: &World) -> FlowResult {
 /// Homeserver shows another document at that version, signed with the identity key, as a
 /// copy of the key in other hands could write. The signer raises the alarm: it publishes
 /// nothing over it and signs nothing on top. Once the user clears the alert, the signer
-/// reads the switch's copy, its own, publishes it over the other, and signs on.
+/// delivers its version again, a retry the switch answers as the delivery it took, reads
+/// the switch's copy, its own, publishes it over the other, and signs on.
 ///
-/// Calls: `GET /v1/{id}/apps` as the copy an alarm is cleared against, and the next
-/// version's delivery after it.
+/// Calls: `PUT /v1/{id}/identity` with the version the switch holds, sent again, `GET
+/// /v1/{id}/apps` as the copy an alarm is cleared against, and the next version's delivery
+/// after it. The switch's part is those ordinary answers: the alarm and its clearing are
+/// the signer's.
 ///
 /// # Errors
 ///
@@ -267,8 +279,19 @@ pub async fn signer_new_install(world: &World) -> FlowResult {
         "the first install was asked for a new version",
         &json!({ "ended": ended(&refused), "signer": status(&old)? }),
     );
-    if refused.is_ok() || deliveries(world) != delivered {
-        return Err("the first install still signs after the take-over".into());
+    // Refused for that reason: the new install is the signer.
+    let reason = old.status();
+    if refused.is_ok()
+        || deliveries(world) != delivered
+        || reason
+            != (SignerStatus::ManagedBy {
+                install: new.install_id(),
+            })
+    {
+        return Err(format!(
+            "the first install still signs after the take-over, or stands as {reason:?}"
+        )
+        .into());
     }
     Ok(())
 }
@@ -315,8 +338,16 @@ pub async fn signer_records_behind(world: &World) -> FlowResult {
         "the install, put back, was asked for a new version",
         &json!({ "ended": ended(&behind), "signer": status(&signer)? }),
     );
-    if behind.is_ok() || deliveries(world) != delivered {
-        return Err("the install signed with its records behind".into());
+    // Refused for that reason: its records are behind its own second version.
+    let reason = signer.status();
+    if behind.is_ok()
+        || deliveries(world) != delivered
+        || reason
+            != (SignerStatus::RecordsBehind {
+                version: second.version(),
+            })
+    {
+        return Err(format!("the install, put back, signed or stands as {reason:?}").into());
     }
     world.advance_ms(STEP_MS);
 
@@ -396,6 +427,34 @@ pub async fn signer_restore_undelivered(world: &World) -> FlowResult {
             "signer": status(&new)?,
         }),
     );
+    // The first of the two is the version the install that is gone signed, byte for byte:
+    // its signature is the one the delivery that didn't arrive carried, and the second
+    // carries another.
+    let signatures: Vec<Option<String>> = {
+        let trace = world.trace();
+        let sent: Vec<_> = trace
+            .lines
+            .iter()
+            .filter(|line| line.label == "{alice} PUT /v1/{alice}/identity")
+            .collect();
+        sent.iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(|line| line.facts.get("request body.identity.sig").cloned())
+            .collect()
+    };
+    let as_signed = matches!(
+        signatures.as_slice(),
+        [Some(lost), Some(first), Some(second)] if lost == first && first != second
+    );
+    if !as_signed {
+        return Err(format!(
+            "the restore's deliveries carry the signatures {signatures:?}: the first isn't \
+             the version as the lost install signed it"
+        )
+        .into());
+    }
     if deliveries(world) - delivered != 2
         || taken.version() != before.version() + 2
         || taken.body().signer != new.install_id()
