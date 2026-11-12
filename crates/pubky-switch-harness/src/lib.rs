@@ -66,13 +66,60 @@ pub enum HarnessError {
 /// What a flow returns: an error only for what should fail against no switch.
 pub type FlowResult = Result<(), Box<dyn std::error::Error>>;
 
+/// The stack a flow runs on, in bytes.
+///
+/// A flow's futures nest deeply: the client's and the signer's calls, and under them the
+/// service itself, are all polled from the flow's thread, and in a debug build each level
+/// keeps its large futures in its frame. A test's thread has 2 MiB, which the deepest flows
+/// come close to, so a flow gets a thread of its own with a stack that doesn't depend on
+/// who runs it: STACK_NOTE
+pub const FLOW_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Run `work` to its end on a thread of its own with [`FLOW_STACK_BYTES`] of stack, in a
+/// runtime of its own, and give what it returned. The calling thread waits for it. A panic
+/// in `work` goes on in the caller, and the thread carries the caller's name, so a test
+/// reads the same as when it ran the work itself.
+///
+/// # Errors
+///
+/// When the thread or its runtime can't be started.
+pub fn on_flow_stack<T: Send>(work: impl AsyncFnOnce() -> T + Send) -> Result<T, HarnessError> {
+    let name = std::thread::current().name().unwrap_or("flow").to_owned();
+    std::thread::scope(|scope| {
+        let thread = std::thread::Builder::new()
+            .name(name)
+            .stack_size(FLOW_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| HarnessError::Setup(format!("a flow's runtime: {error}")))?;
+                Ok(runtime.block_on(work()))
+            })
+            .map_err(|error| HarnessError::Setup(format!("a flow's thread: {error}")))?;
+        match thread.join() {
+            Ok(done) => done,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
 /// Run `flow` in a world answered by `backend`, and give what the run showed; `None` for
-/// the service when no test database is configured.
+/// the service when no test database is configured. The flow runs on a thread of its own
+/// ([`on_flow_stack`]), and the caller's thread waits for it.
 ///
 /// # Errors
 ///
 /// When the world can't be set up, or the flow fails.
 pub async fn run(
+    backend: Backend,
+    flow: impl AsyncFn(&World) -> FlowResult + Sync,
+) -> Result<Option<Trace>, HarnessError> {
+    on_flow_stack(async || run_here(backend, &flow).await)?
+}
+
+/// [`run`], on the calling thread.
+async fn run_here(
     backend: Backend,
     flow: impl AsyncFn(&World) -> FlowResult,
 ) -> Result<Option<Trace>, HarnessError> {
@@ -112,7 +159,7 @@ pub struct Comparison {
 /// When a world can't be set up, or the flow fails in one.
 pub async fn compare_backends(
     name: &str,
-    flow: impl AsyncFn(&World) -> FlowResult,
+    flow: impl AsyncFn(&World) -> FlowResult + Sync,
 ) -> Result<Option<Comparison>, HarnessError> {
     let scripted = run(Backend::Scripted, &flow)
         .await?
