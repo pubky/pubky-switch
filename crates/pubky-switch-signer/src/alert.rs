@@ -145,6 +145,33 @@ pub enum Alert {
         /// When its certificate expires, in Unix milliseconds.
         expires_at: u64,
     },
+    /// An app whose renewals stopped ([`Alert::RenewalsStopped`]) still owns attempts open
+    /// or `unknown`, as `GET /apps` lists them: at `expires_at` it isn't current any more, its
+    /// open ones are orphaned, and its `unknown` ones are left, for the identity's other apps
+    /// or the user to resolve (Switch spec 3.2, 10.2). The user renews it, which keeps them its own, or lets it lapse. Brought up
+    /// to date at each run; cleared once it owns none, its renewals start again, or it is
+    /// removed.
+    LapsingWithOpenAttempts {
+        /// The app.
+        app_id: [u8; 16],
+        /// When its certificate expires, in Unix milliseconds.
+        expires_at: u64,
+        /// How many attempts it owns that are open or `unknown`.
+        open_attempts: u64,
+    },
+    /// An app being revoked, or revoked, owns attempts open or `unknown`, as `GET /apps`
+    /// lists them: they remain, the open ones orphaned, for the identity's other apps or the
+    /// user to resolve (Switch spec 12.2, 10.2). The revocation goes on all the same; before
+    /// it, the host shows the count [`crate::Signer::open_attempts`] gives. Brought up to date
+    /// at each read of `GET /apps` the removal makes; cleared once it owns none. It is this
+    /// install's own: a new install, restored once the removal is delivered, doesn't find it
+    /// again.
+    RevokedWithOpenAttempts {
+        /// The app.
+        app_id: [u8; 16],
+        /// How many attempts it owns that are open or `unknown`.
+        open_attempts: u64,
+    },
     /// This app's certificate is past half its lifetime, and the signer doesn't renew it by
     /// itself, for `reason` (Switch spec 3.2). Unless the user renews it, the certificate
     /// expires and the switch stops serving the app.

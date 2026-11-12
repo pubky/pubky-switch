@@ -300,4 +300,12 @@ against it now:
 - the hand-over both ways, the abort, the take-over's checks and its lost answers, and which
   copies delete a key (`handover.rs`), save the scripted faults;
 - the account's erasure, its lost answer, retry and refusal (`erasure.rs`), save the scripted
-  faults.
+  faults;
+- the provider loss: declaring it, at a new service and in place, declaring it again, the
+  staged admission's end, a refused recovery, and a restore mid-recovery (`recovery.rs`),
+  save the scripted faults;
+- the warnings about an app's open attempts at a revocation and before a lapse
+  (`revocation.rs`, `renewal.rs`), whose attempts the test calls `open_attempt` and
+  `fail_attempt` script directly, with no entry or proof held and without the permission or
+  writer checks the service makes; `open_attempt` refuses, as the service does, a second open
+  attempt on a claim and any on a SETTLED one, and `fail_attempt` names the app resolving it.
