@@ -42,6 +42,7 @@ const ACCOUNT_TABLES: &[(&str, &str)] = &[
     ("retired_enrollments", "account_id"),
     ("pending_revoked_apps", "account_id"),
     ("divergent_uploads", "account_id"),
+    ("connect_requests", "account_id"),
 ];
 
 fn alice_id() -> String {
