@@ -356,7 +356,14 @@ async fn test_upload_divergent_record_flag_goes_at_a_provider_loss() {
     drop(app);
     // The signer declares generation 2 lost, at a third service.
     lost.router.remove(NEXT);
-    let _third = third_recovering(&lost.w, &lost.router, 3, 2);
+    let third = third_recovering(&lost.w, &lost.router, 3, 2);
+    // The third switch's view would clear the flag too: its read fails for now, so only the
+    // loss can.
+    third.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::Unavailable,
+        current: Value::Null,
+    });
     let (app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
         .await
         .unwrap();
