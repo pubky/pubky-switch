@@ -426,26 +426,12 @@ impl Signer {
     /// generation, at the origin the backup's version names and below its version: the
     /// Homeserver's copy. Any other key is never taken.
     async fn serving_key_in_place(&self, view: &BackupView) -> Result<Option<[u8; 32]>> {
-        let identity = self.state.identity;
         let doc = &view.identity_doc;
         let Some(lost) = doc.body().recovery_from else {
             return Ok(None);
         };
-        let serving = self
-            .env
-            .homeserver
-            .get(IDENTITY_PATH)
+        self.lost_generations_key_on_homeserver(&doc.inbox().url, lost, doc.version())
             .await
-            .map_err(SignerError::Homeserver)?
-            .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
-            .and_then(|signed| IdentityDoc::verify(&signed, &identity).ok())
-            .filter(|copy| {
-                copy.generation() == lost
-                    && copy.version() < doc.version()
-                    && copy.inbox().url == doc.inbox().url
-            })
-            .map(|copy| copy.inbox().service_key);
-        Ok(serving)
     }
 
     /// `GET /apps` read again under `serving`, the key the recovery's service served the
