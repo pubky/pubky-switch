@@ -341,10 +341,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   An app's call is `403 permission_missing`. Then every call, the retry included, gets the
   `404` signed with a fixed operator key. `erased` tells a test it happened; app tests set the
   flag directly. The service keeps no freeze or import state yet, so it refuses no erasure for
-  a move; and after an erasure it takes `POST /v1/enroll` again, creating a
-  new staged account, where this switch answers it with the operator's `404` too. That account
-  serves from its first `identity.json`, at the next generation with `recovery_from` (Switch
-  wire 7.4.16), which starts its recovery.
+  a move. After an erasure both take `POST /v1/enroll` again and make a new account under
+  another service key, which signs that answer and every answer after it; nothing of the
+  erased account stays, its kept App IDs included, which the new enrollment names again.
+  That account serves from its first `identity.json`, at the next generation with
+  `recovery_from` (Switch wire 7.4.16), which starts its recovery.
   This switch deletes everything at once and owes no key: its `404` comes right after the
   erasure. The service can owe the erased account's key when its key store fails, and until
   the key is gone it answers a request signed with the identity key, whatever its timestamp,

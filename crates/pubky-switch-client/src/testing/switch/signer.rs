@@ -158,6 +158,11 @@ impl Inner {
             Ok(enrollment) => enrollment,
             Err(_) => return Ok(bad(ErrorCode::BadRequest, "bad enrollment", json!(null))),
         };
+        // An erased account is gone, so its enrollment makes a new one, as for an identity
+        // the service never hosted (Switch wire 7.4.16, Switch spec 12.7 step 4).
+        if self.erased {
+            self.start_new_account();
+        }
         // An enrollment the service answered with a key a generation change has retired: its
         // signer enrolls anew (Switch wire 3.7).
         if self
@@ -235,6 +240,48 @@ impl Inner {
             self.kept_at = self.now();
         }
         Ok((200, value))
+    }
+
+    /// A new account in the place of an erased one, as the enrollment after an erasure
+    /// makes it (Switch wire 7.4.16, Switch spec 12.7 step 4): another service key, and
+    /// nothing of what the erased account held, its enrollments, its kept App IDs and its
+    /// counts included. The account then starts as at a service that never hosted the
+    /// identity: its first `identity.json` is the next generation's, naming the erased one
+    /// in `recovery_from`. What a test set of the switch's configuration stays set.
+    fn start_new_account(&mut self) {
+        // A read still held is answered for an account under another key.
+        self.wake_held();
+        // The erased account's key is gone for good: another one, the same in every run.
+        let mut seed = self.service.to_bytes();
+        seed[0] ^= 0x3c;
+        seed[31] = seed[31].wrapping_add(1);
+        let tip = pubky_switch_core::chain::ChainTip {
+            generation: 1,
+            seq: 0,
+            chain_hash: pubky_switch_core::chain::ZERO_HASH,
+        };
+        let mut fresh = Inner::fresh(
+            super::clone_key(&self.identity),
+            SigningKey::from_bytes(&seed),
+            Arc::clone(&self.clock),
+            tip,
+        );
+        // Nothing enrolled at it yet, and it serves only once it takes its first document.
+        fresh.enrolled = None;
+        fresh.staged = true;
+        fresh.origin = self.origin.clone();
+        fresh.enroll_limits = self.enroll_limits;
+        fresh.uploads_per_app_per_hour = self.uploads_per_app_per_hour;
+        fresh.max_contacts = self.max_contacts;
+        fresh.max_deny = self.max_deny;
+        fresh.feed_limit = self.feed_limit;
+        fresh.max_page_bytes = self.max_page_bytes;
+        fresh.keep_passed = self.keep_passed;
+        fresh.open_admission = self.open_admission;
+        fresh.faults = std::mem::take(&mut self.faults);
+        // A read held before the erasure drops its number when it ends.
+        fresh.held_ids = self.held_ids;
+        *self = fresh;
     }
 
     /// Start the account afresh under `key` at `generation`, as a recovery in place does:
@@ -912,6 +959,39 @@ mod tests {
         };
         assert!(switch.handle(&request).is_err(), "the answer is lost");
         assert!(switch.lock().answer_key.is_none());
+    }
+
+    #[test]
+    fn test_scripted_enrollment_after_an_erasure_makes_a_new_account() {
+        // As at the service, where the erased account doesn't exist any more (Switch wire
+        // 7.4.16, Switch spec 12.7 step 4): another key, and nothing of what the erased
+        // account kept.
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let clock = Arc::new(crate::clock::TestClock::new(1_700_000_000_000));
+        let switch = ScriptedSwitch::unenrolled_at(&identity, [2; 32], clock, SWITCH_ORIGIN);
+        let (status, first) = enroll_at(&switch, &identity, 1, Some(vec![[7; 16]]));
+        assert_eq!(status, 200);
+        assert_eq!(switch.kept_app_ids(), vec![[7; 16]]);
+        {
+            let mut inner = switch.lock();
+            inner.erased = true;
+            inner.uploads_per_app_per_hour = 7;
+        }
+
+        let (status, second) = enroll_at(&switch, &identity, 2, Some(vec![[9; 16]]));
+        assert_eq!(status, 200);
+        assert_ne!(second["service_key"], first["service_key"]);
+        assert!(!switch.erased());
+        // The erased account's kept App ID went with it; the new enrollment names its own.
+        assert_eq!(switch.kept_app_ids(), vec![[9; 16]]);
+        // The new account's key is the one that signs from now on.
+        let named = b64(&switch.lock().service.verifying_key().to_bytes());
+        assert_eq!(second["service_key"].as_str(), Some(named.as_str()));
+        // The switch's configuration stays.
+        assert_eq!(switch.lock().uploads_per_app_per_hour, 7);
+        // The same enrollment again gets the same answer, and makes no further account.
+        let (status, again) = enroll_at(&switch, &identity, 2, Some(vec![[9; 16]]));
+        assert_eq!((status, again), (200, second));
     }
 
     #[test]
