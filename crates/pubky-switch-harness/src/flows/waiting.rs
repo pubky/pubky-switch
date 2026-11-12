@@ -1,5 +1,6 @@
 //! A feed read that waits (Switch wire 7.4.4 `wait`): an app with nothing to read asks the
-//! switch to hold its read, and a write of another app answers it.
+//! switch to hold its read, and a write of another app answers it; or it waits through a
+//! handle while it goes on writing.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -9,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use pubky_switch_client::app::{App, AppConfig, RecordTarget};
+use pubky_switch_client::app::{App, AppConfig, RecordTarget, Woken};
 use pubky_switch_core::records::IDENTITY_PATH;
 use pubky_switch_signer::UserConfirmed;
 use serde_json::json;
@@ -113,6 +114,74 @@ pub async fn waiting_read(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
     look(world, &mut watch, "the watch's next read").await?;
     look(world, &mut wallet, "the wallet after its write").await?;
+    Ok(())
+}
+
+/// alice's wallet waits for its feed through a handle that doesn't hold it
+/// ([`App::feed_wait`]), and writes a record while the switch holds that read: the write
+/// isn't held up by the wait, and its record, on the feed, wakes it. The wallet then reads
+/// with no wait and finds its own write.
+///
+/// Calls: `GET /v1/{id}/feed` with `wait`, the same app's `POST /v1/{id}/ops` while it is
+/// held.
+///
+/// # Errors
+///
+/// As [`waiting_read`], or when the wait wakes with anything but [`Woken::Ready`].
+pub async fn waiting_through_a_handle(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let (mut wallet, _) = joined_with(
+        world,
+        &alice,
+        &mut signer,
+        Asking::new(world.app_keys(&alice, "wallet")?)?,
+        notes_protocol_with_records(),
+        AppConfig::default(),
+    )
+    .await?;
+    look(world, &mut wallet, "the wallet before the wait").await?;
+
+    let target = RecordTarget::new(notes_collection(), b"shopping list");
+    let handle = wallet.feed_wait(WAIT_S);
+    let answered = Cell::new(false);
+    let held_at_the_write = Cell::new(false);
+    let wait = async {
+        let woken = handle.wait().await;
+        answered.set(true);
+        woken
+    };
+    let write = async {
+        // Until the switch holds the read, or answered it without holding it.
+        while world.held_reads() == 0 && !answered.get() {
+            tokio::task::yield_now().await;
+        }
+        held_at_the_write.set(world.held_reads() > 0);
+        wallet
+            .put_record(&target, br#"{"items":["milk"]}"#, Vec::new())
+            .await
+    };
+    let both = each_on_its_own_wake(wait, write);
+    let Ok((woken, written)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+        return Err("the write didn't finish and wake the wait: the read is still held".into());
+    };
+    written?;
+    if !held_at_the_write.get() {
+        return Err("the switch answered the waiting read without holding it".into());
+    }
+    world.outcome(
+        "the wallet's wait, answered by its own write",
+        &json!({
+            "held_when_the_wallet_wrote": held_at_the_write.get(),
+            "woken": format!("{woken:?}"),
+        }),
+    );
+    if woken != Woken::Ready {
+        return Err(format!("the wait woke {woken:?}, not Ready").into());
+    }
+    world.advance_ms(STEP_MS);
+    look(world, &mut wallet, "the wallet's read after the wait").await?;
     Ok(())
 }
 
