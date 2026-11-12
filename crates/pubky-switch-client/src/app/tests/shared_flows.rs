@@ -6470,3 +6470,42 @@ async fn test_records_listing_waiting_for_a_key_publishes_the_record_it_delivers
         "delivered in the read, not published"
     );
 }
+
+/// A read whose owed listing waits for a scope key reads no feed, so an app whose devices
+/// share its keys writes no missing Homeserver copy back in it: another device may have
+/// deleted the copy to leave, and only a feed would show the departure (Switch spec 4.2).
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_writes_no_missing_copy_back() {
+    let s = Setup::new();
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let config = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let mut app = App::join(s.env(), s.protocol.clone(), config, request)
+        .await
+        .unwrap();
+    let me = app.app_id();
+    let path = pubky_switch_core::records::app_record_path(&me);
+    app.set_multi_device(true).await.unwrap();
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    app.receive(None).await.unwrap();
+    assert!(app.listing_owed().await.unwrap());
+    s.w.homeserver.remove(s.w.alice.public(), &path);
+    s.w.clock.advance_ms(crate::app::PUBLISHED_CHECK_MS);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ListingWaitsForKey)),
+        "{:?}",
+        report.events
+    );
+    assert!(s.w.homeserver.file(s.w.alice.public(), &path).is_none());
+}
