@@ -733,6 +733,51 @@ async fn test_kept_batch_status_unindexed_batch_is_indexed_at_load() {
     assert_eq!(again.commits(), 0, "nothing to index");
 }
 
+/// The load indexes only entries no index names: one a kept batch holds already stays
+/// that batch's, whichever kept batch the load meets first.
+#[tokio::test]
+async fn test_kept_batch_status_load_leaves_an_index_a_kept_batch_holds() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_app(&w, &router).await;
+    let me = app.app_id();
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let (batch, signed) = batch_of(&w, &app);
+    let id = app
+        .submit_batch(batch)
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
+    w.switch.lock().faults.clear();
+    // Another kept batch with the same message and attempt and no index, under an ID the
+    // load meets first.
+    let (_, pending) = app.kept_batches().await.unwrap().pop().unwrap();
+    let other = [0; 16];
+    assert!(other < id);
+    let mut tx = app.tx().unwrap();
+    crate::app::App::keep_signed_again(&other, &pending, &mut tx).unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let app = load_on(&w, &router, Arc::clone(&w.store) as Arc<dyn StateStore>, me)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.kept_attempt(attempt())
+            .await
+            .unwrap()
+            .map(|k| k.batch_id),
+        Some(id)
+    );
+    assert_eq!(
+        app.delivery(signed.msg_id()).await.unwrap(),
+        Some(Delivery::Kept { batch_id: id })
+    );
+}
+
 /// A batch sent once, its answer lost to the network, unapplied, still inside its window.
 async fn sent_unanswered(w: &World, router: &Router) -> ([u8; 16], SignedMessage, [u8; 16]) {
     let mut app = join_app(w, router).await;
