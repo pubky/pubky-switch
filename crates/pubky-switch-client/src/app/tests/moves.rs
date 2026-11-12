@@ -4982,3 +4982,79 @@ async fn test_claim_step_past_its_last_entry_outside_a_loss_is_a_rollback() {
         app.alarm()
     );
 }
+
+/// The lost world followed by an app holding every permission, which wrote an attempt at
+/// [`CLAIM`] at the new switch; then another app's upload changed the claim beside it.
+async fn gapped_after_a_loss() -> (Lost, App) {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &Permission::ALL,
+        false,
+        true,
+    )
+    .await;
+    let (mut app, _) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    if app.reconcile_mode() {
+        app.end_reconcile(UserConfirmed::new()).await.unwrap();
+    }
+    app.write_claim(
+        ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+    upload_beside(&lost.next);
+    (lost, app)
+}
+
+#[tokio::test]
+async fn test_gapped_claim_read_by_an_app_without_a_loss_record() {
+    // An app that holds no loss record, as one that joined at the new switch after the
+    // loss: the identity's identity.json carries `recovery_from`, so the rebuilt claim's gap
+    // is read without an alarm (Switch wire 7.4.8).
+    let (_lost, mut app) = gapped_after_a_loss().await;
+    let mut tx = app.tx().unwrap();
+    tx.delete(crate::app::recovery::keys::LOSS).unwrap();
+    app.commit(tx).await.unwrap();
+    assert!(app.state.own_doc.body().recovery_from.is_some());
+    let read = app.read_claim(&CLAIM).await;
+    assert!(read.is_ok(), "the gapped claim is read: {read:?}");
+    assert!(app.alarm().is_none(), "{:?}", app.alarm());
+}
+
+#[tokio::test]
+async fn test_gapped_claim_read_at_a_generation_after_the_loss() {
+    // An app whose loss record names an earlier generation than the one it serves now, as
+    // after a later move or key change: the claim's gap is still read (Switch wire 7.4.8,
+    // 10.5).
+    let (_lost, mut app) = gapped_after_a_loss().await;
+    let mut loss = app.loss_record().await.unwrap().unwrap();
+    loss.generation -= 1;
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::recovery::keys::LOSS, &loss).unwrap();
+    app.commit(tx).await.unwrap();
+    let read = app.read_claim(&CLAIM).await;
+    assert!(read.is_ok(), "the gapped claim is read: {read:?}");
+    assert!(app.alarm().is_none(), "{:?}", app.alarm());
+}
+
+#[tokio::test]
+async fn test_gapped_claim_that_isnt_rebuilt_is_a_rollback_after_a_loss() {
+    // Even at an identity that had a provider loss, a claim whose view isn't `rebuilt` and
+    // whose step is past its last entry's contradicts the answer: a service that dropped its
+    // newest entries (Switch wire 7.4.8).
+    let (lost, mut app) = gapped_after_a_loss().await;
+    if let Some(claim) = lost.next.lock().shared.claims.get_mut(&CLAIM) {
+        claim.rebuilt = false;
+    }
+    assert!(app.read_claim(&CLAIM).await.is_err());
+    assert!(
+        matches!(app.alarm(), Some(crate::app::Alarm::Rollback { .. })),
+        "{:?}",
+        app.alarm()
+    );
+}

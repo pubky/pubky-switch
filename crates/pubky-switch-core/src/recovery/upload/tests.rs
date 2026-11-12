@@ -657,3 +657,29 @@ fn test_upload_settled_proof_at_the_highest_step_is_taken() {
         assert_eq!(checked.settled[&CLAIM_KEY].0.step, later.step);
     }
 }
+
+#[test]
+fn test_upload_claim_view_says_rebuilt_only_when_it_is() {
+    // A claim an upload changed shows `rebuilt` in its view, written only when true, so a
+    // claim never rebuilt reads exactly as before (Switch wire 6.8, 7.4.8).
+    let view = view_after(&[attempt_fields()]);
+    assert!(!view.rebuilt);
+    assert!(view.to_value().get("rebuilt").is_none());
+    let anyone = |_: &[u8; 16]| true;
+    let entry = UploadedEntry {
+        entry: ClaimFields {
+            attempt_id: vec![22; 16],
+            ..attempt_fields()
+        }
+        .check()
+        .unwrap(),
+        writer: [9; 16],
+        proof: None,
+    };
+    let merge = merge_upload_claim(None, None, &[entry], NOW, 64);
+    let rebuilt = merge.claim.unwrap().view(&CLAIM_KEY, NOW, &anyone);
+    assert!(rebuilt.rebuilt);
+    let value = rebuilt.to_value();
+    assert_eq!(value["rebuilt"], json!(true));
+    assert_eq!(ClaimView::from_value(&value).unwrap(), rebuilt);
+}
