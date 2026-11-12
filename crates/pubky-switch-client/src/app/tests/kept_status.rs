@@ -4,6 +4,7 @@
 //! the retention after (Switch spec 6.4, 12.5 "Kept batches"; Switch wire 6.4 step 5).
 
 use ed25519_dalek::SigningKey;
+use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, RecordVersion};
 use pubky_switch_core::records::{Freeze, FreezeBody, Inbox};
 use pubky_switch_core::scopes::Permission;
@@ -730,4 +731,180 @@ async fn test_kept_batch_status_unindexed_batch_is_indexed_at_load() {
         .await
         .unwrap();
     assert_eq!(again.commits(), 0, "nothing to index");
+}
+
+/// A batch sent once, its answer lost to the network, unapplied, still inside its window.
+async fn sent_unanswered(w: &World, router: &Router) -> ([u8; 16], SignedMessage, [u8; 16]) {
+    let mut app = join_app(w, router).await;
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let (batch, signed) = batch_of(w, &app);
+    let id = app
+        .submit_batch(batch)
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
+    w.switch.lock().faults.clear();
+    assert!(app.kept_batches().await.unwrap()[0].1.kept_ms.is_some());
+    (id, signed, app.app_id())
+}
+
+/// A kept batch refused for good when sent again, stopped after each commit of the read:
+/// its end and its `BatchRefused` duty event come in one commit, so no crash leaves the
+/// one without the other.
+#[tokio::test]
+async fn test_kept_batch_status_refusal_and_its_duty_after_a_crash_at_each_commit() {
+    let mut refused = false;
+    let mut commits = None;
+    let mut n = 1;
+    loop {
+        let w = World::new();
+        let router = Router::of(&w);
+        let (id, signed, me) = sent_unanswered(&w, &router).await;
+        w.switch.fail_next(Fault::Error {
+            path: "ops".into(),
+            code: ErrorCode::Conflict,
+            current: json!(null),
+        });
+        let store = stopping(&w, commits.map(|_| n));
+        let mut app = load_on(&w, &router, Arc::clone(&store) as Arc<dyn StateStore>, me)
+            .await
+            .unwrap();
+        let result = app.receive(None).await;
+        drop(app);
+        let Some(total) = commits else {
+            result.unwrap();
+            commits = Some(store.commits());
+            continue;
+        };
+        let mut app = load_on(&w, &router, Arc::clone(&w.store) as Arc<dyn StateStore>, me)
+            .await
+            .unwrap();
+        let found = reads_agree(&app, signed.msg_id()).await.unwrap();
+        let duty = has(
+            &app.unacknowledged_events().await.unwrap(),
+            |e| matches!(e, AppEvent::BatchRefused { batch_id, .. } if *batch_id == id),
+        );
+        match found.status {
+            KeptBatchStatus::Kept { .. } => assert!(!duty, "commit {n}"),
+            KeptBatchStatus::Dropped {
+                reason: KeptBatchDrop::Refused { .. },
+                ..
+            } => {
+                assert!(duty, "commit {n}: ended without its duty event");
+                refused = true;
+            }
+            other => panic!("commit {n}: {other:?}"),
+        }
+        if n >= total {
+            break;
+        }
+        n += 1;
+    }
+    assert!(refused, "a crash met the batch refused");
+}
+
+/// A batch applied at generation 1 with its answer lost, then sent again unchanged after a
+/// key change in place, stopped after each commit: its original proofs settle it, and its
+/// end comes in the commit that settles it.
+#[tokio::test]
+async fn test_kept_batch_status_old_generation_resend_applied_after_a_crash_at_each_commit() {
+    let mut applied = false;
+    let mut commits = None;
+    let mut n = 1;
+    loop {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join_app(&w, &router).await;
+        let me = app.app_id();
+        w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+        let (batch, signed) = batch_of(&w, &app);
+        let id = app
+            .submit_batch(batch)
+            .await
+            .unwrap_err()
+            .kept_batch()
+            .unwrap();
+        drop(app);
+        change_key(&w, &router);
+        let store = stopping(&w, commits.map(|_| n));
+        let mut app = load_on(&w, &router, Arc::clone(&store) as Arc<dyn StateStore>, me)
+            .await
+            .unwrap();
+        let result = app.receive(None).await;
+        drop(app);
+        let Some(total) = commits else {
+            result.unwrap();
+            commits = Some(store.commits());
+            continue;
+        };
+        let mut app = load_on(&w, &router, Arc::clone(&w.store) as Arc<dyn StateStore>, me)
+            .await
+            .unwrap();
+        let found = reads_agree(&app, signed.msg_id()).await.unwrap();
+        assert_eq!(found.batch_id, id);
+        if matches!(found.status, KeptBatchStatus::Applied { .. }) {
+            applied = true;
+        }
+        app.receive(None).await.unwrap();
+        let found = reads_agree(&app, signed.msg_id()).await.unwrap();
+        assert!(
+            matches!(found.status, KeptBatchStatus::Applied { .. }),
+            "commit {n}: {found:?}"
+        );
+        assert_eq!(allow_ops_for(&w.switch.applied(), carol()), 1);
+        if n >= total {
+            break;
+        }
+        n += 1;
+    }
+    assert!(applied, "a crash met the batch settled");
+}
+
+/// The prune of an end leaves an index entry a later batch took over: the later batch's
+/// attempt still finds it.
+#[tokio::test]
+async fn test_kept_batch_status_prune_keeps_an_index_a_later_batch_took_over() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let (first, _, me) = sent_past_the_window(&w, &router).await;
+    let mut app = load_on(&w, &router, Arc::clone(&w.store) as Arc<dyn StateStore>, me)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    assert!(matches!(
+        app.kept_batch(first).await.unwrap(),
+        Some(KeptBatchStatus::Dropped { .. })
+    ));
+    // A later batch carries the same attempt, and takes over its index.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let (batch, _) = batch_of(&w, &app);
+    let later = app
+        .submit_batch(batch)
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
+    w.switch.lock().faults.clear();
+    assert_eq!(
+        app.kept_attempt(attempt()).await.unwrap().unwrap().batch_id,
+        later
+    );
+    // The first batch's end goes at its retention; the index stays the later batch's.
+    w.clock.advance_ms(SENT_RETENTION_MS);
+    app.flush_outbox().await.unwrap();
+    assert_eq!(app.kept_batch(first).await.unwrap(), None);
+    assert_eq!(
+        app.kept_attempt(attempt())
+            .await
+            .unwrap()
+            .map(|k| k.batch_id),
+        Some(later)
+    );
 }

@@ -244,3 +244,34 @@ async fn test_sender_document_unreachable_when_read_again_holds_the_entry() {
     }
     assert_eq!(w.homeserver.identity_reads(&bob), reads + 2);
 }
+
+/// A Homeserver that serves bob's older document again after the app took his renewal: an
+/// entry under his first certificate, which only the older document lists, has the
+/// document read again once and is dropped, since the older copy doesn't replace the newer
+/// one held.
+#[tokio::test]
+async fn test_sender_document_older_copy_served_again_lists_nothing_back() {
+    let w = World::new();
+    let mut app = app_holding_bobs_document(&w).await;
+    let older = w.homeserver.identity_doc(&w.bob.public()).unwrap();
+    w.clock.advance_ms(60_000);
+    let renewed = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["scope-a"]);
+    publish_renewal(&w, &renewed);
+    let seq = note_under(&w, &renewed, app.app_id(), "under the renewal");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    // The Homeserver goes back to the older document.
+    w.homeserver.publish(&older).unwrap();
+    w.clock.advance_ms(SENDER_REREAD_MS);
+    let bob = w.bob.public();
+    let reads = w.homeserver.identity_reads(&bob);
+    let seq = note_under(&w, &w.bob_cert.clone(), app.app_id(), "under the first");
+    let report = app.receive(None).await.unwrap();
+    assert!(!received(&report.events, seq));
+    assert!(
+        dropped_at_check_7(&report.events, seq),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(w.homeserver.identity_reads(&bob), reads + 1);
+}

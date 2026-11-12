@@ -5713,3 +5713,59 @@ async fn test_records_record_job_waiting_for_a_key_ends_at_the_retention() {
     assert!(told(&wallet.unacknowledged_events().await.unwrap()));
     assert_eq!(wallet.delivery(&msg_id).await.unwrap(), None);
 }
+
+/// Giving up a record job leaves the message in the outbox while a re-send of it is owed:
+/// only the record job goes, told by its duty event, and the re-send is still tried.
+#[tokio::test]
+async fn test_records_record_job_given_up_keeps_an_owed_resend() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    wallet.receive(None).await.unwrap();
+    let signed = wallet
+        .sign_message(s.note("hello"))
+        .unwrap()
+        .with_record(crate::app::RecordJob {
+            target: s.target("n1"),
+            tag: b"sent".to_vec(),
+        });
+    let msg_id = wallet.queue_signed(signed).await.unwrap();
+    wallet.flush_outbox().await.unwrap();
+    let Some(Delivery::Accepted { accepted_at_ms }) = wallet.delivery(&msg_id).await.unwrap()
+    else {
+        panic!("accepted");
+    };
+    // A re-send asked, and its delivery fails for now.
+    s.peer
+        .fail_next("inbox", ErrorCode::Unavailable, json!(null));
+    let delivery = wallet.resend(&msg_id).await.unwrap();
+    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    s.w.clock
+        .set_ms(accepted_at_ms + crate::app::SENT_RETENTION_MS);
+    s.peer
+        .fail_next("inbox", ErrorCode::Unavailable, json!(null));
+    wallet.flush_outbox().await.unwrap();
+    assert!(
+        wallet
+            .unacknowledged_events()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(
+                e,
+                AppEvent::RecordJobDropped { msg_id: m, .. } if *m == msg_id
+            ))
+    );
+    assert!(
+        wallet
+            .reader()
+            .exists(&format!("out/{msg_id}"))
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        wallet.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Queued { .. })
+    ));
+}
