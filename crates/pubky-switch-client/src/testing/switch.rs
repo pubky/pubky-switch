@@ -208,6 +208,16 @@ pub enum Fault {
         /// The member left out.
         member: String,
     },
+    /// [`Fault::LeaveOut`], with the top-level `member` replaced by `value` instead, such as
+    /// `GET /apps`' `identity` by a copy that doesn't verify.
+    Replace {
+        /// A part of the request's path and query.
+        path: String,
+        /// The member replaced.
+        member: String,
+        /// What the answer carries instead.
+        value: Value,
+    },
 }
 
 pub(crate) struct Inner {
@@ -1070,12 +1080,14 @@ impl ScriptedSwitch {
         let path = request.path_and_query.clone();
         let mut lose = false;
         let mut leave_out = None;
+        let mut replace = None;
         let matching = inner.faults.iter().position(|fault| match fault {
             Fault::Error { path: p, .. }
             | Fault::LoseAnswer { path: p }
             | Fault::LoseAnswerAfter { path: p, .. }
             | Fault::Unreachable { path: p, .. }
-            | Fault::LeaveOut { path: p, .. } => path.contains(p.as_str()),
+            | Fault::LeaveOut { path: p, .. }
+            | Fault::Replace { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
             Some(Fault::Unreachable { after, .. } | Fault::LoseAnswerAfter { after, .. })
@@ -1109,6 +1121,7 @@ impl ScriptedSwitch {
                 }
                 Some(Fault::LoseAnswer { .. } | Fault::LoseAnswerAfter { .. }) => lose = true,
                 Some(Fault::LeaveOut { member, .. }) => leave_out = Some(member),
+                Some(Fault::Replace { member, value, .. }) => replace = Some((member, value)),
                 Some(Fault::Unreachable { .. }) => {
                     inner.unreached.push(request.body.clone());
                     return Err(TransportError::Connect("scripted".into()));
@@ -1181,6 +1194,9 @@ impl ScriptedSwitch {
         }
         if let (Some(member), Some(object)) = (leave_out, body.as_object_mut()) {
             object.remove(&member);
+        }
+        if let (Some((member, value)), Some(object)) = (replace, body.as_object_mut()) {
+            object.insert(member, value);
         }
         Ok(inner.respond(request, status, &body))
     }
