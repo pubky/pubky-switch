@@ -3,6 +3,7 @@
 //! lost, for the readers that held it and for one that joins afterwards.
 
 use pubky_switch_client::app::{App, AppError, AppEvent, RecordTarget};
+use pubky_switch_core::records::IDENTITY_PATH;
 use pubky_switch_signer::CertChange;
 use serde_json::{Value, json};
 
@@ -192,5 +193,121 @@ pub async fn renewal_drops_scope(world: &World) -> FlowResult {
         &json!({ "listed": listed.len(), "app": app_status(&mut tablet) }),
     );
     record_at(world, "the tablet", &mut tablet, &target).await?;
+    Ok(())
+}
+
+/// A reduction whose publication fails (Switch wire 3.8 "A closing delivery owed"). alice's
+/// wallet holds two scopes. A day later her signer renews its certificate without the one
+/// that has no keys, a reduction that rotates nothing; her Homeserver fails the write of
+/// `identity.json` once. The switch takes the renewing version and then the closing one,
+/// which cuts the earlier certificate off: a Homeserver that refuses writes doesn't hold
+/// the closing back. Only publication waits, and the signer's next run publishes the
+/// closing version.
+///
+/// Calls: `PUT /v1/{id}/identity` with a renewing version and with the version that closes
+/// the earlier certificate, neither published yet.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, the closing version doesn't
+/// reach the switch while the publication fails, or it isn't published by the next run.
+pub async fn reduction_unpublished(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let both = Asking::for_scopes(world.app_keys(&alice, "wallet")?, &[NOTES, NOTES_LISTS])?;
+    let (mut wallet, _) = joined_as(
+        world,
+        &alice,
+        &mut signer,
+        both,
+        notes_protocol_with_records(),
+    )
+    .await?;
+    look(world, &mut wallet, "the wallet before the renewal").await?;
+    world.advance_ms(DAY_MS);
+
+    let published = |world: &World| {
+        world
+            .files()
+            .identity_doc(&alice.public())
+            .map(|doc| doc.version())
+    };
+    let before = published(world);
+    let deliveries = |world: &World| {
+        let trace = world.trace();
+        trace
+            .lines
+            .iter()
+            .filter(|line| line.label == "{alice} PUT /v1/{alice}/identity")
+            .filter(|line| line.facts.get("status").map(String::as_str) == Some("200"))
+            .count()
+    };
+    let delivered = deliveries(world);
+    world.fail_homeserver_write(IDENTITY_PATH);
+    let change = CertChange {
+        scopes: Some(vec![NOTES.to_owned()]),
+        expires_at: None,
+    };
+    let renewing = signer.renew(wallet.app_id(), change).await;
+    let newest = signer.identity_doc()?;
+    let closes = |doc: &pubky_switch_core::records::IdentityDoc| {
+        doc.body()
+            .renewed
+            .iter()
+            .filter(|renewed| renewed.until.is_some())
+            .count()
+    };
+    world.outcome(
+        "the signer renewed the wallet without the scope, the publication failing",
+        &json!({
+            "ok": renewing.is_ok(),
+            "versions_delivered": deliveries(world) - delivered,
+            "newest_version": newest.as_ref().map(|doc| doc.version()),
+            "closed": newest.as_ref().map(closes),
+            "published_moved": published(world) != before,
+            "signer": status(&signer)?,
+        }),
+    );
+    // Both versions reached the switch, the closing one included; neither is published.
+    if renewing.is_ok()
+        || deliveries(world) - delivered != 2
+        || newest.as_ref().map(closes) != Some(1)
+        || published(world) != before
+        || world.homeserver_faults_left() != 0
+    {
+        return Err(format!(
+            "with the publication failing, the renewal ended ok: {}, {} versions were \
+             delivered, the newest closes {:?} certificates, and the published version \
+             went from {before:?} to {:?}",
+            renewing.is_ok(),
+            deliveries(world) - delivered,
+            newest.as_ref().map(closes),
+            published(world)
+        )
+        .into());
+    }
+    world.advance_ms(STEP_MS);
+
+    signer.resume().await?;
+    let newest = signer.identity_doc()?.map(|doc| doc.version());
+    world.outcome(
+        "the signer's next run published the closing version",
+        &json!({ "published_is_newest": published(world) == newest, "signer": status(&signer)? }),
+    );
+    if published(world) != newest {
+        return Err("the closing version isn't published after the next run".into());
+    }
+    world.advance_ms(STEP_MS);
+
+    let read = wallet.receive(None).await;
+    world.outcome(
+        "the wallet after the renewal",
+        &json!({
+            "ended": ended(&read),
+            "scopes": wallet.cert().body().scopes.clone(),
+            "app": app_status(&mut wallet),
+        }),
+    );
     Ok(())
 }

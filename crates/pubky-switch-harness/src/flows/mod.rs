@@ -55,7 +55,7 @@ pub use recovery::{
     provider_loss_refusals_in_transit, provider_loss_refused, provider_loss_restored,
     provider_loss_revocation_meanwhile, provider_loss_sender_admitted,
 };
-pub use reduction::renewal_drops_scope;
+pub use reduction::{reduction_unpublished, renewal_drops_scope};
 pub use removal::{departure, revocation};
 pub use renewal::{renewal, renewed_twice};
 pub use restore::restore;
@@ -119,6 +119,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("deny list", |world| Box::pin(deny_list(world))),
     ("renewal, a scope dropped", |world| {
         Box::pin(renewal_drops_scope(world))
+    }),
+    ("renewal, a reduction unpublished", |world| {
+        Box::pin(reduction_unpublished(world))
     }),
     ("renewed twice", |world| Box::pin(renewed_twice(world))),
     ("third epoch", |world| Box::pin(third_epoch(world))),
