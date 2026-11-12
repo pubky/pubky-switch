@@ -697,3 +697,21 @@ pub fn operator_public() -> [u8; 32] {
         .verifying_key()
         .to_bytes()
 }
+
+/// Wake requests waiting on an account's changes, as the service's listener does, until
+/// the returned sender is used or dropped.
+pub async fn listen(
+    replay: &Replay,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = pubky_switch::changes::ChangeListener::connect(replay.db.store())
+        .await
+        .expect("listen");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(listener.run(replay.service.changes(), async {
+        let _ = stopped.await;
+    }));
+    (stop, task)
+}
