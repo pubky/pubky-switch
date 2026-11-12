@@ -1162,8 +1162,9 @@ impl ScriptedSwitch {
             .and_then(|text| app_id_decode(text).ok());
         let rest = path.splitn(4, '/').nth(3).unwrap_or_default().to_owned();
         let account = inner.identity.public();
-        // An own app the switch holds no record for, at any call but the batch that can
-        // carry its `app.put`: no key verifies the request, so authentication refuses it,
+        // An own app the switch holds no record for, at any call but a batch that carries
+        // its `app.put` (or doesn't parse, which the batch's checks refuse first): no key
+        // verifies the request, so authentication refuses it,
         // whatever the route and before the account's lock, the staged and frozen answers
         // included, as the service does: `403 not_current`, no head, the last committed
         // time, and the app not seen (Switch wire 7.1 "`Switch-Head` on refusals", 7.2 "An
@@ -1171,7 +1172,7 @@ impl ScriptedSwitch {
         if let Some(app) = caller
             && !(inner.erased || inner.enrolled.is_none())
             && inbox::Sender::foreign(request, &account).is_none()
-            && !(request.method == "POST" && rest == "ops")
+            && !(request.method == "POST" && rest == "ops" && carries_app_put(&request.body, &app))
             && inner
                 .apps
                 .get(&app)
@@ -2544,4 +2545,17 @@ impl Inner {
                     "apps_version": self.apps_version }),
         )
     }
+}
+
+/// Whether a `POST /ops` body can be an own app's first call (Switch wire 7.2): it doesn't
+/// parse, which the batch's own checks refuse first (Switch wire 6.4 step 2), or an
+/// `app.put` of the batch names `app`, as the service looks for it.
+fn carries_app_put(body: &[u8], app: &[u8; 16]) -> bool {
+    let Ok(parsed) = OpsRequest::parse(body) else {
+        return true;
+    };
+    parsed
+        .signed()
+        .filter_map(|doc| SignedOp::peek(doc).ok())
+        .any(|op| matches!((&op.body().kind, op.body().app_id), (OpKind::AppPut { .. }, Some(id)) if &id == app))
 }

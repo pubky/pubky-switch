@@ -5785,6 +5785,26 @@ fn scripted_call(
     method: &str,
     rest: &str,
 ) -> (u16, Value, bool, Option<String>) {
+    scripted_request(s, app, method, rest, b"{}".to_vec())
+}
+
+/// As [`scripted_call`], a `POST` with `body`.
+fn scripted_post(
+    s: &Setup,
+    app: [u8; 16],
+    rest: &str,
+    body: Vec<u8>,
+) -> (u16, Value, bool, Option<String>) {
+    scripted_request(s, app, "POST", rest, body)
+}
+
+fn scripted_request(
+    s: &Setup,
+    app: [u8; 16],
+    method: &str,
+    rest: &str,
+    body: Vec<u8>,
+) -> (u16, Value, bool, Option<String>) {
     use pubky_switch_core::http::header;
     let response =
         s.w.switch
@@ -5799,7 +5819,7 @@ fn scripted_call(
                         &pubky_switch_core::enc::zbase32_encode(&app),
                     ),
                 ],
-                body: b"{}".to_vec(),
+                body,
             })
             .unwrap();
     let body: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
@@ -5844,9 +5864,19 @@ async fn test_scripted_first_call_without_a_record_is_refused_alike_at_every_rou
         pubky_switch_core::time::rfc3339(s.w.switch.lock().stamped_ms),
         committed
     );
-    // A batch can carry its `app.put`: it goes on to the batch's checks.
+    // A batch that doesn't parse goes on to the batch's checks; one that parses without
+    // the app's `app.put` is refused alike (Switch wire 7.2).
     let (status, code, _, _) = scripted_call(&s, unknown, "POST", "ops");
     assert_ne!((status, code), (403, json!("not_current")));
+    let cursor_only = crate::client::Batch::cursor_only(pubky_switch_core::ops::Position {
+        generation: 1,
+        seq: 1,
+    });
+    let stamped = pubky_switch_core::time::rfc3339(s.w.switch.lock().stamped_ms);
+    assert_eq!(
+        scripted_post(&s, unknown, "ops", cursor_only.body().to_vec()),
+        (403, json!("not_current"), false, Some(stamped))
+    );
     // An app the switch holds a record for goes on to the route.
     let (status, _, head, _) = scripted_call(&s, phone.app_id(), "GET", "allow");
     assert_eq!((status, head), (200, true));

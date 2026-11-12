@@ -161,7 +161,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   test switch only.
 - **An own app's first call** (Switch wire 7.1 "`Switch-Head` on refusals", 7.2), as at
   the service (`crates/pubky-switch/src/service/batch/mod.rs`, `verify_own_app`): an own
-  app the switch holds no record for, at any call but `POST /ops`, gets `403 not_current`
+  app the switch holds no record for, at any call but a `POST /ops` whose batch carries its
+  `app.put` or doesn't parse, gets `403 not_current`
   at authentication, before the account's lock and before a staged or frozen account's
   answer (Switch wire 7.3 steps 5 to 8), whatever the route: no `Switch-Head`,
   `Switch-Server-Time` the last time stamped, and the app not seen. A departed app that
