@@ -6,7 +6,6 @@ use sqlx::Row;
 
 use super::{AccountTxn, StoreError, from_db, identity::time_to_db, to_db};
 use crate::keys::KeyId;
-use pubky_switch_core::sig::SignedDoc;
 
 /// The recovery the generation the account serves began with (Switch wire 7.4.12
 /// `recovery`).
@@ -66,21 +65,15 @@ pub fn recovery_clears() -> Vec<&'static str> {
 }
 
 impl super::Store {
-    /// What a recovery upload to `id` is judged against, read without the account's lock:
-    /// the generation declared lost, while the account serves the generation a recovery
-    /// began, and the `identity.json` it holds. `None` otherwise. The upload compares both
-    /// with what it reads under the lock before it takes a judgment made with them.
-    pub async fn upload_context(
-        &self,
-        id: &str,
-    ) -> Result<Option<(u64, Option<SignedDoc>)>, StoreError> {
-        let row = sqlx::query(
-            "SELECT recovery_from, generation, identity_doc FROM accounts WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(StoreError::from_db)?;
+    /// The generation declared lost at `id`, read without the account's lock, while it
+    /// serves the generation a recovery began; `None` otherwise. A recovery upload judged
+    /// with it compares it with what it reads under the lock before it takes the judgment.
+    pub async fn recovery_from_of(&self, id: &str) -> Result<Option<u64>, StoreError> {
+        let row = sqlx::query("SELECT recovery_from, generation FROM accounts WHERE id = $1")
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(StoreError::from_db)?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -90,14 +83,7 @@ impl super::Store {
             return Ok(None);
         };
         let from = from_db(from, "recovery_from")?;
-        if from.checked_add(1) != Some(from_db(generation, "generation")?) {
-            return Ok(None);
-        }
-        let doc: Option<Vec<u8>> = row.try_get("identity_doc")?;
-        let doc = doc
-            .map(|doc| super::identity::decode_doc(&doc, "identity_doc"))
-            .transpose()?;
-        Ok(Some((from, doc)))
+        Ok((from.checked_add(1) == Some(from_db(generation, "generation")?)).then_some(from))
     }
 }
 

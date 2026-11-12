@@ -20,6 +20,7 @@ use pubky_switch_core::recovery::{
 use pubky_switch_core::shared::RecordState;
 use serde_json::json;
 
+use super::batch::{VerifiedApp, check_own_app};
 use super::recovery::{AdmissionEnd, chain_transition};
 use super::{Answer, Service, batch::refused, store_error};
 use crate::{
@@ -127,18 +128,113 @@ pub(super) struct Prechecked {
     checked: CheckedUpload,
 }
 
+/// What a recovery upload settled before the account's lock: its slot of
+/// `uploads_per_app_per_hour` (the seconds to wait when it got none), and its items judged,
+/// when they could be.
+pub(super) struct PreparedUpload {
+    rate: Result<(), u64>,
+    prechecked: Option<Prechecked>,
+}
+
+/// The `(account, app)` whose upload's items are being judged before the lock: one at a time
+/// for each, removed when the judgment ends.
+struct Judging<'a> {
+    set: &'a parking_lot::Mutex<std::collections::HashSet<(String, [u8; 16])>>,
+    key: (String, [u8; 16]),
+}
+
+impl<'a> Judging<'a> {
+    /// Enter the judgment of `key`; `None` while another of its uploads is judged.
+    fn enter(
+        set: &'a parking_lot::Mutex<std::collections::HashSet<(String, [u8; 16])>>,
+        key: (String, [u8; 16]),
+    ) -> Option<Self> {
+        // The set's lock ends with this statement, before a guard is made: dropping one
+        // takes it again.
+        let entered = set.lock().insert(key.clone());
+        entered.then(|| Self { set, key })
+    }
+}
+
+impl Drop for Judging<'_> {
+    fn drop(&mut self) {
+        self.set.lock().remove(&self.key);
+    }
+}
+
 impl Service {
+    /// What a recovery upload from the own app `verified` settles before the account's lock,
+    /// at `time_ms` (Switch wire 7.4.14, 9.4). First its slot of `uploads_per_app_per_hour`,
+    /// taken by every upload that verifies, a refused one included, so the hourly limit
+    /// bounds the judgments too; then, with a slot, its items judged, at most one upload of
+    /// each app of each account at a time: one sent while another is judged gets no slot
+    /// (`429`, a second to wait). Every refusal is answered under the lock, in the wire's
+    /// order.
+    pub(super) async fn prepare_upload(
+        &self,
+        account: &str,
+        verified: &VerifiedApp,
+        body: &[u8],
+        time_ms: u64,
+    ) -> PreparedUpload {
+        let key = (account.to_owned(), verified.app_id());
+        let rate =
+            self.upload_rate
+                .take(key.clone(), self.limits.uploads_per_app_per_hour, time_ms);
+        if rate.is_err() {
+            return PreparedUpload {
+                rate,
+                prechecked: None,
+            };
+        }
+        let Some(_judging) = Judging::enter(&self.upload_judging, key) else {
+            return PreparedUpload {
+                rate: Err(1),
+                prechecked: None,
+            };
+        };
+        PreparedUpload {
+            rate,
+            prechecked: self.precheck_upload(account, verified, body, time_ms).await,
+        }
+    }
+
     /// Judge a recovery upload's items before the account's lock, off the async threads:
     /// their signature work needs only the lost generation and the apps the held
-    /// `identity.json` lists as removed, which are read without the lock. `None` when the
-    /// body doesn't read or the account is in no loss's generation: the endpoint answers it
-    /// under the lock.
-    pub(super) async fn precheck_upload(&self, account: &str, body: &[u8]) -> Option<Prechecked> {
-        let upload = UploadBody::parse(body).ok()?;
+    /// `identity.json` lists as removed, which are read without the lock. Only for an upload
+    /// the endpoint would take: its app current with an unexpired certificate, its body read
+    /// and its lists ones it may send, all checked here again as under the lock. `None`
+    /// otherwise, or when the account is in no loss's generation: the endpoint answers it.
+    async fn precheck_upload(
+        &self,
+        account: &str,
+        verified: &VerifiedApp,
+        body: &[u8],
+        time_ms: u64,
+    ) -> Option<Prechecked> {
         let identity = pubky_switch_core::enc::pubky_key(account).ok()?;
-        let (recovery_from, doc) = self.store.upload_context(account).await.ok()??;
-        let removed = doc
-            .and_then(|doc| IdentityDoc::verify(&doc, &identity).ok())
+        let (doc, row, kept) = self
+            .store
+            .own_app_view(account, &verified.app_id())
+            .await
+            .ok()??;
+        let held = match doc {
+            Some(doc) => Some(IdentityDoc::verify(&doc, &identity).ok()?),
+            None => None,
+        };
+        let cert = check_own_app(
+            &identity,
+            held.as_ref(),
+            row.as_ref(),
+            kept,
+            verified,
+            time_ms,
+        )
+        .ok()?;
+        let upload = UploadBody::parse(body).ok()?;
+        upload.check_permissions(&cert).ok()?;
+        let recovery_from = self.store.recovery_from_of(account).await.ok()??;
+        let removed = held
             .map(|doc| doc.body().removed.clone())
             .unwrap_or_default();
         let judged = removed.clone();
@@ -164,8 +260,9 @@ impl Service {
     /// body that doesn't read, `403 permission_missing` for lists the caller may not send,
     /// `429 rate_limited` past `uploads_per_app_per_hour`, else the merge, one `upload`
     /// transition, and `{ result, proof, head }`. `held` is the account's newest
-    /// `identity.json`, whose `removed` judges removed apps' operations. `prechecked` is the
-    /// judgment made before the lock, taken when its `recovery_from` and `removed` are the
+    /// `identity.json`, whose `removed` judges removed apps' operations. `prepared` is what
+    /// the upload settled before the lock: its rate slot, answered `429` here in the wire's
+    /// order, and its items judged, taken when their `recovery_from` and `removed` are the
     /// ones read here; otherwise the items are judged here.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn recovery_upload(
@@ -175,7 +272,7 @@ impl Service {
         held: Option<&IdentityDoc>,
         caller: &AppCert,
         body: &[u8],
-        prechecked: Option<&Prechecked>,
+        prepared: Option<&PreparedUpload>,
         time_ms: u64,
     ) -> Result<Answer, ApiError> {
         let Some(recovery) = txn.recovery().await.map_err(|e| store_error(&e))? else {
@@ -186,15 +283,18 @@ impl Service {
         let upload = UploadBody::parse(body).map_err(refused)?;
         upload.check_permissions(caller).map_err(refused)?;
         let by = caller.app_id();
-        self.upload_rate
-            .take(
+        // The slot was taken before the lock; an upload that settled nothing there takes it
+        // here.
+        let rate = match prepared {
+            Some(prepared) => prepared.rate,
+            None => self.upload_rate.take(
                 (txn.head().id.clone(), by),
                 self.limits.uploads_per_app_per_hour,
                 time_ms,
-            )
-            .map_err(|retry| {
-                ApiError::rate_limited("9.4: recovery uploads from this app", retry)
-            })?;
+            ),
+        };
+        rate.map_err(|retry| ApiError::rate_limited("9.4: recovery uploads from this app", retry))?;
+        let prechecked = prepared.and_then(|prepared| prepared.prechecked.as_ref());
         let identity = txn.head().identity_key;
         let removed = held.map_or(&[][..], |doc| doc.body().removed.as_slice());
         let judged_here;

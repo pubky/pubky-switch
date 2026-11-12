@@ -2139,7 +2139,7 @@ async fn test_upload_refusals() {
     // read and `429` past `uploads_per_app_per_hour`, with what to wait. A refusal merges
     // and chains nothing.
     let limits = pubky_switch::limits::Limits {
-        uploads_per_app_per_hour: 4,
+        uploads_per_app_per_hour: 5,
         max_contacts: 1,
         ..pubky_switch::limits::Limits::default()
     };
@@ -2543,10 +2543,11 @@ async fn test_upload_bound_past_the_integer_range_is_unverified() {
 
 #[tokio::test]
 async fn test_upload_refusals_order_and_the_rate_slot() {
-    // `404` before `400` at an account in neither stage; after the loss a `400` takes no
-    // slot of `uploads_per_app_per_hour`, an app not current here is `403 not_current`, an
-    // app of another identity `403 permission_missing`, and the one slot then goes to the
-    // first upload that reads.
+    // `404` before `400` at an account in neither stage; after the loss, a body that doesn't
+    // read is `400` whatever the rate, but it takes the one slot of
+    // `uploads_per_app_per_hour`, a refused upload counting (Switch wire 7.4.14), so the
+    // upload that reads after it is `429`. An app not current here is `403 not_current`, an
+    // app of another identity `403 permission_missing`.
     let limits = pubky_switch::limits::Limits {
         uploads_per_app_per_hour: 1,
         ..pubky_switch::limits::Limits::default()
@@ -2580,7 +2581,6 @@ async fn test_upload_refusals_order_and_the_rate_slot() {
     let other = other_request("shop", ORIGIN, "POST", &path, b"{}".to_vec(), None, at);
     let refused = replay.service.handle(other).await;
     assert_eq!(code(&refused), (403, "permission_missing".into()));
-    assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
     assert_eq!(
         code(&upload(&replay, &json!({}), at).await),
         (429, "rate_limited".into())
@@ -2701,5 +2701,102 @@ async fn test_claim_that_isnt_rebuilt_and_lost_an_entry_is_unavailable() {
         .handle(app_request(&wallet_keys(), "GET", &path, Vec::new(), at))
         .await;
     assert_eq!(code(&read), (503, "unavailable".into()));
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// An upload from the wallet with `count` heads that verify with the lost key.
+fn many_heads(lost: &IdentityDoc, count: usize) -> Value {
+    let head = vectors("chain.json")["signed_heads"][0]["head"].clone();
+    let heads: Vec<Value> = (0..count).map(|_| head.clone()).collect();
+    json!({ "lost_identity": lost.signed(), "heads": heads })
+}
+
+#[tokio::test]
+async fn test_upload_past_the_limit_is_refused_without_its_judgment() {
+    // The slot of `uploads_per_app_per_hour` is taken before an upload's items are judged:
+    // past the limit, a body of 20,000 heads is `429` about as fast as an empty one, its
+    // items never judged (Switch wire 7.4.14).
+    let limits = pubky_switch::limits::Limits {
+        uploads_per_app_per_hour: 1,
+        ..pubky_switch::limits::Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
+    let body = many_heads(&lost, 20_000);
+    let started = std::time::Instant::now();
+    let limited = upload(&replay, &body, at).await;
+    let refused_in = started.elapsed();
+    let small = std::time::Instant::now();
+    let limited_small = upload(&replay, &json!({}), at).await;
+    let small_in = small.elapsed();
+    assert_eq!(code(&limited), (429, "rate_limited".into()));
+    assert_eq!(code(&limited_small), (429, "rate_limited".into()));
+    assert!(
+        refused_in < small_in * 20,
+        "the 429 waited for a judgment: {refused_in:?} vs {small_in:?}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_upload_while_another_of_the_app_is_judged_is_429() {
+    // One upload of each app of an account is judged at a time: a second sent meanwhile is
+    // `429` with a second to wait, and once the first is answered the app uploads again.
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let replay = std::sync::Arc::new(replay);
+    let body = many_heads(&lost, 20_000);
+    let first = {
+        let replay = std::sync::Arc::clone(&replay);
+        tokio::spawn(async move { upload(&replay, &body, at).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let second = upload(&replay, &json!({}), at).await;
+    assert_eq!(code(&second), (429, "rate_limited".into()));
+    assert_eq!(json_of(&second)["retry_after"], json!(1));
+    assert_eq!(first.await.expect("first").status, 200);
+    assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
+    let replay = std::sync::Arc::try_unwrap(replay).ok().expect("one owner");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_from_a_revoked_app_is_refused_without_its_judgment() {
+    // An app whose record remains but that isn't current any more is `403 not_current`, and
+    // its upload's items aren't judged for it: a large body is refused about as fast as an
+    // empty one.
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let wallet = app(&vectors("keys.json"), "wallet")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let path = format!("/v1/{}/apps/{wallet}/revoke", alice_id());
+    let revoked = replay
+        .service
+        .handle(signer_request("POST", &path, Vec::new(), at))
+        .await;
+    assert_eq!(
+        revoked.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&revoked.body)
+    );
+    let body = many_heads(&lost, 20_000);
+    let started = std::time::Instant::now();
+    let refused = upload(&replay, &body, at).await;
+    let refused_in = started.elapsed();
+    let small = std::time::Instant::now();
+    let refused_small = upload(&replay, &json!({}), at).await;
+    let small_in = small.elapsed();
+    assert_eq!(code(&refused), (403, "not_current".into()));
+    assert_eq!(code(&refused_small), (403, "not_current".into()));
+    assert!(
+        refused_in < small_in * 20,
+        "the 403 waited for a judgment: {refused_in:?} vs {small_in:?}"
+    );
     replay.db.drop_database().await.expect("drop");
 }

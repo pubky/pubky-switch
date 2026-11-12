@@ -2143,7 +2143,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
   - The caller is an own app under the checks of 7.2, so its `app.put` comes first (`403 not_current` before it). The rest of the order in the last bullet below is the app's to keep; the merge holds whatever the order, since writes at N win.
   - A body that doesn't read as the table above is `400`.
   - `contacts` from an app without `lists.manage`, or `deny` from one with neither `lists.read` nor `lists.manage`, is `403 permission_missing` for the whole upload, and nothing merges: the permission is the caller's, not an item's.
-  - Past `uploads_per_app_per_hour` an upload is `429 rate_limited` (9.4).
+  - Past `uploads_per_app_per_hour` an upload is `429 rate_limited` (9.4). Every upload from an own app whose request verifies counts against it, one refused for another reason included, since its slot is taken before its items are judged; and one sent while another of the same app is still being judged is `429` too, with `retry_after` 1. The refusals stay in the order above.
   - An uploaded item that fails a check is counted in the answer (below) and left out, and the rest merges: apps upload whatever they kept, and one stale item mustn't block the rest.
   - The merge checks no time condition (spec 12.6 step 3) and uploaded attempts are orphaned whatever their age (6.8), so it needs no trusted time (7.3).
 - **One transition for each upload.** Every upload accepted after a provider loss appends exactly one `upload` transition (6.5), with empty changes too, so its answer always carries the proof that binds it (6.5, Binding of the other writes). A retry merges nothing new and gets a transition of its own.

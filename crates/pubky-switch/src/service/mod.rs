@@ -93,6 +93,9 @@ pub struct Service {
     notify_rate: KeyedWindows<(String, [u8; 32])>,
     /// Recovery uploads per app per hour (Switch wire 7.4.14).
     upload_rate: KeyedWindows<(String, [u8; 16])>,
+    /// The `(account, app)` whose recovery upload's items are being judged before the lock:
+    /// one at a time for each.
+    upload_judging: parking_lot::Mutex<std::collections::HashSet<(String, [u8; 16])>>,
     /// The sweeps a retried erasure of an account gone may run (Switch wire 7.4.16): only
     /// the signer's, verified with the identity key, and bounded per account, since anyone
     /// who saw one can replay it within its timestamp window.
@@ -221,9 +224,9 @@ fn unsigned(error: &ApiError) -> SwitchResponse {
 enum Prepared {
     /// A delivered `identity.json`, read and verified (Switch wire 7.4.5).
     Delivery(Box<Result<peers::Delivered, ApiError>>),
-    /// A recovery upload's items, judged against the account as it stood before the lock;
-    /// `None` when they couldn't be (Switch wire 7.4.14).
-    Upload(Option<Box<upload::Prechecked>>),
+    /// A recovery upload's rate slot and its items, judged against the account as it stood
+    /// before the lock (Switch wire 7.4.14).
+    Upload(Box<upload::PreparedUpload>),
 }
 
 fn store_error(error: &StoreError) -> ApiError {
@@ -273,6 +276,7 @@ impl Service {
             sender_app_rate: KeyedWindows::default(),
             notify_rate: KeyedWindows::default(),
             upload_rate: KeyedWindows::hours(),
+            upload_judging: parking_lot::Mutex::default(),
             erasure_sweeps: KeyedWindows::default(),
             changes: ChangeHub::new(),
             entry_ids: Arc::new(random_entry_id),
@@ -505,11 +509,13 @@ impl Service {
                     other.as_ref(),
                 ))))
             }
-            Call::RecoveryUpload if verified.is_some() => Some(Prepared::Upload(
-                self.precheck_upload(&account, &request.body)
-                    .await
-                    .map(Box::new),
-            )),
+            Call::RecoveryUpload => match verified.as_ref() {
+                Some(app) => Some(Prepared::Upload(Box::new(
+                    self.prepare_upload(&account, app, &request.body, base_ms.max(stamped_ms))
+                        .await,
+                ))),
+                None => None,
+            },
             _ => None,
         };
         // The reads that run after the lock on its snapshot take their account's turn and
@@ -1478,8 +1484,8 @@ impl Service {
                         serving,
                     ));
                 }
-                let prechecked = match prepared {
-                    Some(Prepared::Upload(prechecked)) => prechecked.as_deref(),
+                let prepared = match prepared {
+                    Some(Prepared::Upload(prepared)) => Some(&**prepared),
                     _ => None,
                 };
                 return self
@@ -1489,7 +1495,7 @@ impl Service {
                         held.as_ref(),
                         caller,
                         &request.body,
-                        prechecked,
+                        prepared,
                         time_ms,
                     )
                     .await
