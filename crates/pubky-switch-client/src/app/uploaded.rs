@@ -70,28 +70,22 @@ pub(super) fn divergent_key(key: &[u8; 32]) -> String {
 impl App {
     /// Mark for reading again the records and claims an upload changed or made divergent,
     /// from its `upload` transition in the feed (Switch wire 7.4.14), in `tx`.
-    /// A key already marked keeps its mark's time. An app without `claims.read` can't read
+    /// A key already marked is marked again, at the transition's read. An app without `claims.read` can't read
     /// claims, and marks none; a record it may not read is unmarked when the switch refuses
     /// its read.
-    pub(crate) async fn mark_uploaded<'a>(
-        &mut self,
+    pub(crate) fn mark_uploaded<'a>(
+        &self,
         records: impl IntoIterator<Item = &'a [u8; 32]>,
         claims: impl IntoIterator<Item = &'a [u8; 32]>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let at = self.now();
         for key in records.into_iter().take(MAX_MARKED_KEYS) {
-            let mark = record_reread_key(key);
-            if !self.reader().exists(&mark).await? {
-                tx.put(&mark, &at)?;
-            }
+            tx.put(&record_reread_key(key), &at)?;
         }
         if self.state.cert.has_permission(Permission::ClaimsRead) {
             for claim_key in claims.into_iter().take(MAX_MARKED_KEYS) {
-                let mark = reread_key(claim_key);
-                if !self.reader().exists(&mark).await? {
-                    tx.put(&mark, &at)?;
-                }
+                tx.put(&reread_key(claim_key), &at)?;
             }
         }
         Ok(())
