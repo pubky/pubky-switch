@@ -1386,6 +1386,10 @@ mod tests {
             },
         );
         states.push(stored);
+        // The target app known, its renewed certificate replaced or carried since.
+        let mut carried = current_at_nine();
+        carried.apps.insert(target.app_id(), AppDocs::default());
+        states.push(carried);
         states.push(CurrentDocs::default());
         for (n, current) in states.iter().enumerate() {
             for row in &items {
