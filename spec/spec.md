@@ -73,7 +73,7 @@ Everything else is the switch's: identities and their `identity.json`, app certi
 |---|---|
 | **Signer** (Ring, or Bitkit as signer) | Holds the Pubky identity key. Approves apps, signs `identity.json`, derives Shared Data Keys and writes key bundles, enrolls the identity at the switch, performs revocation, key rotation, freeze and recovery. An identity has one signer at a time, the install its `identity.json` names; it can hand the identity to another signer, and backs its records up on the Homeserver (Section 12.8). |
 | **App** | Its own keys, scopes, local data, outbox and cursor, and what its protocol adds, such as Paykit's payment journal. |
-| **Homeserver** | Long-term data: `identity.json`, the records an app publishes, such as those of Paykit apps with public payment endpoints, the signer's backup, optional encrypted backups of apps, and a protocol's own public files. |
+| **Homeserver** | Long-term data: `identity.json`, the records an app publishes, such as those of Paykit apps with public payment endpoints, the signer's backup, optional encrypted backups of apps, and a protocol's own public files and folders. |
 | **Pubky Switch** (hosts many identities; each identity uses one at a time, chosen by the user) | Inbox and feed, allowlist and deny list, the coordination primitives (claims and shared records), app records, key bundles, receive key records, push hooks, directory, revocation, freeze, export and recovery. |
 | **Push relay** (per app vendor; a reference relay is published) | Turns signed, content-free webhooks into APNs or FCM pushes. |
 
@@ -152,10 +152,10 @@ The samples in this spec use Paykit's scope names, message kinds, collections an
 - **Scopes** come only from the signer-signed certificate. An app record's `accepts` may narrow them, never widen them.
 - **Senders** wrap a message to an app only if its certificate allows receiving that kind and its `accepts` lists the kind. A protocol may narrow this further, as Paykit does for a payer's replies (Paykit spec, Section 3.4).
 - **Recipients** drop a message when the sender's certificate lacks the sending scope, or the kind is outside their own certificate. They also drop a message that their protocol's narrower rule for senders wouldn't have sent them.
-- **Homeserver grants.** Each app's Pubky grant covers exactly these paths, with `<app_id>` derived from the certified signing key, and nothing else:
+- **Homeserver grants.** Each app's Pubky grant covers only these paths, with `<app_id>` derived from the certified signing key, and nothing else:
   - `/pub/pubky-switch/v1/apps/<app_id>.json`, read and write (its record);
   - `/priv/pubky-switch/v1/apps/<app_id>/`, read and write, for an app that keeps its backups on the Homeserver;
-  - a public file of the app's protocol, read and write, only for an app the user allows to edit it, such as Paykit's Profile (Paykit spec, Section 3.4).
+  - the public files and folders of the app's protocol, read and write, only for an app the user allows to edit them; the user may approve the app and decline them. Paykit's Profile and its blobs folder are such paths (Paykit spec, Section 3.4).
 
   The user allows each path a protocol adds, or declines it, when approving the app, as that protocol's rule on its paths allows: a protocol may require some of them together. The app's record and backup paths aren't the user's to decline. A decline changes only the grant: the certificate, its scopes and its keys are those the app asked for. An app takes a path it asked for that its grant lacks as declined, and asks for it again only when the user does, with a new auth request, which renews its certificate (Section 12.1). A path a later request leaves out isn't declined: that grant covers only what the request names, and the app's earlier grants stay as they were. No step takes one granted path back short of revoking the app (Section 12.2).
 
@@ -220,7 +220,7 @@ Each app rotates its own receive key, without involving the signer, its other ow
 | HS `/pub/pubky-switch/v1/apps/<app_id>.json` | App record, only for an app that publishes it, such as a Paykit app with public endpoints | That app |
 | HS `/pub/pubky-switch/v1/identity.json` | Switch pointer, policy, current and removed apps, data epoch, the signing install | Signer |
 | HS `/pub/pubky-switch/v1/signer-backup.json` | The signer's backup, sealed to a key only the identity key derives (Section 12.8) | Signer |
-| HS, a protocol's own paths | Its public files, such as the Paykit Profile (Paykit spec, Section 4) | Signer or authorized app |
+| HS, a protocol's own paths | Its public files and folders, such as the Paykit Profile (Paykit spec, Section 4) | Signer or authorized app |
 | HS `/priv/pubky-switch/v1/apps/<app_id>/` | Optional encrypted backup (Section 12.4) | That app |
 | Pubky Switch | Inbox entries, chain items and stubs, contacts, conversation entries and the deny list, claims, shared records, app records, key bundles, receive key records, push handles | Per Sections 3.6, 6, 7 and 10 |
 | App storage | Derived state, outbox and the messages it sent in the last 30 days, processed message IDs, cursor, and its protocol's own state, such as Paykit's (Paykit spec, Section 4) | The app (storage is its choice) |
