@@ -3226,3 +3226,56 @@ async fn test_restore_in_place_keeps_the_earlier_picked_distrust_time() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_provider_loss_revocation_asked_meanwhile_waits_for_the_new_service() {
+    // A revocation asked for while a recovery is in progress sends nothing, to the lost
+    // service or any other: it is kept, shown pending, and the new service is sent it right
+    // after it takes the recovery's version, which the version removing the app follows
+    // (Switch spec 12.6 step 1, 12.2).
+    let world = World::new();
+    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
+    let id = notes_app_id();
+    let typo = "https://recovery.exmaple";
+    signer
+        .declare_provider_loss(typo, confirmed())
+        .await
+        .unwrap_err();
+    let sent = router.log().len();
+    assert_eq!(
+        signer.revoke(id, None, confirmed()).await.unwrap_err(),
+        Refusal::Recovering.into()
+    );
+    assert_eq!(router.log().len(), sent, "nothing sent");
+    assert!(signer.alerts().iter().any(|alert| matches!(
+        alert,
+        Alert::RevocationPending { app_id, at_switch: false } if *app_id == id
+    )));
+    signer.run_due().await.unwrap_err();
+    assert!(
+        !router.log()[sent..]
+            .iter()
+            .any(|line| line.contains(SWITCH_ORIGIN)),
+        "nothing to the lost service"
+    );
+    let recovered = signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    assert!(recovered.listed_cert(&id).is_none());
+    assert!(recovered.body().removed.iter().any(|r| r.app_id == id));
+    assert_eq!(service.identity_doc().unwrap().hash(), recovered.hash());
+    assert!(
+        router
+            .log()
+            .iter()
+            .any(|line| line.contains(NEW_ORIGIN) && line.contains("/revoke")),
+        "revoked there"
+    );
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::RevocationPending { .. }))
+    );
+}

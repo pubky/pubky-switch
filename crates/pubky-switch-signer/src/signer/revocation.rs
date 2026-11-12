@@ -67,7 +67,10 @@ impl Signer {
     /// [`Refusal::NotListed`] for an app the newest `identity.json` doesn't list;
     /// [`Refusal::HandingOver`] or [`Refusal::TakingOver`] while a hand-over or a take-over is
     /// in progress; [`Refusal::FlowInProgress`] while an erasure is, with nothing kept or sent
-    /// (Switch spec 12.7 step 5); otherwise as [`Signer::resume`]. A revocation cut short goes
+    /// (Switch spec 12.7 step 5); [`Refusal::Recovering`] during a recovery, with the
+    /// revocation kept and [`Alert::RevocationPending`] raised: nothing goes to the lost
+    /// service, and the new one is sent the revocation once it takes the recovery's version
+    /// (Switch spec 12.6 step 1); otherwise as [`Signer::resume`]. A revocation cut short goes
     /// on at [`Signer::run_due`]. While an alarm holds signing back, the app is still revoked
     /// at the switch, and the error is the alarm's: the version that removes it waits until the
     /// alarm is cleared.
@@ -120,6 +123,17 @@ impl Signer {
             taken,
         });
         self.commit(state, self.flow.clone()).await?;
+        // During a recovery it is kept for the new service, which is sent it once it takes the
+        // recovery's version; nothing goes to the lost one (Switch spec 12.6 step 1).
+        if self.state.recovering {
+            let mut state = self.state.clone();
+            state.alert(Alert::RevocationPending {
+                app_id,
+                at_switch: false,
+            });
+            self.commit(state, self.flow.clone()).await?;
+            return Err(Refusal::Recovering.into());
+        }
         let completed = self.remove_now().await;
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         if newest.listed_cert(&app_id).is_none() {
@@ -316,6 +330,12 @@ impl Signer {
         if matches!(self.flow, Some(Flow::Erase { .. })) {
             return Ok(Vec::new());
         }
+        // Nor does one go out during a recovery: the lost service can't be asked, and the new
+        // one is sent each revocation the recovery's version still lists, right after it takes
+        // that version (Switch spec 12.6 step 1).
+        if self.state.recovering {
+            return Ok(Vec::new());
+        }
         let failures = self.send_revocations().await?;
         if !failures.is_empty() {
             let mut state = self.state.clone();
@@ -342,14 +362,25 @@ impl Signer {
     /// alarm or not. One that can't be read, is missing or doesn't open adds nothing, alarm
     /// or not: a take-over shows at the switch first, as a newer copy, which stops it already
     /// (Switch wire 3.13), and the revocation is the user's confirmed safety step.
+    ///
+    /// Nor is a revocation held back when the switch's copy can't be read, whatever the
+    /// switch answered instead, a signed error included: it may answer a compromise (Switch
+    /// spec 12.2), and it signs nothing new. The version that removes the app is signed only
+    /// after a read of the switch's copy that does succeed.
     async fn named_for_revoking(&mut self) -> Result<Named> {
         self.check_named()?;
-        let held = self.read_apps().await?.answer.identity;
+        let held = match self.read_apps().await {
+            Ok(read) => Some(read.answer.identity),
+            Err(SignerError::Switch(_)) => None,
+            Err(error) => return Err(error),
+        };
         let in_flow = match &self.flow {
             Some(Flow::Deliver { doc, .. } | Flow::Renew { doc, .. }) => Some(doc.clone()),
             _ => None,
         };
-        if held.is_none() || held != in_flow {
+        if let Some(held) = held
+            && (held.is_none() || held != in_flow)
+        {
             match self.confirm_copy(held.as_ref()).await {
                 Ok(()) | Err(SignerError::Alarm(_)) => {}
                 Err(error) => return Err(error),
