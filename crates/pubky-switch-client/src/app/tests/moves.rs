@@ -252,7 +252,7 @@ fn first_proof(switch: &ScriptedSwitch) -> SignedDoc {
         .unwrap()
 }
 
-fn note_at(w: &World, switch: &ScriptedSwitch, to: [u8; 16], text: &str) -> u64 {
+pub(crate) fn note_at(w: &World, switch: &ScriptedSwitch, to: [u8; 16], text: &str) -> u64 {
     switch
         .send(
             &w.bob,
@@ -1907,13 +1907,20 @@ async fn test_loss_registration_naming_another_key_stops_the_recovery() {
     let error = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
         .await
         .unwrap_err();
-    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
+    // The conflict names no key, so the app looks for its own in the directory; the new
+    // service holds no record of it yet, its registration refused, and refuses the read as
+    // a first call, with no head (Switch wire 7.2). That isn't a removal.
+    assert_eq!(error.code(), Some(ErrorCode::NotCurrent), "{error:?}");
     // Nothing past the registration ran; the next read resumes it.
     assert!(lost.next.uploads().is_empty());
     assert!(lost.protocol.losses.lock().unwrap().is_empty());
-    let (app, _) = follow_loss(&lost, store as Arc<dyn StateStore>)
+    let (app, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
         .await
         .unwrap();
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::Removed)),
+        "{events:?}"
+    );
     assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
 }
 
@@ -3948,6 +3955,7 @@ async fn test_loss_reports_the_attempts_of_a_kept_effect_it_drops() {
         stored: None,
         deadlines: Vec::new(),
         kept_ms: Some(lost.note_at_ms),
+        forget: Vec::new(),
         entry: crate::app::state::KeptEntry {
             cert: app.cert().signed().clone(),
             plaintext: Vec::new(),
@@ -4015,6 +4023,7 @@ async fn keep_an_effect(
         stored: parked.then_some(seq),
         deadlines: Vec::new(),
         kept_ms: Some(w.clock.now_ms()),
+        forget: Vec::new(),
         entry: entry.clone(),
     };
     let mut tx = app.tx().unwrap();
@@ -5392,4 +5401,226 @@ async fn test_restore_check_owed_across_a_crash_after_a_key_change_still_asks() 
     assert_eq!(loaded.restore_question(), vec![1]);
     assert!(loaded.alarm().is_none());
     assert_eq!(loaded.receive_key_numbers().last(), Some(&2));
+}
+
+/// A record changed while the old service was gone is delivered with the re-registration at
+/// the new one, and published on the Homeserver after it (Switch spec 4.2, 12.6 step 3).
+#[tokio::test]
+async fn test_loss_record_changed_before_it_is_published_after_the_re_registration() {
+    loss_record_published(false).await;
+}
+
+/// As above, the Homeserver failing at the read that follows the loss: the record stays
+/// owed in the store, and a later load publishes it.
+#[tokio::test]
+async fn test_loss_record_changed_before_stays_owed_across_a_load() {
+    loss_record_published(true).await;
+}
+
+async fn loss_record_published(homeserver_fails: bool) {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let publishing = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let path = pubky_switch_core::records::app_record_path(&app_keys("wallet").app_id_bytes());
+    let mut app = App::load(
+        lost.router
+            .env(&lost.w, Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+        publishing.clone(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap_err();
+    let changed = app.record().clone();
+    assert!(
+        lost.w
+            .homeserver
+            .file(lost.w.alice.public(), &path)
+            .is_none()
+    );
+    drop(app);
+    let mut app = App::load(
+        lost.router
+            .env(&lost.w, Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+        publishing,
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    app.refresh_identity().await.unwrap();
+    if homeserver_fails {
+        lost.w.homeserver.fail_writes(1, false);
+    }
+    app.receive(None).await.unwrap();
+    let me = app.app_id();
+    assert_eq!(lost.next.app(&me).record, Some(changed.clone()));
+    if homeserver_fails {
+        assert!(
+            lost.w
+                .homeserver
+                .file(lost.w.alice.public(), &path)
+                .is_none()
+        );
+        drop(app);
+        let mut app = App::load(
+            lost.router
+                .env(&lost.w, Arc::clone(&store) as Arc<dyn StateStore>),
+            Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+            AppConfig {
+                publishes_record: true,
+                ..World::config()
+            },
+            me,
+        )
+        .await
+        .unwrap();
+        app.receive(None).await.unwrap();
+    }
+    assert_eq!(
+        lost.w.homeserver.file(lost.w.alice.public(), &path),
+        Some(serde_json::to_vec(&changed).unwrap())
+    );
+}
+
+/// A record changed while the old service was frozen goes with the re-registration at the
+/// next one, and is published after it (Switch spec 4.2, 12.5).
+#[tokio::test]
+async fn test_move_record_changed_before_it_is_published_after_the_re_registration() {
+    move_record_published(false).await;
+}
+
+/// As above, the Homeserver failing at the read that follows the move: the record stays
+/// owed in the store, and a later load publishes it.
+#[tokio::test]
+async fn test_move_record_changed_before_stays_owed_across_a_load() {
+    move_record_published(true).await;
+}
+
+async fn move_record_published(homeserver_fails: bool) {
+    let store = Arc::new(MemoryStore::new());
+    let (w, router, next, _) = moved_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let publishing = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let me = app_keys("wallet").app_id_bytes();
+    let path = pubky_switch_core::records::app_record_path(&me);
+    let load = || {
+        App::load(
+            router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+            w.protocol.clone(),
+            publishing.clone(),
+            me,
+        )
+    };
+    let mut app = load().await.unwrap();
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap_err();
+    let changed = app.record().clone();
+    drop(app);
+    if homeserver_fails {
+        // Both reads of the follow meet it.
+        w.homeserver.fail_writes(2, false);
+    }
+    let mut app = load().await.unwrap();
+    app.receive(None).await.unwrap();
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    assert_eq!(next.app(&me).record, Some(changed.clone()));
+    if homeserver_fails {
+        assert!(w.homeserver.file(w.alice.public(), &path).is_none());
+        drop(app);
+        load().await.unwrap().receive(None).await.unwrap();
+    }
+    assert_eq!(
+        w.homeserver.file(w.alice.public(), &path),
+        Some(serde_json::to_vec(&changed).unwrap())
+    );
+}
+
+/// Switch spec 4.2: a record the new service refuses at the re-registration, holding a later
+/// one of the app's from another device, is never published.
+#[tokio::test]
+async fn test_loss_record_the_new_service_refuses_is_never_published() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    lost.router.remove(NEXT);
+    assert!(
+        follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+            .await
+            .is_err()
+    );
+    // Another device of the app registers its key first, with a later record of the app.
+    let mut app = load_lost(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let other = pubky_switch_core::keys::ReceiveKey::generate(1).unwrap();
+    let mut later =
+        pubky_switch_core::records::AppRecord::verify(app.record(), &lost.w.alice.public())
+            .unwrap()
+            .body()
+            .clone();
+    later.updated_at += 60_000;
+    later.label = Some("the other device".into());
+    let later = pubky_switch_core::records::AppRecord::sign(&app_keys("wallet"), later).unwrap();
+    let keys = app_keys("wallet");
+    lost.next
+        .app_op(
+            &keys,
+            OpKind::AppPut {
+                record: later.signed().clone(),
+            },
+        )
+        .unwrap();
+    lost.next
+        .app_op(
+            &keys,
+            OpKind::ReceiveKeyPut {
+                record: wallet_key_record(&app, &other).signed().clone(),
+            },
+        )
+        .unwrap();
+    app.take_device_keys(crate::app::DeviceKeys {
+        receive_keys: Vec::new(),
+        known: vec![(pubky_switch_core::enc::b64(&other.kid), 1)],
+        rotation_ms: 0,
+    })
+    .await
+    .unwrap();
+    drop(app);
+    lost.router.add(NEXT, &lost.next);
+    let mut app = App::load(
+        lost.router
+            .env(&lost.w, Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+        AppConfig {
+            publishes_record: true,
+            ..World::config()
+        },
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    app.refresh_identity().await.unwrap();
+    app.receive(None).await.unwrap();
+    assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
+    // The new service holds the later record; the app's own was refused, so nothing of it
+    // was noted as accepted or published.
+    let me = app.app_id();
+    assert_eq!(lost.next.app(&me).record, Some(later.signed().clone()));
+    let path = pubky_switch_core::records::app_record_path(&me);
+    assert!(
+        lost.w
+            .homeserver
+            .file(lost.w.alice.public(), &path)
+            .is_none()
+    );
 }

@@ -100,7 +100,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `unreadable` item with the entry's `entry_id`. The quota refuses nothing here: no append
   is `429 quota_exceeded`, so a full inbox with no app reading, where the service refuses
   senders, isn't shown. Marks are judged at every such request, the switch's clock being
-  trusted. A scripted `missed` item (`push_missed`) is shown to every app and a scripted
+  trusted. A scripted `missed` item (`push_missed`, or `push_missed_unparsable` for one whose times don't parse) is shown to every app and a scripted
   `unreadable` item (`push_unreadable`) has an `entry_id` of its own, and both stay
   whatever the cursors. Checkpoints and dropped stubs exist only when a test scripts them;
   claims are deleted only when `GET /claims` finds them deletable; batch records are never
@@ -162,9 +162,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   and `after` must be `b64(32)`, and `limit` digits from 1 to 1000 (`400`); a record by key
   needs its `read_scope` (`403 permission_missing`, with the head), and a list shows only
   the records whose `read_scope` the reader holds, by the certificate the switch checks the
-  app against. Unlike the service, which answers an own app it holds no certificate for
-  `401` at authentication, this switch serves it as one holding no scope: `403` by key and
-  an empty list. Order by the key text, `after`
+  app against. An own app it holds no record for meets the first-call refusal below, as
+  at the service, before its query or key is read. Order by the key text, `after`
   as a key's text, `next`, the byte budget with its first view shown, deleted records shown
   by key and left out of lists, and a view's `cert`, the certificate the write was checked
   against, kept with the record whatever a renewal or revocation later changes, are the
@@ -186,6 +185,17 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   answer it so.
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
+- **An own app's first call** (Switch wire 7.1 "`Switch-Head` on refusals", 7.2), as at
+  the service (`crates/pubky-switch/src/service/batch/mod.rs`, `verify_own_app`): an own
+  app the switch holds no record for, at any call but a `POST /ops` whose batch carries its
+  `app.put` or doesn't parse, gets `403 not_current`
+  at authentication, before the account's lock and before a staged or frozen account's
+  answer (Switch wire 7.3 steps 5 to 8), whatever the route: no `Switch-Head`,
+  `Switch-Server-Time` the last time stamped, and the app not seen. A departed app that
+  delivered its record keeps it, so it goes on to the route's checks, as at the service,
+  until the test call `purge` frees it, as a service may once the signer purges the app
+  from `removed` (Switch wire 9.1): then it meets the first call's refusal, without the
+  head. The service keeps a purged app's record, so it answers that app with the head.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
   delivered its record: current, with an unexpired certificate, the stored renewed one once
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
@@ -396,6 +406,9 @@ What stays only on the scripted switch, and why:
 ## The test Homeserver
 
 `homeserver.rs` holds public files in memory, as a Homeserver serves them, with no
-authentication. `set_down` makes every read fail to connect, and `identity_reads` counts the
-reads of an identity's `identity.json`, those that failed included, so a test can bound how
-often the app reads a counterparty's document.
+authentication: an app's writes through `HomeserverWriter` go to any path of the identity it
+names, where a Homeserver checks the app's grant (Switch spec 3.4). `set_down` makes every
+read and write fail to connect, and `identity_reads` counts the reads of an identity's
+`identity.json`, those that failed included, so a test can bound how often the app reads a
+counterparty's document. `fail_writes` fails the next writes, refused or with the answer
+lost after the file is written, and `writes` counts the writes of a path.

@@ -646,7 +646,7 @@ async fn test_upload_divergent_flag_follows_the_last_note_in_one_commit() {
 async fn test_upload_records_past_the_mark_cap_owe_a_listing() {
     // Uploads that would leave more than `MAX_RECORD_MARKS` records marked, counting those
     // a commit marked before, drop every record mark and owe a listing instead, which the
-    // next read makes first.
+    // read makes before it hands any later entry over.
     let store = Arc::new(MemoryStore::new());
     let (lost, mut app) = followed(&store, false).await;
     let keys = |from: usize| -> BTreeSet<[u8; 32]> {
@@ -665,11 +665,9 @@ async fn test_upload_records_past_the_mark_cap_owe_a_listing() {
         };
         lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
     }
-    app.receive(None).await.unwrap();
-    assert_eq!(marks(&store, "rcread/"), 0);
-    assert!(store_of(&store, "list_due"));
     let listings = lost.next.lock().shared.listings;
     app.receive(None).await.unwrap();
+    assert_eq!(marks(&store, "rcread/"), 0);
     assert!(lost.next.lock().shared.listings > listings, "listed");
     assert!(!store_of(&store, "list_due"));
 }
@@ -919,4 +917,48 @@ async fn test_upload_claim_kept_earlier_in_the_same_commit_is_marked() {
     app.receive(None).await.unwrap();
     assert!(app.claim_doubt(&CLAIM).await.unwrap().unwrap().divergent);
     assert_eq!(marks(&store, "clread/"), 0);
+}
+
+#[tokio::test]
+async fn test_upload_past_the_mark_cap_lists_before_a_later_entry() {
+    // The listing an upload past the mark cap owes comes before any later entry of the read
+    // is handed to the protocol, as a `missed` item's does (Switch spec 8.2): a listing that
+    // fails hands nothing over, and the next read lists, then hands the entry over once.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, false).await;
+    let changes = UploadChanges {
+        records: (0..=MAX_RECORD_MARKS)
+            .map(|i| {
+                let mut key = [0; 32];
+                key[..8].copy_from_slice(&u64::try_from(i).unwrap().to_be_bytes());
+                key
+            })
+            .collect(),
+        ..UploadChanges::default()
+    };
+    lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
+    let seq = super::moves::note_at(&lost.w, &lost.next, app.app_id(), "after the upload");
+    let handed = |lost: &Lost| {
+        lost.protocol
+            .sample
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(s, _, _)| *s == seq)
+            .count()
+    };
+    lost.next.fail_next(Fault::Unreachable {
+        path: "records?collection".into(),
+        after: 0,
+    });
+    app.receive(None).await.unwrap_err();
+    assert_eq!(handed(&lost), 0);
+    assert!(store_of(&store, "list_due"));
+    assert!(app.cursor().seq < seq);
+    let listings = lost.next.lock().shared.listings;
+    app.receive(None).await.unwrap();
+    assert!(lost.next.lock().shared.listings > listings, "listed");
+    assert_eq!(handed(&lost), 1);
+    assert!(app.cursor().seq >= seq);
 }

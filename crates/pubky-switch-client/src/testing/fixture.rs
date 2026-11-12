@@ -16,8 +16,8 @@ use pubky_switch_core::scopes::Permission;
 
 use super::{SWITCH_ORIGIN, ScriptError, ScriptedSwitch, TestHomeserver, TestIdentity};
 use crate::app::{
-    AppEnv, Collection, Effect, HomeserverReader, JoinRequest, LocalWrite, MissedEntries, Outcome,
-    Protocol, ReceivedMessage, ResendNeeded,
+    AppEnv, Collection, Effect, HomeserverReader, HomeserverWriter, JoinRequest, LocalWrite,
+    MissedEntries, Outcome, Protocol, ReceivedMessage, ResendNeeded,
 };
 use crate::clock::{Clock, TestClock};
 use crate::store::{StateStore, StoreHandle};
@@ -330,6 +330,7 @@ impl TestSigner {
             transport,
             clock: Arc::clone(&self.clock) as Arc<dyn Clock>,
             homeserver: Arc::clone(&self.homeserver) as Arc<dyn HomeserverReader>,
+            homeserver_writer: Some(Arc::clone(&self.homeserver) as Arc<dyn HomeserverWriter>),
         }
     }
 }

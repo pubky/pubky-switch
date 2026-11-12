@@ -20,6 +20,7 @@ mod join;
 mod lagging;
 mod lists;
 mod messaging;
+mod own_record;
 mod pages;
 mod records;
 mod recovery;
@@ -53,6 +54,7 @@ pub use join::join;
 pub use lagging::{lagging_app, missed_item, unreadable_after_revoke};
 pub use lists::lists_without_read;
 pub use messaging::messaging;
+pub use own_record::own_record;
 pub use pages::pages;
 pub use records::records;
 pub use recovery::{
@@ -142,6 +144,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
         Box::pin(reduction_unpublished(world))
     }),
     ("renewed twice", |world| Box::pin(renewed_twice(world))),
+    ("own record", |world| Box::pin(own_record(world))),
     ("third epoch", |world| Box::pin(third_epoch(world))),
     ("third epoch, three readers", |world| {
         Box::pin(epochs_three_readers(world))
