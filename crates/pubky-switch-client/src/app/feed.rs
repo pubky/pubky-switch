@@ -2200,9 +2200,12 @@ impl App {
                     // wire 7.4.14). Changes that don't read mark nothing.
                     ServiceTransition::Upload { changes, .. } => {
                         if let Ok(changes) = UploadChanges::from_value(&changes) {
+                            // Owned keys: the read's future stays `Send` across the awaits.
+                            let records = changes.records.iter().chain(&changes.divergent);
+                            let claims = changes.claims.iter().chain(&changes.divergent_claims);
                             self.mark_uploaded(
-                                changes.records.iter().chain(&changes.divergent),
-                                changes.claims.iter().chain(&changes.divergent_claims),
+                                records.copied().collect(),
+                                claims.copied().collect(),
                                 &mut read.tx,
                             )
                             .await?;
