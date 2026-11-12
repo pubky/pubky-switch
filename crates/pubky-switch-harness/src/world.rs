@@ -625,3 +625,42 @@ impl SecretVault for MemoryVault {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_homeserver_fault_fails_one_write_or_deletion_of_its_path() {
+        let files = Arc::new(TestHomeserver::new());
+        let faults = Arc::new(Mutex::new(vec![
+            HomeserverFault {
+                deletion: false,
+                path: "/pub/a".into(),
+            },
+            HomeserverFault {
+                deletion: true,
+                path: "/pub/a".into(),
+            },
+        ]));
+        let own = OwnFiles {
+            identity: [1; 32],
+            files: files.clone(),
+            faults: faults.clone(),
+        };
+        // Another path isn't touched, nor is a read.
+        assert!(own.put("/pub/b", b"b".to_vec()).await.is_ok());
+        assert_eq!(own.get("/pub/a").await.ok(), Some(None));
+        // The write fails once, and writes nothing.
+        assert!(own.put("/pub/a", b"first".to_vec()).await.is_err());
+        assert_eq!(files.file([1; 32], "/pub/a"), None);
+        assert!(own.put("/pub/a", b"second".to_vec()).await.is_ok());
+        assert_eq!(files.file([1; 32], "/pub/a"), Some(b"second".to_vec()));
+        // The deletion fails once, and the file stays.
+        assert!(own.delete("/pub/a").await.is_err());
+        assert!(files.file([1; 32], "/pub/a").is_some());
+        assert!(own.delete("/pub/a").await.is_ok());
+        assert_eq!(files.file([1; 32], "/pub/a"), None);
+        assert!(lock(&faults).is_empty());
+    }
+}
