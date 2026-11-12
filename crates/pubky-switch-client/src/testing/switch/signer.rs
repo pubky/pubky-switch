@@ -292,6 +292,8 @@ impl Inner {
         fresh.keep_passed = self.keep_passed;
         fresh.open_admission = self.open_admission;
         fresh.faults = std::mem::take(&mut self.faults);
+        // A read held before the recovery drops its number when it ends; numbering anew would
+        // let it drop a later read's waker under the same number.
         fresh.held_ids = self.held_ids;
         fresh.kept_at = self.kept_at;
         fresh.kept_app_ids = std::mem::take(&mut self.kept_app_ids);

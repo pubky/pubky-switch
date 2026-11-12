@@ -23,8 +23,9 @@ fn operator_503() -> Value {
     json!({ "code": "unavailable", "message": "7.6: a temporary failure" })
 }
 
-/// A feed answer as the transport saw it: status, body and header names.
-type Seen = (u16, Value, Vec<String>);
+/// A feed answer as the transport saw it: status, body, header names, and whether the
+/// scripted switch's operator key signs it.
+type Seen = (u16, Value, Vec<String>, bool);
 
 /// The switch's transport, keeping each feed answer; with `forge`, every feed read is
 /// answered instead [`operator_503`] signed with a key the app doesn't know, as a hostile
@@ -73,6 +74,10 @@ impl Transport for Recording {
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
         Box::pin(async move {
             let feed = request.path_and_query.contains("/feed");
+            let request_signature = request
+                .header(header::SIGNATURE)
+                .and_then(|text| unb64(text).ok())
+                .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok());
             let answer = if feed && *self.forge.lock().unwrap() {
                 Ok(Self::forged(&request))
             } else {
@@ -81,10 +86,27 @@ impl Transport for Recording {
             if feed && let Ok(response) = &answer {
                 let body = serde_json::from_slice(&response.body).unwrap_or_default();
                 let names = response.headers.iter().map(|h| h.name.clone()).collect();
+                let operator = SigningKey::from_bytes(&[42; 32]).verifying_key().to_bytes();
+                let by_operator = response
+                    .header(header::SERVICE_SIGNATURE)
+                    .and_then(|text| unb64(text).ok())
+                    .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())
+                    .zip(response.header(header::SERVER_TIME))
+                    .is_some_and(|(signature, time)| {
+                        pubky_switch_core::http::verify_response(
+                            &operator,
+                            response.status,
+                            request_signature.as_ref(),
+                            time,
+                            &response.body,
+                            &signature,
+                        )
+                        .is_ok()
+                    });
                 self.feeds
                     .lock()
                     .unwrap()
-                    .push((response.status, body, names));
+                    .push((response.status, body, names, by_operator));
             }
             answer
         })
@@ -118,9 +140,13 @@ async fn test_feed_read_held_across_a_recovery_in_place_is_read_again_at_the_new
         let read = app.receive(Some(10)).await;
         (app, read)
     });
-    while w.switch.held_reads() == 0 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while w.switch.held_reads() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the read is held");
     let pending = SigningKey::from_bytes(&seed("service/alice/in-place"));
     let prev = w.switch.identity_doc().unwrap().hash();
     let doc = w
@@ -142,13 +168,12 @@ async fn test_feed_read_held_across_a_recovery_in_place_is_read_again_at_the_new
     // The held read's own answer, with the fields the service's has (endpoints_recovery's
     // test of the same).
     let feeds = recording.feeds.lock().unwrap().clone();
-    let (status, body, names) = &feeds[feeds_before];
+    let (status, body, names, by_operator) = &feeds[feeds_before];
     assert_eq!((*status, body), (503, &operator_503()));
-    assert!(
-        names.iter().any(|n| n == header::SERVICE_SIGNATURE),
-        "{names:?}"
-    );
-    assert!(names.iter().any(|n| n == header::SERVER_TIME), "{names:?}");
+    let mut names = names.clone();
+    names.sort_unstable();
+    assert_eq!(names, [header::SERVER_TIME, header::SERVICE_SIGNATURE]);
+    assert!(*by_operator, "signed with the operator key");
     // The new key came from the own identity.json, before the read at the new sequence.
     let report = read.unwrap();
     let at = |wanted: fn(&AppEvent) -> bool| report.events.iter().position(wanted);
