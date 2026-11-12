@@ -463,6 +463,27 @@ pub enum Outcome {
     /// effect's batch ([`ReceivedMessage::conflict`]) nothing of it was applied, so a `Pass`
     /// then passes the entry.
     Pass,
+    /// The step needs a scope key of `data_epoch` that the app doesn't hold yet (Switch
+    /// spec 3.5, 8.2), such as to read a record held sealed at that epoch
+    /// ([`super::Unopened::KeyNotHeld`]) or to write while the app lacks the current data
+    /// epoch's key ([`ReceiveContext::holds_scope_key`], [`ReceiveContext::data_epoch`]).
+    /// What the context added is discarded. When a key the app's certificate is given is
+    /// missing at an epoch up to the current one, and no full bundle is asked for yet, the
+    /// app fetches its key bundle once, asking for a full bundle if a key is still missing,
+    /// and runs the step again if the epoch's keys came; otherwise the entry is stored
+    /// locally and the cursor passes it at once ([`super::ParkReason::AwaitingKey`]), with
+    /// no bounded wait and no [`super::AppEvent::StoreFailing`]. It is tried again once the
+    /// app holds every key of `data_epoch` its certificate is given, in the read whose
+    /// fetch brought them, after the listing a read owes first, or at a later read; it is
+    /// bounded with the entries whose sender couldn't be checked and dropped past the
+    /// bounds ([`super::AppEvent::StoredEntryDropped`]). Each read's report names the
+    /// epochs waited for ([`super::AppEvent::AwaitingKeys`]). An effect applied with a
+    /// write the context refused for want of the key ([`ReceiveContext::put_record`]) ends
+    /// the same way, waiting for the current data epoch.
+    AwaitKey {
+        /// The data epoch whose key the step waits for.
+        data_epoch: u64,
+    },
 }
 
 /// Entries the app can't read and whose senders it asks to send again (Switch spec 8.2):
@@ -609,7 +630,7 @@ pub trait Protocol: Send + Sync {
     /// the writes the app holds and the claims it keeps, and adds record writes and claim
     /// entries to the effect's batch, which carries the cursor move. What `cx` added goes
     /// only with [`Outcome::Apply`]; a [`Outcome::Drop`], an [`Outcome::Need`], an
-    /// [`Outcome::Retry`] or an [`Outcome::Pass`] discards it. After an [`Outcome::Need`] the app reads what it
+    /// [`Outcome::Retry`], an [`Outcome::Pass`] or an [`Outcome::AwaitKey`] discards it. After an [`Outcome::Need`] the app reads what it
     /// names and calls this again, the answers in [`ReceiveContext::switch_claim`]. A read
     /// of the context, or of the protocol's own store, that fails with a store error is an
     /// [`Outcome::Retry`] ([`StoreFailure::try_from`]): the entry is held for a later read,

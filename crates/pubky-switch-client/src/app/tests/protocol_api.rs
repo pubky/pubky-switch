@@ -398,7 +398,12 @@ async fn test_receive_context_without_the_current_key_waits_for_it() {
     let (seq, note) = w.note(app.app_id(), "hello");
     app.receive(None).await.unwrap();
     assert_eq!(record_puts(&w), 0);
-    assert!(app.cursor().seq < seq, "the entry waits");
+    // The entry waits for the key stored locally, with the cursor past it.
+    assert_eq!(
+        app.stored_at(seq).map(|stored| stored.reason),
+        Some(crate::app::ParkReason::AwaitingKey { data_epoch: 2 })
+    );
+    assert!(app.cursor().seq >= seq, "the cursor passes the entry");
     // Once the bundle is there, the entry is handed over again and written.
     let has_keys = |scope: &str| SampleProtocol::default().has_keys(scope);
     for part in seal_bundle_parts(&w.alice, &cert, 1, 2, &has_keys).unwrap() {
@@ -413,7 +418,7 @@ async fn test_receive_context_without_the_current_key_waits_for_it() {
     }
     app.receive(None).await.unwrap();
     assert_eq!(record_puts(&w), 1);
-    assert!(app.cursor().seq >= seq);
+    assert!(app.stored_at(seq).is_none());
     let key = app.record_key(&inbox()).unwrap();
     let record = app.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(record.content.value()), vec![note.msg_id]);

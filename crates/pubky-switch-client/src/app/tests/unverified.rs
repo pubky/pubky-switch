@@ -341,6 +341,7 @@ async fn test_unverified_bound_drop_keeps_a_duty_event_naming_the_entry() {
                 sender,
                 accepted_at_ms,
                 reason: DropReason::Age,
+                awaited_epoch: None,
             } if *stored_id == id
                 && *s == seq
                 && *sender == h.identity.public()

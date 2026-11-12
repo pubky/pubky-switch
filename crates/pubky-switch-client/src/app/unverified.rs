@@ -1,9 +1,10 @@
 //! The bounds on entries stored because their sender's standing couldn't be checked
-//! (Switch spec 8.2, [`ParkReason::Unverifiable`]): at most [`MAX_UNVERIFIED_AGE_MS`] from
-//! acceptance, [`MAX_UNVERIFIED_PER_SENDER`] per sender identity and
-//! [`MAX_UNVERIFIED_TOTAL`] in all. Past them the app drops entries without processing
-//! them and tells its protocol ([`AppEvent::StoredEntryDropped`]), which may ask the sender
-//! to send them again (Switch spec 11).
+//! (Switch spec 8.2, [`ParkReason::Unverifiable`]), and on entries stored because they
+//! wait for a scope key ([`ParkReason::AwaitingKey`]), the two counted together: at most
+//! [`MAX_UNVERIFIED_AGE_MS`] from acceptance, [`MAX_UNVERIFIED_PER_SENDER`] per sender
+//! identity and [`MAX_UNVERIFIED_TOTAL`] in all. Past them the app drops entries without
+//! processing them and tells its protocol ([`AppEvent::StoredEntryDropped`]), which may ask
+//! the sender to send them again (Switch spec 11).
 //!
 //! The bounds apply at the start of every read, before entries stored locally are tried
 //! again, and before a layered backup is taken, to every such entry the store holds: those
@@ -33,18 +34,20 @@ use super::events::{DropReason, Duty, ParkReason};
 use super::state::ParkedEntry;
 use super::{App, AppError};
 
-/// How long an entry stored as [`ParkReason::Unverifiable`] is kept from its acceptance:
-/// 21 days, judged on the highest service time the app verified, so the sender, which
-/// answers re-sends for 30 days from a message's first acceptance (Switch spec 11), still
-/// can when the protocol asks.
+/// How long an entry stored as [`ParkReason::Unverifiable`] or [`ParkReason::AwaitingKey`]
+/// is kept from its acceptance: 21 days, judged on the highest service time the app
+/// verified, so the sender, which answers re-sends for 30 days from a message's first
+/// acceptance (Switch spec 11), still can when the protocol asks.
 pub const MAX_UNVERIFIED_AGE_MS: u64 = 21 * DAY_MS;
 
-/// The most entries stored as [`ParkReason::Unverifiable`] the app keeps for one sender
-/// identity, the identity the entry's certificate names: 64.
+/// The most entries stored as [`ParkReason::Unverifiable`] or [`ParkReason::AwaitingKey`],
+/// together, the app keeps for one sender identity, the identity the entry's certificate
+/// names: 64.
 pub const MAX_UNVERIFIED_PER_SENDER: usize = 64;
 
-/// The most entries stored as [`ParkReason::Unverifiable`] the app keeps in all: 128, at
-/// most about 16 MiB as stored of what a restore commits at once.
+/// The most entries stored as [`ParkReason::Unverifiable`] or [`ParkReason::AwaitingKey`],
+/// together, the app keeps in all: 128, at most about 16 MiB as stored of what a restore
+/// commits at once.
 pub const MAX_UNVERIFIED_TOTAL: usize = 128;
 
 /// The most entries one commit drops: each drop deletes the entry and its retry count and
@@ -69,7 +72,8 @@ impl Counted {
 }
 
 /// The entries past the bounds, in the order they are dropped, each with the bound it is
-/// past, given every entry stored as [`ParkReason::Unverifiable`] and the highest service
+/// past, given every entry the bounds count ([`ParkReason::Unverifiable`] and
+/// [`ParkReason::AwaitingKey`]) and the highest service
 /// time the app verified (`None` before any verified answer: then none is dropped for its
 /// age, since the device clock alone doesn't judge it).
 ///
@@ -126,10 +130,10 @@ pub(crate) fn over_bounds(entries: &[Counted], verified_ms: Option<u64>) -> Vec<
 }
 
 impl App {
-    /// Apply the bounds on entries stored as [`ParkReason::Unverifiable`] (Switch spec 8.2):
-    /// drop every entry past them, at most [`UNVERIFIED_DROPS_PER_COMMIT`] per commit, each
-    /// commit deleting the entries with their retry counts and keeping a
-    /// [`super::AppEvent::StoredEntryDropped`] for each.
+    /// Apply the bounds on entries stored as [`ParkReason::Unverifiable`] or
+    /// [`ParkReason::AwaitingKey`] (Switch spec 8.2): drop every entry past them, at most
+    /// [`UNVERIFIED_DROPS_PER_COMMIT`] per commit, each commit deleting the entries with
+    /// their retry counts and keeping a [`super::AppEvent::StoredEntryDropped`] for each.
     ///
     /// The entry a kept effect belongs to ([`super::state::PendingEffect::stored`]) is
     /// neither counted nor dropped, whoever calls this: its effect may have been applied,
@@ -145,7 +149,7 @@ impl App {
             .state
             .parked
             .iter()
-            .filter(|(id, stored)| stored.reason == ParkReason::Unverifiable && Some(**id) != kept)
+            .filter(|(id, stored)| ParkReason::bounded(stored.reason) && Some(**id) != kept)
             .map(|(id, stored)| Counted {
                 id: *id,
                 sender: stored.sender,
@@ -176,6 +180,7 @@ fn dropped(id: u64, stored: &ParkedEntry, reason: DropReason) -> Duty {
         sender: stored.sender,
         accepted_at_ms: stored.accepted_at_ms,
         reason,
+        awaited_epoch: stored.reason.awaited_epoch(),
     }
 }
 

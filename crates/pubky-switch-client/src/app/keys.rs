@@ -190,6 +190,66 @@ impl App {
     }
 }
 
+/// The data epochs at which the app lacks a scope key its certificate is given (Switch
+/// spec 3.5), as ranges, from epoch 1 through the epoch they were worked out to.
+pub(crate) struct KeyGaps {
+    gaps: Vec<(u64, u64)>,
+}
+
+impl KeyGaps {
+    /// Whether a key of `data_epoch` is missing.
+    pub(crate) fn covers(&self, data_epoch: u64) -> bool {
+        self.gaps
+            .iter()
+            .any(|(first, last)| *first <= data_epoch && data_epoch <= *last)
+    }
+}
+
+impl App {
+    /// The keys missing through `through`.
+    fn key_gaps_through(&self, through: u64) -> KeyGaps {
+        let protocol = std::sync::Arc::clone(&self.protocol);
+        let gaps = missing_keys(
+            &self.state.scope_keys,
+            &self.state.cert,
+            &|scope| protocol.has_keys(scope),
+            through,
+        )
+        .iter()
+        .map(|gap| (gap.first_epoch, gap.last_epoch))
+        .collect();
+        KeyGaps { gaps }
+    }
+
+    /// The keys missing through the current data epoch, or the highest epoch an entry stored
+    /// locally waits for ([`super::ParkReason::AwaitingKey`]) when that is later.
+    pub(crate) fn key_gaps(&self) -> KeyGaps {
+        let through = self
+            .state
+            .parked
+            .values()
+            .filter_map(|stored| stored.reason.awaited_epoch())
+            .fold(self.state.own_doc.data_epoch(), u64::max);
+        self.key_gaps_through(through)
+    }
+
+    /// Whether the app holds every key of `data_epoch` its certificate is given.
+    pub(crate) fn holds_epoch_keys(&self, data_epoch: u64) -> bool {
+        let through = data_epoch.max(self.state.own_doc.data_epoch());
+        !self.key_gaps_through(through).covers(data_epoch)
+    }
+
+    /// Whether fetching the key bundle now may bring a key of `data_epoch` (Switch spec
+    /// 3.5): one is missing at that epoch, which is the current one or before it, and no
+    /// full bundle is asked for. While one is asked for, the signer's answer comes as a part
+    /// the feed shows, which fetches it; a later epoch's keys come once the epoch rises.
+    pub(crate) fn key_may_come_by_fetch(&self, data_epoch: u64) -> bool {
+        data_epoch <= self.state.own_doc.data_epoch()
+            && self.state.bundle.full_requested_ms.is_none()
+            && !self.holds_epoch_keys(data_epoch)
+    }
+}
+
 fn skip_text(reason: &SkipReason) -> String {
     match reason {
         SkipReason::Unverified => "the identity key's signature doesn't verify".into(),

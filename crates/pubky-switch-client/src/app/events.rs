@@ -302,8 +302,9 @@ pub enum AppEvent {
         conflicting: bool,
     },
     /// An entry stored because its sender's standing couldn't be checked
-    /// ([`ParkReason::Unverifiable`]) was dropped without being processed, past the bounds
-    /// Switch spec 8.2 sets ([`super::MAX_UNVERIFIED_AGE_MS`],
+    /// ([`ParkReason::Unverifiable`]), or because it waits for a scope key
+    /// ([`ParkReason::AwaitingKey`]), was dropped without being processed, past the bounds
+    /// Switch spec 8.2 sets for both together ([`super::MAX_UNVERIFIED_AGE_MS`],
     /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]). The protocol
     /// may ask the sender to send it again while the sender still keeps it (Switch spec
     /// 11). A duty event, kept in the commit that deletes the entry.
@@ -323,6 +324,10 @@ pub enum AppEvent {
         accepted_at_ms: u64,
         /// Which bound it was past.
         reason: DropReason,
+        /// The data epoch whose scope key the entry waited for
+        /// ([`ParkReason::AwaitingKey`]); `None` for an entry whose sender couldn't be
+        /// checked.
+        awaited_epoch: Option<u64>,
     },
     /// An entry stored locally was processed.
     Unparked {
@@ -385,6 +390,18 @@ pub enum AppEvent {
     RestoreQuestion {
         /// The registrations' numbers.
         n: Vec<u64>,
+    },
+    /// Entries stored locally wait for scope keys the app doesn't hold yet
+    /// ([`ParkReason::AwaitingKey`], Switch spec 3.5, 8.2): the data epochs they wait for,
+    /// in order, and how many entries wait. Raised in the report of every read while any
+    /// waits; informational, since the entries are kept and each later read tells it again.
+    /// Each is processed once a key bundle brings its key, or dropped past the bounds
+    /// ([`AppEvent::StoredEntryDropped`]).
+    AwaitingKeys {
+        /// The data epochs waited for, each once, lowest first.
+        epochs: Vec<u64>,
+        /// How many entries wait.
+        entries: u64,
     },
     /// The app holds every scope key through this data epoch (Switch spec 3.5).
     KeysThrough {
@@ -906,6 +923,8 @@ pub(crate) enum Duty {
         sender: [u8; 32],
         accepted_at_ms: u64,
         reason: DropReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        awaited_epoch: Option<u64>,
     },
     KeptBatchDropped {
         #[serde(with = "serde_b64")]
@@ -1029,6 +1048,7 @@ impl Duty {
                 sender,
                 accepted_at_ms,
                 reason,
+                awaited_epoch,
             } => AppEvent::StoredEntryDropped {
                 id,
                 stored_id,
@@ -1037,6 +1057,7 @@ impl Duty {
                 sender,
                 accepted_at_ms,
                 reason,
+                awaited_epoch,
             },
             Self::KeptBatchDropped { batch_id } => AppEvent::KeptBatchDropped { id, batch_id },
             Self::BatchRefused { batch_id, code } => AppEvent::BatchRefused { id, batch_id, code },
@@ -1096,8 +1117,9 @@ pub enum BackupRefusal {
     TooLarge,
 }
 
-/// Which of the bounds on entries stored as [`ParkReason::Unverifiable`] an entry was
-/// dropped past (Switch spec 8.2, [`AppEvent::StoredEntryDropped`]).
+/// Which of the bounds on entries stored as [`ParkReason::Unverifiable`] or
+/// [`ParkReason::AwaitingKey`], counted together, an entry was dropped past (Switch spec
+/// 8.2, [`AppEvent::StoredEntryDropped`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum DropReason {
@@ -1105,10 +1127,10 @@ pub enum DropReason {
     /// judged on the highest service time the app verified.
     Age,
     /// Its sender identity held more than [`super::MAX_UNVERIFIED_PER_SENDER`] such
-    /// entries, and it was that sender's accepted earliest.
+    /// entries, of both reasons, and it was that sender's accepted earliest.
     PerSender,
-    /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries were stored, and it was the
-    /// one accepted earliest of the sender identity that held the most.
+    /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries, of both reasons, were stored,
+    /// and it was the one accepted earliest of the sender identity that held the most.
     Total,
 }
 
@@ -1163,13 +1185,27 @@ pub enum ParkReason {
     /// A build earlier than schema 3 (`STATE.md`) refuses a store that holds this reason, or
     /// [`ParkReason::EffectTooLarge`], from the schema version alone, so neither is misread.
     Released,
+    /// Its receive step needs a scope key of `data_epoch` that the app doesn't hold yet
+    /// (Switch spec 3.5, 8.2): the step answered [`super::Outcome::AwaitKey`], or applied an
+    /// effect with a write the context couldn't seal for want of the current data epoch's
+    /// key, after the key bundle was fetched once. It is stored at once, with no bounded
+    /// wait and no [`AppEvent::StoreFailing`]. It is tried again once the app holds every
+    /// key of `data_epoch` its certificate is given, and not before, so an entry whose key
+    /// never comes costs no request of its own. It is bounded together with the entries
+    /// stored as [`ParkReason::Unverifiable`], and dropped past the bounds
+    /// ([`AppEvent::StoredEntryDropped`]).
+    AwaitingKey {
+        /// The data epoch whose key the step waits for.
+        data_epoch: u64,
+    },
 }
 
 impl ParkReason {
     /// Whether an entry stored for this reason is processed again by a later read: one
     /// whose sender couldn't be checked, whose write hit a quota, whose receive step the
-    /// store kept from finishing, or that the host released. The others stay stored until
-    /// the protocol or the host acts on them ([`super::App::forget_parked`]).
+    /// store kept from finishing, that waits for a scope key (once the key is held), or that
+    /// the host released. The others stay stored until the protocol or the host acts on
+    /// them ([`super::App::forget_parked`]).
     pub fn tried_again(self) -> bool {
         matches!(
             self,
@@ -1178,6 +1214,22 @@ impl ParkReason {
                 | Self::StoreUnavailable
                 | Self::StoreRejected
                 | Self::Released
+                | Self::AwaitingKey { .. }
         )
+    }
+
+    /// Whether entries stored for this reason count against the bounds of Switch spec 8.2
+    /// (`unverified.rs`): those whose sender couldn't be checked and those that wait for a
+    /// scope key, together.
+    pub(crate) fn bounded(self) -> bool {
+        matches!(self, Self::Unverifiable | Self::AwaitingKey { .. })
+    }
+
+    /// The data epoch an entry stored for this reason waits for, if it waits for a key.
+    pub(crate) fn awaited_epoch(self) -> Option<u64> {
+        match self {
+            Self::AwaitingKey { data_epoch } => Some(data_epoch),
+            _ => None,
+        }
     }
 }

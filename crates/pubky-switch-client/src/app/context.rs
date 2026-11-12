@@ -381,6 +381,15 @@ impl<'a> ReceiveContext<'a> {
         self.state.own_doc.data_epoch()
     }
 
+    /// Whether the app holds the key of `scope` at `data_epoch`, a sub-scope's derived
+    /// from its parent's (Switch spec 3.5). With [`ReceiveContext::data_epoch`], a step
+    /// checks before it writes a record sealed under `scope`, and answers
+    /// [`super::Outcome::AwaitKey`] without the key, so the entry waits for it stored
+    /// locally.
+    pub fn holds_scope_key(&self, scope: &str, data_epoch: u64) -> bool {
+        self.state.scope_keys.get(data_epoch, scope).is_some()
+    }
+
     /// The highest service time the app verified, Unix milliseconds (Switch spec 10.1);
     /// `None` before any verified answer.
     pub fn highest_service_time(&self) -> Option<u64> {
@@ -609,8 +618,10 @@ impl<'a> ReceiveContext<'a> {
     /// written already in this batch (Switch wire 6.2), the batch is full, or the
     /// protocol's mark of the value is over [`super::MAX_SEEN_MARK_BYTES`];
     /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data
-    /// epoch: the message then waits, whatever the protocol returns, and is handed over
-    /// again at a later read; a store failure.
+    /// epoch ([`ReceiveContext::holds_scope_key`]): an effect the step applies anyway isn't
+    /// sent; the entry waits for the key as for [`super::Outcome::AwaitKey`] at the current
+    /// data epoch, stored locally and passed ([`super::ParkReason::AwaitingKey`]); a store
+    /// failure.
     ///
     /// A write refused with [`Refusal::Usage`], its mark over the bound included, isn't
     /// added: a protocol that carries on returns an effect that applies without it. That is
