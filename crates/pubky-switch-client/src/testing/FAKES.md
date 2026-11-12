@@ -328,7 +328,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
   leaves out a top-level member, such as a feed page's `items`; **`Fault::Replace`** one
   whose answer carries another value for it, such as `GET /apps`' `identity` replaced by a
-  copy that doesn't verify.
+  copy that doesn't verify; **`Fault::SignWith`** one that applies the request and signs
+  its answer with another key, such as a third key, or the key a recovery in place leaves,
+  signing the delivery that starts the new generation; **`Fault::ErrorSignedWith`** an
+  error answer under another key, applying nothing.
 - **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` checks the body names
   the account's service key (`409 conflict` for another) and, when it names one, the hash of
   the `identity.json` this switch holds (`409 conflict` for another, or for none held), and
@@ -378,8 +381,11 @@ declines change only the Pubky grant the host approves, never the certificate, t
 or the key bundle, so the switch's traffic is the same as for an approval that allows them.
 
 Not every honest path has a flow there. Among those without one: a stale backup refused at
-a restore, a Homeserver that holds another body at a restore, and a restore in place below
-the signer's mark (`restore.rs`).
+a restore, a Homeserver that holds another body at a restore, a restore in place below
+the signer's mark (`restore.rs`), and a restore on a new install from a backup a recovery in
+place wrote before its version reached the service, which answers under the key it served
+with until then (`recovery.rs`): the scripted switch serves under the account's key and holds
+the pending key apart, as the service does, so it needs nothing more for it.
 
 What stays only on the scripted switch, and why:
 

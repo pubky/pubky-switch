@@ -221,6 +221,26 @@ pub enum Fault {
         /// What the answer carries instead.
         value: Value,
     },
+    /// Apply an own app's or the signer's request, then sign the answer with the key
+    /// `secret` makes instead of the account's, with no head, as a hostile or faulty
+    /// service would. An enrollment, a staged or erased account's refusal and a `401
+    /// stale_timestamp` are answered as without it, and use it up.
+    SignWith {
+        /// A part of the request's path and query.
+        path: String,
+        /// The secret of the key that signs the answer.
+        secret: [u8; 32],
+    },
+    /// [`Fault::Error`], the answer signed with the key `secret` makes instead of the
+    /// account's, with no head.
+    ErrorSignedWith {
+        /// A part of the request's path and query.
+        path: String,
+        /// The error code answered.
+        code: ErrorCode,
+        /// The secret of the key that signs the answer.
+        secret: [u8; 32],
+    },
 }
 
 pub(crate) struct Inner {
@@ -1128,13 +1148,16 @@ impl ScriptedSwitch {
         let mut lose = false;
         let mut leave_out = None;
         let mut replace = None;
+        let mut sign_with = None;
         let matching = inner.faults.iter().position(|fault| match fault {
             Fault::Error { path: p, .. }
             | Fault::LoseAnswer { path: p }
             | Fault::LoseAnswerAfter { path: p, .. }
             | Fault::Unreachable { path: p, .. }
             | Fault::LeaveOut { path: p, .. }
-            | Fault::Replace { path: p, .. } => path.contains(p.as_str()),
+            | Fault::Replace { path: p, .. }
+            | Fault::SignWith { path: p, .. }
+            | Fault::ErrorSignedWith { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
             Some(Fault::Unreachable { after, .. } | Fault::LoseAnswerAfter { after, .. })
@@ -1169,6 +1192,13 @@ impl ScriptedSwitch {
                 Some(Fault::LoseAnswer { .. } | Fault::LoseAnswerAfter { .. }) => lose = true,
                 Some(Fault::LeaveOut { member, .. }) => leave_out = Some(member),
                 Some(Fault::Replace { member, value, .. }) => replace = Some((member, value)),
+                Some(Fault::SignWith { secret, .. }) => sign_with = Some(secret),
+                Some(Fault::ErrorSignedWith { code, secret, .. }) => {
+                    let (status, body) = bad(code, "scripted", Value::Null);
+                    inner.seen(request);
+                    let key = SigningKey::from_bytes(&secret);
+                    return Ok(inner.respond_with(&key, request, status, &body));
+                }
                 Some(Fault::Unreachable { .. }) => {
                     inner.unreached.push(request.body.clone());
                     return Err(TransportError::Connect("scripted".into()));
@@ -1272,6 +1302,10 @@ impl ScriptedSwitch {
         }
         if let (Some((member, value)), Some(object)) = (replace, body.as_object_mut()) {
             object.insert(member, value);
+        }
+        if let Some(secret) = sign_with {
+            let key = SigningKey::from_bytes(&secret);
+            return Ok(inner.respond_with(&key, request, status, &body));
         }
         Ok(inner.respond(request, status, &body))
     }
