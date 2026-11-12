@@ -928,6 +928,8 @@ impl App {
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
                 tx.commit(&app.env.store).await?;
             }
+            // Batches an earlier build kept carry no index of their messages and attempts.
+            app.index_kept_batches().await?;
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties().await?;
             app.queue_duties(kept);

@@ -165,6 +165,42 @@ pub(crate) fn index_kept(
 }
 
 impl App {
+    /// Index the messages and attempts of every kept batch that names one with no index
+    /// entry, as a batch an earlier build kept does, in one commit at load: so
+    /// [`App::kept_attempt`] and [`App::delivery`] find a batch the store keeps, and a
+    /// caller never reads one still to be sent as unknown. An entry a later batch took over
+    /// is left as it is. The kept batches are at most [`super::MAX_KEPT_BATCHES_BYTES`], so
+    /// the commit is bounded; a store with nothing to index commits nothing.
+    pub(crate) async fn index_kept_batches(&mut self) -> Result<(), AppError> {
+        let kept = self.kept_batches().await?;
+        if kept.is_empty() {
+            return Ok(());
+        }
+        let reader = self.reader();
+        let mut tx = self.tx()?;
+        let mut indexed = std::collections::BTreeSet::new();
+        for (batch_id, pending) in kept {
+            let batch = Batch::from_body(pending.body.clone())?;
+            let index = KeptIndex { batch_id };
+            let attempts = attempts_in(&batch);
+            let keys = pending
+                .queued
+                .iter()
+                .map(|item| message_key(item.msg_id()))
+                .chain(attempts.iter().map(attempt_key));
+            for key in keys {
+                if !indexed.contains(&key) && !reader.exists(&key).await? {
+                    tx.put(&key, &index)?;
+                    indexed.insert(key);
+                }
+            }
+        }
+        if !tx.is_empty() {
+            self.commit(tx).await?;
+        }
+        Ok(())
+    }
+
     /// End the batch kept under `batch_id` in `tx`: it is no longer kept, and its end is
     /// written in the same commit, at the app's clock.
     pub(crate) fn end_kept_batch(
@@ -241,6 +277,9 @@ impl App {
     /// [`App::kept_batch`] answers: whether the attempt may still be applied by a resend,
     /// was applied, or was dropped. The latest batch kept with it answers. `None` for an
     /// attempt no batch this store keeps, or ended within [`SENT_RETENTION_MS`], carries.
+    /// `None` never says the attempt was never sent: a batch ended longer ago, or kept
+    /// before a restore, isn't known here, and an attempt written another way never was.
+    /// The protocol reads the claim then ([`App::read_claim`]).
     ///
     /// # Errors
     ///

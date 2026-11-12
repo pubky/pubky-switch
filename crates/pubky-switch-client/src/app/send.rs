@@ -911,7 +911,9 @@ impl App {
 
     /// Where the message `msg_id` is: in the outbox, sent, or in a kept batch that queues it
     /// ([`Delivery::Kept`], and [`Delivery::Failed`] once that batch is dropped); `None` for
-    /// one the app doesn't keep.
+    /// one the app doesn't keep. `None` never says the message was never sent: one
+    /// accepted or ended longer than [`SENT_RETENTION_MS`] ago, or queued before a
+    /// restore, isn't known here. The protocol reads its shared state then.
     ///
     /// # Errors
     ///
