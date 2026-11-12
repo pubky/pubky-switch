@@ -2295,6 +2295,11 @@ impl App {
                                 &mut read.tx,
                             )
                             .await?;
+                            // One past the record marks owes a listing: made before any
+                            // later entry is handed over, as a `missed` item's is.
+                            if read.tx.pending_state(super::records::LIST_DUE) == Some(true) {
+                                read.list_first = true;
+                            }
                         }
                         Ok(Step::Pass)
                     }

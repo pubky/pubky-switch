@@ -243,7 +243,7 @@ fn first_proof(switch: &ScriptedSwitch) -> SignedDoc {
         .unwrap()
 }
 
-fn note_at(w: &World, switch: &ScriptedSwitch, to: [u8; 16], text: &str) -> u64 {
+pub(crate) fn note_at(w: &World, switch: &ScriptedSwitch, to: [u8; 16], text: &str) -> u64 {
     switch
         .send(
             &w.bob,
