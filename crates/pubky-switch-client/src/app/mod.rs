@@ -599,6 +599,9 @@ pub struct App {
     /// When the Homeserver copy of the app's record was last read to compare it with the
     /// newest record the switch accepted, device clock (`own_record.rs`). In memory only.
     published_checked_ms: Option<u64>,
+    /// When this app last asked for its full key bundle, device clock (`keys.rs`,
+    /// [`keys::KEY_REQUEST_RETRY_MS`]). In memory only.
+    bundle_asked_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for App {
@@ -828,6 +831,7 @@ impl App {
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
+                bundle_asked_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
@@ -962,6 +966,7 @@ impl App {
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
+                bundle_asked_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
@@ -1670,6 +1675,7 @@ impl App {
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
+                bundle_asked_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };

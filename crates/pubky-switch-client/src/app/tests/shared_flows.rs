@@ -6227,3 +6227,124 @@ async fn test_records_listing_owed_until_a_listing_runs() {
     .unwrap();
     assert!(restored.listing_owed().await.unwrap(), "after a restore");
 }
+
+/// A listing that waits for a scope key reads no feed, so the part that answers a
+/// full-bundle request never shows there: the app asks again once `KEY_REQUEST_RETRY_MS`
+/// has passed. The signer's first answer still lacks the key; its second has it, and the
+/// read after lists and hands the entry over. Each waiting read says why nothing arrives,
+/// and rotates its receive key when due.
+#[tokio::test]
+async fn test_records_owed_listing_waiting_for_a_key_asks_again() {
+    use crate::app::keys::KEY_REQUEST_RETRY_MS;
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    let shop = s.peer.apps()[0].cert.app_id();
+    // A note opened, so a rotation comes due with time.
+    s.peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "first" }),
+            &[me],
+        )
+        .unwrap();
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    let (_, note) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "behind it" }),
+            &[me],
+        )
+        .unwrap();
+    let asked = |events: &[AppEvent]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, AppEvent::FullBundleRequested))
+            .count()
+    };
+    let waits = |events: &[AppEvent]| {
+        events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ListingWaitsForKey))
+    };
+    // The read that passes the missed item asks once.
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(asked(&report.events), 1, "{:?}", report.events);
+    // The signer answers with a part that lacks the key: no request again yet.
+    let no_keys = |_: &str| false;
+    let epoch = s.w.switch.identity_doc().unwrap().data_epoch();
+    for part in seal_bundle_parts(&s.w.alice, &cert, 1, epoch, &no_keys).unwrap() {
+        s.w.switch
+            .signer_op(OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: me,
+                bundle: part.bundle,
+                first_epoch: part.first_epoch,
+                last_epoch: part.last_epoch,
+            }))
+            .unwrap();
+    }
+    let report = app.receive(None).await.unwrap();
+    assert!(waits(&report.events), "{:?}", report.events);
+    assert_eq!(asked(&report.events), 0);
+    assert_eq!(handed(&s, &note.msg_id), 0);
+    // Past the interval, and a day on so a rotation is due: asked again, and rotated.
+    let keys = app.receive_key_numbers();
+    s.w.clock.advance_ms(KEY_REQUEST_RETRY_MS.max(DAY_MS));
+    let report = app.receive(None).await.unwrap();
+    assert!(waits(&report.events), "{:?}", report.events);
+    assert_eq!(asked(&report.events), 1, "{:?}", report.events);
+    assert!(app.receive_key_numbers().len() > keys.len());
+    assert_eq!(handed(&s, &note.msg_id), 0);
+    // The second answer has the key: the next read lists, then hands the entry over.
+    store_parts_for(&s, &cert);
+    let report = app.receive(None).await.unwrap();
+    assert!(!waits(&report.events), "{:?}", report.events);
+    assert_eq!(handed(&s, &note.msg_id), 1);
+}
+
+/// A `missed` item met mid-read owes a listing that waits for a key no read fetches at its
+/// start, a full-bundle request being outstanding: the read fetches the bundle at the item,
+/// takes the key the signer stored since, lists, and hands the entry behind it over in the
+/// same read.
+#[tokio::test]
+async fn test_records_listing_at_a_missed_item_fetches_the_key_and_reads_on() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    app.state.bundle.full_requested_ms = Some(s.w.clock.now_ms());
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    tx.put(crate::app::state::key::BUNDLE, &app.state.bundle)
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    store_parts_for(&s, &cert);
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (_, note) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "behind it" }),
+            &[me],
+        )
+        .unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(handed(&s, &note.msg_id), 1, "{:?}", report.events);
+    assert!(!app.listing_owed().await.unwrap());
+}

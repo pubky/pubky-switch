@@ -419,21 +419,52 @@ impl App {
         // and again: a later item that owes one ends the read, and the next read lists
         // first.
         let mut listed = self.list_collections_if_due().await?;
+        let mut waits_for_key = false;
         if !listed && self.reader().exists(super::records::LIST_DUE).await? {
             // The key a listing waits for comes in a key bundle part, which the feed would
             // show only past this point: fetched here, then the listing tried once more.
             self.fetch_key_bundle().await?;
             listed = self.list_collections_if_due().await?;
-            if !listed && self.reader().exists(super::records::LIST_DUE).await? {
-                return Ok(ReceiveReport {
-                    cursor: self.cursor(),
-                    ..ReceiveReport::default()
-                });
-            }
+            waits_for_key = !listed && self.reader().exists(super::records::LIST_DUE).await?;
         }
+        let mut report = ReceiveReport::default();
+        if waits_for_key {
+            // Receiving waits for the key, and the read says so. The feed item that would
+            // answer the full-bundle request isn't read meanwhile, so the request is made
+            // again at a bounded interval: the signer's answer may have lacked the key.
+            // The read's upkeep below goes on.
+            self.ask_again_while_a_listing_waits().await?;
+            self.events.push(AppEvent::ListingWaitsForKey);
+        } else {
+            self.read_the_feed(wait, listed, &mut report).await?;
+        }
+        if self.state.alarm.is_none() {
+            // A stopped read leaves the claims and records it marked for the next one, and so
+            // does one that waits for a key.
+            if !report.stopped && !waits_for_key {
+                self.reread_claims().await?;
+                self.reread_records().await?;
+                self.fetch_entry_writers().await?;
+            }
+            self.delete_retired_keys().await?;
+            self.forget_chain_behind_cursor().await?;
+            self.maybe_rotate().await?;
+            self.flush_cursor_if_due().await?;
+        }
+        report.cursor = self.cursor();
+        Ok(report)
+    }
+
+    /// The stored entries' retries, the owed calls, and the feed to its end, for a read whose
+    /// owed listing, if any, is made (`listed`).
+    async fn read_the_feed(
+        &mut self,
+        wait: Option<u32>,
+        mut listed: bool,
+        report: &mut ReceiveReport,
+    ) -> Result<(), AppError> {
         self.retry_parked().await?;
         self.retry_owed().await?;
-        let mut report = ReceiveReport::default();
         let mut wait = wait.map(|w| w.min(25));
         // The read position moves on page by page, past a held entry, while the cursor
         // stays before it (Switch spec 8.2); the held `seq` carries over to later pages.
@@ -487,20 +518,7 @@ impl App {
                 }
             }
         }
-        if self.state.alarm.is_none() {
-            // A stopped read leaves the claims and records it marked for the next one.
-            if !report.stopped {
-                self.reread_claims().await?;
-                self.reread_records().await?;
-                self.fetch_entry_writers().await?;
-            }
-            self.delete_retired_keys().await?;
-            self.forget_chain_behind_cursor().await?;
-            self.maybe_rotate().await?;
-            self.flush_cursor_if_due().await?;
-        }
-        report.cursor = self.cursor();
-        Ok(report)
+        Ok(())
     }
 
     /// One page, read after `after`, with the lowest `seq` held so far in this read: how it

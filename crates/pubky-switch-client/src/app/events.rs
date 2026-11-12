@@ -427,6 +427,11 @@ pub enum AppEvent {
         /// Why the write failed.
         error: String,
     },
+    /// A listing of the collections is owed and waits for a scope key the app lacks at the
+    /// current data epoch: the read ended before the feed, handing nothing over, and the
+    /// app asks for its full key bundle again at a bounded interval (Switch spec 3.5, 8.2).
+    /// The read after the key arrives lists, then reads the feed.
+    ListingWaitsForKey,
     /// The own app was revoked or recorded as departed: it is no longer current.
     Removed,
     /// Continuity since the verified position couldn't be verified: the app continued
