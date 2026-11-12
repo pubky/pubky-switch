@@ -994,3 +994,111 @@ async fn test_own_record_crash_before_the_leave_is_kept_deletes_nothing() {
     assert!(w.published(id).is_none());
     assert!(w.switch.app(&id).departed);
 }
+
+/// The wallet restored on a store of its own from `backup`.
+async fn restored_publishing(w: &World, backup: &crate::app::AppBackup) -> App {
+    App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        publishing(),
+        backup,
+    )
+    .await
+    .unwrap()
+}
+
+/// Switch spec 4.2: a backup taken while a record's `app.put` was refused carries the
+/// accepted record apart. The restored app publishes only that one, never the refused
+/// record it holds; the protocol's next change delivers the record held again, signed
+/// anew, and publishes it once the switch accepts it.
+#[tokio::test]
+async fn test_own_record_restore_never_publishes_a_record_the_switch_refused() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let accepted = w.held(id);
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::NotCurrent,
+        current: json!({}),
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    let refused = app.record().clone();
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    let mut restored = restored_publishing(&w, &backup).await;
+    assert_eq!(restored.record(), &refused);
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        restored.publish_record().await.unwrap(),
+        Publication::Published
+    );
+    assert_eq!(w.held(id), accepted);
+    assert_eq!(w.published(id), accepted.as_ref().map(bytes_of));
+    // The protocol sets its member again: signed anew, delivered, then published.
+    w.clock.advance_ms(1_000);
+    restored
+        .set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap();
+    assert_ne!(restored.record(), &refused);
+    assert_eq!(
+        record_of(&restored).body().protocol(PROTO),
+        member(json!({ "a": 1 })).as_ref()
+    );
+    assert_eq!(w.held(id).as_ref(), Some(restored.record()));
+    assert_eq!(w.published(id), Some(bytes_of(restored.record())));
+}
+
+/// As above, the `app.put` never answered when the backup was taken: a restored read
+/// publishes the accepted record, never the one held.
+#[tokio::test]
+async fn test_own_record_restore_never_publishes_a_record_never_delivered() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let accepted = w.held(id);
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    let undelivered = app.record().clone();
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    let mut restored = restored_publishing(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    w.clock.advance_ms(PUBLISHED_CHECK_MS);
+    w.homeserver.remove(w.alice.public(), &app_record_path(&id));
+    restored.receive(None).await.unwrap();
+    assert_eq!(w.held(id), accepted);
+    assert_ne!(w.published(id), Some(bytes_of(&undelivered)));
+    assert_eq!(w.published(id), accepted.as_ref().map(bytes_of));
+}
+
+/// Switch spec 4.2: a restore of an app that publishes needs a Homeserver writer, as a join
+/// and a load do; nothing is written without one.
+#[tokio::test]
+async fn test_own_record_restore_publishing_needs_a_writer() {
+    let w = World::new();
+    let app = w.join_publishing("wallet").await;
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    let env = AppEnv {
+        homeserver_writer: None,
+        ..w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>)
+    };
+    let error = App::restore(env, w.protocol.clone(), publishing(), &backup)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(Refusal::Usage(_))),
+        "{error}"
+    );
+}

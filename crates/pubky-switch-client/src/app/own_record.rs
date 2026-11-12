@@ -231,7 +231,17 @@ impl App {
     ) -> Result<Publication, AppError> {
         let identity = self.state.meta.identity;
         let held = AppRecord::verify(&self.state.record, &identity)?;
-        if renew || &body != held.body() {
+        // A record held that the switch never accepted, with no delivery of it kept, as
+        // after a restore from a backup taken while its `app.put` was refused or unanswered,
+        // goes again with this change, signed anew: the backup carries the accepted record
+        // apart, and only that one is published (Switch spec 4.2).
+        let unaccepted = self.state.pending_record.is_none()
+            && self
+                .state
+                .accepted
+                .as_ref()
+                .is_some_and(|accepted| accepted != &self.state.record);
+        if renew || unaccepted || &body != held.body() {
             // Later than every record of the app before (Switch spec 4.2): the one held is
             // the newest this device delivered or took.
             body.updated_at = self.now().max(held.updated_at().saturating_add(1));

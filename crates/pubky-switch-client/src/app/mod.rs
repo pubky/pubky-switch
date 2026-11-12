@@ -339,7 +339,13 @@ pub struct AppBackup {
     meta: Meta,
     keys: AppKeys,
     cert: SignedDoc,
+    /// The record the app presents, which may be one the switch hasn't accepted yet.
     record: SignedDoc,
+    /// The newest record the switch accepted from the app (`record/accepted`), apart from
+    /// `record`: a restore publishes this one, never `record` (Switch spec 4.2). Absent from
+    /// a backup of an app the switch accepted no record from that it knows of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted: Option<SignedDoc>,
     naming: NamingKey,
     scope_keys: Vec<ScopeKey>,
     own_doc: SignedDoc,
@@ -1140,6 +1146,7 @@ impl App {
             keys: state.keys.clone(),
             cert: state.cert.signed().clone(),
             record: state.record.clone(),
+            accepted: state.accepted.clone(),
             naming: state.naming.clone(),
             scope_keys: state.scope_keys.keys.clone(),
             own_doc: state.own_doc.signed().clone(),
@@ -1421,8 +1428,9 @@ impl App {
     /// another protocol, or a protocol without a backup name, made, or for one the protocol
     /// refuses; [`Refusal::CarriedTooLarge`] for a restore in place whose backup fits one
     /// commit but not with the duty events and owed calls the store would carry beside it;
-    /// a store failure, writes over the store's sizes included. Nothing is written on any
-    /// of them.
+    /// [`Refusal::Usage`] for an app that publishes its record without a Homeserver writer
+    /// ([`AppEnv::homeserver_writer`]); a store failure, writes over the store's sizes
+    /// included. Nothing is written on any of them.
     pub async fn restore(
         env: AppEnv,
         protocol: Arc<dyn Protocol>,
@@ -1464,6 +1472,8 @@ impl App {
         layer_check: LayerCheck,
     ) -> Result<Restorable, AppError> {
         Box::pin(async move {
+            // As at a join and a load: an app that publishes needs its writer.
+            own_record::check_publisher(&env, &config)?;
             let meta = backup.meta.clone();
             let invalid = |why: &str| AppError::InvalidData(format!("the backup: {why}"));
             let cert = AppCert::verify(&backup.cert, &meta.identity)
@@ -1479,6 +1489,16 @@ impl App {
                 .map_err(|_| invalid("its app record doesn't verify"))?;
             if record.cert().hash() != cert.hash() {
                 return Err(invalid("its app record carries another certificate"));
+            }
+            // The newest record the switch accepted is the app's own, signed with its key.
+            if let Some(accepted) = &backup.accepted {
+                let accepted = AppRecord::verify(accepted, &meta.identity)
+                    .map_err(|_| invalid("its accepted app record doesn't verify"))?;
+                if accepted.cert().app_id() != meta.app_id
+                    || accepted.cert().signing_key() != backup.keys.signing_public()
+                {
+                    return Err(invalid("its accepted app record isn't its keys'"));
+                }
             }
             let own_doc = IdentityDoc::verify(&backup.own_doc, &meta.identity)
                 .map_err(|_| invalid("its identity.json doesn't verify"))?;
@@ -1612,9 +1632,12 @@ impl App {
                 pending_effect: None,
                 pending_record: None,
                 pending_publish: None,
-                // The backup's record is one the switch accepted; a publication after the
-                // restore never writes it over a later Homeserver copy (Switch spec 4.2).
-                accepted: Some(backup.record.clone()),
+                // The newest record the switch accepted, as the backup carries it apart from
+                // the record held, which may be one whose `app.put` was refused or never
+                // answered: only the accepted one is published, and never over a later
+                // Homeserver copy (Switch spec 4.2). The record held goes to the switch again
+                // only with the next change the protocol makes (`own_record.rs`).
+                accepted: backup.accepted.clone(),
                 alarm: None,
                 restore: Some(RestoreState {
                     n_floor,
