@@ -90,7 +90,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `unreadable` item with the entry's `entry_id`. The quota refuses nothing here: no append
   is `429 quota_exceeded`, so a full inbox with no app reading, where the service refuses
   senders, isn't shown. Marks are judged at every such request, the switch's clock being
-  trusted. A scripted `missed` item (`push_missed`) is shown to every app and a scripted
+  trusted. A scripted `missed` item (`push_missed`, or `push_missed_unparsable` for one whose times don't parse) is shown to every app and a scripted
   `unreadable` item (`push_unreadable`) has an `entry_id` of its own, and both stay
   whatever the cursors. Checkpoints and dropped stubs exist only when a test scripts them;
   claims are deleted only when `GET /claims` finds them deletable; batch records are never

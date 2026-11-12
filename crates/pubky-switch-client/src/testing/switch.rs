@@ -45,6 +45,9 @@ mod signer;
 
 pub use shared::HeldRecord;
 
+/// The time a scripted `missed` item writes as text that doesn't parse.
+const UNPARSABLE_TIME: u64 = u64::MAX;
+
 /// The origin the scripted switch of an account is reached at, unless a test routes
 /// another one to it.
 pub const SWITCH_ORIGIN: &str = "https://switch.example";
@@ -1372,6 +1375,12 @@ impl ScriptedSwitch {
         self.lock().uploads_per_app_per_hour = uploads;
     }
 
+    /// A `missed` item whose times don't parse, as a faulty service may write one (Switch
+    /// wire 7.4.4). Returns its `seq`.
+    pub fn push_missed_unparsable(&self, entries: u64) -> u64 {
+        self.push_missed(entries, UNPARSABLE_TIME, UNPARSABLE_TIME)
+    }
+
     /// A `missed` item: `entries` entries accepted from `from` until `until` were deleted
     /// while the app lagged (Switch wire 7.4.4). Returns its `seq`.
     pub fn push_missed(&self, entries: u64, from: u64, until: u64) -> u64 {
@@ -2260,8 +2269,16 @@ impl Inner {
                 if of.is_some_and(|of| of != app) {
                     return None;
                 }
+                // A scripted item whose times don't parse ([`ScriptedSwitch::push_missed_unparsable`]).
+                let time = |at: u64| {
+                    if at == UNPARSABLE_TIME {
+                        json!("not a time")
+                    } else {
+                        json!(rfc3339(at))
+                    }
+                };
                 json!({ "type": "missed", "seq": seq, "entries": entries,
-                        "accepted_from": rfc3339(*from), "accepted_until": rfc3339(*until) })
+                        "accepted_from": time(*from), "accepted_until": time(*until) })
             }
         })
     }

@@ -6093,3 +6093,102 @@ async fn test_records_missed_items_side_by_side_share_one_listing() {
         s.log()
     );
 }
+
+/// Switch spec 8.2, wire 7.4.4: a `missed` item whose times don't parse asks for no
+/// re-send, but still owes the listing, made before the entry behind it.
+#[tokio::test]
+async fn test_records_missed_item_with_unparsable_times_still_owes_the_listing() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let missed = s.w.switch.push_missed_unparsable(3);
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (seq, note) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "behind it" }),
+            &[app.app_id()],
+        )
+        .unwrap();
+    app.receive(None).await.unwrap();
+    assert!(s.protocol.sample.missed.lock().unwrap().is_empty());
+    let listed = last_request(&s, |l| l.contains("records?collection")).unwrap();
+    let from_item = format!("feed?after=1:{missed}&");
+    let read_on = last_request(&s, |l| l.contains(&from_item)).unwrap();
+    assert!(listed < read_on, "{:?}", s.log());
+    assert_eq!(handed(&s, &note.msg_id), 1);
+    assert!(app.cursor().seq >= seq);
+}
+
+/// While a listing is owed and fails, no owed call of the protocol is made again before
+/// it: the read ends at the listing (Switch spec 8.2). Once it succeeds, the owed call is
+/// made.
+#[tokio::test]
+async fn test_records_owed_listing_goes_before_the_protocols_owed_calls() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    // The protocol fails its missed-entries call once: the call is owed.
+    *s.protocol.sample.failing.lock().unwrap() = 1;
+    s.w.switch.push_missed(3, START, START + 1);
+    for _ in 0..2 {
+        s.w.switch.fail_next(Fault::Unreachable {
+            path: "records?collection".into(),
+            after: 0,
+        });
+        app.receive(None).await.unwrap_err();
+        assert!(s.protocol.sample.missed.lock().unwrap().is_empty());
+    }
+    app.receive(None).await.unwrap();
+    assert_eq!(s.protocol.sample.missed.lock().unwrap().len(), 1);
+}
+
+/// A listing that can't be made yet, for want of the scope key of a collection's read
+/// scope, stops the read before any entry is handed over; receiving waits for the key, and
+/// nothing is passed or lost meanwhile.
+#[tokio::test]
+async fn test_records_owed_listing_waiting_for_a_key_hands_nothing_over() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    // The app lacks the key of its read scope at the current epoch.
+    let held = app.state.scope_keys.keys.clone();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    let missed = s.w.switch.push_missed(3, START, START + 1);
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (seq, note) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "behind it" }),
+            &[app.app_id()],
+        )
+        .unwrap();
+    for _ in 0..2 {
+        app.receive(None).await.unwrap();
+        assert_eq!(handed(&s, &note.msg_id), 0);
+        assert!(app.cursor().seq >= missed && app.cursor().seq < seq);
+    }
+    // The key comes back: the next read lists, then hands the entry over once.
+    let mut tx = app.tx().unwrap();
+    for key in &held {
+        tx.put(
+            &crate::app::state::key::scope(key.data_epoch, &key.scope),
+            key,
+        )
+        .unwrap();
+    }
+    app.commit(tx).await.unwrap();
+    app.state.scope_keys.keys = held;
+    app.receive(None).await.unwrap();
+    assert_eq!(handed(&s, &note.msg_id), 1);
+    assert!(app.cursor().seq >= seq);
+}

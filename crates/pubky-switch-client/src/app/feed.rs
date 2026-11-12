@@ -412,12 +412,28 @@ impl App {
         // The bounds on entries stored unverified go before any is tried again (Switch
         // spec 8.2).
         self.bound_unverified().await?;
+        // A listing owed comes before any entry is handed to the protocol, one stored
+        // locally or an owed call included (Switch spec 8.2, wire 7.4.4). One that can't be
+        // made yet, for want of a scope key, ends the read here: receiving waits for the
+        // key, and nothing is passed or lost meanwhile. At most one listing a read, so a
+        // switch that shows one `missed` item after another can't make a read list again
+        // and again: a later item that owes one ends the read, and the next read lists
+        // first.
+        let mut listed = self.list_collections_if_due().await?;
+        if !listed && self.reader().exists(super::records::LIST_DUE).await? {
+            // The key a listing waits for comes in a key bundle part, which the feed would
+            // show only past this point: fetched here, then the listing tried once more.
+            self.fetch_key_bundle().await?;
+            listed = self.list_collections_if_due().await?;
+            if !listed && self.reader().exists(super::records::LIST_DUE).await? {
+                return Ok(ReceiveReport {
+                    cursor: self.cursor(),
+                    ..ReceiveReport::default()
+                });
+            }
+        }
         self.retry_parked().await?;
         self.retry_owed().await?;
-        // At most one listing a read, so a switch that shows one `missed` item after
-        // another can't make a read list again and again: a later item that owes one ends the
-        // read, and the next read lists first.
-        let mut listed = self.list_collections_if_due().await?;
         let mut report = ReceiveReport::default();
         let mut wait = wait.map(|w| w.min(25));
         // The read position moves on page by page, past a held entry, while the cursor
@@ -457,6 +473,10 @@ impl App {
                         break;
                     }
                     listed = self.list_collections_if_due().await?;
+                    if !listed && self.reader().exists(super::records::LIST_DUE).await? {
+                        self.fetch_key_bundle().await?;
+                        listed = self.list_collections_if_due().await?;
+                    }
                     if !listed {
                         break;
                     }
@@ -2117,7 +2137,13 @@ impl App {
         read: &mut Read,
     ) -> Result<Step, AppError> {
         let Some(from) = accepted_from else {
-            // The service writes the item; one whose times don't parse is ignored.
+            // The service writes the item: one whose times don't parse asks for no re-send,
+            // but still owes the listing (Switch spec 8.2, wire 7.4.4).
+            if self.state.asked.insert(seq) {
+                read.tx.put(&key::asked(seq), &())?;
+                read.tx.put(super::records::LIST_DUE, &true)?;
+                read.list_first = true;
+            }
             return Ok(Step::Pass);
         };
         if self.state.asked.insert(seq) {
