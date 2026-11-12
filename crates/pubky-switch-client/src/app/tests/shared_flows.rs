@@ -6529,6 +6529,107 @@ async fn test_records_reopening_too_large_for_one_commit_keeps_reads_going() {
     }
 }
 
+/// A store whose commits that put a held record fail once, after `pass` of them went
+/// through, while armed.
+struct FailingRecordCommit {
+    inner: MemoryStore,
+    armed: std::sync::Mutex<Option<u32>>,
+}
+
+impl StateStore for FailingRecordCommit {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, crate::error::StoreError> {
+        self.inner.get(ns, key)
+    }
+
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::KeyValue>, crate::error::StoreError> {
+        self.inner.scan(ns, prefix, after, limit)
+    }
+
+    fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), crate::error::StoreError> {
+        let puts_record = batch.writes.iter().any(|write| {
+            matches!(write, crate::store::Write::Put { key, .. } if key.starts_with(b"rec/"))
+        });
+        if puts_record {
+            let mut armed = self.armed.lock().unwrap();
+            match *armed {
+                Some(0) => {
+                    *armed = None;
+                    return Err(crate::error::StoreError::Unavailable);
+                }
+                Some(pass) => *armed = Some(pass - 1),
+                None => {}
+            }
+        }
+        self.inner.commit(batch)
+    }
+}
+
+/// A reopening of more records than one commit takes that fails after its first commit:
+/// the mark stays, since only the last commit clears it, and the rest open at the next
+/// try.
+#[tokio::test]
+async fn test_records_reopening_cut_short_keeps_the_rest_owed() {
+    let s = Setup::new();
+    let store = Arc::new(FailingRecordCommit {
+        inner: MemoryStore::new(),
+        armed: std::sync::Mutex::new(None),
+    });
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let mut wallet = App::join(
+        s.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        s.protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let pad = "x".repeat(200 * 1024);
+    let mut keys = Vec::new();
+    for n in 0..80 {
+        let target = s.target(&format!("big{n}"));
+        let big = json!({ "items": ["a"], "pad": pad })
+            .to_string()
+            .into_bytes();
+        phone.put_record(&target, &big, vec![]).await.unwrap();
+        keys.push(phone.record_key(&target).unwrap());
+    }
+    wallet.receive(None).await.unwrap();
+    // The key arrives; the reopening's first commit goes through and its second fails.
+    *store.armed.lock().unwrap() = Some(1);
+    store_parts_for(&s, &wallet.cert().clone());
+    let report = wallet.receive(None).await.unwrap();
+    assert!(
+        store.armed.lock().unwrap().is_none(),
+        "the second commit failed"
+    );
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ReopeningOwed { .. })),
+        "{:?}",
+        report.events
+    );
+    wallet.receive(None).await.unwrap();
+    for key in &keys {
+        let held = wallet.shared_record(key).await.unwrap().unwrap();
+        assert_eq!(ids(held.content.value()), vec!["a"]);
+    }
+    let ns = crate::store::client_namespace(&wallet.app_id());
+    assert!(store.get(&ns, b"reopen").unwrap().is_none());
+}
+
 /// A record write sealed at an epoch whose key a later item of the same page brings: the
 /// write is taken unreadable in the page's open writes, the key's fetch reopens what the
 /// store holds, and the record must still open once the key is held.

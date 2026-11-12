@@ -1241,3 +1241,53 @@ async fn test_awaiting_key_of_a_later_epoch_isnt_due_for_an_earlier_epochs_keys(
     assert_eq!(protocol.runs_of(&note.msg_id), 1);
     assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(3));
 }
+
+/// A waiting entry dropped after another copy of its message was processed names no
+/// `msg_id`: the message wasn't given up.
+#[tokio::test]
+async fn test_awaiting_key_drop_of_a_processed_message_names_no_msg_id() {
+    use pubky_switch_core::message::{Message as Msg, Sender};
+    let w = World::new();
+    let protocol = Keyed::new(Mode::Await(3));
+    let transport = w.switch.transport();
+    let mut app = wallet(&w, &protocol, &transport).await;
+    let app_id = app.app_id();
+    let mut body = serde_json::Map::new();
+    body.insert("text".into(), json!("twice"));
+    let message = Msg::new(
+        "sample.note",
+        Sender::of_app(w.bob.public(), &w.bob_keys),
+        w.alice.public(),
+        w.clock.now_ms(),
+        vec![],
+        body,
+    )
+    .unwrap();
+    let plaintext = message.sign(&w.bob_keys).unwrap();
+    let waiting = w
+        .switch
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[app_id])
+        .unwrap();
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_at(waiting).map(|s| s.reason), awaiting(3));
+    // A second copy is processed while the first still waits.
+    *protocol.mode.lock().unwrap() = Mode::Write;
+    w.switch
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[app_id])
+        .unwrap();
+    app.receive(None).await.unwrap();
+    assert!(app.stored_at(waiting).is_some());
+    w.clock.advance_ms(MAX_UNVERIFIED_AGE_MS + 1);
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    assert!(app.stored_at(waiting).is_none());
+    assert!(
+        has(&events, |e| matches!(
+            e,
+            AppEvent::StoredEntryDropped { seq, msg_id: None, awaited_epoch: Some(3), .. } if *seq == waiting
+        )),
+        "{events:?}"
+    );
+}
