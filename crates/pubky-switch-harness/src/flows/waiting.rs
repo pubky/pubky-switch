@@ -2,7 +2,12 @@
 //! switch to hold its read, and a write of another app answers it.
 
 use std::cell::Cell;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
+
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 
 use pubky_switch_client::app::{App, AppConfig, RecordTarget};
 use pubky_switch_core::records::IDENTITY_PATH;
@@ -87,8 +92,8 @@ pub async fn waiting_read(world: &World) -> FlowResult {
             .put_record(&target, br#"{"items":["milk"]}"#, Vec::new())
             .await
     };
-    let both = futures_util::future::join(read, write);
-    let Ok((read, written)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+    let both = each_on_its_own_wake(read, write);
+    let Ok(Some((read, written))) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
         return Err("the write didn't answer the waiting read: the read is still held".into());
     };
     written?;
@@ -109,6 +114,35 @@ pub async fn waiting_read(world: &World) -> FlowResult {
     look(world, &mut watch, "the watch's next read").await?;
     look(world, &mut wallet, "the wallet after its write").await?;
     Ok(())
+}
+
+/// Run a held read and the call that is to wake it to their ends, each polled only when
+/// its own waker fires. Joined as one future, the read would be polled again whenever the
+/// other call moved, and a switch that never woke it would pass. `None` when one of the
+/// two never ended.
+async fn each_on_its_own_wake<A, B>(
+    read: impl Future<Output = A>,
+    act: impl Future<Output = B>,
+) -> Option<(A, B)> {
+    enum Ended<A, B> {
+        Read(A),
+        Act(B),
+    }
+    let read: Pin<Box<dyn Future<Output = Ended<A, B>> + '_>> =
+        Box::pin(async { Ended::Read(read.await) });
+    let act: Pin<Box<dyn Future<Output = Ended<A, B>> + '_>> =
+        Box::pin(async { Ended::Act(act.await) });
+    let mut running = FuturesUnordered::new();
+    running.push(read);
+    running.push(act);
+    let (mut read, mut acted) = (None, None);
+    while let Some(ended) = running.next().await {
+        match ended {
+            Ended::Read(ended) => read = Some(ended),
+            Ended::Act(ended) => acted = Some(ended),
+        }
+    }
+    read.zip(acted)
 }
 
 /// `app` follows its feed to the end and moves its cursor: the events it raises at this
@@ -174,8 +208,8 @@ pub async fn waiting_read_erased(world: &World) -> FlowResult {
             .close_account(UserConfirmed::shown_and_confirmed())
             .await
     };
-    let both = futures_util::future::join(read, erase);
-    let Ok((_, erased)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+    let both = each_on_its_own_wake(read, erase);
+    let Ok(Some((_, erased))) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
         return Err("the held read wasn't answered: it is still held".into());
     };
     erased?;
@@ -241,10 +275,10 @@ pub async fn waiting_read_revoked(world: &World) -> FlowResult {
             .revoke(app_id, None, UserConfirmed::shown_and_confirmed())
             .await
     };
-    let both = futures_util::future::join(read, revoke);
+    let both = each_on_its_own_wake(read, revoke);
     let both = tokio::time::timeout(STEP_TIMEOUT, both).await;
     world.let_go();
-    let Ok((report, revoked)) = both else {
+    let Ok(Some((report, revoked))) = both else {
         return Err("the held read wasn't answered: it is still held".into());
     };
     revoked?;
@@ -336,8 +370,8 @@ pub async fn waiting_read_recovered(world: &World) -> FlowResult {
             .declare_provider_loss(ORIGIN, UserConfirmed::shown_and_confirmed())
             .await
     };
-    let both = futures_util::future::join(read, recover);
-    let Ok((report, recovered)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+    let both = each_on_its_own_wake(read, recover);
+    let Ok(Some((report, recovered))) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
         return Err("the held read wasn't answered: it is still held".into());
     };
     if !held_then.get() {
