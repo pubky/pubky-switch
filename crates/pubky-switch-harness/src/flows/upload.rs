@@ -88,8 +88,9 @@ async fn read(
         &json!({ "record": shown(read.as_ref()), "events": events(&raised) }),
     );
     world.advance_ms(STEP_MS);
-    // Whether the app holds the record divergent: it was told when a view first showed it
-    // so (`RecordDivergent`), at this read or at the feed read that met the upload.
+    // Whether the app holds the record divergent: it was told once, when a view first
+    // showed it so (`RecordDivergent`), at this read or at the feed read that met the
+    // upload.
     Ok(read.as_ref().is_some_and(|record| record.divergent))
 }
 
@@ -201,7 +202,7 @@ pub async fn recovery_upload_records(world: &World) -> FlowResult {
         "the wallet read its feed at the new service",
     )
     .await?;
-    let told = read(
+    let held = read(
         world,
         "the wallet read the first record, with a divergent upload",
         &mut wallet,
@@ -209,10 +210,10 @@ pub async fn recovery_upload_records(world: &World) -> FlowResult {
     )
     .await?;
     let divergent = last_record_read(world, "wallet");
-    if divergent.as_deref() != Some("bool true") || !told {
+    if divergent.as_deref() != Some("bool true") || !held {
         return Err(format!(
             "the record with a divergent upload reads divergent {divergent:?}, and the \
-             wallet was told so: {told}"
+             wallet holds it so: {held}"
         )
         .into());
     }
@@ -237,7 +238,7 @@ pub async fn recovery_upload_records(world: &World) -> FlowResult {
     );
     world.advance_ms(STEP_MS);
     look(world, &mut phone, "the phone followed the wallet's write").await?;
-    let told = read(
+    let held = read(
         world,
         "the phone read the first record, the divergent upload cleared",
         &mut phone,
@@ -245,14 +246,62 @@ pub async fn recovery_upload_records(world: &World) -> FlowResult {
     )
     .await?;
     let divergent = last_record_read(world, "phone");
-    if divergent.as_deref() != Some("bool false") || told {
+    if divergent.as_deref() != Some("bool false") || held {
         return Err(format!(
             "after a newer write the record reads divergent {divergent:?}, and the phone \
-             was told it is: {told}"
+             holds it so: {held}"
+        )
+        .into());
+    }
+    // The wallet is told once, at the feed read that meets the upload transition, and at
+    // no other step of the flow; nothing tells the phone after the newer write.
+    let notices = [
+        "the wallet followed the recovery",
+        "the wallet read its feed at the new service",
+        "the wallet read the first record, with a divergent upload",
+        "the wallet read the second record",
+        "the wallet wrote a newer version at the new service",
+        "the phone followed the wallet's write",
+        "the phone read the first record, the divergent upload cleared",
+    ]
+    .map(|label| divergent_told(world, label));
+    let in_all = divergent_told_anywhere(world);
+    if notices != [0, 1, 0, 0, 0, 0, 0] || in_all != 1 {
+        return Err(format!(
+            "RecordDivergent raised at the flow's steps {notices:?}, {in_all} times in all"
         )
         .into());
     }
     Ok(())
+}
+
+/// How many `RecordDivergent` events the flow's outcome `label` shows.
+fn divergent_told(world: &World, label: &str) -> usize {
+    let label = format!("outcome {label}");
+    world
+        .trace()
+        .lines
+        .iter()
+        .filter(|line| line.label == label)
+        .flat_map(|line| line.facts.iter())
+        .filter(|(fact, value)| {
+            fact.starts_with("outcome.events[") && value.as_str() == "text RecordDivergent"
+        })
+        .count()
+}
+
+/// How many `RecordDivergent` events every outcome of the flow shows.
+fn divergent_told_anywhere(world: &World) -> usize {
+    world
+        .trace()
+        .lines
+        .iter()
+        .filter(|line| line.label.starts_with("outcome "))
+        .flat_map(|line| line.facts.iter())
+        .filter(|(fact, value)| {
+            fact.starts_with("outcome.events[") && value.as_str() == "text RecordDivergent"
+        })
+        .count()
 }
 
 /// The `divergent` member of the last record view alice's app `name` read by key.

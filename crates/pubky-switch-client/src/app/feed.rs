@@ -2204,7 +2204,8 @@ impl App {
                                 changes.records.iter().chain(&changes.divergent),
                                 changes.claims.iter().chain(&changes.divergent_claims),
                                 &mut read.tx,
-                            )?;
+                            )
+                            .await?;
                         }
                         Ok(Step::Pass)
                     }

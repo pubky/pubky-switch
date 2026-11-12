@@ -690,8 +690,12 @@ pub enum KeptReason {
 /// What [`App::take_write`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Taken {
+    /// A newer write, now held.
     New,
+    /// The write held.
     Same,
+    /// The write held, unopened before, now opened: no newer write.
+    Reopened,
     NotNewer,
     Flagged,
 }
@@ -1069,7 +1073,8 @@ impl App {
         Ok(())
     }
 
-    /// Take a record view, from a read, a list page, after a conflict or after an upload.
+    /// Take a record view, from a read, a list page, after a conflict or after an upload;
+    /// then hold what it says of divergent uploads, once the write is judged.
     pub(crate) async fn take_view(
         &mut self,
         view: &SharedRecordView,
@@ -1083,8 +1088,13 @@ impl App {
             stub: None,
             view_version: Some(RecordVersion::new(view.generation, view.version)),
         };
-        self.note_divergent(&view.key, view.divergent, tx).await?;
-        self.read_write(&evidence, expect, view.key, tx).await
+        let read = self.read_write(&evidence, expect, view.key, tx).await?;
+        // Only a view of the key asked for says anything of that record's uploads.
+        if expect.is_none_or(|(asked, _)| *asked == view.key) {
+            self.note_view_divergence(&view.key, view.divergent, tx)
+                .await?;
+        }
+        Ok(read)
     }
 
     /// A `record.put` chain item from the feed, its stub verified (Switch spec 8.3): taken
@@ -1109,21 +1119,49 @@ impl App {
             view_version: None,
         };
         let key = put.key;
-        // A newer write clears the record's divergent uploads before it (Switch wire
-        // 7.4.14); the write held doesn't: uploads after it may conflict with it.
-        if self.read_write(&evidence, None, key, tx).await? == WriteRead::Taken {
-            self.note_divergent(&key, false, tx).await?;
+        let mut viewed = None;
+        let read = self
+            .judge_write(&evidence, None, key, tx, &mut viewed)
+            .await?;
+        match viewed {
+            // The record's view, read to judge the write, is the switch's latest word.
+            Some(divergent) => self.note_view_divergence(&key, divergent, tx).await?,
+            // A newer write clears the record's divergent uploads before it (Switch wire
+            // 7.4.14); the write held doesn't: uploads after it may conflict with it.
+            None if read == WriteRead::Taken => self.note_divergent(&key, false, tx).await?,
+            None => {}
         }
         Ok(())
     }
 
-    /// Check a write and take it, or flag it, or raise the rollback it proves.
+    /// Check a write and take it, or flag it, or raise the rollback it proves; a view
+    /// read to judge it says what the app holds of divergent uploads.
     async fn read_write(
         &mut self,
         evidence: &Evidence<'_>,
         expect: Option<(&[u8; 32], &Collection)>,
         shown_key: [u8; 32],
         tx: &mut Tx,
+    ) -> Result<WriteRead, AppError> {
+        let mut viewed = None;
+        let read = self
+            .judge_write(evidence, expect, shown_key, tx, &mut viewed)
+            .await?;
+        if let Some(divergent) = viewed {
+            self.note_view_divergence(&shown_key, divergent, tx).await?;
+        }
+        Ok(read)
+    }
+
+    /// [`App::read_write`], with `viewed` set to the `divergent` of a view of `shown_key`
+    /// read to judge the write, if one was.
+    async fn judge_write(
+        &mut self,
+        evidence: &Evidence<'_>,
+        expect: Option<(&[u8; 32], &Collection)>,
+        shown_key: [u8; 32],
+        tx: &mut Tx,
+        viewed: &mut Option<bool>,
     ) -> Result<WriteRead, AppError> {
         let mut outcome = self.accept_write(evidence, expect, tx).await?;
         let mut version = evidence
@@ -1138,7 +1176,9 @@ impl App {
             let collection = collection.clone();
             outcome = match self.record_view(&shown_key).await? {
                 Some(view) => {
-                    self.note_divergent(&view.key, view.divergent, tx).await?;
+                    if view.key == shown_key {
+                        *viewed = Some(view.divergent);
+                    }
                     // A view of the feed's own write keeps what the feed gave it: the
                     // verified stub, which dates the write and gives its version whatever
                     // proof the view shows, and the item's proof. A view of another write
@@ -1166,7 +1206,7 @@ impl App {
             Ok(accepted) => {
                 return Ok(match self.take_write(accepted, false, tx).await? {
                     Taken::New => WriteRead::Taken,
-                    Taken::Same => WriteRead::Held,
+                    Taken::Same | Taken::Reopened => WriteRead::Held,
                     Taken::NotNewer => WriteRead::NotNewer,
                     Taken::Flagged => WriteRead::Refused,
                 });
@@ -1776,7 +1816,11 @@ impl App {
         };
         tx.put(&record_key_of(&key), &record)?;
         self.events.push(AppEvent::RecordChanged { key });
-        Ok(Taken::New)
+        Ok(if reopened {
+            Taken::Reopened
+        } else {
+            Taken::New
+        })
     }
 
     /// An own `record.put` the switch answered: taken at the version its proof gives.

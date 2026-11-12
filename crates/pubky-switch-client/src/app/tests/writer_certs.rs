@@ -262,3 +262,12 @@ async fn test_writer_cert_left_out_entries_are_in_the_recovery_report() {
     assert_eq!(info.loss.generation, 2);
     assert_eq!(info.claim_entries_left_out, 1);
 }
+
+#[tokio::test]
+async fn test_writer_cert_of_an_entry_kept_from_a_claim_read_is_marked() {
+    // An entry kept from `GET /claims`, not the feed, marks its writer too.
+    let store = Arc::new(MemoryStore::new());
+    let (_w, mut app) = joined_after_the_writer(&store).await;
+    app.read_claim(&CLAIM).await.unwrap();
+    assert_eq!(mark_of(&store, &phone()), Some(0));
+}

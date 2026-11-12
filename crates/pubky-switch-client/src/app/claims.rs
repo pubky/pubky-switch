@@ -1037,11 +1037,9 @@ impl App {
         Ok(Some(doubt))
     }
 
-    /// The claim entries the app keeps, each with its writer's certificate where the app
-    /// knows it, and the SETTLED and tombstone proofs: evidence for the uploads of a move
-    /// or a recovery (Switch spec 6.3, 12.5, 12.6).
     /// The claim entries the app keeps, each with a certificate of its writer that verifies
-    /// it, and the SETTLED and tombstone proofs; and how many entries it keeps without one,
+    /// it, and the SETTLED and tombstone proofs: evidence for the uploads of a move or a
+    /// recovery (Switch spec 6.3, 12.5, 12.6); and how many entries it keeps without one,
     /// which an upload can't carry (Switch wire 7.4.14).
     pub(crate) async fn claim_evidence_items(
         &self,

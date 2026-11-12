@@ -18,7 +18,8 @@ use super::moves::{
 use super::shared_flows::{ids, items, value};
 use super::*;
 use crate::app::{
-    AppEvent, ClaimOp, ObligationDeadline, RECORD_REREADS_PER_READ, RecordTarget, UserConfirmed,
+    AppEvent, ClaimOp, MAX_RECORD_MARKS, ObligationDeadline, RECORD_REREADS_PER_READ, RecordTarget,
+    UserConfirmed,
 };
 use crate::testing::Fault;
 
@@ -437,4 +438,322 @@ async fn test_upload_claims_unmarked_without_claims_read() {
     app.receive(None).await.unwrap();
     assert_eq!(marks(&store, "clread/"), 0);
     assert_eq!(marks(&store, "rcread/"), 1);
+}
+
+#[tokio::test]
+async fn test_upload_claim_the_app_doesnt_hold_isnt_marked() {
+    // A claim rebuilt at the next switch from another app's upload, which this app (with
+    // `claims.read`) never held: the transition marks nothing for it, and nothing reads it
+    // (Switch wire 7.4.14); the app reads it when it first attempts on it.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, false).await;
+    assert!(app.claim_doubt(&CLAIM).await.unwrap().is_none());
+    {
+        let mut next = lost.next.lock();
+        let entry = pubky_switch_core::recovery::UploadedEntry {
+            entry: pubky_switch_core::claims::ClaimEntry {
+                claim_key: CLAIM,
+                attempt_id: [77; 16],
+                expected_step: 0,
+                kind: pubky_switch_core::claims::EntryKind::Attempt {
+                    orphan_after: 60,
+                    deadline: None,
+                },
+            },
+            writer: PHONE,
+            proof: None,
+        };
+        let merge =
+            pubky_switch_core::recovery::merge_upload_claim(None, None, &[entry], START, 64);
+        assert!(merge.changed, "{merge:?}");
+        next.shared.claims.insert(CLAIM, merge.claim.unwrap());
+    }
+    let changes = UploadChanges {
+        claims: [CLAIM].into(),
+        ..UploadChanges::default()
+    };
+    lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
+    // A pending fault on the claim read shows whether the claim was asked for at all.
+    lost.next.fail_next(Fault::Error {
+        path: "/claims/".into(),
+        code: ErrorCode::Unavailable,
+        current: Value::Null,
+    });
+    app.receive(None).await.unwrap();
+    assert_eq!(lost.next.lock().faults.len(), 1, "the claim was read");
+    assert_eq!(marks(&store, "clread/"), 0);
+}
+
+#[tokio::test]
+async fn test_upload_record_reread_refused_for_an_expired_certificate_keeps_its_mark() {
+    // `403 cert_expired` is `Retry::No`, but a renewal ends it: the record is still owed a
+    // read again, unlike one whose read scope the app lacks.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, false).await;
+    upload_unheld_record(&lost, &mut app).await;
+    lost.next.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::CertExpired,
+        current: Value::Null,
+    });
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        marks(&store, "rcread/"),
+        1,
+        "the mark went at a cert_expired"
+    );
+}
+
+#[tokio::test]
+async fn test_upload_divergent_flag_of_a_record_the_app_doesnt_take_isnt_kept() {
+    // A record the app doesn't take (a collection its protocol doesn't list), whose view
+    // shows divergent: the app holds no record there, yet the read again keeps
+    // `rcdiv/<key>` and raises `RecordDivergent` for it; nothing reads that key again to
+    // clear it.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, false).await;
+    let key = upload_unheld_record(&lost, &mut app).await;
+    *lost.protocol.collections.lock().unwrap() = vec![];
+    lost.next.lock().shared.divergent.insert(key, vec![[1; 32]]);
+    let report = app.receive(None).await.unwrap();
+    assert!(app.shared_record(&key).await.unwrap().is_none());
+    assert_eq!(divergent(&report.events, key), 0, "{:?}", report.events);
+    assert!(!store_of(&store, &format!("rcdiv/{}", b64(&key))));
+}
+
+#[tokio::test]
+async fn test_upload_records_read_again_go_oldest_mark_first() {
+    // Marks of an earlier transition go before a later one's, whatever their keys' order:
+    // the later transition's one key sorts first, and is left for the next read.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, false).await;
+    let first: BTreeSet<[u8; 32]> = (0..RECORD_REREADS_PER_READ)
+        .map(|i| [u8::try_from(i).unwrap() + 100; 32])
+        .collect();
+    let changes = UploadChanges {
+        records: first,
+        ..UploadChanges::default()
+    };
+    // The first read fails for now, so all its marks stay.
+    lost.next.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::Unavailable,
+        current: Value::Null,
+    });
+    lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
+    app.receive(None).await.unwrap();
+    assert_eq!(marks(&store, "rcread/"), RECORD_REREADS_PER_READ);
+    lost.w.clock.advance_ms(1000);
+    let later = UploadChanges {
+        records: [[0; 32]].into(),
+        ..UploadChanges::default()
+    };
+    lost.next.chain_upload(PHONE, later.to_value()).unwrap();
+    app.receive(None).await.unwrap();
+    assert!(store_of(&store, &format!("rcread/{}", b64(&[0; 32]))));
+    assert_eq!(marks(&store, "rcread/"), 1);
+}
+
+#[tokio::test]
+async fn test_upload_changed_claim_listed_is_read_again() {
+    // A claim the upload changed without making it divergent (`claims`, not
+    // `divergent_claims`) is read again too.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, false).await;
+    app.write_claim(
+        ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+    app.receive(None).await.unwrap();
+    upload_beside(&lost.next);
+    let changes = UploadChanges {
+        claims: [CLAIM].into(),
+        ..UploadChanges::default()
+    };
+    lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ClaimChanged { claim_key } if *claim_key == CLAIM)),
+        "{:?}",
+        report.events
+    );
+}
+
+#[tokio::test]
+async fn test_upload_record_view_of_another_key_isnt_taken() {
+    // A switch that answers `GET /records/{key}` with a view of another key: nothing is
+    // taken or flagged under either key, and the mark goes.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, false).await;
+    let key = upload_unheld_record(&lost, &mut app).await;
+    let other = [9; 32];
+    lost.next.lock().shared.divergent.insert(key, vec![[1; 32]]);
+    lost.next.fail_next(Fault::Replace {
+        path: "/records/".into(),
+        member: "key".into(),
+        value: json!(b64(&other)),
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(app.shared_record(&key).await.unwrap().is_none());
+    assert!(app.shared_record(&other).await.unwrap().is_none());
+    assert!(!changed(&report.events, key) && !changed(&report.events, other));
+    assert_eq!(divergent(&report.events, other), 0, "{:?}", report.events);
+    assert_eq!(marks(&store, "rcdiv/"), 0);
+    assert_eq!(marks(&store, "rcread/"), 0);
+}
+
+#[tokio::test]
+async fn test_upload_divergent_flag_follows_the_last_note_in_one_commit() {
+    // Notes in one commit read the commit's own writes: a clear then a set leaves the record
+    // divergent, as the later view says, and tells the app again.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, true).await;
+    let key = *lost
+        .next
+        .lock()
+        .shared
+        .records
+        .keys()
+        .next()
+        .expect("the record");
+    let mut tx = app.tx().unwrap();
+    app.note_view_divergence(&key, true, &mut tx).await.unwrap();
+    app.commit(tx).await.unwrap();
+    assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
+    let mut tx = app.tx().unwrap();
+    app.note_divergent(&key, false, &mut tx).await.unwrap();
+    app.note_view_divergence(&key, true, &mut tx).await.unwrap();
+    app.commit(tx).await.unwrap();
+    assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(divergent(&report.events, key), 2, "{:?}", report.events);
+}
+
+#[tokio::test]
+async fn test_upload_records_past_the_mark_cap_owe_a_listing() {
+    // Uploads that would leave more than `MAX_RECORD_MARKS` records marked, counting those
+    // a commit marked before, drop every record mark and owe a listing instead, which the
+    // next read makes first.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, false).await;
+    let keys = |from: usize| -> BTreeSet<[u8; 32]> {
+        (from..from + MAX_RECORD_MARKS / 2 + 1)
+            .map(|i| {
+                let mut key = [0; 32];
+                key[..8].copy_from_slice(&u64::try_from(i).unwrap().to_be_bytes());
+                key
+            })
+            .collect()
+    };
+    for from in [0, MAX_RECORD_MARKS] {
+        let changes = UploadChanges {
+            records: keys(from),
+            ..UploadChanges::default()
+        };
+        lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
+    }
+    app.receive(None).await.unwrap();
+    assert_eq!(marks(&store, "rcread/"), 0);
+    assert!(store_of(&store, "list_due"));
+    let listings = lost.next.lock().shared.listings;
+    app.receive(None).await.unwrap();
+    assert!(lost.next.lock().shared.listings > listings, "listed");
+    assert!(!store_of(&store, "list_due"));
+}
+
+#[tokio::test]
+async fn test_upload_records_up_to_the_mark_cap_are_marked() {
+    // Up to `MAX_RECORD_MARKS`, the records are marked, and no listing is owed.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, false).await;
+    let keys: BTreeSet<[u8; 32]> = (0..MAX_RECORD_MARKS)
+        .map(|i| {
+            let mut key = [0; 32];
+            key[..8].copy_from_slice(&u64::try_from(i).unwrap().to_be_bytes());
+            key
+        })
+        .collect();
+    let changes = UploadChanges {
+        records: keys,
+        ..UploadChanges::default()
+    };
+    lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
+    let listings = lost.next.lock().shared.listings;
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        marks(&store, "rcread/"),
+        MAX_RECORD_MARKS - RECORD_REREADS_PER_READ
+    );
+    assert_eq!(lost.next.lock().shared.listings, listings, "no listing");
+}
+
+#[tokio::test]
+async fn test_upload_divergent_flag_reads_in_the_receive_context() {
+    // The protocol's receive context reads the flag too (`ReceiveContext::record_at`).
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, true).await;
+    let key = upload_fork(&lost, [99; 16]);
+    app.receive(None).await.unwrap();
+    let shown = |app: &App| {
+        let store = Arc::clone(app.env.store.store());
+        let cx = crate::app::ReceiveContext::new(
+            &app.state,
+            app.protocol.as_ref(),
+            store.as_ref(),
+            &app.ns,
+            false,
+            &[],
+            &[],
+            &[],
+        );
+        cx.record_at(&key).unwrap().unwrap().divergent
+    };
+    assert!(shown(&app));
+    let target = RecordTarget::new(items(), b"key");
+    app.put_record(&target, &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    assert!(!shown(&app));
+}
+
+#[tokio::test]
+async fn test_upload_record_held_is_read_again_under_its_own_collection() {
+    // A record the app holds, of a collection its protocol doesn't list, is read again as
+    // its own collection: a newer upload of it is taken.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, true).await;
+    *lost.protocol.collections.lock().unwrap() = vec![];
+    let (key, kind, version) = {
+        let next = lost.next.lock();
+        let (key, taken) = next.shared.records.iter().next().expect("the record");
+        let op = pubky_switch_core::ops::SignedOp::peek(&taken.op).unwrap();
+        (*key, op.body().kind.clone(), taken.state.version)
+    };
+    // The lost generation's next write, built on the version uploaded: it replaces it.
+    let OpKind::RecordPut(mut put) = kind else {
+        unreachable!("a record op");
+    };
+    put.expected_version = version;
+    put.id_inputs = None;
+    let op = sign_batch(
+        &app_keys("wallet"),
+        &lost.w.alice.public(),
+        Some(app_keys("wallet").app_id_bytes()),
+        1,
+        [95; 16],
+        vec![(Vec::new(), OpKind::RecordPut(put))],
+    )
+    .unwrap();
+    let body = json!({ "records": [{ "op": op[0].signed(), "cert": app.cert().signed() }] });
+    let (status, answer) = upload_at_next(&lost, &body.to_string());
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["result"]["records"], json!([b64(&key)]));
+    let report = app.receive(None).await.unwrap();
+    assert!(changed(&report.events, key), "{:?}", report.events);
 }
