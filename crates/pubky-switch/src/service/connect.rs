@@ -105,23 +105,24 @@ impl Service {
             _ => return Err(identity_needed(copy.as_ref().map(IdentityDoc::version))),
         }
         let known = copy.as_ref().map(IdentityDoc::version);
-        // The rates, each refusal a hit against the sender (Switch wire 9.4).
-        let limited = |txn: &mut AccountTxn, result: Result<(), u64>, what: &str| {
-            result.map_err(|retry_after| {
+        // The rates (Switch wire 9.4). Only the sender's own rate counts a hit against it:
+        // the strangers' rate belongs to the whole account, and a flood of fresh identities
+        // spending it says nothing about whoever asks next.
+        self.connect_rate
+            .take(
+                (account.id.clone(), sender),
+                self.limits.connect_per_min,
+                time_ms,
+            )
+            .map_err(|retry_after| {
                 txn.note_flag_hit(sender, self.limits.max_flags);
-                ApiError::rate_limited(format!("9.4: {what}"), retry_after)
-            })
-        };
-        let taken = self.connect_rate.take(
-            (account.id.clone(), sender),
-            self.limits.connect_per_min,
-            time_ms,
-        );
-        limited(txn, taken, "connect requests from this sender")?;
-        let taken =
-            self.stranger_rate
-                .take(account.id.clone(), self.limits.stranger_per_min, time_ms);
-        limited(txn, taken, "strangers at this account")?;
+                ApiError::rate_limited("9.4: connect requests from this sender", retry_after)
+            })?;
+        self.stranger_rate
+            .take(account.id.clone(), self.limits.stranger_per_min, time_ms)
+            .map_err(|retry_after| {
+                ApiError::rate_limited("9.4: strangers at this account", retry_after)
+            })?;
         let pending = json!({ "pending": true, "known_version": known });
         // A sender already pending, or one the allowlist already admits, which nothing is
         // kept for: an admission answers a request, so the two never hold together.

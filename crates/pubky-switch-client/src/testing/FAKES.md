@@ -107,13 +107,16 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **Connect requests** (Switch wire 7.4.7), in `switch/inbox.rs` `connect` and
   `switch/shared.rs`: as at the service (`crates/pubky-switch/src/service/connect.rs`), in its
   order: `503 staged` while admission is staged, whatever the policy; `403 not_admitted` with
-  the policy off; `409 identity_needed` unless the copy of the sender's document lists the
-  app; a sender already pending answered `pending`; the policy's `max_pending`, capped at the
+  the policy off; check 5 by the sender's certificate: the copy lists the app with it, or
+  a renewal of it still open, a closed renewal being `403 not_current`, and otherwise `409
+  identity_needed` naming the held version, or none when the copy lists the app as
+  removed; a sender already pending answered `pending`; the policy's `max_pending`, capped at the
   wire's default `max_connect_pending` (1,000), refusing a new sender `429 quota_exceeded`
   before the deny list; a denied sender answered `pending`, its request not kept. `GET
-  /connect` needs `lists.read`, `DELETE /connect/{pubky}` `conversation.add`. A contact, a
-  conversation entry or a deny list entry for the sender answers its request, the entry an
-  invite code's first append writes included. Unlike the service: no `connect_per_min` or
+  /connect` needs `lists.read`, `DELETE /connect/{pubky}` `conversation.add`, and an own app's
+  or the signer's `POST /connect` is `403 permission_missing`. A contact, a conversation
+  entry or a deny list entry for the sender answers its request, the entry an invite code's
+  first append writes and the entries a recovery upload's list merge writes included. Unlike the service: no `connect_per_min` or
   `stranger_per_min` (no rates, above), and no flag hits. A sender the allowlist admits is
   answered `pending` with nothing kept, as at the service. Neither switch sends the push
   `policy.connect_requests.push` asks for yet: push isn't served.

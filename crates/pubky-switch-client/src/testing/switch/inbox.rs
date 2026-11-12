@@ -14,7 +14,7 @@ use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::{ErrorCode, header};
 use pubky_switch_core::ident::invite_code_hash;
 use pubky_switch_core::ops::AllowKind;
-use pubky_switch_core::records::{AppCert, IdentityDoc};
+use pubky_switch_core::records::{AppCert, IdentityDoc, Standing};
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::rfc3339;
 use serde_json::{Value, json};
@@ -133,7 +133,7 @@ impl Inner {
                 self.peers_put(&sender.identity, &request.body)
             }
             ("POST", "inbox") => self.append(request, Some(sender), query)?,
-            ("POST", "connect") => self.connect(sender),
+            ("POST", "connect") => self.connect(request, sender),
             // The feed, the claims, the lists and the records are read only by the account's
             // own apps; a batch is `not_admitted`; every other call of Switch wire 7.4 only an
             // own app or the signer makes (7.6; `crates/pubky-switch/src/service/rules.rs`,
@@ -259,24 +259,42 @@ impl Inner {
     /// `POST /connect` (Switch wire 7.4.7), in the service's order
     /// (`crates/pubky-switch/src/service/connect.rs`): `503 staged` while admission is
     /// staged, whatever the policy; `not_admitted` while the policy turns connect requests
-    /// off; `identity_needed` unless the copy of the sender's document lists the app; a
+    /// off; check 5 against the sender's certificate, as at the service; a
     /// sender already pending, or one the allowlist admits, answered `pending`, nothing kept
     /// for the admitted one; a full list `429 quota_exceeded`, before
     /// the deny list; a denied sender answered `pending`, its request not kept.
-    fn connect(&mut self, sender: &Sender) -> Answer {
+    fn connect(&mut self, request: &Request, sender: &Sender) -> Answer {
         if self.admission_staged {
             return self.not_admitted_now();
         }
         if !self.connect_requests_on() {
             return not_admitted();
         }
-        let listed = sender.app.is_some_and(|app| {
-            self.peers
-                .get(&sender.identity)
-                .is_some_and(|doc| doc.listed_cert(&app).is_some() && !doc.lists_removed(&app))
-        });
-        if !listed {
-            return identity_needed(None);
+        // Check 5 (Switch wire 7.2), as at the service: the copy lists the app with this
+        // very certificate, or a renewal of it still open; a closed renewal is `403
+        // not_current`; otherwise `409 identity_needed`, naming the held version unless the
+        // copy lists the app as removed, which is answered like a stranger with no copy.
+        let cert = request
+            .header(header::CERT)
+            .and_then(|text| SignedDoc::from_compact(text).ok())
+            .and_then(|signed| AppCert::verify(&signed, &sender.identity).ok());
+        let Some(cert) = cert.filter(|cert| Some(cert.app_id()) == sender.app) else {
+            return bad(ErrorCode::BadRequest, "Switch-Cert", json!(null));
+        };
+        let copy = self.peers.get(&sender.identity);
+        match copy.map(|doc| doc.standing(&cert.app_id(), &cert.hash())) {
+            Some(Standing::Listed | Standing::RenewedOpen) => {}
+            Some(Standing::RenewedClosed { .. }) => {
+                return bad(
+                    ErrorCode::NotCurrent,
+                    "3.8: the certificate's renewal has closed",
+                    json!(null),
+                );
+            }
+            Some(Standing::Removed { .. }) => return identity_needed(None),
+            Some(Standing::None) | None => {
+                return identity_needed(copy.map(IdentityDoc::version));
+            }
         }
         let pending = (
             200,
@@ -803,8 +821,8 @@ mod tests {
     fn test_scripted_staged_admission_holds_senders_back() {
         // While admission is staged after a provider loss, a sender the switch can't
         // otherwise admit gets `503 staged` at `PUT /peers`, the inbox and the directory,
-        // and `403 not_admitted` once it ends (Switch spec 12.6 step 2; wire 7.4.3, 7.4.5,
-        // 7.4.10).
+        // and `403 not_admitted` once it ends, `POST /connect` included, whatever the policy
+        // (Switch spec 12.6 step 2; wire 7.4.3, 7.4.5, 7.4.7, 7.4.10).
         let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
         let switch = ScriptedSwitch::new(
             &identity,
@@ -836,6 +854,7 @@ mod tests {
             ("PUT", "/peers", "peers"),
             ("POST", "/inbox?apps_version=0", "inbox?apps_version=0"),
             ("GET", "/directory", "directory"),
+            ("POST", "/connect", "connect"),
         ];
         for (staged, code) in [(true, "staged"), (false, "not_admitted")] {
             inner.admission_staged = staged;
@@ -848,6 +867,173 @@ mod tests {
                     "{method} {path}, staged {staged}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_scripted_connect_check_five_is_the_services() {
+        // At the service (`crates/pubky-switch/src/service/connect.rs`, check 5 by the
+        // certificate, Switch wire 7.2): a held copy that doesn't list the app, or lists it
+        // with another certificate, is `409 identity_needed` naming the held version; a
+        // closed renewal `403 not_current`; the scripted switch answers alike.
+        use pubky_switch_core::records::{
+            IdentityBody, IdentityPolicy, Inbox, ListedApp, RenewedCert,
+        };
+        let (switch, cert) = switch_and_stranger();
+        let mut inner = switch.lock();
+        let own = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let mut policy = IdentityPolicy::default();
+        policy.connect_requests.enabled = true;
+        let key = inner.service.verifying_key().to_bytes();
+        let body = IdentityBody::first(
+            own.public(),
+            [0; 16],
+            Inbox::new(crate::testing::SWITCH_ORIGIN, key),
+            policy,
+        );
+        inner.doc = Some(IdentityDoc::sign(&own, body).unwrap());
+        let other = pubky_switch_core::keys::IdentityKey::from_secret([7; 32]);
+        let copy = |edit: &dyn Fn(&mut IdentityBody)| {
+            let mut body = IdentityBody::first(
+                other.public(),
+                [0; 16],
+                Inbox::new(crate::testing::SWITCH_ORIGIN, [5; 32]),
+                IdentityPolicy::default(),
+            );
+            edit(&mut body);
+            IdentityDoc::sign(&other, body).unwrap()
+        };
+        let another = ListedApp {
+            app_id: cert.app_id(),
+            cert: [9; 32],
+        };
+        let sender = Sender {
+            identity: other.public(),
+            app: Some(cert.app_id()),
+            code: None,
+        };
+        let request = foreign("POST", "/connect", &cert);
+        let cases = [
+            (
+                "not listed",
+                copy(&|_| {}),
+                (409, json!("identity_needed"), json!(1)),
+            ),
+            (
+                "another certificate",
+                copy(&|b| b.apps = vec![another]),
+                (409, json!("identity_needed"), json!(1)),
+            ),
+            (
+                "renewal closed",
+                copy(&|b| {
+                    b.apps = vec![another];
+                    b.renewed = vec![RenewedCert {
+                        app_id: cert.app_id(),
+                        cert: cert.hash(),
+                        until: Some(1),
+                    }];
+                }),
+                (403, json!("not_current"), Value::Null),
+            ),
+        ];
+        let mut differences = Vec::new();
+        for (what, doc, service) in cases {
+            inner.peers.insert(other.public(), doc);
+            let (status, body) = inner.route_foreign(&request, &sender, "connect").unwrap();
+            let got = (
+                status,
+                body["code"].clone(),
+                body.get("known_version").cloned().unwrap_or(Value::Null),
+            );
+            if got != service {
+                differences.push(format!("{what}: scripted {got:?}, service {service:?}"));
+            }
+        }
+        assert!(differences.is_empty(), "{}", differences.join("\n"));
+    }
+
+    #[test]
+    fn test_scripted_upload_lists_answer_a_connect_request() {
+        // The service writes an upload's list entries with `put_list_entry`, which removes
+        // the sender's pending connect request (`crates/pubky-switch/src/store/ops.rs`).
+        // The scripted merge removes both requests too.
+        let (switch, _) = switch_and_stranger();
+        let mut inner = switch.lock();
+        inner.shared.connect.push(([4; 32], 1));
+        inner.shared.connect.push(([6; 32], 1));
+        let lists = pubky_switch_core::recovery::UploadLists {
+            contacts: Some(vec![[4; 32]]),
+            deny: Some(vec![[6; 32]]),
+        };
+        let mut changes = pubky_switch_core::recovery::UploadChanges::default();
+        inner.shared.merge_upload(
+            &pubky_switch_core::recovery::CheckedUpload::default(),
+            Some(&lists),
+            (100, 100),
+            1,
+            1,
+            &mut changes,
+        );
+        assert!(
+            inner.shared.connect.is_empty(),
+            "{:?}",
+            inner.shared.connect
+        );
+    }
+
+    #[test]
+    fn test_scripted_connect_reads_and_declines_need_their_permissions() {
+        // As at the service: the signer, holding neither `lists.read` nor
+        // `conversation.add`, reads no connect requests and declines none, and neither the
+        // signer nor an own app asks to connect.
+        let (switch, _) = switch_and_stranger();
+        let mut inner = switch.lock();
+        inner.shared.connect.push(([4; 32], 1));
+        let pubky = pubky_switch_core::enc::pubky_id(&[4; 32]);
+        for (method, rest) in [
+            ("GET", "connect".to_string()),
+            ("DELETE", format!("connect/{pubky}")),
+            ("POST", "connect".to_string()),
+        ] {
+            let request = crate::transport::Request {
+                method: method.into(),
+                origin: crate::testing::SWITCH_ORIGIN.into(),
+                path_and_query: format!("/{rest}"),
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            let (status, body) = inner.route_shared(&request, None, &rest).unwrap();
+            assert_eq!(
+                (status, body["code"].clone()),
+                (403, json!("permission_missing")),
+                "{method} {rest}"
+            );
+        }
+        assert_eq!(inner.shared.connect.len(), 1, "nothing declined");
+    }
+
+    #[test]
+    fn test_scripted_connect_cap_is_the_wires_at_most() {
+        // A policy's `max_pending` above `max_connect_pending` is capped at it, as at the
+        // service; one below it applies.
+        use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
+        let (switch, _) = switch_and_stranger();
+        let mut inner = switch.lock();
+        let own = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let key = inner.service.verifying_key().to_bytes();
+        for (asked, applies) in [(MAX_CONNECT_PENDING + 1, MAX_CONNECT_PENDING), (3, 3)] {
+            let mut policy = IdentityPolicy::default();
+            policy.connect_requests.enabled = true;
+            policy.connect_requests.max_pending = asked;
+            let body = IdentityBody::first(
+                own.public(),
+                [0; 16],
+                Inbox::new(crate::testing::SWITCH_ORIGIN, key),
+                policy,
+            );
+            inner.doc = Some(IdentityDoc::sign(&own, body).unwrap());
+            assert_eq!(inner.connect_cap(), applies);
         }
     }
 }

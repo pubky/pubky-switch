@@ -2867,3 +2867,46 @@ async fn test_upload_from_a_revoked_app_is_refused_without_its_judgment() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_admission_staged_holds_back_connect_requests_whatever_the_policy() {
+    // The recovery document takes no connect requests: while admission is staged a
+    // stranger's `POST /connect` is still `503 staged` (decision: "whatever the policy"),
+    // and `403 not_admitted` once it ends.
+    let Some(replay) = replay().await else { return };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let before = held(&replay).await;
+    let mut body: IdentityBody = before.body().clone();
+    body.version += 1;
+    body.generation += 1;
+    body.inbox.service_key = pending;
+    body.recovery_from = Some(1);
+    body.policy.connect_requests.enabled = false;
+    let recovery = IdentityDoc::sign(&alice_key(), body)
+        .expect("sign")
+        .signed()
+        .clone();
+    let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    let ask = || {
+        other_request(
+            "shop",
+            ORIGIN,
+            "POST",
+            &format!("/v1/{}/connect", alice_id()),
+            Vec::new(),
+            None,
+            at,
+        )
+    };
+    assert_eq!(
+        code(&replay.service.handle(ask()).await),
+        (503, "staged".into())
+    );
+    assert_eq!(admission(&replay, Vec::new(), at).await.status, 200);
+    assert_eq!(
+        code(&replay.service.handle(ask()).await),
+        (403, "not_admitted".into())
+    );
+    replay.db.drop_database().await.expect("drop");
+}

@@ -430,11 +430,14 @@ impl Shared {
                 (&mut self.contacts, &lists.contacts, max_contacts),
                 (&mut self.deny, &lists.deny, max_deny),
             ] {
-                // Entries past the list's limit are dropped (Switch wire 7.4.14 "Lists").
+                // Entries past the list's limit are dropped (Switch wire 7.4.14 "Lists"). Each
+                // entry the merge writes answers the sender's connect request, as any list
+                // entry does (7.4.7).
                 for pubky in entries.iter().flatten() {
                     if !list.contains(pubky) && u64::try_from(list.len()).unwrap_or(u64::MAX) < max
                     {
                         list.insert(*pubky);
+                        self.connect.retain(|(pending, _)| pending != pubky);
                         changes.lists = true;
                     }
                 }
@@ -680,6 +683,13 @@ impl Inner {
             ("GET", "allow") if self.allow.is_none() => self.allow_list(),
             // Own apps only, each with its permission, as at the service
             // (`crates/pubky-switch/src/service/connect.rs`).
+            // Apps of another identity ask to connect (`inbox.rs`); the account's own apps
+            // and its signer don't.
+            ("POST", "connect") => bad(
+                ErrorCode::PermissionMissing,
+                "7.4.7: apps of another identity ask to connect",
+                json!(null),
+            ),
             ("GET", "connect") => {
                 if !self.caller_holds(caller, Permission::ListsRead) {
                     return Some(bad(
