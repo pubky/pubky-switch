@@ -5873,3 +5873,95 @@ async fn test_scripted_first_call_without_a_record_is_refused_alike_at_every_rou
     let (status, code, head, _) = scripted_call(&s, unknown, "GET", "feed");
     assert_eq!((status, code, head), (404, json!("not_found"), false));
 }
+
+/// The position in the request log of the last request matching `what`.
+fn last_request(s: &Setup, what: impl Fn(&str) -> bool) -> Option<usize> {
+    s.log().iter().rposition(|line| what(line))
+}
+
+/// How many times the protocol was handed the message `msg_id`.
+fn handed(s: &Setup, msg_id: &str) -> usize {
+    s.protocol
+        .sample
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, id, _)| id == msg_id)
+        .count()
+}
+
+/// Switch wire 7.4.4: after a `missed` item the app lists its collections before it hands
+/// any later item of the read to its protocol, so an entry behind the item is never judged
+/// on records the listing would change. Here the note's effect batch follows the listing.
+#[tokio::test]
+async fn test_records_missed_item_lists_before_a_later_entry_in_the_same_read() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let missed = s.w.switch.push_missed(3, START, START + 1);
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (seq, note) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "after the miss" }),
+            &[app.app_id()],
+        )
+        .unwrap();
+    assert!(seq > missed);
+    let report = app.receive(None).await.unwrap();
+    assert!(super::moves::has(&report.events, |e| matches!(
+        e,
+        AppEvent::Missed { .. }
+    )));
+    // The read stopped at the item, listed, and read on from it: the note came after.
+    let listed = last_request(&s, |l| l.contains("records?collection")).unwrap();
+    let from_item = format!("feed?after=1:{missed}&");
+    let read_on = last_request(&s, |l| l.contains(&from_item)).unwrap();
+    assert!(listed < read_on, "{:?}", s.log());
+    // Processed once, in that read.
+    assert_eq!(handed(&s, &note.msg_id), 1);
+    assert!(app.cursor().seq >= seq);
+    app.receive(None).await.unwrap();
+    assert_eq!(handed(&s, &note.msg_id), 1);
+}
+
+/// A listing a `missed` item owes that fails ends the read at the item: nothing after it
+/// is handed over or passed, and the next read lists first, then processes the entry once.
+#[tokio::test]
+async fn test_records_missed_item_listing_failure_consumes_nothing_after_it() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let missed = s.w.switch.push_missed(3, START, START + 1);
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (seq, note) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "after the miss" }),
+            &[app.app_id()],
+        )
+        .unwrap();
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "records?collection".into(),
+        after: 0,
+    });
+    app.receive(None).await.unwrap_err();
+    assert_eq!(handed(&s, &note.msg_id), 0);
+    assert!(app.cursor().seq >= missed && app.cursor().seq < seq);
+    app.receive(None).await.unwrap();
+    // The protocol was told of the miss once; the note handed over once, after the listing
+    // the next read made first.
+    assert_eq!(s.protocol.sample.missed.lock().unwrap().len(), 1);
+    assert_eq!(handed(&s, &note.msg_id), 1);
+    assert!(app.cursor().seq >= seq);
+    let listed = last_request(&s, |l| l.contains("records?collection")).unwrap();
+    let read_on = last_request(&s, |l| l.contains("/feed?")).unwrap();
+    assert!(listed < read_on, "{:?}", s.log());
+}

@@ -243,6 +243,18 @@ struct Read {
     /// The (sender, `msg_id`) pairs processed in this read and not yet committed, with
     /// their message hashes (Switch spec 11).
     pairs: HashMap<([u8; 32], String), [u8; 32]>,
+    /// A `missed` item owed a listing of the collections: no later item of the read is
+    /// processed before it (Switch wire 7.4.4).
+    list_first: bool,
+}
+
+/// How a page of the feed ended, when the read didn't stop on it.
+enum PageEnd {
+    /// Processed to its end; whether the feed has more.
+    Read { more: bool },
+    /// Processed through the `missed` item at this `seq`, which owes a listing of the
+    /// collections, made before any later item is processed (Switch wire 7.4.4).
+    ListFirst(u64),
 }
 
 impl Read {
@@ -253,6 +265,7 @@ impl Read {
             opaque,
             epoch_rose: false,
             pairs: HashMap::new(),
+            list_first: false,
         }
     }
 
@@ -426,8 +439,22 @@ impl App {
             let page = self.take(result).await?;
             let scanned = page.scanned_through;
             match self.process_page(page, after, &mut blocked).await? {
-                Some(true) => after = after.max(scanned).max(self.state.cursor.seq),
-                Some(false) => break,
+                Some(PageEnd::Read { more: true }) => {
+                    after = after.max(scanned).max(self.state.cursor.seq);
+                }
+                Some(PageEnd::Read { more: false }) => break,
+                // The listing a `missed` item owes, before any later item: ending the page's
+                // processing at the item and committing it keeps the cursor rules as they
+                // are, the listing's own commits never interleaving with a page's open
+                // writes. A listing that can't be made yet, for want of a scope key, ends
+                // the read there; the next one lists first.
+                Some(PageEnd::ListFirst(through)) => {
+                    self.list_collections_if_due().await?;
+                    if self.reader().exists(super::records::LIST_DUE).await? {
+                        break;
+                    }
+                    after = after.max(through);
+                }
                 None => {
                     report.stopped = true;
                     break;
@@ -448,14 +475,14 @@ impl App {
         Ok(report)
     }
 
-    /// One page, read after `after`, with the lowest `seq` held so far in this read:
-    /// `Some(more)`, or `None` when the read stops on it.
+    /// One page, read after `after`, with the lowest `seq` held so far in this read: how it
+    /// ended, or `None` when the read stops on it.
     async fn process_page(
         &mut self,
         page: FeedPage,
         after: u64,
         blocked: &mut Option<u64>,
-    ) -> Result<Option<bool>, AppError> {
+    ) -> Result<Option<PageEnd>, AppError> {
         let now = self.now();
         let multi = self.state.device.multi_device;
         let Some(chain) = self.state.chain.as_mut() else {
@@ -497,6 +524,7 @@ impl App {
             return Ok(None);
         }
         let mut stopped = None;
+        let mut list_through = None;
         // A stub names no object: once the page shows the stub of an operation, the claims
         // the app follows are read again at the end of the read (Switch wire 7.5), noted in
         // the commit that passes it.
@@ -566,13 +594,20 @@ impl App {
                 stopped = Some(seq);
                 break;
             }
+            // Switch wire 7.4.4: the listing a `missed` item owes comes before any later
+            // item is processed.
+            if read.list_first {
+                list_through = Some(seq);
+                break;
+            }
         }
+        let through = list_through.unwrap_or(page.scanned_through);
         let end = match (stopped, read.blocked) {
             (Some(stop), _) => stop
                 .saturating_sub(1)
                 .min(read.blocked.map_or(u64::MAX, |b| b.saturating_sub(1))),
-            (None, Some(blocked)) => blocked.saturating_sub(1).min(page.scanned_through),
-            (None, None) => page.scanned_through,
+            (None, Some(blocked)) => blocked.saturating_sub(1).min(through),
+            (None, None) => through,
         };
         if end > self.state.cursor.seq {
             self.state.cursor.seq = end;
@@ -586,7 +621,10 @@ impl App {
         if stopped.is_some() {
             return Ok(None);
         }
-        Ok(Some(page.more))
+        if let Some(through) = list_through {
+            return Ok(Some(PageEnd::ListFirst(through)));
+        }
+        Ok(Some(PageEnd::Read { more: page.more }))
     }
 
     /// Commit the page: the cursor, deferred when it moved past what the service holds,
@@ -2102,6 +2140,7 @@ impl App {
             }
             read.tx.put(&key::asked(seq), &())?;
             read.tx.put(super::records::LIST_DUE, &true)?;
+            read.list_first = true;
             self.events.push(AppEvent::Missed { seq, entries });
         }
         Ok(Step::Pass)
