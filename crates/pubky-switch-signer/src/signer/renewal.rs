@@ -48,7 +48,7 @@ use pubky_switch_core::records::{
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
-use super::{RENEWALS_PER_RUN, Signer};
+use super::Signer;
 use crate::alert::{Alert, RenewalSkip};
 use crate::error::{Refusal, Result, SignerError};
 use crate::key::SigningKey;
@@ -821,7 +821,13 @@ impl Signer {
     ///
     /// - **Work.** Each step does a bounded amount: at most four renewals, four full-bundle
     ///   answers, 32 checks of owed deletions and 32 record deletions, the rest left for the
-    ///   next run. The removals aren't capped: they are one version, whatever the number of
+    ///   next run. That is one budget for the whole run, however its steps nest: the owed
+    ///   steps a renewal or a full-bundle answer runs again spend from it too. Nothing that
+    ///   can't be done now takes a place in it, so nothing holds the rest back for good: an
+    ///   app that hasn't joined or is being cut off isn't due for renewal, a full-bundle
+    ///   request that can't be answered is passed over, and a deletion or a check the
+    ///   Homeserver fails goes behind the others. Every owed deletion's grant reminder is
+    ///   raised at once, whether or not its record goes in this run. The removals aren't capped: they are one version, whatever the number of
     ///   apps removed, and one `POST /revoke` for each revocation pending, at most the apps
     ///   listed, so no app the user removed stays current for want of a run.
     /// - **Time.** Once 30 seconds have passed on the device clock since the run began, no
@@ -848,8 +854,18 @@ impl Signer {
     ///
     /// As [`Signer::resume`].
     pub async fn run_due(&mut self) -> Result<RunDue> {
-        let began = self.env.clock.now_ms();
+        // One budget for the whole run, however its steps nest: a `resume` inside a step
+        // spends from it too.
         self.left = RunDue::default();
+        self.run = Some(super::Allowance::RUN);
+        let ran = self.run_due_steps().await;
+        self.run = None;
+        ran
+    }
+
+    /// The steps of [`Signer::run_due`], within its budget.
+    async fn run_due_steps(&mut self) -> Result<RunDue> {
+        let began = self.env.clock.now_ms();
         // While a hand-over or a take-over is in progress, only its own step runs: nothing
         // routine is signed, and what is owed stays owed (Switch wire 3.12).
         self.refresh().await?;
@@ -969,7 +985,16 @@ impl Signer {
             if carried {
                 taken.push(listed.app_id);
             }
-            if removed || !past_half_lifetime(cert, switch_time) {
+            // An app that hasn't joined can't be renewed yet (Switch wire 6.2), and one being
+            // cut off goes: neither takes a place among the renewals a run makes.
+            let joined = statuses
+                .iter()
+                .any(|s| s.app_id == listed.app_id && s.record_cert.is_some());
+            if removed
+                || !joined
+                || self.cut_off(&listed.app_id)
+                || !past_half_lifetime(cert, switch_time)
+            {
                 continue;
             }
             // Two automatic renewals in a row untaken: the app stays away, and the user
@@ -1044,12 +1069,16 @@ impl Signer {
         if state != self.state {
             self.commit(state, None).await?;
         }
-        // The soonest to expire first, a bounded number each run: the rest are due at the next.
+        // The soonest to expire first, as many as the run's budget renews: the rest are due at
+        // the next. Only apps that can be renewed are due, so none holds a place for good.
         due.sort_by_key(|(_, _, expires_at)| *expires_at);
-        if due.len() > RENEWALS_PER_RUN {
+        let allowed = self.allowance().renewals;
+        if due.len() > allowed {
             self.left.renewals_left = true;
-            due.truncate(RENEWALS_PER_RUN);
+            due.truncate(allowed);
         }
+        let tried = due.len();
+        self.spend(|run| run.renewals = run.renewals.saturating_sub(tried));
         let mut renewed = Vec::new();
         for (app_id, lifetime, _) in due {
             self.ready().await?;

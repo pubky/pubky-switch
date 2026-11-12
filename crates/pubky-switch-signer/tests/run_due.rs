@@ -318,3 +318,169 @@ async fn test_run_due_checks_32_owed_deletions_a_run() {
     let report = restored.run_due().await.unwrap();
     assert!(!report.more_due());
 }
+
+/// An app approved and never joined: it delivered no record.
+async fn approved_unjoined(signer: &mut Signer, app: &App) {
+    let review = signer.review(&app.request, &app.auth).unwrap();
+    let approved = signer.approve(review).await.unwrap();
+    signer.claim_delivered(&approved.request).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_run_due_renews_a_joined_app_behind_four_unjoined_ones() {
+    // Four apps that never joined expire first; none can be renewed, so none takes a place,
+    // and the fifth, which joined, is renewed in the first run.
+    let world = World::new();
+    let mut signer = enrolled_for_many(&world).await;
+    let apps = apps(5);
+    for app in &apps[..4] {
+        approved_unjoined(&mut signer, app).await;
+        world.clock.advance_ms(DAY_MS);
+    }
+    world.approve(&mut signer, &apps[4]).await;
+    let joined = apps[4].keys.app_id_bytes();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    let since = world.clock.now_ms();
+    let report = signer.run_due().await.unwrap();
+    assert_eq!(renewed_since(&signer, &[joined], since), [joined]);
+    assert!(!report.renewals_left);
+}
+
+#[tokio::test]
+async fn test_run_due_answers_a_full_bundle_behind_four_that_cant_be() {
+    // Four apps that never joined asked first: none can be answered, so none takes a place,
+    // and the fifth's request is answered in the first run.
+    let world = World::new();
+    let mut signer = enrolled_for_many(&world).await;
+    let apps = apps(5);
+    for app in &apps[..4] {
+        approved_unjoined(&mut signer, app).await;
+        world.switch.request_full_bundle(app.keys.app_id_bytes());
+        world.clock.advance_ms(1_000);
+    }
+    world.approve(&mut signer, &apps[4]).await;
+    let joined = apps[4].keys.app_id_bytes();
+    world.switch.request_full_bundle(joined);
+    let report = signer.run_due().await.unwrap();
+    assert!(world.switch.app(&joined).full_requested.is_none());
+    assert!(!report.full_bundles_left);
+}
+
+#[tokio::test]
+async fn test_run_due_failing_deletions_hold_back_no_other_record() {
+    // Thirty-three apps leave; every deletion fails in the first run, which tries 32 and
+    // reminds of every grant. The next run tries the one left first, and it goes.
+    let world = World::new();
+    let mut signer = enrolled_for_many(&world).await;
+    let apps = apps(33);
+    for app in &apps {
+        world.approve(&mut signer, app).await;
+    }
+    let paths: Vec<String> = apps
+        .iter()
+        .map(|a| app_record_path(&a.keys.app_id_bytes()))
+        .collect();
+    for (app, path) in apps.iter().zip(&paths) {
+        world.homeserver.set(path, b"{}".to_vec());
+        world.switch.leave(app.keys.app_id_bytes()).unwrap();
+    }
+    *world.homeserver.failing_deletes.lock().unwrap() = paths.iter().cloned().collect();
+    world.homeserver.deletes.lock().unwrap().clear();
+    let report = signer.run_due().await.unwrap();
+    let tried: Vec<String> = world.homeserver.deletes.lock().unwrap().clone();
+    assert_eq!(tried.len(), 32);
+    assert!(report.deletions_left);
+    for app in &apps {
+        let app_id = app.keys.app_id_bytes();
+        assert!(
+            signer
+                .alerts()
+                .contains(&pubky_switch_signer::Alert::GrantRevocationOwed { app_id }),
+            "every grant reminded"
+        );
+    }
+    let untried = paths.iter().find(|p| !tried.contains(p)).unwrap().clone();
+    world
+        .homeserver
+        .failing_deletes
+        .lock()
+        .unwrap()
+        .remove(&untried);
+    world.homeserver.deletes.lock().unwrap().clear();
+    signer.run_due().await.unwrap();
+    assert_eq!(world.homeserver.deletes.lock().unwrap()[0], untried);
+    assert!(world.homeserver.file(&untried).is_none());
+}
+
+#[tokio::test]
+async fn test_run_due_deletes_32_records_however_its_steps_nest() {
+    // Thirty-three apps leave while another app's renewal is due: the renewal's own run of
+    // the owed steps doesn't start a budget of its own, so the run deletes 32 records.
+    let world = World::new();
+    let mut signer = enrolled_for_many(&world).await;
+    let apps = apps(34);
+    for app in &apps {
+        world.approve(&mut signer, app).await;
+    }
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    for app in &apps[..33] {
+        let id = app.keys.app_id_bytes();
+        world.homeserver.set(&app_record_path(&id), b"{}".to_vec());
+        world.switch.leave(id).unwrap();
+    }
+    world.homeserver.deletes.lock().unwrap().clear();
+    let report = signer.run_due().await.unwrap();
+    let deleted = world
+        .homeserver
+        .deletes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.contains("/apps/"))
+        .count();
+    assert_eq!(deleted, 32);
+    assert!(report.deletions_left);
+}
+
+#[tokio::test]
+async fn test_run_due_a_check_that_keeps_failing_holds_back_no_other() {
+    // A new install restored after 33 apps left finds their records still on the Homeserver;
+    // the read of one keeps failing. It goes behind the others, so the first run checks and
+    // deletes the other 32.
+    let world = World::new();
+    let mut signer = enrolled_for_many(&world).await;
+    let apps = apps(33);
+    for app in &apps {
+        world.approve(&mut signer, app).await;
+    }
+    for app in &apps {
+        world.switch.leave(app.keys.app_id_bytes()).unwrap();
+    }
+    signer.run_due().await.unwrap();
+    signer.run_due().await.unwrap();
+    drop(signer);
+    let paths: Vec<String> = apps
+        .iter()
+        .map(|a| app_record_path(&a.keys.app_id_bytes()))
+        .collect();
+    for path in &paths {
+        world.homeserver.set(path, b"{}".to_vec());
+    }
+    let smallest = apps.iter().map(|a| a.keys.app_id_bytes()).min().unwrap();
+    let failing = app_record_path(&smallest);
+    *world.homeserver.failing_read_path.lock().unwrap() = Some(failing.clone());
+    let env = world.env(Arc::new(MemoryStore::new()));
+    let mut restored = Signer::restore_new(
+        env,
+        world.keyring(),
+        pubky_switch_signer::UserConfirmed::shown_and_confirmed(),
+    )
+    .await
+    .unwrap();
+    restored.run_due().await.unwrap();
+    let held: Vec<&String> = paths
+        .iter()
+        .filter(|p| world.homeserver.file(p).is_some())
+        .collect();
+    assert_eq!(held, [&failing]);
+}

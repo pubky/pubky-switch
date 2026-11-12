@@ -33,9 +33,9 @@ use pubky_switch_core::records::{
     IdentityDoc, ListedApp, RemovedApp, SIGNER_BACKUP_PATH, app_record_path, seal_bundle_parts,
 };
 
+use super::Signer;
 use super::clients::Named;
 use super::renewal::{Op, keyed, push_parts};
-use super::{FULL_BUNDLES_PER_RUN, RECORD_DELETIONS_PER_RUN, Signer};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::state::{Flow, RefusedRequest, RenewBatch, Revoking};
@@ -576,13 +576,28 @@ impl Signer {
             // Once no version lists the app: removed, or purged from `removed` since.
             .filter(|app| newest.listed_cert(app).is_none())
             .collect();
-        // A bounded number each run; the rest stay owed for the next.
-        if done.len() > RECORD_DELETIONS_PER_RUN {
+        // The grant reminder is raised once for each owed deletion, every one at once, whether
+        // or not its record goes in this run.
+        let mut state = self.state.clone();
+        for app_id in &done {
+            if !state.grant_reminded.contains(app_id) {
+                state.alert(Alert::GrantRevocationOwed { app_id: *app_id });
+                state.grant_reminded.push(*app_id);
+            }
+        }
+        if state != self.state {
+            self.commit(state, self.flow.clone()).await?;
+        }
+        // A bounded number each run, from the run's budget; the rest stay owed for the next.
+        let allowed = self.allowance().deletions;
+        if done.len() > allowed {
             self.left.deletions_left = true;
         }
-        // The grant reminder is raised once for each owed deletion, whether or not the record
-        // goes now; a deletion that fails stays owed, and doesn't hold back the next app's.
-        for app_id in done.into_iter().take(RECORD_DELETIONS_PER_RUN) {
+        let tried = done.len().min(allowed);
+        self.spend(|run| run.deletions = run.deletions.saturating_sub(tried));
+        // A deletion that fails stays owed and goes behind the others, so a record that keeps
+        // failing holds back no other app's.
+        for app_id in done.into_iter().take(allowed) {
             let deleted = self
                 .env
                 .homeserver
@@ -590,14 +605,12 @@ impl Signer {
                 .await
                 .is_ok();
             let mut state = self.state.clone();
-            if !state.grant_reminded.contains(&app_id) {
-                state.alert(Alert::GrantRevocationOwed { app_id });
-                state.grant_reminded.push(app_id);
-            }
+            state.cleanup.retain(|a| *a != app_id);
             if deleted {
-                state.cleanup.retain(|a| *a != app_id);
                 state.revoking.retain(|r| r.app_id != app_id);
                 state.grant_reminded.retain(|a| *a != app_id);
+            } else {
+                state.cleanup.push(app_id);
             }
             if state != self.state {
                 self.commit(state, self.flow.clone()).await?;
@@ -650,8 +663,11 @@ impl Signer {
         let keyed = keyed(&protocols);
         let key = self.signing_key()?;
         // One flow for each app, so a refused one doesn't hold back the others. The oldest
-        // requests first, and at most `FULL_BUNDLES_PER_RUN` of them: the rest are answered
-        // at the next run, and an app asking again goes behind the others.
+        // requests first, and only those the run's budget answers: the rest are answered at
+        // the next run, and an app asking again goes behind the others. A request that can't
+        // be answered now (an app not served, cut off, refused before or with a scope no
+        // protocol owns) takes no place in the budget.
+        let allowed = self.allowance().full_bundles;
         let mut requests: Vec<(RefusedRequest, Vec<Op>)> = Vec::new();
         let mut alerts = Vec::new();
         let mut asking: Vec<(&ListedApp, &AppStatus, u64)> = newest
@@ -691,8 +707,8 @@ impl Signer {
                 });
                 continue;
             }
-            // One more request to answer than the run answers: the next run does.
-            if requests.len() >= FULL_BUNDLES_PER_RUN {
+            // One more request to answer than the run's budget answers: the next run does.
+            if requests.len() >= allowed {
                 self.left.full_bundles_left = true;
                 break;
             }
@@ -716,6 +732,8 @@ impl Signer {
             }
             requests.push((request, ops));
         }
+        let answering = requests.len();
+        self.spend(|run| run.full_bundles = run.full_bundles.saturating_sub(answering));
         let signed: Vec<(RefusedRequest, Vec<RenewBatch>)> = requests
             .into_iter()
             .map(|(request, ops)| Ok((request, self.sign_batches(&key, newest.generation(), ops)?)))

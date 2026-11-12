@@ -217,6 +217,9 @@ pub struct Signer {
     unsure: bool,
     /// What the [`Signer::run_due`] in progress left because a bound cut it short.
     left: RunDue,
+    /// What the [`Signer::run_due`] in progress may still do: one budget for the whole run,
+    /// however its steps nest. `None` outside a run, where each call has a budget of its own.
+    run: Option<Allowance>,
 }
 
 impl std::fmt::Debug for Signer {
@@ -275,6 +278,7 @@ impl Signer {
             flow: Some(flow),
             unsure: false,
             left: RunDue::default(),
+            run: None,
         })
     }
 
@@ -298,6 +302,7 @@ impl Signer {
             flow,
             unsure: false,
             left: RunDue::default(),
+            run: None,
         };
         // Records of a hand-over that took effect: the deletion is finished now.
         if let Some(install) = handed_over {
@@ -947,6 +952,18 @@ impl Signer {
     fn service_client(&self) -> Result<RequestClient> {
         let service = self.service()?;
         RequestClient::new(&self.env, &self.service_target(&service), &self.keyring)
+    }
+
+    /// What this run, or this call outside a run, may still do.
+    pub(crate) fn allowance(&self) -> Allowance {
+        self.run.unwrap_or(Allowance::RUN)
+    }
+
+    /// Spend from the run's budget; outside a run each call had its own, and nothing is kept.
+    pub(crate) fn spend(&mut self, spend: impl FnOnce(&mut Allowance)) {
+        if let Some(run) = self.run.as_mut() {
+            spend(run);
+        }
     }
 
     /// Whether the key a recovery in place's service served the lost generation with is
@@ -2000,6 +2017,33 @@ pub(crate) const FULL_BUNDLES_PER_RUN: usize = 4;
 /// The most removed apps' records one call deletes from the Homeserver, each one request: the
 /// rest stay owed, deleted at the next run (design note, section 4.5).
 pub(crate) const RECORD_DELETIONS_PER_RUN: usize = 32;
+
+/// What one run, or one call outside a run, may still do (design note, section 4.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Allowance {
+    /// Certificates renewed by themselves.
+    pub(crate) renewals: usize,
+    /// Full-bundle requests answered.
+    pub(crate) full_bundles: usize,
+    /// Removed apps' records deleted, or tried.
+    pub(crate) deletions: usize,
+    /// Owed deletions checked, or tried.
+    pub(crate) checks: usize,
+}
+
+impl Allowance {
+    /// One run's.
+    pub(crate) const RUN: Self = Self {
+        renewals: RENEWALS_PER_RUN,
+        full_bundles: FULL_BUNDLES_PER_RUN,
+        deletions: RECORD_DELETIONS_PER_RUN,
+        checks: DELETION_CHECKS_PER_RUN,
+    };
+}
+
+/// The most owed deletions one run checks on the Homeserver, each one request: the rest at
+/// the next run (design note, section 4.5).
+pub(crate) const DELETION_CHECKS_PER_RUN: usize = 32;
 
 /// How long, on the device clock, [`Signer::run_due`] goes on starting its later steps: once
 /// this has passed since the run began, it starts none, and they come at the next run. The

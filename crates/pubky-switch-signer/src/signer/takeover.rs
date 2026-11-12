@@ -238,6 +238,7 @@ impl Signer {
             flow: Some(flow),
             unsure: false,
             left: super::RunDue::default(),
+            run: None,
         };
         Ok((signer, records))
     }
