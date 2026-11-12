@@ -456,10 +456,12 @@ pub fn check_conditions<'a>(
                 let now = state.record_version(key);
                 // `{0, 0}` matches a record that is absent, forgotten or deleted, as a
                 // compare-and-swap's `expected_version` does (Switch wire 6.3), so a writer
-                // that holds a delete names it the same way whether or not the service has
-                // forgotten the key since.
+                // that holds or follows a delete names it the same way whether or not the
+                // service has forgotten the key since. The deleted case only for a caller
+                // that may read the record: to one that may not, a delete and a live write
+                // look alike, as its feed shows it both as stubs.
                 let holds = if version.version == 0 {
-                    now.is_none() || state.record_deleted(key)
+                    now.is_none() || (state.record_deleted(key) && state.may_read_record(key))
                 } else {
                     now == *version
                 };
@@ -903,6 +905,12 @@ mod tests {
         };
         assert!(check_conditions(&[record(9, 0)], &deleted).is_ok());
         assert!(check_conditions(&[record(1, 6)], &deleted).is_ok());
+        // To a caller that may not read the record, a delete looks like a live write.
+        let unreadable = State {
+            readable: false,
+            ..deleted
+        };
+        assert!(check_conditions(&[record(9, 0)], &unreadable).is_err());
         let step = |s| Condition::ClaimStep {
             claim_key: [2; 32],
             step: s,

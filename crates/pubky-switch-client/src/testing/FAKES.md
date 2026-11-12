@@ -120,7 +120,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires. Codes that expired or
   ran out go at the first request a minute of the switch's clock after the last sweep,
-  as at the service; until then `invite_uses_left` still shows a spent code at 0. Unlike
+  or at once when the clock is behind that sweep's mark, as at the service; until then `invite_uses_left` still shows a spent code at 0. Unlike
   the service, any request sweeps, a signer's or a caller's that doesn't verify included,
   and none waits for trusted time, the switch's clock being trusted.
 - **Lists**: `flagged` is always empty.

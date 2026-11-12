@@ -68,8 +68,7 @@ impl AccountTxn {
     /// 9.1), the oldest deletes first: the record's current write is its delete, written at
     /// this service (one taken from a recovery upload has no chain item here to stand for
     /// it), at or before `through`, the lowest cursor the key waits for; and no divergent
-    /// upload
-    /// names the key. The record's row goes, so its delete shows as its chain stub and a
+    /// upload names the key. The record's row goes, so its delete shows as its chain stub and a
     /// create at the key starts afresh. A range scan of `shared_records_deleted` up to
     /// `through`. The number forgotten.
     pub async fn forget_deleted_keys(

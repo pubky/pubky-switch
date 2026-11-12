@@ -167,7 +167,9 @@ impl Inner {
         let shared = &mut self.shared;
         if shared
             .swept_at
-            .is_some_and(|at| now < at.saturating_add(60_000))
+            // A mark ahead of the clock, left before it stepped back, is due at once, as at
+            // the service.
+            .is_some_and(|at| at <= now && now < at.saturating_add(60_000))
         {
             return;
         }

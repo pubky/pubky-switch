@@ -467,7 +467,8 @@ impl<'a> ReceiveContext<'a> {
 
     /// A `record_version` condition on the version of record `key` the app holds, or the
     /// version the switch showed for a write the app refused (Switch wire 6.3); `{0, 0}` for
-    /// a record it holds nothing of.
+    /// a record it holds nothing of, and when that write, held or refused, is a delete, which
+    /// `{0, 0}` matches as it matches a forgotten key (Switch spec 10.3).
     ///
     /// # Errors
     ///
@@ -475,7 +476,7 @@ impl<'a> ReceiveContext<'a> {
     pub fn record_condition(&self, key: &[u8; 32]) -> Result<Condition, AppError> {
         let version = self
             .held(key)?
-            .map_or(RecordVersion::NONE, |held| held.base_version());
+            .map_or(RecordVersion::NONE, |held| held.write_base());
         Ok(Condition::RecordVersion { key: *key, version })
     }
 

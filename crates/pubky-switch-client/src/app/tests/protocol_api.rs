@@ -3418,3 +3418,20 @@ async fn test_scripted_invite_codes_spent_or_expired_go_at_the_minutes_sweep() {
     assert_eq!(left(&at_the_sweep.code), None);
     assert_eq!(left(&live.code), Some(2));
 }
+
+#[tokio::test]
+async fn test_scripted_invite_codes_sweep_with_the_clock_behind_its_mark() {
+    // A minute's mark ahead of the switch's clock, left before the clock stepped back, is
+    // due at once, as at the service: an expired code goes at the next request.
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let code = shop
+        .register_invite_code(START + MINUTE, 1, Value::Null)
+        .await
+        .unwrap();
+    p.bob.switch().lock().shared.swept_at = Some(START + DAY_MS);
+    p.clock.advance_ms(2 * MINUTE);
+    shop.receive(None).await.unwrap();
+    assert_eq!(p.bob.switch().invite_uses_left(&code.code), None);
+}

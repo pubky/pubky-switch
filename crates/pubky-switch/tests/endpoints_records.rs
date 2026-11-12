@@ -1011,6 +1011,23 @@ async fn test_records_deleted_key_every_reader_passed_is_forgotten() {
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert_eq!(record_rows(&replay, &key).await, 0);
     assert_eq!(record_rows(&replay, &live).await, 1, "a live record stays");
+    // A write naming the forgotten delete's own version is refused for good; a writer that
+    // held or followed the delete names `{0, 0}` instead (Switch spec 8.2, 10.3).
+    let on_the_delete = record_put(
+        PAYMENTS,
+        b"gone",
+        "pay",
+        RecordVersion::new(1, deleted_at),
+        b"{\"n\":2}",
+    );
+    let refused = post_answer(
+        &replay,
+        "wallet",
+        &batch("wallet", 9, vec![OpKind::RecordPut(on_the_delete)]),
+        AT,
+    )
+    .await;
+    assert_eq!(code_of(&refused), (409, json!("conflict")));
     let (again, ..) = create(&replay, 3, b"gone", "pay").await;
     assert_eq!(again, key);
     let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);

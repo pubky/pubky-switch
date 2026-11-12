@@ -6595,3 +6595,110 @@ async fn test_scripted_records_deleted_key_doesnt_wait_for_a_revoked_app() {
     read_on(&mut wallet).await;
     assert!(!held_at_switch(&s, &key));
 }
+
+#[tokio::test]
+async fn test_scripted_records_refused_delete_is_written_over_after_a_forget() {
+    // The signer removes the wallet, distrusted from an hour ago, while the switch still
+    // takes its delete: the phone refuses the delete and follows its version, so its next
+    // write builds on it and puts back what it trusts (Switch spec 8.2). The phone is the
+    // only app the switch waits for, so once it reads past the delete the key may be
+    // forgotten; the phone's write must still be taken.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+    read_on(&mut phone).await;
+    let me = wallet.app_id();
+    let doc =
+        s.w.signer
+            .sign_next(|body| {
+                body.apps.retain(|app| app.app_id != me);
+                body.removed.push(RemovedApp {
+                    app_id: me,
+                    distrust_from: START - HOUR,
+                })
+            })
+            .unwrap();
+    wallet.delete_record(&target, vec![]).await.unwrap();
+    assert!(matches!(
+        phone.refresh_identity().await.unwrap(),
+        IdentityRefresh::Newer { .. }
+    ));
+    s.w.switch.deliver_identity(&doc).unwrap();
+    read_on(&mut phone).await;
+    let held = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+    assert!(held.flagged);
+    let forgotten = !held_at_switch(&s, &key);
+    let written = phone.put_record(&target, &value(&["a"]), vec![]).await;
+    assert!(written.is_ok(), "forgotten: {forgotten}; {written:?}");
+}
+
+#[tokio::test]
+async fn test_scripted_records_deleted_key_waits_for_a_listed_app_not_registered() {
+    // As at the service: an app the held `identity.json` lists that hasn't registered here
+    // yet holds every key, so the readers that have passed the delete free nothing.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let _later = s.approve(&app_keys("later"), &ALL_PERMISSIONS);
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    read_on(&mut wallet).await;
+    read_on(&mut phone).await;
+    assert!(held_at_switch(&s, &key), "the listed app hasn't registered");
+}
+
+#[tokio::test]
+async fn test_scripted_records_deleted_key_doesnt_wait_for_a_kept_app_id() {
+    // As at the service: an App ID kept for good (revoked) isn't waited for, though the held
+    // `identity.json` still lists it.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    read_on(&mut wallet).await;
+    assert!(held_at_switch(&s, &key), "the phone hasn't passed it");
+    s.w.switch.lock().kept_app_ids.push(phone.app_id());
+    wallet
+        .put_record(&s.target("n2"), &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    read_on(&mut wallet).await;
+    assert!(!held_at_switch(&s, &key));
+}
+
+#[tokio::test]
+async fn test_scripted_records_condition_on_a_held_delete_holds_across_a_forget() {
+    use pubky_switch_core::ops::Condition;
+    // The app's condition on a record it holds as deleted names `{0, 0}`, which matches
+    // the delete while the switch keeps it and the absent key once the switch forgets it
+    // (Switch wire 6.3, spec 10.3): the fenced write goes through both times.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    let fenced = |condition: Condition, pubky: u8| {
+        OpBatch::new().op_if(OpKind::DenyPut { pubky: [pubky; 32] }, vec![condition])
+    };
+    let condition = wallet.record_condition(&key).await.unwrap();
+    assert_eq!(
+        condition,
+        Condition::RecordVersion {
+            key,
+            version: RecordVersion::NONE
+        }
+    );
+    wallet.submit_batch(fenced(condition, 8)).await.unwrap();
+    read_on(&mut wallet).await;
+    read_on(&mut phone).await;
+    assert!(!held_at_switch(&s, &key), "forgotten");
+    wallet.submit_batch(fenced(condition, 9)).await.unwrap();
+}

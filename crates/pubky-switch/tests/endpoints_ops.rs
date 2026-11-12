@@ -2168,3 +2168,22 @@ async fn test_sweeps_mark_ahead_of_the_time_base_doesnt_pause_them() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_sweeps_need_a_caller_that_has_verified() {
+    // The public read authenticates nothing, so it runs no sweep, whatever the time base:
+    // the batch's proofs stay until a request with a verified caller comes (Switch wire 7.3
+    // step 4).
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let ops = wallet_batch(71, 1, vec![contact(bob())]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let late = after(30 * DAY_MS);
+    public_read(&replay, &late).await;
+    assert_eq!(proofs_kept(&replay, 71).await, Some(true));
+    wallet_request_at(&replay, &late).await;
+    assert_eq!(proofs_kept(&replay, 71).await, Some(false));
+    replay.db.drop_database().await.expect("drop");
+}
