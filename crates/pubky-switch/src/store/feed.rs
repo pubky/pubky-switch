@@ -69,7 +69,7 @@ impl CurrentDocs {
     /// documents current (Switch wire 7.5): the union, over every reader, of what
     /// `service::feed::shows` shows in full. An item it isn't for shows as a stub to every
     /// app, whoever reads and wherever its cursor stands, so its document may go
-    /// ([`super::AccountTxn::drop_stale_documents`]).
+    /// (`AccountTxn::drop_stale_documents`).
     ///
     /// # Errors
     ///
