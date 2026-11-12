@@ -43,7 +43,7 @@ use pubky_switch::http::route::Call;
 pub use admission::{deny_list, invite_code};
 pub use claim::claim;
 pub use collections::two_collections;
-pub use connect::connect_request;
+pub use connect::{connect_request, connect_request_full, connect_request_turned_off};
 pub use enrollment::enrollment;
 pub use epochs::{epochs_three_readers, rotation_given_up, third_epoch};
 pub use erasure::{erasure, erasure_answer_lost};
@@ -170,6 +170,12 @@ pub const FLOWS: &[(&str, Flow)] = &[
         Box::pin(waiting_read_recovered(world))
     }),
     ("connect request", |world| Box::pin(connect_request(world))),
+    ("connect request, the list full", |world| {
+        Box::pin(connect_request_full(world))
+    }),
+    ("connect request, turned off", |world| {
+        Box::pin(connect_request_turned_off(world))
+    }),
     ("approval, grant paths declined", |world| {
         Box::pin(grant_paths_declined(world))
     }),
