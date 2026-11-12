@@ -119,8 +119,7 @@ The flows send every call the service serves, each at both switches. What they l
   takes more requests in a minute than a flow sends; the push a request queues; a request
   an invite code's first admitted append answers; one to a frozen account; and a `POST
   /connect` from an own app or from the signer.
-- **Longer lives:** a renewal that adds a scope, a claim that runs out by time, an
-  identity that enrolls again after an erasure.
+- **Longer lives:** a renewal that adds a scope, and a claim that runs out by time.
 - **The Homeserver's side of a grant.** The `approval` flows hold the capabilities the
   signer grants when the user declines a protocol's paths, and that the switch is sent
   the same with the paths declined as with them allowed. The grant itself is given and
@@ -177,6 +176,6 @@ Each flow's run against the service makes one test database and drops it, also w
 test panics; the flows run one after another. Each run is on a thread of its own with 16 MiB
 of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flow used
 1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
-that ran the flows had less left. Seventy-one flows take about three minutes in a
+that ran the flows had less left. Seventy-four flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.
