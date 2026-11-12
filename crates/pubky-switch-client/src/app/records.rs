@@ -970,12 +970,13 @@ impl App {
     /// a read scope of a collection it lists, such as after a renewal that adds one: listed
     /// before its key arrives, a record would be held `Unreadable` until the key opened it
     /// ([`App::reopen_unreadable`]). `list_due` stays, so the read after the key arrives
-    /// lists.
-    pub(crate) async fn list_collections_if_due(&mut self) -> Result<(), AppError> {
+    /// lists. Returns whether it listed.
+    pub(crate) async fn list_collections_if_due(&mut self) -> Result<bool, AppError> {
         if !self.reader().exists(LIST_DUE).await? || self.listing_lacks_keys() {
-            return Ok(());
+            return Ok(false);
         }
-        self.list_collections().await
+        self.list_collections().await?;
+        Ok(true)
     }
 
     /// Whether the certificate lacks, at the current data epoch, the key of a scope it

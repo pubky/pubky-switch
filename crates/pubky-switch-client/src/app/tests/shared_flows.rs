@@ -5985,6 +5985,17 @@ async fn test_records_missed_item_listing_failure_consumes_nothing_after_it() {
     app.receive(None).await.unwrap_err();
     assert_eq!(handed(&s, &note.msg_id), 0);
     assert!(app.cursor().seq >= missed && app.cursor().seq < seq);
+    // Neither the owed listing nor the re-send notice is lost: the notice's writes are
+    // committed with the item, and the listing stays owed.
+    assert_eq!(s.protocol.sample.missed.lock().unwrap().len(), 1);
+    assert!(
+        app.protocol_get(format!("missed/{missed}").as_bytes())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let ns = crate::store::client_namespace(&app.app_id());
+    assert!(s.w.store.get(&ns, b"list_due").unwrap().is_some());
     app.receive(None).await.unwrap();
     // The protocol was told of the miss once; the note handed over once, after the listing
     // the next read made first.
@@ -5994,4 +6005,91 @@ async fn test_records_missed_item_listing_failure_consumes_nothing_after_it() {
     let listed = last_request(&s, |l| l.contains("records?collection")).unwrap();
     let read_on = last_request(&s, |l| l.contains("/feed?")).unwrap();
     assert!(listed < read_on, "{:?}", s.log());
+}
+
+/// A switch that shows one `missed` item after another can't make a read list again and
+/// again: each read lists at most once, a later item that owes a listing ends the read
+/// there, and the next read lists first. Every entry is still handed over once.
+#[tokio::test]
+async fn test_records_missed_items_in_a_row_list_once_a_read() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let shop = s.peer.apps()[0].cert.app_id();
+    let mut notes = Vec::new();
+    for text in ["one", "two", "three"] {
+        s.w.switch.push_missed(3, START, START + 1);
+        let (_, note) = s
+            .peer
+            .send_to(
+                &s.w.switch,
+                shop,
+                "sample.note",
+                json!({ "text": text }),
+                &[app.app_id()],
+            )
+            .unwrap();
+        notes.push(note);
+    }
+    let listings = |s: &Setup| {
+        s.log()
+            .iter()
+            .filter(|l| l.contains("records?collection"))
+            .count()
+    };
+    for read in 0..3 {
+        let before = listings(&s);
+        app.receive(None).await.unwrap();
+        assert_eq!(listings(&s), before + 1, "read {read}");
+        assert_eq!(handed(&s, &notes[read].msg_id), 1, "read {read}");
+        if let Some(next) = notes.get(read + 1) {
+            assert_eq!(handed(&s, &next.msg_id), 0, "read {read}");
+        }
+    }
+    let before = listings(&s);
+    app.receive(None).await.unwrap();
+    assert_eq!(listings(&s), before);
+    assert!(notes.iter().all(|note| handed(&s, &note.msg_id) == 1));
+}
+
+/// `missed` items in a row owe one listing, made after the last of them and before the
+/// entry behind them, in one read.
+#[tokio::test]
+async fn test_records_missed_items_side_by_side_share_one_listing() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let shop = s.peer.apps()[0].cert.app_id();
+    let mut last = 0;
+    for _ in 0..3 {
+        last = s.w.switch.push_missed(3, START, START + 1);
+    }
+    let (seq, note) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "behind them" }),
+            &[app.app_id()],
+        )
+        .unwrap();
+    let listings = |s: &Setup| {
+        s.log()
+            .iter()
+            .filter(|l| l.contains("records?collection"))
+            .count()
+    };
+    let before = listings(&s);
+    app.receive(None).await.unwrap();
+    assert_eq!(listings(&s), before + 1);
+    assert_eq!(s.protocol.sample.missed.lock().unwrap().len(), 3);
+    assert_eq!(handed(&s, &note.msg_id), 1);
+    assert!(app.cursor().seq >= seq);
+    let from_last = format!("feed?after=1:{last}&");
+    assert!(
+        s.log().iter().any(|l| l.contains(&from_last)),
+        "{:?}",
+        s.log()
+    );
 }

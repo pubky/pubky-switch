@@ -414,7 +414,10 @@ impl App {
         self.bound_unverified().await?;
         self.retry_parked().await?;
         self.retry_owed().await?;
-        self.list_collections_if_due().await?;
+        // At most one listing a read, so a switch that shows one `missed` item after
+        // another can't make a read list again and again: a later item that owes one ends the
+        // read, and the next read lists first.
+        let mut listed = self.list_collections_if_due().await?;
         let mut report = ReceiveReport::default();
         let mut wait = wait.map(|w| w.min(25));
         // The read position moves on page by page, past a held entry, while the cursor
@@ -447,10 +450,14 @@ impl App {
                 // processing at the item and committing it keeps the cursor rules as they
                 // are, the listing's own commits never interleaving with a page's open
                 // writes. A listing that can't be made yet, for want of a scope key, ends
-                // the read there; the next one lists first.
+                // the read there; the next one lists first, and so does one past the read's
+                // one listing.
                 Some(PageEnd::ListFirst(through)) => {
-                    self.list_collections_if_due().await?;
-                    if self.reader().exists(super::records::LIST_DUE).await? {
+                    if listed {
+                        break;
+                    }
+                    listed = self.list_collections_if_due().await?;
+                    if !listed {
                         break;
                     }
                     after = after.max(through);
@@ -534,6 +541,9 @@ impl App {
             if seq <= start {
                 continue;
             }
+            if list_through.is_some() && !matches!(item, FeedItem::Missed { .. }) {
+                break;
+            }
             // Room for one more item, whatever it writes: the read's writes so far are
             // committed first once they pass the high-water mark (`ITEM_ROOM_BYTES`).
             self.make_room(&mut read, ITEM_ROOM_BYTES).await?;
@@ -595,10 +605,10 @@ impl App {
                 break;
             }
             // Switch wire 7.4.4: the listing a `missed` item owes comes before any later
-            // item is processed.
+            // item is processed but another `missed` item, which only tells the protocol and
+            // owes the same listing.
             if read.list_first {
                 list_through = Some(seq);
-                break;
             }
         }
         let through = list_through.unwrap_or(page.scanned_through);
