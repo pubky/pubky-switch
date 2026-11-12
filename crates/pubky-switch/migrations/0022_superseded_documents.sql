@@ -5,8 +5,11 @@
 -- The App ID an `app.put` or `cert.put` document concerns, so the documents of an app whose
 -- record or renewed certificate changes are found without reading every item; null for
 -- every other item, and once the document is deleted.
-ALTER TABLE chain_items
-    ADD COLUMN doc_app BYTEA CHECK (doc_app IS NULL OR octet_length(doc_app) = 16);
+-- The check is NOT VALID, so adding it reads no existing row (every one is null): new and
+-- updated rows are checked.
+ALTER TABLE chain_items ADD COLUMN doc_app BYTEA;
+ALTER TABLE chain_items ADD CONSTRAINT chain_items_doc_app_length
+    CHECK (doc_app IS NULL OR octet_length(doc_app) = 16) NOT VALID;
 CREATE INDEX chain_items_by_doc_app ON chain_items (account_id, doc_app)
     WHERE doc_app IS NOT NULL;
 -- The documents chained before this rule are checked at the account's requests, a bounded

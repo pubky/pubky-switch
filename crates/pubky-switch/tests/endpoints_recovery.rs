@@ -380,6 +380,14 @@ async fn test_recovery_in_place_starts_afresh_under_the_pending_key() {
         chain(&replay).await,
         [(2, 1, "service".into()), (2, 2, "identity".into())]
     );
+    // The new sequence's items keep their documents: what the recovery superseded at the
+    // generation it left touches none of them (Switch wire 7.5).
+    for seq in [1, 2] {
+        assert_eq!(
+            chain_document_kept(&replay, &alice_id(), seq).await,
+            (true, false)
+        );
+    }
     // The new document's apps are listed afresh, in the new generation.
     assert_eq!(
         scalar_i64(
