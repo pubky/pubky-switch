@@ -101,7 +101,11 @@ The flows send every call the service serves, each at both switches. What they l
   records list that `limit` ends takes more than a thousand records, and no flow writes
   that many. The directory has no pages (Switch wire 7.4.10).
 - **A wait that runs out, and a held read after a leave.** The `waiting read` flows' reads
-  are answered by a write, by an erasure and by the reader's revocation. A read whose wait
+  are answered by a write, by an erasure, by the reader's revocation and by a recovery in
+  place. In that last flow the new document's publication fails once, so the woken app
+  finds nothing to follow until the signer's next run: an app woken after the publication
+  follows the recovery inside the same call, and which of the two happens depends on how
+  the read's answer and the signer's are ordered, which no flow pins. A read whose wait
   passes with nothing written takes real seconds at the service, and no flow sends one;
   nor one held while its app leaves, which the app itself would have to send while it
   waits.
@@ -123,7 +127,13 @@ The flows send every call the service serves, each at both switches. What they l
   again, a retry the switch answers as the delivery it took. The switch refuses a
   delivery where two deliveries race: a hand-over's abort against its take-over, either
   arriving first, and two installs restored at once, each `409 stale_identity` for the
-  one that arrives second. A switch that shows an older copy or another body (a rollback
+  one that arrives second. All three are refused because the version they build on is
+  no longer the newest the switch holds. A delivery that builds on the held version
+  without a higher version number, or at a lower generation, is refused by a rule of its
+  own, and no conforming signer sends one: a signer that builds on a version signs the
+  next, and a provider loss in place, whose version needn't build on the held one, is
+  declared only by a signer whose backup and published copy show nothing newer than its
+  records. That rule stays with the core's unit test. A switch that shows an older copy or another body (a rollback
   or an equivocation at the switch) and a backup that doesn't open stay with the signer's
   tests on the scripted switch, as do a stale backup refused at a restore, a Homeserver
   that holds another body at a restore, and a restore in place below the signer's mark.
@@ -155,6 +165,9 @@ Run the `trace` example to see what the two switches answered, and list each dif
 ## Run time and databases
 
 Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Sixty-three flows take about three minutes in a
+test panics; the flows run one after another. Each run is on a thread of its own with 16 MiB
+of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flow used
+1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
+that ran the flows had less left. Sixty-four flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.
