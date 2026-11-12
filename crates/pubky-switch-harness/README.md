@@ -28,8 +28,9 @@ fails instead.
 
 ## Retries
 
-`World::lose_answer` and `World::unreachable` put a fault of the network in front of either
-switch: an answer lost after the switch took the request, or a request that never arrives.
+`World::lose_answer`, `World::unreachable` and `World::refuse` put a fault of the network in
+front of either switch: an answer lost after the switch took the request, a request that
+never arrives, or a refusal that comes back in the switch's place with no signature.
 The retry flows send each of these again, and the service and the scripted switch answer
 every one alike:
 
@@ -73,12 +74,15 @@ before, 24 hours after the first. Both erasure flows run that wait, and a read s
 
 The flows send every call the service serves, each at both switches. What they leave out:
 
-- **Calls the service doesn't serve yet**, thirteen of the thirty-three of Switch wire 7.4:
+- **Calls the service doesn't serve yet**, twelve of the thirty-three of Switch wire 7.4:
   the connection requests (`POST`, `GET` and `DELETE /connect`), `PUT /push`, `POST /freeze`
   and `/unfreeze`, `GET /export` and its chunks, `POST /import` with its chunks and
-  activation, and `POST /recovery/admission` and `/recovery/upload`. So no flow moves an
-  account, changes its key in place, or recovers from a lost provider. `flows::flow_of`
-  lists them, and the test fails once one is served without a flow.
+  activation, and `POST /recovery/upload`. So no flow moves an account or changes its key in
+  place, and after a provider loss none brings an app's records and lists back to the new
+  service. The provider-loss flows are the signer's part, and of an app's only its first
+  steps: in two of them the wallet registers at the new service and reads the new chain
+  from its first item, the recovery's record, and its upload is kept from reaching either
+  switch. `flows::flow_of` lists them, and the test fails once one is served without a flow.
 - **Faults in front of most reads.** The retries above are the ones covered. No answer is
   lost and no connection fails in front of `GET /allow`, `/claims/{claim_key}`,
   `/directory`, `/apps/{app_id}/keys`, `/records`, `/records/{key}`, `/handover` or the
@@ -99,15 +103,19 @@ The flows send every call the service serves, each at both switches. What they l
   conversation entry pruned, a connection request.
 - **Longer lives:** a renewal that adds a scope, a claim that runs out by time, an
   identity that enrolls again after an erasure.
-- **More than one switch with traffic between them:** the identities of a flow share one
-  origin.
+- **A message between two switches.** In the provider-loss flows the sender's service
+  isn't the recipient's, and his message is held back; no flow has one accepted across two
+  services.
 
 Not this crate's to cover: refusals, limits, rates, quotas and retention, which the
 service's own tests hold, and a faulty or hostile switch, which stays on the scripted
 switch. Around the service, the flows don't touch TLS, the listener, the proxy's
 client-address header, the client's HTTPS transport, the time source (trusted time comes
 from the test clock), key generation (accounts take keys from fixed seeds), or more than one
-instance on a database. `src/check.rs` says what of an answer the harness verifies itself
+instance on a database. Of a service's limits, a world carries only the inbox quota and
+the app limit to the scripted switch (`World::add_switch_with`): a flow that leaned on
+another would compare a service so set with a scripted switch at its defaults. `src/check.rs`
+says what of an answer the harness verifies itself
 and what it leaves to the client and the signer.
 
 ## Adding a flow
@@ -120,6 +128,6 @@ Run the `trace` example to see what the two switches answered, and list each dif
 ## Run time and databases
 
 Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Thirty-three flows take about a minute in a
+test panics; the flows run one after another. Thirty-nine flows take about a minute and a half in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.

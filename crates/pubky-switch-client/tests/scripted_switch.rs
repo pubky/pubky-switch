@@ -955,3 +955,17 @@ async fn test_testing_lagging_marks_are_judged_only_when_the_current_apps_change
     switch.revoke(tablet.app_id()).unwrap();
     assert!(switch.app(&phone.app_id()).lagging);
 }
+
+#[tokio::test]
+async fn test_testing_held_read_given_up_is_held_no_more() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let (_app, request) = held_read(&s).await;
+    let transport = switch.holding_transport();
+    let mut read = transport.send(request);
+    assert!(poll_once(&mut read).is_none());
+    assert_eq!(switch.held_reads(), 1);
+    // Its caller gives the read up, as at a timeout of its own.
+    drop(read);
+    assert_eq!(switch.held_reads(), 0);
+}

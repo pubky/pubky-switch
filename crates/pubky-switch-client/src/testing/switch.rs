@@ -477,6 +477,14 @@ impl Future for Held<'_> {
     }
 }
 
+impl Drop for Held<'_> {
+    /// A read that is answered, or that its caller gave up, is held no more.
+    fn drop(&mut self) {
+        let id = self.id;
+        self.switch.lock().held.retain(|(held, _)| *held != id);
+    }
+}
+
 impl std::fmt::Debug for ScriptedSwitch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.lock();
@@ -1096,6 +1104,11 @@ impl ScriptedSwitch {
             }
         }
         if request.method == "POST" && path == "/v1/enroll" {
+            // Its timestamp is checked first, as every request's (Switch wire 7.1): a stale
+            // enrollment is refused whatever the switch holds for it.
+            if let Some(answer) = inner.stale_enrollment(request) {
+                return Ok(answer);
+            }
             let (status, body) = inner
                 .enroll(request)
                 .map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
@@ -1639,6 +1652,29 @@ impl Inner {
             json!({ "server_time": rfc3339(now) }),
         );
         Some(self.respond_at(&self.service, request, status, &body, self.stamped_ms))
+    }
+
+    /// An enrollment whose `Switch-Timestamp` is more than 5 minutes from the time base is
+    /// `401 stale_timestamp` (Switch wire 7.1), at an account the switch holds or not, and
+    /// whatever became of the key its answer named: the refusal comes before the enrollment
+    /// is looked at. It is the operator's, as an enrollment's other errors are (Switch wire
+    /// 7.4.1), and stamps nothing.
+    fn stale_enrollment(&self, request: &Request) -> Option<Response> {
+        let now = self.now();
+        let stale = request
+            .header(header::TIMESTAMP)
+            .and_then(|text| pubky_switch_core::time::parse_rfc3339(text).ok())
+            .is_some_and(|at| at.abs_diff(now) > pubky_switch_core::records::CLOCK_TOLERANCE_MS);
+        if !stale {
+            return None;
+        }
+        let (status, body) = bad(
+            ErrorCode::StaleTimestamp,
+            "Switch wire 7.1: the timestamp is more than 5 minutes from the service's time",
+            json!({ "server_time": rfc3339(now) }),
+        );
+        let operator = SigningKey::from_bytes(&[42; 32]);
+        Some(self.respond_with(&operator, request, status, &body))
     }
 
     fn respond_with(

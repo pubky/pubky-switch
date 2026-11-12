@@ -60,6 +60,8 @@ pub struct World {
     names: Arc<Names>,
     services: Mutex<Vec<RealSwitch>>,
     scripted: Mutex<Vec<Arc<ScriptedSwitch>>>,
+    /// How many switches each identity was given an account's key at, by Pubky ID.
+    homes: Mutex<std::collections::HashMap<String, u8>>,
 }
 
 impl std::fmt::Debug for World {
@@ -100,6 +102,7 @@ impl World {
             names,
             services: Mutex::new(Vec::new()),
             scripted: Mutex::new(Vec::new()),
+            homes: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -153,7 +156,7 @@ impl World {
 
     /// As [`World::add_switch`], the service running with `limits` (Switch wire 9.2) in
     /// place of its defaults, as an operator may configure it. The scripted switch takes the
-    /// inbox quota of them, the one limit it has a setting for.
+    /// inbox quota and the app limit of them, the two it has a setting for.
     ///
     /// # Errors
     ///
@@ -164,42 +167,46 @@ impl World {
         identities: &[&TestIdentity],
         limits: Limits,
     ) -> Result<(), HarnessError> {
-        // Each account's answers are verified with the service key of its identity's seed
-        // (an Ed25519 key, as an identity key is).
-        for identity in identities {
+        // Each account's answers are verified with the service key its seed gives it here
+        // (an Ed25519 key, as an identity key is); a key an account takes later, as at a
+        // recovery in place, the checker learns from the enrollment that answers it.
+        let secrets: Vec<[u8; 32]> = identities
+            .iter()
+            .map(|identity| self.service_secret_at_next_switch(identity))
+            .collect();
+        for (identity, secret) in identities.iter().zip(&secrets) {
             self.checker.account(
                 &identity.key().id(),
                 identity.public(),
-                IdentityKey::from_secret(identity.service_secret()).public(),
+                IdentityKey::from_secret(*secret).public(),
             );
         }
         match self.backend {
             Backend::Service => {
-                let switch = RealSwitch::start(
-                    origin,
-                    self.clock.clone(),
-                    identities
-                        .iter()
-                        .map(|identity| identity.service_secret())
-                        .collect(),
-                    OPERATOR_SECRET,
-                    limits,
-                )
-                .await?
-                .ok_or_else(|| HarnessError::Setup("no test database".into()))?;
+                let switch =
+                    RealSwitch::start(origin, self.clock.clone(), secrets, OPERATOR_SECRET, limits)
+                        .await?
+                        .ok_or_else(|| HarnessError::Setup("no test database".into()))?;
                 self.router.add(origin, switch.transport());
                 lock(&self.services).push(switch);
             }
             Backend::Scripted => {
                 // A scripted switch holds one account: one per identity, behind one origin.
                 let mut accounts = Vec::with_capacity(identities.len());
-                for identity in identities {
-                    let switch = ScriptedSwitch::unenrolled(
+                for (identity, secret) in identities.iter().zip(secrets) {
+                    let switch = ScriptedSwitch::unenrolled_at(
                         identity.key(),
-                        identity.service_secret(),
+                        secret,
                         self.clock.clone(),
+                        origin,
                     );
-                    switch.set_inbox_quota(limits.quota_bytes);
+                    // The limits an enrollment announces that the scripted switch has a
+                    // setting for: the inbox quota and the app limit.
+                    switch.set_enroll_limits(pubky_switch_core::records::Limits {
+                        app_limit: u64::from(limits.app_limit),
+                        quota_bytes: limits.quota_bytes,
+                        ..pubky_switch_core::records::Limits::default()
+                    });
                     accounts.push((identity.key().id(), switch.holding_transport()));
                     lock(&self.scripted).push(switch);
                 }
@@ -207,6 +214,24 @@ impl World {
             }
         }
         Ok(())
+    }
+
+    /// The service key secret `identity`'s account takes at the next switch it is given
+    /// one at: its seed's at the first, and one derived from it at each later one, so an
+    /// identity that recovers at another service gets another key there.
+    fn service_secret_at_next_switch(&self, identity: &TestIdentity) -> [u8; 32] {
+        let mut homes = lock(&self.homes);
+        let nth = homes.entry(identity.key().id()).or_insert(0);
+        let mut secret = identity.service_secret();
+        secret[0] ^= *nth;
+        *nth = nth.saturating_add(1);
+        secret
+    }
+
+    /// The switch at `origin` is lost: every request to it fails to connect from now on, as
+    /// to a provider that is gone (Switch spec 12.6).
+    pub fn lose_switch(&self, origin: &str) {
+        self.router.remove(origin);
     }
 
     /// The transport every party of this world sends through: to the switch of the
@@ -327,6 +352,71 @@ impl World {
             path: path.to_owned(),
             after,
         });
+    }
+
+    /// Answer the next `method` request whose path contains `path` in the switch's place,
+    /// with `status` and `code` and no signature, as an intermediary can: the request
+    /// doesn't reach the switch, and the caller can't take the answer for the switch's word.
+    pub fn refuse(&self, method: &str, path: &str, status: u16, code: &str) {
+        self.recorder.fail_next(Fault::Refuse {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            status,
+            code: code.to_owned(),
+        });
+    }
+
+    /// Send the `nth` enrollment of the run again (from 0), byte for byte, as a retry that
+    /// was still on its way: to see what the switch answers it now.
+    ///
+    /// # Errors
+    ///
+    /// When the run sent no such enrollment, or it doesn't reach a switch.
+    pub async fn enroll_again(&self, nth: usize) -> Result<Response, HarnessError> {
+        let request = self
+            .recorder
+            .enrollment(nth)
+            .ok_or_else(|| HarnessError::Setup(format!("the run sent no enrollment {nth}")))?;
+        self.transport()
+            .send(request)
+            .await
+            .map_err(|error| HarnessError::Setup(error.to_string()))
+    }
+
+    /// What the run's last request labelled `label` was answered, as the trace keeps it: the
+    /// facts `status`, `body.code` and `answer signed with`, each empty when the line has
+    /// none. For a flow that holds a step to what it must be at either switch.
+    pub fn last_answer(&self, label: &str) -> Option<[String; 3]> {
+        let trace = self.recorder.trace();
+        let line = trace.lines.iter().rev().find(|line| line.label == label)?;
+        let fact = |name: &str| line.facts.get(name).cloned().unwrap_or_default();
+        Some([
+            fact("status"),
+            fact("body.code"),
+            fact("answer signed with"),
+        ])
+    }
+
+    /// One fact of the run's last request labelled `label`, as the trace keeps it.
+    pub fn last_fact(&self, label: &str, fact: &str) -> Option<String> {
+        let trace = self.recorder.trace();
+        let line = trace.lines.iter().rev().find(|line| line.label == label)?;
+        line.facts.get(fact).cloned()
+    }
+
+    /// How many requests the run has sent so far.
+    pub fn requests_sent(&self) -> usize {
+        let trace = self.recorder.trace();
+        trace
+            .lines
+            .iter()
+            .filter(|line| !line.label.starts_with("outcome "))
+            .count()
+    }
+
+    /// How many different enrollments the run has sent so far: one sent again counts once.
+    pub fn enrollments_sent(&self) -> usize {
+        self.recorder.enrollments_sent()
     }
 
     /// The faults asked for that no request has met yet.
