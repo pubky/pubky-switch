@@ -69,11 +69,13 @@ pub type FlowResult = Result<(), Box<dyn std::error::Error>>;
 /// The stack a flow runs on, in bytes.
 ///
 /// A flow's futures nest deeply: the client's and the signer's calls, and under them the
-/// service itself, are all polled from the flow's thread, and in a debug build each level
-/// keeps its large futures in its frame. A test's thread has 2 MiB, which the deepest flows
-/// come close to, so a flow gets a thread of its own with a stack that doesn't depend on
-/// who runs it: STACK_NOTE
-pub const FLOW_STACK_BYTES: usize = 64 * 1024 * 1024;
+/// service itself, are all polled from the flow's thread, and in a debug build every level
+/// takes a large frame. Measured in a debug build, the deepest flow (`third epoch, three
+/// readers`, against the service) used 1.9 MiB of stack and 27 of the 63 flows used more
+/// than 1.5 MiB, against the 2 MiB a test's thread has. So a flow gets a thread of its own
+/// whose stack doesn't depend on who runs it: 16 MiB, eight times what the deepest flow
+/// used. The pages are committed only as they are touched.
+pub const FLOW_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Run `work` to its end on a thread of its own with [`FLOW_STACK_BYTES`] of stack, in a
 /// runtime of its own, and give what it returned. The calling thread waits for it. A panic
@@ -174,4 +176,54 @@ pub async fn compare_backends(
         scripted,
         verdict,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Touch `bytes` of stack and give the last byte back.
+    #[inline(never)]
+    fn deep(bytes: usize) -> u8 {
+        const STEP: usize = 64 * 1024;
+        let mut frame = [0u8; STEP];
+        frame[STEP - 1] = 1;
+        let frame = std::hint::black_box(frame);
+        if bytes <= STEP {
+            frame[STEP - 1]
+        } else {
+            std::hint::black_box(deep(bytes - STEP))
+        }
+    }
+
+    #[test]
+    fn test_flow_stack_holds_more_than_a_test_thread_has() {
+        // Twice a test thread's 2 MiB, which would abort the test there.
+        let reached = on_flow_stack(async || deep(4 * 1024 * 1024));
+        assert!(matches!(reached, Ok(1)));
+    }
+
+    #[test]
+    fn test_flow_stack_thread_carries_its_callers_name_and_runs_a_runtime() {
+        let here = std::thread::current().name().map(str::to_owned);
+        let there = on_flow_stack(async || {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            std::thread::current().name().map(str::to_owned)
+        });
+        assert!(here.is_some());
+        assert!(matches!(there, Ok(name) if name == here));
+    }
+
+    #[test]
+    fn test_flow_stack_panic_goes_on_in_the_caller() {
+        let caught = std::panic::catch_unwind(|| {
+            on_flow_stack(async || {
+                if std::hint::black_box(true) {
+                    std::panic::panic_any("the flow's own panic");
+                }
+            })
+        });
+        let payload = caught.err().and_then(|panic| panic.downcast::<&str>().ok());
+        assert_eq!(payload.as_deref(), Some(&"the flow's own panic"));
+    }
 }
