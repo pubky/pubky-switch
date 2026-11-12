@@ -47,7 +47,7 @@ use pubky_switch_core::enc::{serde_b64, serde_b64_vec};
 use pubky_switch_core::http::{ErrorCode, Retry};
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
 use pubky_switch_core::ops::{AllowKind, OpKind};
-use pubky_switch_core::records::DAY_MS;
+use pubky_switch_core::records::{DAY_MS, IdentityDoc};
 use pubky_switch_core::scopes::Permission;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -1382,13 +1382,72 @@ impl App {
     }
 
     /// One delivery try (module docs, steps 2 to 4).
+    /// [`App::deliver_under`] the copy of the recipient's `identity.json` held, and once
+    /// more after reading the newest one when an answer of its switch didn't verify with the
+    /// service key that copy names and the newest names another key or switch
+    /// (Switch spec 4.3: a copy is re-fetched after any failure). The reads are bounded
+    /// ([`App::reread_after_unverified`]); an answer that still doesn't verify is queued as
+    /// any other.
     async fn deliver(&mut self, item: &mut OutboxItem) -> Result<Tried, AppError> {
+        loop {
+            match self.deliver_under(item).await? {
+                Delivered::Tried(tried) => return Ok(tried),
+                // The bound makes this at most once per call.
+                Delivered::Unverified { held, error } => {
+                    if !self.reread_after_unverified(&item.to, &held).await? {
+                        return queued_or(error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read the newest `identity.json` of `to` after an answer of its switch didn't verify
+    /// with the service key the copy `held` names, as after a provider loss in place, whose
+    /// new key a sender within its cache of the earlier document doesn't know (Switch spec
+    /// 4.3: a copy is re-fetched after any failure; 12.6). At most one such read per
+    /// identity per [`super::SENDER_REREAD_MS`], kept in memory, so a switch answering under
+    /// keys no document names makes the app read no more. Returns whether the newest copy
+    /// names another switch or key, under which the delivery is tried again; a newer copy
+    /// has the directory read again (Switch spec 8.1).
+    async fn reread_after_unverified(
+        &mut self,
+        to: &[u8; 32],
+        held: &IdentityDoc,
+    ) -> Result<bool, AppError> {
+        let now = self.now();
+        let lately = |at: u64| at <= now && now - at < super::SENDER_REREAD_MS;
+        if self.peer_rereads.get(to).is_some_and(|at| lately(*at)) {
+            return Ok(false);
+        }
+        self.peer_rereads.retain(|_, at| lately(*at));
+        self.peer_rereads.insert(*to, now);
+        let newer = match self.peer_identity(to, true).await {
+            Ok(doc) => doc,
+            Err(AppError::Store(error)) => return Err(error.into()),
+            Err(_) => return Ok(false),
+        };
+        Ok(newer.inbox() != held.inbox())
+    }
+
+    /// One try of the delivery under the recipient's `identity.json` held.
+    async fn deliver_under(&mut self, item: &mut OutboxItem) -> Result<Delivered, AppError> {
         let to = item.to;
         let own = to == self.state.meta.identity;
         let invite = item.invite_code.clone();
         let doc = match self.peer_identity(&to, false).await {
             Ok(doc) => doc,
-            Err(error) => return queued_or(error),
+            Err(error) => return queued_or(error).map(Delivered::Tried),
+        };
+        // An answer of the recipient's switch that doesn't verify with the key `doc` names.
+        let failed = |error: AppError| -> Result<Delivered, AppError> {
+            if is_unverified(&error) {
+                return Ok(Delivered::Unverified {
+                    held: Box::new(doc.clone()),
+                    error,
+                });
+            }
+            queued_or(error).map(Delivered::Tried)
         };
         if let Some(sealed) = &item.sealed
             && (sealed.origin != doc.inbox().url || sealed.generation != doc.generation())
@@ -1400,18 +1459,18 @@ impl App {
                 .deliver_own_identity(&to, invite.as_deref(), false)
                 .await
         {
-            return queued_or(error);
+            return failed(error);
         }
         if item.sealed.is_none()
             && let Err(error) = self.seal(item, invite.as_deref()).await
         {
-            return queued_or(error);
+            return failed(error);
         }
         let mut resealed = 0usize;
         let mut redelivered = false;
         loop {
             let Some(sealed) = item.sealed.clone() else {
-                return Ok(Tried::Queued("not sealed".into()));
+                return Ok(Delivered::Tried(Tried::Queued("not sealed".into())));
             };
             let result = if own {
                 let result = self
@@ -1431,7 +1490,7 @@ impl App {
                     .map_err(AppError::from)
             };
             match result {
-                Ok(answer) => return Ok(Tried::Accepted(answer)),
+                Ok(answer) => return Ok(Delivered::Tried(Tried::Accepted(answer))),
                 Err(AppError::Switch(ClientError::Switch {
                     code: ErrorCode::StaleKey,
                     current,
@@ -1440,7 +1499,7 @@ impl App {
                     resealed = resealed.saturating_add(1);
                     self.take_stale_key(&to, &current).await?;
                     if let Err(error) = self.seal(item, invite.as_deref()).await {
-                        return queued_or(error);
+                        return failed(error);
                     }
                 }
                 Err(AppError::Switch(ClientError::Switch {
@@ -1452,7 +1511,7 @@ impl App {
                         .deliver_own_identity(&to, invite.as_deref(), true)
                         .await
                     {
-                        return queued_or(error);
+                        return failed(error);
                     }
                 }
                 Err(AppError::Switch(ClientError::Switch {
@@ -1463,9 +1522,9 @@ impl App {
                     // (Switch spec 11).
                     self.peer_identity(&to, true).await.ok();
                     self.mark_directory_stale(&to).await?;
-                    return Ok(Tried::Queued("moved".into()));
+                    return Ok(Delivered::Tried(Tried::Queued("moved".into())));
                 }
-                Err(error) => return queued_or(error),
+                Err(error) => return failed(error),
             }
         }
     }
@@ -1547,6 +1606,27 @@ impl App {
 
 /// Whether an error is the app's own (an alarm, the store, a refusal of the app's rules)
 /// rather than the network's or the switch's, which the outbox retries.
+/// What one try of a delivery came to.
+enum Delivered {
+    /// Tried: accepted, queued, undeliverable or failed.
+    Tried(Tried),
+    /// An answer of the recipient's switch that didn't verify with the service key of the
+    /// copy `held` of its `identity.json`.
+    Unverified {
+        held: Box<IdentityDoc>,
+        error: AppError,
+    },
+}
+
+/// Whether `error` is an answer whose service signature is missing or doesn't verify with
+/// the key pinned (Switch wire 7.1).
+fn is_unverified(error: &AppError) -> bool {
+    matches!(
+        error.unkept(),
+        AppError::Switch(ClientError::BadServiceSignature { .. })
+    )
+}
+
 fn is_local(error: &AppError) -> bool {
     matches!(error.unkept(), AppError::Alarm(_) | AppError::Store(_))
 }

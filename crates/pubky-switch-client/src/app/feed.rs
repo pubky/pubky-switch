@@ -265,10 +265,12 @@ impl Read {
     }
 }
 
-/// The least time, device clock, between two reads of one sender's `identity.json` that a
-/// failed check 7 against a held copy makes (Switch wire 5.1 check 7). Within it, an entry
-/// of the sender failing the check in a later read is held, not dropped, until the first
-/// read after it reads the document again.
+/// The least time, device clock, between two reads of one identity's `identity.json` that
+/// a failed check makes: of a sender's, a failed check 7 against a held copy (Switch wire
+/// 5.1 check 7), and of a recipient's, an answer of its switch that doesn't verify with the
+/// key the held copy names (Switch spec 4.3). Within it, an entry of the sender failing the
+/// check in a later read is held, not dropped, until the first read after it reads the
+/// document again; a message to the recipient stays queued.
 pub const SENDER_REREAD_MS: u64 = 60_000;
 
 /// When a failed check 7 last had a sender's `identity.json` read again: the device time,

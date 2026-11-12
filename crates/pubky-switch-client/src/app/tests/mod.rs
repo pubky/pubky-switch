@@ -11,6 +11,7 @@ mod protocol_api;
 mod protocol_reads;
 mod push;
 mod sender_document;
+mod sender_key;
 mod shared_flows;
 mod store_failures;
 mod unverified;

@@ -583,6 +583,10 @@ pub struct App {
     /// (`feed.rs`, [`SENDER_REREAD_MS`]). Kept in memory only: it bounds the reads, and a
     /// restart may read once more.
     sender_rereads: HashMap<[u8; 32], feed::SenderReread>,
+    /// When an answer of each recipient's switch that didn't verify last had its
+    /// `identity.json` read again (`send.rs`, [`SENDER_REREAD_MS`]), device clock. Kept in
+    /// memory only: it bounds the reads, and a restart may read once more.
+    peer_rereads: HashMap<[u8; 32], u64>,
     /// How many reads ([`App::receive`]) this app began since it was loaded.
     reads_begun: u64,
 }
@@ -812,6 +816,7 @@ impl App {
                 kept_rate_limited: None,
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
+                peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
             app.update_keys_through();
@@ -946,6 +951,7 @@ impl App {
                 kept_rate_limited: None,
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
+                peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
             // A store an earlier build wrote keeps the epoch read now.
@@ -1648,6 +1654,7 @@ impl App {
                 kept_rate_limited: None,
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
+                peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
             // Every write of the one commit; what fails here is mostly a write the store
