@@ -56,6 +56,7 @@ ops_per_min = 3000
 control_per_min = 60
 cursor_hold_ms = 2592000000            # 30 days
 max_divergent_uploads = 8
+uploads_per_app_per_hour = 60
 max_import_bytes = 4294967296
 max_page_bytes = 8388608               # 8 MiB
 sender_per_min = 120

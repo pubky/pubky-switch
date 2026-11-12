@@ -841,9 +841,19 @@ impl App {
         if let Some(next) = next
             && next != answer.claim.step
         {
-            return Ok(Err(
-                "Switch wire 7.4.8: the claim's step doesn't follow its last entry".into(),
-            ));
+            // A claim rebuilt from uploads after a provider loss lists the entries written
+            // here: an upload's step has none, so the claim's step may be past the last
+            // entry's, never before it. Only on a claim the view says is rebuilt, for an
+            // identity whose identity.json carries `recovery_from`, which it keeps from
+            // then on, whatever the app's own history (Switch wire 7.4.8, 7.4.14, 10.5).
+            let after_loss = next < answer.claim.step
+                && answer.claim.rebuilt
+                && self.state.own_doc.body().recovery_from.is_some();
+            if !after_loss {
+                return Ok(Err(
+                    "Switch wire 7.4.8: the claim's step doesn't follow its last entry".into(),
+                ));
+            }
         }
         Ok(Ok(ClaimRead {
             view: answer.claim.clone(),
@@ -1231,6 +1241,7 @@ mod tests {
             deadline,
             divergent: false,
             next_possibly_duplicate: false,
+            rebuilt: false,
         }
     }
 

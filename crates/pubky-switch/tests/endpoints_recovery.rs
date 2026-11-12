@@ -14,8 +14,10 @@ use pubky_switch::http::{Handler, SwitchResponse};
 use pubky_switch::keys::{KeyId, KeyStore};
 use pubky_switch::time::Clock;
 use pubky_switch_core::{
+    claims::{ClaimFields, ClaimType},
     http::{IdentityDelivery, header},
     keys::IdentityKey,
+    ops::{OpKind, RecordPut, RecordVersion, SignedOp},
     records::{Enrollment, EnrollmentBody, IdentityBody, IdentityDoc},
     sig::SignedDoc,
     time::rfc3339,
@@ -1808,5 +1810,974 @@ async fn test_admission_ends_with_a_proof_under_the_current_key() {
         serde_json::from_value(json_of(&answer)["proofs"][0].clone()).expect("proof");
     let body: Value = serde_json::from_slice(&proof.body_bytes().expect("body")).expect("json");
     assert_eq!(body["object"], json!("admission"));
+    replay.db.drop_database().await.expect("drop");
+}
+
+// POST /recovery/upload after a provider loss (Switch wire 7.4.14).
+
+/// The vectors' transition proof named `name`, of the lost generation 1.
+fn lost_proof(name: &str) -> Value {
+    named(&vectors("chain.json")["transition_proofs"], name)["signed"].clone()
+}
+
+/// The wallet's operation at `seq` of the vectors' chain, uploaded with its certificate and,
+/// when `proof` names one, the lost service's proof of it.
+fn uploaded_op(seq: u64, proof: Option<&str>) -> Value {
+    let mut op = json!({
+        "op": chain_item(&vectors("chain.json"), seq)["item"].clone(),
+        "cert": wallet().2.signed(),
+    });
+    if let Some(name) = proof {
+        op["proof"] = lost_proof(name);
+    }
+    op
+}
+
+const CREATED: &str = "record.put create (seq 6): the record's first version is (1, 6)";
+const UPDATED: &str = "record.put update (seq 8): the new version is (1, 8)";
+const ATTEMPTED: &str = "claim attempt (seq 7)";
+
+/// alice recovered in place from the loss of generation 1, admission staged, with the
+/// wallet current again at generation 2: the lost generation's `identity.json` and the time.
+async fn recovered_with_the_wallet(replay: &Replay) -> (IdentityDoc, u64) {
+    let (pending, at) = serving_with_a_pending_key(replay).await;
+    let before = held(replay).await;
+    let recovery = next_generation(&before, pending, Some(1));
+    let (answer, _) = deliver(replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    let (status, body) = wallet_registers(replay, 77, 2, 3, true, at).await;
+    assert_eq!(status, 200, "{body}");
+    (before, at)
+}
+
+async fn upload(replay: &Replay, body: &Value, at_ms: u64) -> SwitchResponse {
+    upload_as(replay, &wallet_keys(), body, at_ms).await
+}
+
+async fn upload_as(replay: &Replay, keys: &Value, body: &Value, at_ms: u64) -> SwitchResponse {
+    let path = format!("/v1/{}/recovery/upload", alice_id());
+    let body = serde_json::to_vec(body).expect("json");
+    replay
+        .service
+        .handle(app_request(keys, "POST", &path, body, at_ms))
+        .await
+}
+
+async fn wallet_get(replay: &Replay, path: &str, at_ms: u64) -> Value {
+    let path = format!("/v1/{}/{path}", alice_id());
+    let answer = replay
+        .service
+        .handle(app_request(&wallet_keys(), "GET", &path, Vec::new(), at_ms))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{path}: {}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    json_of(&answer)
+}
+
+/// The record key and the claim key the vectors' chain writes.
+fn record_and_claim_keys() -> (String, String) {
+    let state = |name: &str| -> Value {
+        let body = lost_proof(name)["body"].as_str().expect("body").to_owned();
+        let bytes = pubky_switch_core::enc::unb64(&body).expect("b64");
+        serde_json::from_slice(&bytes).expect("json")
+    };
+    (
+        state(CREATED)["object"].as_str().expect("key").to_owned(),
+        state(ATTEMPTED)["object"].as_str().expect("key").to_owned(),
+    )
+}
+
+#[tokio::test]
+async fn test_upload_fills_in_what_the_lost_generation_held() {
+    // The wallet uploads its record's two writes and its attempt, each with the lost
+    // service's proof, and the lost service's head: the record is taken at the proved (1, 8),
+    // at the upload transition's seq and with no proof; the claim is rebuilt with the
+    // attempt; one `upload` transition lists both (Switch wire 7.4.14).
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let head = vectors("chain.json")["signed_heads"][0]["head"].clone();
+    let body = json!({
+        "lost_identity": lost.signed(),
+        "records": [uploaded_op(6, Some(CREATED)), uploaded_op(8, Some(UPDATED))],
+        "claims": [uploaded_op(7, Some(ATTEMPTED))],
+        "heads": [head],
+    });
+    let length = chain(&replay).await.len();
+    let answer = upload(&replay, &body, at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let (record, claim) = record_and_claim_keys();
+    let answered = json_of(&answer);
+    assert_eq!(
+        answered["result"],
+        json!({ "records": [record], "divergent": [], "claims": [claim],
+                "divergent_claims": [], "unverified": 0, "distrusted": 0, "refused": 0,
+                "heads": 1, "lists": false })
+    );
+    assert!(answered["proof"].is_object() && answered["head"].is_object());
+    assert!(header_text(&answer, "switch-head").is_some());
+    let items = chain(&replay).await;
+    assert_eq!(items.len(), length + 1, "one transition");
+    let (_, upload_seq, kind) = items.last().expect("item").clone();
+    assert_eq!(kind, "service");
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    assert_eq!(
+        (view["generation"].clone(), view["version"].clone()),
+        (json!(1), json!(8))
+    );
+    assert_eq!(view["seq"], json!(upload_seq));
+    assert!(view.get("proof").is_none(), "{view}");
+    assert_eq!(view["divergent"], json!(false));
+    let claimed = wallet_get(&replay, &format!("claims/{claim}"), at).await;
+    assert_eq!(
+        claimed["claim"]["attempts"].as_array().map(Vec::len),
+        Some(1),
+        "{claimed}"
+    );
+    // The same upload again merges nothing new, and still chains a transition of its own.
+    let again = upload(&replay, &body, at).await;
+    assert_eq!(again.status, 200);
+    assert_eq!(json_of(&again)["result"]["records"], json!([]));
+    assert_eq!(json_of(&again)["result"]["claims"], json!([]));
+    assert_eq!(chain(&replay).await.len(), length + 2);
+    // A fork of the update, built on the same (1, 6) in another batch, is kept divergent:
+    // the record stays at (1, 8), its view `divergent`.
+    let update: SignedDoc =
+        serde_json::from_value(chain_item(&vectors("chain.json"), 8)["item"].clone()).expect("op");
+    let update = pubky_switch_core::ops::SignedOp::peek(&update).expect("op");
+    let fork = wallet_batch(90, 1, vec![(Vec::new(), update.body().kind.clone())]);
+    let forked = json!({
+        "lost_identity": lost.signed(),
+        "records": [{ "op": fork[0].signed(), "cert": wallet().2.signed() }],
+    });
+    let answer = upload(&replay, &forked, at).await;
+    assert_eq!(json_of(&answer)["result"]["divergent"], json!([record]));
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    assert_eq!(
+        (view["version"].clone(), view["divergent"].clone()),
+        (json!(8), json!(true))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_without_the_lost_identity_checks_no_proof() {
+    // Without `lost_identity` the proofs and heads count for nothing: the update is taken at
+    // its lower bound, (1, 7) above the (1, 6) it built on, and the head is unverified.
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let head = vectors("chain.json")["signed_heads"][0]["head"].clone();
+    let body = json!({ "records": [uploaded_op(8, Some(UPDATED))], "heads": [head] });
+    let answer = upload(&replay, &body, at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let result = &json_of(&answer)["result"];
+    assert_eq!(
+        (result["unverified"].clone(), result["heads"].clone()),
+        (json!(1), json!(0))
+    );
+    let (record, _) = record_and_claim_keys();
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    assert_eq!(
+        (view["generation"].clone(), view["version"].clone()),
+        (json!(1), json!(7))
+    );
+    // The proved write, uploaded later, makes the same operation's version exact.
+    let body = json!({
+        "lost_identity": lost.signed(),
+        "records": [uploaded_op(8, Some(UPDATED))],
+    });
+    let answer = upload(&replay, &body, at).await;
+    assert_eq!(json_of(&answer)["result"]["records"], json!([record]));
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    assert_eq!(view["version"], json!(8));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_contacts_end_staged_admission_and_lists_only_add() {
+    // A deny-only upload leaves admission staged; one carrying contacts from an app holding
+    // `lists.manage` ends it in the same transaction, with no `admission` transition: the
+    // upload's own records it (Switch spec 12.6 step 2).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let bob = pubky_switch_core::enc::pubky_id(&[40; 32]);
+    let denied = upload(&replay, &json!({ "lists": { "deny": [bob] } }), at).await;
+    assert_eq!(denied.status, 200);
+    assert_eq!(json_of(&denied)["result"]["lists"], json!(true));
+    assert_eq!(admission_staged(&replay, at).await, json!(true));
+    let length = chain(&replay).await.len();
+    let contacts = json!({ "lists": { "contacts": [bob, bob], "deny": [bob] } });
+    let ended = upload(&replay, &contacts, at).await;
+    assert_eq!(ended.status, 200);
+    assert_eq!(
+        json_of(&ended)["result"]["lists"],
+        json!(true),
+        "the contact is new"
+    );
+    assert_eq!(admission_staged(&replay, at).await, json!(false));
+    assert_eq!(
+        chain(&replay).await.len(),
+        length + 1,
+        "the upload's transition only"
+    );
+    let again = upload(&replay, &contacts, at).await;
+    assert_eq!(
+        json_of(&again)["result"]["lists"],
+        json!(false),
+        "nothing added"
+    );
+    let allow = wallet_get(&replay, "allow", at).await;
+    assert_eq!(
+        allow["contacts"].as_array().map(Vec::len),
+        Some(1),
+        "{allow}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_contact_also_denied_is_denied() {
+    // An upload may carry one pubky in both lists, as a live `deny.put` leaves a contact in
+    // place: the deny list overrides the contact at admission (Switch spec 7), so bob's shop
+    // is refused once the upload ends staged admission.
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let bob = named(&vectors("keys.json")["identities"], "bob")["pubky_id"].clone();
+    let lists = json!({ "lists": { "contacts": [bob], "deny": [bob] } });
+    assert_eq!(upload(&replay, &lists, at).await.status, 200);
+    assert_eq!(admission_staged(&replay, at).await, json!(false));
+    let (peers, inbox) = from_shop(&replay, at).await;
+    assert_eq!(code(&peers), (403, "not_admitted".into()));
+    assert_eq!(code(&inbox), (403, "not_admitted".into()));
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The executor, listed in alice's document, current again at generation 2 with its
+/// record: its keys.
+async fn executor_registers(replay: &Replay, at: u64) -> Value {
+    let keys = vectors("keys.json");
+    let executor = app(&keys, "executor").clone();
+    let record: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "executor app record",
+        )["signed"]
+            .clone(),
+    )
+    .expect("record");
+    let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(&executor["signing_secret_hex"]));
+    let app_id: [u8; 16] = hex::decode(executor["app_id_bytes_hex"].as_str().expect("hex"))
+        .expect("hex")
+        .try_into()
+        .expect("16 bytes");
+    let batch = pubky_switch_core::ops::sign_batch(
+        &secret,
+        &alice_key().public(),
+        Some(app_id),
+        2,
+        [78; 16],
+        vec![(
+            Vec::new(),
+            pubky_switch_core::ops::OpKind::AppPut { record },
+        )],
+    )
+    .expect("batch");
+    let body = pubky_switch_core::ops::OpsRequest::new(&batch, None).to_json();
+    let path = format!("/v1/{}/ops", alice_id());
+    let put = replay
+        .service
+        .handle(app_request(&executor, "POST", &path, body, at))
+        .await;
+    assert_eq!(put.status, 200, "{}", String::from_utf8_lossy(&put.body));
+    executor
+}
+
+#[tokio::test]
+async fn test_upload_lists_need_the_callers_permission() {
+    // The executor, current again, holds no list permission: contacts or deny entries from
+    // it are `403 permission_missing` for the whole upload, which merges and chains nothing,
+    // and admission stays staged (Switch wire 7.4.14).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let executor = executor_registers(&replay, at).await;
+    let length = chain(&replay).await.len();
+    let bob = pubky_switch_core::enc::pubky_id(&[40; 32]);
+    let before = replay.service.upload_judgments();
+    for lists in [json!({ "contacts": [] }), json!({ "deny": [bob] })] {
+        let refused = upload_as(&replay, &executor, &json!({ "lists": lists }), at).await;
+        assert_eq!(
+            code(&refused),
+            (403, "permission_missing".into()),
+            "{lists}"
+        );
+    }
+    // Refused for its lists, an upload's items are judged nowhere.
+    assert_eq!(replay.service.upload_judgments(), before);
+    assert_eq!(chain(&replay).await.len(), length);
+    assert_eq!(admission_staged(&replay, at).await, json!(true));
+    // Without lists it uploads as any own app.
+    assert_eq!(
+        upload_as(&replay, &executor, &json!({}), at).await.status,
+        200
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_refusals() {
+    // `404` at an account in neither stage; after the loss, `400` for a body that doesn't
+    // read and `429` past `uploads_per_app_per_hour`, with what to wait. A refusal merges
+    // and chains nothing.
+    let limits = pubky_switch::limits::Limits {
+        uploads_per_app_per_hour: 5,
+        max_contacts: 1,
+        ..pubky_switch::limits::Limits::default()
+    };
+    let Some(replay) = replay_with(limits.clone()).await else {
+        return;
+    };
+    let (_, at) = serving_with_a_pending_key(&replay).await;
+    let (status, body) = wallet_registers(&replay, 76, 1, 1, false, at).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        code(&upload(&replay, &json!({}), at).await),
+        (404, "not_found".into())
+    );
+    let replay = {
+        replay.db.drop_database().await.expect("drop");
+        let Some(replay) = replay_with(limits).await else {
+            return;
+        };
+        replay
+    };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let length = chain(&replay).await.len();
+    let bad = upload(&replay, &json!({ "records": {} }), at).await;
+    assert_eq!(code(&bad), (400, "bad_request".into()));
+    assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
+    assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
+    // Entries past `max_contacts` are dropped, not refused.
+    let two = [[40; 32], [41; 32]].map(|k| pubky_switch_core::enc::pubky_id(&k));
+    let capped = upload(&replay, &json!({ "lists": { "contacts": two } }), at).await;
+    assert_eq!(capped.status, 200);
+    let allow = wallet_get(&replay, "allow", at).await;
+    assert_eq!(
+        allow["contacts"].as_array().map(Vec::len),
+        Some(1),
+        "{allow}"
+    );
+    // The limit counts the entries held already: a new contact is dropped too.
+    let third = pubky_switch_core::enc::pubky_id(&[42; 32]);
+    let full = upload(&replay, &json!({ "lists": { "contacts": [third] } }), at).await;
+    assert_eq!(json_of(&full)["result"]["lists"], json!(false));
+    let allow = wallet_get(&replay, "allow", at).await;
+    assert_eq!(
+        allow["contacts"].as_array().map(Vec::len),
+        Some(1),
+        "{allow}"
+    );
+    let limited = upload(&replay, &json!({}), at).await;
+    assert_eq!(code(&limited), (429, "rate_limited".into()));
+    assert!(header_text(&limited, "retry-after").is_some());
+    assert_eq!(chain(&replay).await.len(), length + 4);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_judged_before_the_lock_is_judged_again_when_its_state_changed() {
+    // The upload's items are judged before the account's lock. A document listing the phone
+    // as removed commits while the upload waits for the lock: the judgment made before is
+    // dropped, and the phone's proofless operation is distrusted (Switch wire 7.4.14).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let mut txn = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    let held = held(&replay).await;
+    let keys = vectors("keys.json");
+    let phone = app(&keys, "phone").clone();
+    let phone_id: [u8; 16] = hex::decode(phone["app_id_bytes_hex"].as_str().expect("hex"))
+        .expect("hex")
+        .try_into()
+        .expect("16 bytes");
+    let record: SignedDoc = serde_json::from_value(
+        named(&vectors("documents.json")["documents"], "phone app record")["signed"].clone(),
+    )
+    .expect("record");
+    let cert = pubky_switch_core::records::AppRecord::verify(&record, &alice_key().public())
+        .expect("record")
+        .cert()
+        .clone();
+    let update: SignedDoc =
+        serde_json::from_value(chain_item(&vectors("chain.json"), 8)["item"].clone()).expect("op");
+    let update = pubky_switch_core::ops::SignedOp::peek(&update).expect("op");
+    let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(&phone["signing_secret_hex"]));
+    let ops = pubky_switch_core::ops::sign_batch(
+        &secret,
+        &alice_key().public(),
+        Some(phone_id),
+        1,
+        [79; 16],
+        vec![(Vec::new(), update.body().kind.clone())],
+    )
+    .expect("batch");
+    let mut body: IdentityBody = held.body().clone();
+    body.version += 1;
+    body.apps.retain(|listed| listed.app_id != phone_id);
+    body.removed.push(pubky_switch_core::records::RemovedApp {
+        app_id: phone_id,
+        distrust_from: 0,
+    });
+    let removing = IdentityDoc::sign(&alice_key(), body).expect("sign");
+    let uploaded = json!({ "records": [{ "op": ops[0].signed(), "cert": cert.signed() }] });
+    let before = replay.service.upload_judgments();
+    let (answer, ()) = tokio::join!(upload(&replay, &uploaded, at), async {
+        let options = replay.db.options();
+        let mut watcher = sqlx::PgConnection::connect_with(options)
+            .await
+            .expect("conn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+                 AND datname = current_database()",
+            )
+            .fetch_one(&mut watcher)
+            .await
+            .expect("count");
+            if waiting > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the upload never waited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        txn.set_identity(&pubky_switch::store::HeldIdentity {
+            doc: removing.signed().clone(),
+            proof: None,
+        })
+        .await
+        .expect("identity");
+        txn.commit().await.expect("commit");
+    });
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let result = &json_of(&answer)["result"];
+    assert_eq!(
+        (result["records"].clone(), result["distrusted"].clone()),
+        (json!([]), json!(1))
+    );
+    // Judged before the lock, and again under it.
+    assert_eq!(
+        replay.service.upload_judgments(),
+        (before.0 + 1, before.1 + 1)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The operation at `seq` of the vectors' chain.
+fn vector_op(seq: u64) -> SignedOp {
+    let signed: SignedDoc =
+        serde_json::from_value(chain_item(&vectors("chain.json"), seq)["item"].clone())
+            .expect("op");
+    SignedOp::peek(&signed).expect("op")
+}
+
+/// The members of the vectors' claim attempt (seq 7).
+#[allow(clippy::panic)]
+fn vector_claim_fields() -> ClaimFields {
+    let OpKind::Claim(fields) = vector_op(7).body().kind.clone() else {
+        panic!("a claim")
+    };
+    fields
+}
+
+/// The members of the vectors' record update (seq 8).
+#[allow(clippy::panic)]
+fn vector_record_put() -> RecordPut {
+    let OpKind::RecordPut(put) = vector_op(8).body().kind.clone() else {
+        panic!("a record.put")
+    };
+    put
+}
+
+async fn wallet_ops(replay: &Replay, batch: &[SignedOp], at: u64) -> SwitchResponse {
+    let body = pubky_switch_core::ops::OpsRequest::new(batch, None).to_json();
+    let path = format!("/v1/{}/ops", alice_id());
+    replay
+        .service
+        .handle(app_request(&wallet_keys(), "POST", &path, body, at))
+        .await
+}
+
+/// `op` uploaded with the wallet's certificate and no proof.
+fn proofless(op: &SignedOp) -> Value {
+    json!({ "op": op.signed(), "cert": wallet().2.signed() })
+}
+
+/// The wallet's live attempt `[9; 16]` at the vectors' claim key, orphaned only after
+/// 1,000,000 s: the claim's key.
+async fn live_attempt(replay: &Replay, at: u64) -> (ClaimFields, String) {
+    let mut fields = vector_claim_fields();
+    fields.attempt_id = vec![9; 16];
+    fields.expected_step = 0;
+    fields.deadline = None;
+    fields.orphan_after = Some(1_000_000);
+    let batch = wallet_batch(91, 2, vec![(Vec::new(), OpKind::Claim(fields.clone()))]);
+    let written = wallet_ops(replay, &batch, at).await;
+    assert_eq!(
+        written.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&written.body)
+    );
+    let key = pubky_switch_core::enc::b64(&fields.claim_key);
+    (fields, key)
+}
+
+#[tokio::test]
+async fn test_upload_claim_changed_last_by_an_upload_lists_a_gap_at_its_end() {
+    // The wallet writes an attempt here for a claim the service held nothing for (step 0 to
+    // 1); an upload then adds another attempt beside it (divergent, step 1 to 2). GET /claims
+    // lists the one entry, at step 0, and the claim at step 2: the upload's step has no
+    // entry (Switch wire 7.4.8).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let (fields, key) = live_attempt(&replay, at).await;
+    let mut uploaded = fields;
+    uploaded.attempt_id = vec![10; 16];
+    let lost_op = wallet_batch(92, 1, vec![(Vec::new(), OpKind::Claim(uploaded))]);
+    let answer = upload(&replay, &json!({ "claims": [proofless(&lost_op[0])] }), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(json_of(&answer)["result"]["divergent_claims"], json!([key]));
+    let read = wallet_get(&replay, &format!("claims/{key}"), at).await;
+    let entries = read["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 1, "{read}");
+    let last = entries[0]["step"].as_u64().expect("step");
+    assert_eq!(
+        (last, read["claim"]["step"].as_u64()),
+        (0, Some(2)),
+        "{read}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_known_limit_an_inflated_bound_replaces_a_proved_record() {
+    // A known limit (Switch spec 19): a proofless operation built on (1, 1,000,000), never
+    // applied anywhere, replaces the record held at the proved (1, 8), which is kept
+    // nowhere; the proved upload again then changes nothing.
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let honest = json!({
+        "lost_identity": lost.signed(),
+        "records": [uploaded_op(6, Some(CREATED)), uploaded_op(8, Some(UPDATED))],
+    });
+    assert_eq!(upload(&replay, &honest, at).await.status, 200);
+    let (record, _) = record_and_claim_keys();
+    let mut put = vector_record_put();
+    put.expected_version = RecordVersion::new(1, 1_000_000);
+    let forged = wallet_batch(93, 1, vec![(Vec::new(), OpKind::RecordPut(put))]);
+    let answer = upload(&replay, &json!({ "records": [proofless(&forged[0])] }), at).await;
+    let result = json_of(&answer)["result"].clone();
+    assert_eq!(
+        (result["records"].clone(), result["divergent"].clone()),
+        (json!([record]), json!([]))
+    );
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    assert_eq!(
+        (view["version"].clone(), view["divergent"].clone()),
+        (json!(1_000_001), json!(false))
+    );
+    let again = json_of(&upload(&replay, &honest, at).await)["result"].clone();
+    assert_eq!(
+        (again["records"].clone(), again["divergent"].clone()),
+        (json!([]), json!([]))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_known_limit_another_policy_uploaded_first_holds_the_key() {
+    // A known limit (Switch spec 19): at a key the service lacks, a proofless operation with
+    // another policy the uploader's certificate satisfies (an extra write scope; not a create,
+    // so no key derivation binds it) fills the record. The honest proved writes are then
+    // divergent, and a live write with the record's real policy is refused.
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let (record, _) = record_and_claim_keys();
+    let mut put = vector_record_put();
+    let real_policy = put.policy.clone();
+    let mut scopes = put.policy.write_scopes.clone();
+    scopes.push("zzz".into());
+    scopes.sort();
+    put.policy.write_scopes = scopes;
+    let forged = wallet_batch(94, 1, vec![(Vec::new(), OpKind::RecordPut(put))]);
+    let answer = upload(&replay, &json!({ "records": [proofless(&forged[0])] }), at).await;
+    assert_eq!(
+        json_of(&answer)["result"]["records"],
+        json!([record]),
+        "{}",
+        json_of(&answer)
+    );
+    let honest = json!({
+        "lost_identity": lost.signed(),
+        "records": [uploaded_op(6, Some(CREATED)), uploaded_op(8, Some(UPDATED))],
+    });
+    let answer = upload(&replay, &honest, at).await;
+    assert_eq!(
+        json_of(&answer)["result"]["divergent"],
+        json!([record]),
+        "{}",
+        json_of(&answer)
+    );
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    let mut write = vector_record_put();
+    write.policy = real_policy;
+    write.expected_version = RecordVersion::new(
+        view["generation"].as_u64().expect("generation"),
+        view["version"].as_u64().expect("version"),
+    );
+    let batch = |id: u8, write: &RecordPut| {
+        wallet_batch(id, 2, vec![(Vec::new(), OpKind::RecordPut(write.clone()))])
+    };
+    let mut answer = wallet_ops(&replay, &batch(95, &write), at).await;
+    if code(&answer).1 == "stale_epoch" {
+        let epoch = json_of(&answer)["current"]["data_epoch"]
+            .as_u64()
+            .expect("epoch");
+        write.value_sealed.data_epoch = epoch;
+        answer = wallet_ops(&replay, &batch(96, &write), at).await;
+    }
+    assert_eq!(
+        code(&answer),
+        (400, "bad_request".into()),
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_known_limit_a_proofless_unknown_applies_to_a_live_attempt() {
+    // A known limit (Switch spec 19): the wallet's live attempt, orphaned only in
+    // 1,000,000 s, refuses a live `unknown`; the same `unknown`, uploaded as an operation of
+    // the lost generation without a proof, applies: the attempt is `unknown`, the claim FREE.
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let (fields, key) = live_attempt(&replay, at).await;
+    let mut unknown = fields;
+    unknown.kind = ClaimType::Unknown;
+    unknown.expected_step = 1;
+    unknown.orphan_after = None;
+    let live_batch = wallet_batch(92, 2, vec![(Vec::new(), OpKind::Claim(unknown.clone()))]);
+    let live = wallet_ops(&replay, &live_batch, at).await;
+    assert_eq!(
+        code(&live),
+        (409, "conflict".into()),
+        "{}",
+        String::from_utf8_lossy(&live.body)
+    );
+    let lost_op = wallet_batch(93, 1, vec![(Vec::new(), OpKind::Claim(unknown))]);
+    let answer = upload(&replay, &json!({ "claims": [proofless(&lost_op[0])] }), at).await;
+    assert_eq!(
+        json_of(&answer)["result"]["claims"],
+        json!([key]),
+        "{}",
+        json_of(&answer)
+    );
+    let read = wallet_get(&replay, &format!("claims/{key}"), at).await;
+    assert_eq!(read["claim"]["state"], json!("FREE"), "{read}");
+    assert_eq!(
+        read["claim"]["attempts"][0]["outcome"],
+        json!("unknown"),
+        "{read}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_bound_past_the_integer_range_is_unverified() {
+    // A proofless operation built on (1, 2^53 - 1): its bound would be past what a record
+    // view carries (Switch wire 1.1), so it is unverified and the service holds no record.
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let mut put = vector_record_put();
+    put.expected_version = RecordVersion::new(1, (1u64 << 53) - 1);
+    let key = pubky_switch_core::enc::b64(&put.key);
+    let forged = wallet_batch(97, 1, vec![(Vec::new(), OpKind::RecordPut(put))]);
+    let answer = upload(&replay, &json!({ "records": [proofless(&forged[0])] }), at).await;
+    assert_eq!(answer.status, 200);
+    let result = &json_of(&answer)["result"];
+    assert_eq!(
+        (result["records"].clone(), result["unverified"].clone()),
+        (json!([]), json!(1))
+    );
+    let path = format!("/v1/{}/records/{key}", alice_id());
+    let read = replay
+        .service
+        .handle(app_request(&wallet_keys(), "GET", &path, Vec::new(), at))
+        .await;
+    assert_eq!(code(&read), (404, "not_found".into()));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_refusals_order_and_the_rate_slot() {
+    // `404` before `400` at an account in neither stage; after the loss, a body that doesn't
+    // read is `400` whatever the rate, but it takes the one slot of
+    // `uploads_per_app_per_hour`, a refused upload counting (Switch wire 7.4.14), so the
+    // upload that reads after it is `429`. An app not current here is `403 not_current`, an
+    // app of another identity `403 permission_missing`.
+    let limits = pubky_switch::limits::Limits {
+        uploads_per_app_per_hour: 1,
+        ..pubky_switch::limits::Limits::default()
+    };
+    let Some(replay) = replay_with(limits.clone()).await else {
+        return;
+    };
+    let (_, at) = serving_with_a_pending_key(&replay).await;
+    let (status, body) = wallet_registers(&replay, 76, 1, 1, false, at).await;
+    assert_eq!(status, 200, "{body}");
+    let path = format!("/v1/{}/recovery/upload", alice_id());
+    let raw = |bytes: &[u8], at| app_request(&wallet_keys(), "POST", &path, bytes.to_vec(), at);
+    assert_eq!(
+        code(&replay.service.handle(raw(b"not json", at)).await),
+        (404, "not_found".into())
+    );
+    replay.db.drop_database().await.expect("drop");
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    for _ in 0..2 {
+        let refused = replay.service.handle(raw(b"not json", at)).await;
+        assert_eq!(code(&refused), (400, "bad_request".into()));
+    }
+    let keys = vectors("keys.json");
+    let executor = app(&keys, "executor").clone();
+    let not_current = upload_as(&replay, &executor, &json!({}), at).await;
+    assert_eq!(code(&not_current), (403, "not_current".into()));
+    // An app of another identity: a call only own apps make (Switch wire 7.6).
+    let other = other_request("shop", ORIGIN, "POST", &path, b"{}".to_vec(), None, at);
+    let refused = replay.service.handle(other).await;
+    assert_eq!(code(&refused), (403, "permission_missing".into()));
+    assert_eq!(
+        code(&upload(&replay, &json!({}), at).await),
+        (429, "rate_limited".into())
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_large_body_is_judged_before_the_lock() {
+    // An upload of about 15 MiB of heads, all verified with the lost key: its items are
+    // judged once, before the account's lock, never under it, so the lock is held only for
+    // the merge (Switch wire 7.4.14).
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let head = vectors("chain.json")["signed_heads"][0]["head"].clone();
+    let one_head = serde_json::to_vec(&head).expect("json").len();
+    let count = 15 * 1024 * 1024 / (one_head + 1);
+    let before = replay.service.upload_judgments();
+    let answer = upload(&replay, &many_heads(&lost, count), at).await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(json_of(&answer)["result"]["heads"], json!(count));
+    assert_eq!(replay.service.upload_judgments(), (before.0 + 1, before.1));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_rate_is_per_app_and_forgotten_on_erasure() {
+    // `uploads_per_app_per_hour` counts each app of each account apart, and an erasure
+    // forgets the account's counts (Switch wire 9.4, 7.4.16).
+    let limits = pubky_switch::limits::Limits {
+        uploads_per_app_per_hour: 1,
+        ..pubky_switch::limits::Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
+    assert_eq!(
+        code(&upload(&replay, &json!({}), at).await),
+        (429, "rate_limited".into())
+    );
+    let executor = executor_registers(&replay, at).await;
+    assert_eq!(
+        upload_as(&replay, &executor, &json!({}), at).await.status,
+        200
+    );
+    let key = replay
+        .keys
+        .public_key(&service_key_id(&replay).await)
+        .await
+        .expect("key");
+    let path = format!("/v1/{}/erase", alice_id());
+    let erase = signer_request(
+        "POST",
+        &path,
+        pubky_switch_core::http::erase_body(&key, None),
+        at,
+    );
+    assert_eq!(replay.service.handle(erase).await.status, 200);
+    assert_eq!(
+        replay.service.counted_at(&alice_id()),
+        0,
+        "every count of the account"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_claim_that_isnt_rebuilt_and_lost_an_entry_is_unavailable() {
+    // Only a claim rebuilt from uploads may hold fewer entries than its step: one that isn't
+    // and lost an entry is a temporary failure, never a view with the entries missing.
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let (_, key) = live_attempt(&replay, at).await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("DELETE FROM claim_entries WHERE account_id = $1")
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("delete");
+    let path = format!("/v1/{}/claims/{key}", alice_id());
+    let read = replay
+        .service
+        .handle(app_request(&wallet_keys(), "GET", &path, Vec::new(), at))
+        .await;
+    assert_eq!(code(&read), (503, "unavailable".into()));
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// An upload from the wallet with `count` heads that verify with the lost key.
+fn many_heads(lost: &IdentityDoc, count: usize) -> Value {
+    let head = vectors("chain.json")["signed_heads"][0]["head"].clone();
+    let heads: Vec<Value> = (0..count).map(|_| head.clone()).collect();
+    json!({ "lost_identity": lost.signed(), "heads": heads })
+}
+
+#[tokio::test]
+async fn test_upload_past_the_limit_is_refused_without_its_judgment() {
+    // The slot of `uploads_per_app_per_hour` is taken before an upload's items are judged:
+    // past the limit, a body of 20,000 heads that verify is `429`, its items judged neither
+    // before the account's lock nor under it (Switch wire 7.4.14).
+    let limits = pubky_switch::limits::Limits {
+        uploads_per_app_per_hour: 1,
+        ..pubky_switch::limits::Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
+    let before = replay.service.upload_judgments();
+    let limited = upload(&replay, &many_heads(&lost, 20_000), at).await;
+    assert_eq!(code(&limited), (429, "rate_limited".into()));
+    assert_eq!(
+        replay.service.upload_judgments(),
+        before,
+        "no judgment for a refused upload"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_upload_while_another_of_the_app_is_judged_is_429() {
+    // One upload of each app of an account is judged at a time: a second sent while the
+    // first is judged is `429` with a second to wait, judged nowhere, and once the first is
+    // answered the app uploads again.
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let replay = std::sync::Arc::new(replay);
+    let before = replay.service.upload_judgments();
+    let body = many_heads(&lost, 20_000);
+    let first = {
+        let replay = std::sync::Arc::clone(&replay);
+        tokio::spawn(async move { upload(&replay, &body, at).await })
+    };
+    // Until the first is being judged.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while replay.service.upload_judgments().0 == before.0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first upload was never judged"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Judging 20,000 heads takes at least half a second even in a release build, so the
+    // second, sent as soon as the first is being judged, arrives while it still is.
+    let second = upload(&replay, &json!({}), at).await;
+    let first = first.await.expect("first");
+    assert_eq!(first.status, 200);
+    assert_eq!(code(&second), (429, "rate_limited".into()));
+    assert_eq!(json_of(&second)["retry_after"], json!(1));
+    assert_eq!(replay.service.upload_judgments(), (before.0 + 1, before.1));
+    assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
+    let replay = std::sync::Arc::try_unwrap(replay).ok().expect("one owner");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_from_a_revoked_app_is_refused_without_its_judgment() {
+    // An app whose record remains but that isn't current any more is `403 not_current`, and
+    // its upload's items are judged neither before the lock nor under it.
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let wallet = app(&vectors("keys.json"), "wallet")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let path = format!("/v1/{}/apps/{wallet}/revoke", alice_id());
+    let revoked = replay
+        .service
+        .handle(signer_request("POST", &path, Vec::new(), at))
+        .await;
+    assert_eq!(
+        revoked.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&revoked.body)
+    );
+    let before = replay.service.upload_judgments();
+    let refused = upload(&replay, &many_heads(&lost, 20_000), at).await;
+    assert_eq!(code(&refused), (403, "not_current".into()));
+    assert_eq!(
+        replay.service.upload_judgments(),
+        before,
+        "no judgment for a refused upload"
+    );
     replay.db.drop_database().await.expect("drop");
 }

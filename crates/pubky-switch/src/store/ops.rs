@@ -704,23 +704,28 @@ impl AccountTxn {
         Ok(deleted)
     }
 
-    /// The `seq` of the entry at `step` of the claim at `claim_key`.
-    pub async fn claim_entry_seq(
+    /// How many entries the claim at `claim_key` holds before `steps`, and the `seq` of the
+    /// last of them.
+    pub async fn claim_entry_tally(
         &mut self,
         claim_key: &[u8; 32],
-        step: u64,
-    ) -> Result<Option<u64>, StoreError> {
+        steps: u64,
+    ) -> Result<(u64, Option<u64>), StoreError> {
         let id = self.head().id.clone();
-        let seq: Option<i64> = sqlx::query_scalar(
-            "SELECT seq FROM claim_entries WHERE account_id = $1 AND claim_key = $2 AND step = $3",
+        let (count, seq): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT count(*), (array_agg(seq ORDER BY step DESC))[1] FROM claim_entries \
+             WHERE account_id = $1 AND claim_key = $2 AND step < $3",
         )
         .bind(id)
         .bind(claim_key.as_slice())
-        .bind(to_db(step, "step")?)
-        .fetch_optional(self.conn())
+        .bind(to_db(steps, "steps")?)
+        .fetch_one(self.conn())
         .await
         .map_err(db)?;
-        seq.map(|seq| from_db(seq, "seq")).transpose()
+        Ok((
+            from_db(count, "claim entries")?,
+            seq.map(|seq| from_db(seq, "seq")).transpose()?,
+        ))
     }
 
     /// Delete the claim at `claim_key`, with its entries, as step 4 would.

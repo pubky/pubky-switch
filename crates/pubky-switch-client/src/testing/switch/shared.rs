@@ -10,11 +10,16 @@ use pubky_switch_core::claims::{
 };
 use pubky_switch_core::enc::{b64, pubky_id, unb64_array, zbase32_encode};
 use pubky_switch_core::http::ErrorCode;
+use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::ops::{
     AllowKind, ConditionState, InviteCodePut, MAX_INVITE_USES, RecordPut, RecordVersion, Refusal,
     SignedOp, check_invite_code_put,
 };
 use pubky_switch_core::records::AppCert;
+use pubky_switch_core::recovery::{
+    CheckedUpload, HeldRecord as MergeHeld, RecordMerge, UploadBase, UploadChanges, UploadLists,
+    UploadVersion, merge_checked_record, merge_upload_claim,
+};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::shared::{RecordState, check_record_put};
 use pubky_switch_core::sig::SignedDoc;
@@ -25,6 +30,10 @@ use super::{Answer, Inner, ScriptedSwitch, SwitchApp, bad, parse_query};
 use crate::clock::Clock;
 use crate::transport::Request;
 
+/// Divergent uploads kept per record: the wire's default `max_divergent_uploads` (Switch
+/// wire 9.2).
+const MAX_DIVERGENT_UPLOADS: usize = 8;
+
 /// A shared record as the switch holds it, with what its reads return (Switch wire 7.4.9).
 #[derive(Clone, Debug)]
 pub struct HeldRecord {
@@ -32,16 +41,24 @@ pub struct HeldRecord {
     pub state: RecordState,
     /// The newest write's signed `record.put`.
     pub op: SignedDoc,
-    /// The write's transition proof.
-    pub proof: SignedDoc,
+    /// The write's transition proof; `None` for a record taken from a recovery upload
+    /// (Switch wire 7.4.9).
+    pub proof: Option<SignedDoc>,
     /// The App ID that wrote it.
     pub writer: [u8; 16],
     /// The writer's certificate the switch checked the write against, kept with the record:
     /// a renewal or revocation later doesn't change it (Switch wire 7.4.9). `None` for a
     /// record held without it, whose view carries the certificate of the writer's record.
     pub cert: Option<SignedDoc>,
-    /// The write's `seq`.
+    /// The write's `seq`; for a record taken from a recovery upload, the `upload`
+    /// transition's.
     pub seq: u64,
+    /// For a record taken from a recovery upload: whether the lost service's proof gave its
+    /// version (Switch wire 7.4.14).
+    pub uploaded: Option<bool>,
+    /// The uploaded version the first write here built on, with its operation's hash
+    /// (Switch wire 10.3 `upload_base`).
+    pub upload_base: Option<UploadBase>,
 }
 
 /// An invite code the switch holds (Switch spec 7).
@@ -71,7 +88,7 @@ pub(crate) struct Shared {
     pub(crate) connect: Vec<([u8; 32], u64)>,
     /// By code hash.
     pub(crate) invites: BTreeMap<[u8; 32], Invite>,
-    contacts: BTreeSet<[u8; 32]>,
+    pub(crate) contacts: BTreeSet<[u8; 32]>,
     /// By Pubky ID: the writer and the time of the entry.
     conversations: BTreeMap<[u8; 32], ([u8; 16], u64)>,
     /// Conversation entries the service wrote for senders an invite code admitted, by Pubky
@@ -81,7 +98,10 @@ pub(crate) struct Shared {
     /// The service time of the last append each conversation entry admitted, by Pubky ID
     /// (Switch wire 7.4.6 `last_used`): none until one.
     conversation_used: BTreeMap<[u8; 32], u64>,
-    deny: BTreeSet<[u8; 32]>,
+    pub(crate) deny: BTreeSet<[u8; 32]>,
+    /// The `doc_hash`es of the divergent uploads kept for each record, by key (Switch wire
+    /// 7.4.14).
+    pub(crate) divergent: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
     /// The flagged senders `GET /allow` shows, with their hits (Switch wire 7.4.6).
     pub(crate) flagged: BTreeMap<[u8; 32], u64>,
     /// Answer the next record read without its proof, as after a recovery upload.
@@ -187,7 +207,12 @@ impl ConditionState for Before<'_> {
 /// A record's view, as `GET /records` returns it (Switch wire 7.4.9): its `cert` is the one
 /// the write was checked against, or for a record held without it, the one the writer's
 /// record carries.
-fn record_view(held: &HeldRecord, apps: &BTreeMap<[u8; 16], SwitchApp>, proof: bool) -> Value {
+fn record_view(
+    held: &HeldRecord,
+    apps: &BTreeMap<[u8; 16], SwitchApp>,
+    proof: bool,
+    divergent: bool,
+) -> Value {
     let cert = held.cert.clone().or_else(|| {
         apps.get(&held.writer)
             .and_then(|app| app.cert.clone())
@@ -204,11 +229,11 @@ fn record_view(held: &HeldRecord, apps: &BTreeMap<[u8; 16], SwitchApp>, proof: b
         "deleted": held.state.deleted,
         "writer": zbase32_encode(&held.writer),
         "op": held.op,
-        "divergent": false,
+        "divergent": divergent,
         "cert": cert,
     });
-    if proof {
-        view["proof"] = json!(held.proof);
+    if proof && let Some(signed) = &held.proof {
+        view["proof"] = json!(signed);
     }
     view
 }
@@ -226,7 +251,8 @@ impl Shared {
         seq: u64,
     ) -> Result<ProofState, Refusal> {
         let held = self.records.get(&put.key);
-        let view = held.map(|h| record_view(h, cx.apps, true));
+        let divergent = self.divergent.contains_key(&put.key);
+        let view = held.map(|h| record_view(h, cx.apps, true, divergent));
         check_record_put(
             put,
             held.map(|h| &h.state),
@@ -252,7 +278,7 @@ impl Shared {
         let records = self
             .records
             .values()
-            .filter_map(|held| generation(&held.proof))
+            .filter_map(|held| held.proof.as_ref().and_then(generation))
             .collect();
         let entries = self
             .entries
@@ -274,19 +300,146 @@ impl Shared {
                 .is_some_and(|entries| entries.iter().any(|e| e.seq == seq))
     }
 
-    /// Keep a written record with its proof.
+    /// Keep a written record with its proof. A write here clears the record's divergent
+    /// uploads, and builds on the upload it replaces (Switch wire 7.4.14 "Writes at N win").
     pub(super) fn record_written(&mut self, put: &RecordPut, written: Written<'_>) {
+        let upload_base = self
+            .records
+            .get(&put.key)
+            .and_then(|held| match held.uploaded {
+                Some(_) => Some(UploadBase {
+                    version: held.state.version,
+                    op_hash: held.op.doc_hash().ok()?,
+                }),
+                None => held.upload_base,
+            });
+        self.divergent.remove(&put.key);
         self.records.insert(
             put.key,
             HeldRecord {
                 state: RecordState::after(put, written.generation, written.seq),
                 op: written.op.signed().clone(),
-                proof: written.proof.clone(),
+                proof: Some(written.proof.clone()),
                 writer: written.writer,
                 cert: written.cert.map(|cert| cert.signed().clone()),
                 seq: written.seq,
+                uploaded: None,
+                upload_base,
             },
         );
+    }
+
+    /// Merge what counted in a recovery upload after a provider loss, as the service does
+    /// (Switch wire 7.4.14): records taken at `seq`, the `upload` transition's, or kept as
+    /// divergent; claims; and the lists, only added to, each up to its limit in `caps`
+    /// (`max_contacts`, `max_deny`).
+    pub(super) fn merge_upload(
+        &mut self,
+        checked: &CheckedUpload,
+        lists: Option<&UploadLists>,
+        (max_contacts, max_deny): (u64, u64),
+        seq: u64,
+        now: u64,
+        changes: &mut UploadChanges,
+    ) {
+        for record in &checked.records {
+            let key = record.put.key;
+            let kept = self.divergent.get(&key).cloned().unwrap_or_default();
+            let held = self.records.get(&key);
+            let from_upload = held.and_then(|held| {
+                let exact = held.uploaded?;
+                let op = SignedOp::peek(&held.op).ok()?;
+                let OpKind::RecordPut(put) = &op.body().kind else {
+                    return None;
+                };
+                Some(MergeHeld::FromUpload {
+                    op_hash: held.op.doc_hash().ok()?,
+                    built_on: put.expected_version,
+                    version: UploadVersion {
+                        version: held.state.version,
+                        exact,
+                    },
+                    divergent: &kept,
+                })
+            });
+            let view = match (held, from_upload) {
+                (None, _) => MergeHeld::Lacking,
+                (Some(_), Some(view)) => view,
+                (Some(held), None) => MergeHeld::WrittenHere {
+                    upload_base: held.upload_base,
+                    divergent: &kept,
+                },
+            };
+            match merge_checked_record(&view, held.map(|h| &h.state), record, MAX_DIVERGENT_UPLOADS)
+            {
+                RecordMerge::Fill | RecordMerge::Replace | RecordMerge::MakeExact => {
+                    let put = &record.put;
+                    let state = RecordState {
+                        version: record.uploaded.version.version,
+                        ..RecordState::after(put, 0, 0)
+                    };
+                    self.records.insert(
+                        key,
+                        HeldRecord {
+                            state,
+                            op: record.op.clone(),
+                            proof: None,
+                            writer: record.writer,
+                            cert: Some(record.cert.clone()),
+                            seq,
+                            uploaded: Some(record.uploaded.version.exact),
+                            upload_base: None,
+                        },
+                    );
+                    changes.record(key);
+                }
+                RecordMerge::Divergent { kept } => {
+                    if kept {
+                        let hash = record.uploaded.op_hash;
+                        self.divergent.entry(key).or_default().push(hash);
+                    }
+                    changes.divergent_record(key);
+                }
+                RecordMerge::Unchanged => {}
+            }
+        }
+        let keys: BTreeSet<[u8; 32]> = checked
+            .claims
+            .keys()
+            .chain(checked.settled.keys())
+            .copied()
+            .collect();
+        for key in keys {
+            let entries = checked.claims.get(&key).map_or(&[][..], Vec::as_slice);
+            let merge = merge_upload_claim(
+                self.claims.get(&key),
+                checked.settled.get(&key),
+                entries,
+                now,
+                ClaimLimits::default().max_attempts_per_claim,
+            );
+            if merge.changed
+                && let Some(claim) = &merge.claim
+            {
+                self.claims.insert(key, claim.clone());
+            }
+            changes.claim(key, &merge);
+        }
+        if let Some(lists) = lists {
+            for (list, entries, max) in [
+                (&mut self.contacts, &lists.contacts, max_contacts),
+                (&mut self.deny, &lists.deny, max_deny),
+            ] {
+                // Entries past the list's limit are dropped (Switch wire 7.4.14 "Lists").
+                for pubky in entries.iter().flatten() {
+                    if !list.contains(pubky) && u64::try_from(list.len()).unwrap_or(u64::MAX) < max
+                    {
+                        list.insert(*pubky);
+                        changes.lists = true;
+                    }
+                }
+            }
+        }
     }
 
     /// A claim entry (Switch wire 6.8), by [`apply_entry`] with the default limits.
@@ -597,7 +750,11 @@ impl Inner {
         if !cert.is_some_and(|cert| cert.holds_scope(&held.state.policy.read_scope)) {
             return permission_missing("7.4.9: reading the record needs its read_scope");
         }
-        (200, record_view(held, &self.apps, !self.shared.hide_proofs))
+        let divergent = self.shared.divergent.contains_key(&key);
+        (
+            200,
+            record_view(held, &self.apps, !self.shared.hide_proofs, divergent),
+        )
     }
 
     /// `GET /records?collection=&after=&limit=` (Switch wire 7.4.9), its query read as the
@@ -658,7 +815,12 @@ impl Inner {
             .map(|held| {
                 (
                     b64(&held.state.key),
-                    record_view(held, &self.apps, !self.shared.hide_proofs),
+                    record_view(
+                        held,
+                        &self.apps,
+                        !self.shared.hide_proofs,
+                        self.shared.divergent.contains_key(&held.state.key),
+                    ),
                 )
             })
             .filter(|(key, _)| after.as_ref().is_none_or(|after| key > after))

@@ -34,6 +34,7 @@ mod peers;
 mod records;
 mod recovery;
 pub mod rules;
+mod upload;
 
 pub use recovery::AdmissionEnd;
 
@@ -57,7 +58,7 @@ use crate::{
     },
     keys::{KeyId, KeyStore, MarkCheck, ServiceSigner},
     limits::Limits,
-    ratelimit::{FailedAuthentications, KeyedMinutes, MinuteWindows},
+    ratelimit::{FailedAuthentications, KeyedWindows, MinuteWindows},
     store::{AccountTxn, Store, StoreError},
     time::TrustedTime,
 };
@@ -83,17 +84,25 @@ pub struct Service {
     failed_auth: FailedAuthentications,
     reads_per_source: MinuteWindows<(String, NetworkSource)>,
     reads_per_account: MinuteWindows<String>,
-    operation_rate: KeyedMinutes<(String, [u8; 16])>,
-    control_rate: KeyedMinutes<(String, [u8; 16])>,
-    invite_rate: KeyedMinutes<(String, [u8; 32])>,
-    stranger_rate: KeyedMinutes<String>,
-    sender_rate: KeyedMinutes<(String, [u8; 32])>,
-    sender_app_rate: KeyedMinutes<(String, [u8; 16])>,
-    notify_rate: KeyedMinutes<(String, [u8; 32])>,
+    operation_rate: KeyedWindows<(String, [u8; 16])>,
+    control_rate: KeyedWindows<(String, [u8; 16])>,
+    invite_rate: KeyedWindows<(String, [u8; 32])>,
+    stranger_rate: KeyedWindows<String>,
+    sender_rate: KeyedWindows<(String, [u8; 32])>,
+    sender_app_rate: KeyedWindows<(String, [u8; 16])>,
+    notify_rate: KeyedWindows<(String, [u8; 32])>,
+    /// Recovery uploads per app per hour (Switch wire 7.4.14).
+    upload_rate: KeyedWindows<(String, [u8; 16])>,
+    /// The `(account, app)` whose recovery upload's items are being judged before the lock:
+    /// one at a time for each.
+    upload_judging: parking_lot::Mutex<std::collections::HashSet<(String, [u8; 16])>>,
+    /// Recovery uploads whose items were judged before the account's lock, and under it.
+    judged_before_lock: std::sync::atomic::AtomicU64,
+    judged_under_lock: std::sync::atomic::AtomicU64,
     /// The sweeps a retried erasure of an account gone may run (Switch wire 7.4.16): only
     /// the signer's, verified with the identity key, and bounded per account, since anyone
     /// who saw one can replay it within its timestamp window.
-    erasure_sweeps: KeyedMinutes<String>,
+    erasure_sweeps: KeyedWindows<String>,
     changes: Arc<ChangeHub>,
     /// Where entry IDs come from: random, opaque to senders (Switch wire 1.7).
     entry_ids: EntryIds,
@@ -213,6 +222,16 @@ fn unsigned(error: &ApiError) -> SwitchResponse {
 }
 
 /// How a store failure is answered: a temporary failure, or the account being busy.
+/// What a request checked before the account's lock: signature work that needs no lock
+/// (Switch wire 7.2 Order).
+enum Prepared {
+    /// A delivered `identity.json`, read and verified (Switch wire 7.4.5).
+    Delivery(Box<Result<peers::Delivered, ApiError>>),
+    /// A recovery upload's rate slot and its items, judged against the account as it stood
+    /// before the lock (Switch wire 7.4.14).
+    Upload(Box<upload::PreparedUpload>),
+}
+
 fn store_error(error: &StoreError) -> ApiError {
     tracing::warn!(%error, "storage");
     ApiError::unavailable("7.6: a temporary failure")
@@ -252,14 +271,18 @@ impl Service {
             failed_auth,
             reads_per_source: MinuteWindows::default(),
             reads_per_account: MinuteWindows::default(),
-            operation_rate: KeyedMinutes::default(),
-            control_rate: KeyedMinutes::default(),
-            invite_rate: KeyedMinutes::default(),
-            stranger_rate: KeyedMinutes::default(),
-            sender_rate: KeyedMinutes::default(),
-            sender_app_rate: KeyedMinutes::default(),
-            notify_rate: KeyedMinutes::default(),
-            erasure_sweeps: KeyedMinutes::default(),
+            operation_rate: KeyedWindows::default(),
+            control_rate: KeyedWindows::default(),
+            invite_rate: KeyedWindows::default(),
+            stranger_rate: KeyedWindows::default(),
+            sender_rate: KeyedWindows::default(),
+            sender_app_rate: KeyedWindows::default(),
+            notify_rate: KeyedWindows::default(),
+            upload_rate: KeyedWindows::hours(),
+            upload_judging: parking_lot::Mutex::default(),
+            judged_before_lock: std::sync::atomic::AtomicU64::new(0),
+            judged_under_lock: std::sync::atomic::AtomicU64::new(0),
+            erasure_sweeps: KeyedWindows::default(),
             changes: ChangeHub::new(),
             entry_ids: Arc::new(random_entry_id),
         }
@@ -271,6 +294,17 @@ impl Service {
     pub fn with_entry_ids(mut self, ids: impl Fn() -> [u8; 16] + Send + Sync + 'static) -> Self {
         self.entry_ids = Arc::new(ids);
         self
+    }
+
+    /// How many recovery uploads had their items judged before the account's lock, and how
+    /// many under it, for tests of what a refused upload costs (Switch wire 7.4.14).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn upload_judgments(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.judged_before_lock.load(Relaxed),
+            self.judged_under_lock.load(Relaxed),
+        )
     }
 
     /// How many counts of its rate limits and of failed authentications the service keeps
@@ -287,6 +321,7 @@ impl Service {
             + self.sender_rate.counted(|(at, _)| at == account)
             + self.sender_app_rate.counted(|(at, _)| at == account)
             + self.notify_rate.counted(|(at, _)| at == account)
+            + self.upload_rate.counted(|(at, _)| at == account)
     }
 
     /// The hub that wakes waiting feed reads. Run a [`crate::changes::ChangeListener`]
@@ -437,6 +472,7 @@ impl Service {
             | Call::GetKeys(_)
             | Call::RequestKeys(_)
             | Call::Leave(_)
+            | Call::RecoveryUpload
             | Call::GetRecord(_)
             | Call::ListRecords
             | Call::GetAllow => {
@@ -474,14 +510,30 @@ impl Service {
         // A delivered identity.json is read and verified before the lock too: signature work
         // needs no account state (Switch wire 7.2 Order). Its refusal is answered under the
         // lock, after the caller's own checks, with the head an own app's refusal carries.
-        let delivered = (*call == Call::PutPeers).then(|| {
-            let other = match caller.as_ref().map(|claimed| &claimed.caller) {
-                Some(Caller::OtherApp { identity, .. }) => Some(*identity),
-                _ => None,
-            };
-            let account_key = pubky_switch_core::enc::pubky_key(&account).unwrap_or([0; 32]);
-            peers::verify_delivery(&request.body, &account_key, other.as_ref())
-        });
+        // So is a recovery upload's from an own app, which the endpoint takes under the lock
+        // only if what it was judged against is unchanged (Switch wire 7.4.14).
+        let prepared = match call {
+            Call::PutPeers => {
+                let other = match caller.as_ref().map(|claimed| &claimed.caller) {
+                    Some(Caller::OtherApp { identity, .. }) => Some(*identity),
+                    _ => None,
+                };
+                let account_key = pubky_switch_core::enc::pubky_key(&account).unwrap_or([0; 32]);
+                Some(Prepared::Delivery(Box::new(peers::verify_delivery(
+                    &request.body,
+                    &account_key,
+                    other.as_ref(),
+                ))))
+            }
+            Call::RecoveryUpload => match verified.as_ref() {
+                Some(app) => Some(Prepared::Upload(Box::new(
+                    self.prepare_upload(&account, app, &request.body, base_ms.max(stamped_ms))
+                        .await,
+                ))),
+                None => None,
+            },
+            _ => None,
+        };
         // The reads that run after the lock on its snapshot take their account's turn and
         // their reader first, so the lock is never held waiting for one. Only an own app's
         // request whose signature verified takes them, one place per app: the signer's is
@@ -538,7 +590,7 @@ impl Service {
             caller.as_ref(),
             verified.as_ref(),
             other.as_ref(),
-            delivered.as_ref(),
+            prepared.as_ref(),
         )
         .await
     }
@@ -726,7 +778,7 @@ impl Service {
         caller: Option<&Claimed>,
         verified: Option<&batch::VerifiedApp>,
         other: Option<&AppCert>,
-        delivered: Option<&Result<peers::Delivered, ApiError>>,
+        prepared: Option<&Prepared>,
     ) -> SwitchResponse {
         let signature = request_signature.as_ref();
         let by_signer = caller.is_some_and(|c| c.caller == Caller::Signer);
@@ -812,7 +864,7 @@ impl Service {
         };
         let (answer, marked) = match self
             .run_at_account(
-                &mut txn, &signer, request, verified, other, delivered, due, time_ms,
+                &mut txn, &signer, request, verified, other, prepared, due, time_ms,
             )
             .await
         {
@@ -973,17 +1025,31 @@ impl Service {
                                 if is_failed_authentication(refusal.error.code) {
                                     self.record_failure(request, txn_account.clone());
                                 }
-                                let head = if refusal.head { fallback_head } else { None };
-                                self.sign_keyed(
-                                    proof,
-                                    &signer,
-                                    signature,
-                                    refusal.time_ms,
-                                    Answer::error(&refusal.error).with_head(head),
-                                    base_ms,
-                                    by_signer,
-                                )
-                                .await
+                                let refusal = *refusal;
+                                let signed = self
+                                    .try_sign_keyed(proof, &signer, signature, |signing| {
+                                        let head = match (&refusal.snapshot, refusal.head) {
+                                            (Some(snapshot), _) => snapshot.sign(signing),
+                                            (None, true) => fallback_head,
+                                            (None, false) => None,
+                                        };
+                                        let answer = Answer::error(&refusal.error).with_head(head);
+                                        (answer, refusal.time_ms)
+                                    })
+                                    .await;
+                                match signed {
+                                    Ok(signed) => signed,
+                                    Err(not_keyed) => {
+                                        self.not_keyed_answer(
+                                            Some(&txn_account),
+                                            not_keyed,
+                                            by_signer,
+                                            signature,
+                                            base_ms,
+                                        )
+                                        .await
+                                    }
+                                }
                             }
                         };
                     }
@@ -1061,7 +1127,7 @@ impl Service {
         request: &SwitchRequest,
         verified: Option<&batch::VerifiedApp>,
         other: Option<&AppCert>,
-        delivered: Option<&Result<peers::Delivered, ApiError>>,
+        prepared: Option<&Prepared>,
         due: Option<u64>,
         time_ms: u64,
     ) -> Result<(Answer, bool), Refused> {
@@ -1334,6 +1400,10 @@ impl Service {
                         ));
                     }
                 };
+                let delivered = match prepared {
+                    Some(Prepared::Delivery(delivered)) => Some(&**delivered),
+                    _ => None,
+                };
                 let delivered = delivered
                     .ok_or_else(|| {
                         Refused::with_head(
@@ -1409,6 +1479,39 @@ impl Service {
                         app_id,
                         &request.body,
                         due.is_some(),
+                        time_ms,
+                    )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::RecoveryUpload => {
+                // An own app uploads (Switch wire 7.4.14); a staged service's uploads, in a
+                // cooperative move, aren't served yet.
+                let Some(caller) = writer.as_ref() else {
+                    return Err(Refused::with_head(
+                        ApiError::new(ErrorCode::PermissionMissing, "7.4.14: an own app uploads"),
+                        serving,
+                    ));
+                };
+                if !serving {
+                    return Err(Refused::with_head(
+                        ApiError::unavailable("7.4.14: this stage isn't served yet"),
+                        serving,
+                    ));
+                }
+                let prepared = match prepared {
+                    Some(Prepared::Upload(prepared)) => Some(&**prepared),
+                    _ => None,
+                };
+                return self
+                    .recovery_upload(
+                        txn,
+                        signer,
+                        held.as_ref(),
+                        caller,
+                        &request.body,
+                        prepared,
                         time_ms,
                     )
                     .await

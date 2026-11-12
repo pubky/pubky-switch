@@ -567,6 +567,9 @@ pub struct App {
     /// between (`App::resume_batches_before_feed`). Kept in memory only: a restart sends
     /// them at its first read.
     kept_rate_limited: Option<(u64, u64)>,
+    /// The end of the wait a recovery upload's `429 rate_limited` asked, device clock: no
+    /// upload of a provider loss's steps goes before it. In memory only.
+    loss_upload_wait: Option<u64>,
     /// When a failed check 7 last had each sender's `identity.json` read again
     /// (`feed.rs`, [`SENDER_REREAD_MS`]). Kept in memory only: it bounds the reads, and a
     /// restart may read once more.
@@ -796,6 +799,7 @@ impl App {
                 duty_handed: 0,
                 time_fresh_at: None,
                 kept_rate_limited: None,
+                loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
                 reads_begun: 0,
             };
@@ -919,6 +923,7 @@ impl App {
                 duty_handed: 0,
                 time_fresh_at: None,
                 kept_rate_limited: None,
+                loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
                 reads_begun: 0,
             };
@@ -1618,6 +1623,7 @@ impl App {
                 duty_handed: 0,
                 time_fresh_at: None,
                 kept_rate_limited: None,
+                loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
                 reads_begun: 0,
             };

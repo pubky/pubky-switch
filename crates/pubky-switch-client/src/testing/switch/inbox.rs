@@ -97,8 +97,9 @@ impl ScriptedSwitch {
 }
 
 impl Inner {
-    /// The routes an app of another identity calls; `permission_missing` at the reads only
-    /// own apps make, and `not_admitted` for every other one (Switch wire 6.4 step 1, 7.2).
+    /// The routes an app of another identity calls; for every other call of Switch wire 7.4
+    /// `403 permission_missing` (one only another caller makes, 7.6), at a batch `403
+    /// not_admitted` (6.4 step 1), and at a route that isn't one `404`, as at the service.
     pub(super) fn route_foreign(
         &mut self,
         request: &Request,
@@ -129,19 +130,19 @@ impl Inner {
             }
             ("POST", "inbox") => self.append(request, Some(sender), query)?,
             ("POST", "connect") => self.connect(sender),
-            // The feed, the claims, the lists and the records are read only by the
-            // account's own apps, and the key bundle calls, a leave, the hand-over and the
-            // signer's calls only an own app or the signer (Switch wire 7.4, 7.6;
-            // `crates/pubky-switch/src/service/rules.rs`, `other_app_refusal`); a batch and
-            // every call not served yet keep `not_admitted`.
+            // The feed, the claims, the lists and the records are read only by the account's
+            // own apps; a batch is `not_admitted`; every other call of Switch wire 7.4 only an
+            // own app or the signer makes (7.6; `crates/pubky-switch/src/service/rules.rs`,
+            // `other_app_refusal`); and a route that isn't one is `404`, as at the service.
             ("GET", "feed" | "allow" | "records") => own_reads_only(),
             ("GET", r) if r.starts_with("claims/") || r.starts_with("records/") => own_reads_only(),
-            (method, r) if own_or_signer_call(method, r) => bad(
+            ("POST", "ops") => not_admitted(),
+            (method, route) if is_route(method, route) => bad(
                 ErrorCode::PermissionMissing,
                 "7.4: a call only an own app or the signer makes",
                 json!(null),
             ),
-            _ => not_admitted(),
+            _ => bad(ErrorCode::NotFound, "no such route", json!(null)),
         })
     }
 
@@ -478,32 +479,44 @@ impl Inner {
 }
 
 /// `403 not_admitted`, which carries no `current` (Switch wire 7.6).
-fn not_admitted() -> Answer {
-    bad(ErrorCode::NotAdmitted, "not admitted", json!(null))
+/// Whether `method` `route` (the path after `/v1/{id}/`) is a call of Switch wire 7.4.
+fn is_route(method: &str, route: &str) -> bool {
+    let segments: Vec<&str> = route.split('/').collect();
+    matches!(
+        (method, segments.as_slice()),
+        ("PUT" | "GET", ["identity"])
+            | (
+                "POST",
+                ["inbox"] | ["ops"] | ["connect"] | ["freeze"] | ["unfreeze"]
+            )
+            | (
+                "POST",
+                ["import"] | ["erase"] | ["recovery", "admission" | "upload"]
+            )
+            | (
+                "POST",
+                ["import", "activate"] | ["apps", _, "keys" | "leave" | "revoke"]
+            )
+            | (
+                "GET",
+                ["feed"] | ["allow"] | ["connect"] | ["records"] | ["directory"]
+            )
+            | (
+                "GET",
+                ["apps"] | ["export"] | ["claims", _] | ["records", _]
+            )
+            | ("GET", ["apps", _, "keys"] | ["export", "chunks", _])
+            | (
+                "PUT",
+                ["peers"] | ["push"] | ["handover"] | ["import", "chunks", _]
+            )
+            | ("GET", ["handover"])
+            | ("DELETE", ["connect", _])
+    )
 }
 
-/// Whether `method` on `route` is a call only an own app or the signer makes, which the
-/// service answers an app of another identity `403 permission_missing`
-/// (`crates/pubky-switch/src/service/rules.rs`, `other_app_refusal`): the key bundle calls,
-/// a leave, the hand-over and the signer's calls (Switch wire 7.4).
-fn own_or_signer_call(method: &str, route: &str) -> bool {
-    let app_call = |name: &str| {
-        route
-            .strip_prefix("apps/")
-            .and_then(|rest| rest.strip_suffix(name))
-            .is_some_and(|app| !app.is_empty() && !app.contains('/'))
-    };
-    match method {
-        "GET" => matches!(route, "apps" | "handover") || app_call("/keys"),
-        "POST" => {
-            matches!(route, "recovery/admission" | "erase")
-                || app_call("/keys")
-                || app_call("/leave")
-                || app_call("/revoke")
-        }
-        "PUT" => matches!(route, "identity" | "handover"),
-        _ => false,
-    }
+fn not_admitted() -> Answer {
+    bad(ErrorCode::NotAdmitted, "not admitted", json!(null))
 }
 
 /// `403 permission_missing` to an app of another identity at a read only own apps make.
@@ -697,6 +710,53 @@ mod tests {
         assert_eq!(body["current"], json!({ "version": null }));
         let members = body.as_object().unwrap();
         assert_eq!(members.get("known_version"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn test_scripted_foreign_app_at_an_own_call_is_permission_missing() {
+        // An app of another identity at a call only own apps or the signer make gets
+        // `403 permission_missing`, as at the service; at a batch, `403 not_admitted`
+        // (Switch wire 6.4 step 1, 7.6).
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let switch = ScriptedSwitch::new(
+            &identity,
+            [2; 32],
+            std::sync::Arc::new(crate::clock::TestClock::new(1_000)),
+        );
+        let mut inner = switch.lock();
+        let other = pubky_switch_core::keys::IdentityKey::from_secret([7; 32]);
+        let keys = pubky_switch_core::keys::AppKeys::from_secrets([8; 32], [9; 32]);
+        let body = pubky_switch_core::records::AppCertBody::new(
+            other.public(),
+            keys.signing_public(),
+            keys.bundle_public(),
+            vec!["notes".into()],
+            &[],
+            0,
+            86_400_000,
+        );
+        let cert = AppCert::issue(&other, body).unwrap();
+        let sender = Sender {
+            identity: other.public(),
+            app: Some(cert.app_id()),
+            code: None,
+        };
+        for (method, rest, code) in [
+            ("POST", "recovery/upload", "permission_missing"),
+            ("GET", "feed", "permission_missing"),
+            ("GET", "records", "permission_missing"),
+            ("POST", "ops", "not_admitted"),
+            ("GET", "no/such/route", "not_found"),
+        ] {
+            let request = foreign(method, &format!("/{rest}"), &cert);
+            let (status, body) = inner.route_foreign(&request, &sender, rest).unwrap();
+            let expected = if code == "not_found" { 404 } else { 403 };
+            assert_eq!(
+                (status, &body["code"]),
+                (expected, &json!(code)),
+                "{method} {rest}"
+            );
+        }
     }
 
     #[test]

@@ -1081,6 +1081,22 @@ fn lists_copy_in(store: &MemoryStore) -> (bool, Option<u64>) {
 /// processed, and kept evidence; then the signer declares generation 1 lost at a new
 /// service, and the old one is gone.
 async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
+    let permissions = [
+        Permission::ListsRead,
+        Permission::ListsManage,
+        Permission::ConversationAdd,
+    ];
+    lost_world_with(store, &permissions, false, true).await
+}
+
+/// [`lost_world`], the app holding `permissions`, with `record` a shared record it wrote
+/// before the loss, and without `lists` nothing in its lists.
+async fn lost_world_with(
+    store: Arc<dyn StateStore>,
+    permissions: &[Permission],
+    record: bool,
+    lists: bool,
+) -> Lost {
     let w = World::new();
     let router = Router::of(&w);
     let protocol = Arc::new(LossProtocol {
@@ -1092,29 +1108,32 @@ async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
         &router,
         store,
         Arc::clone(&protocol) as Arc<dyn Protocol>,
-        &[
-            Permission::ListsRead,
-            Permission::ListsManage,
-            Permission::ConversationAdd,
-        ],
+        permissions,
     )
     .await;
+    if record {
+        let target = crate::app::RecordTarget::new(super::shared_flows::items(), b"key");
+        let value = super::shared_flows::value(&["a"]);
+        app.put_record(&target, &value, vec![]).await.unwrap();
+    }
     let me = app.app_id();
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     let dave = IdentityKey::from_secret(seed("dave/identity")).public();
     let phone = w.other_app("phone", &[Permission::ListsManage]);
-    w.switch
-        .app_op(
-            &phone,
-            OpKind::AllowPut {
-                pubky: carol,
-                kind: AllowKind::Contact,
-            },
-        )
-        .unwrap();
-    w.switch
-        .app_op(&phone, OpKind::DenyPut { pubky: dave })
-        .unwrap();
+    if lists {
+        w.switch
+            .app_op(
+                &phone,
+                OpKind::AllowPut {
+                    pubky: carol,
+                    kind: AllowKind::Contact,
+                },
+            )
+            .unwrap();
+        w.switch
+            .app_op(&phone, OpKind::DenyPut { pubky: dave })
+            .unwrap();
+    }
     w.clock.advance_ms(1000);
     let note_at_ms = w.clock.now_ms();
     w.note(me, "before the loss");
@@ -1500,6 +1519,259 @@ async fn test_new_feed_entry_at_a_stored_entrys_seq_meets_none_of_it() {
     assert!(received(&report.events, seq), "{:?}", report.events);
     // The stored entry is as it was, under its ID.
     assert_eq!(app.state.parked.get(&id), Some(&stored));
+}
+
+#[tokio::test]
+async fn test_loss_upload_merges_the_lists_and_ends_staged_admission() {
+    // The next switch merges the app's record and lists, and its contacts, from an app
+    // holding `lists.manage`, end staged admission (Switch spec 12.6 step 2, wire 7.4.14).
+    let store = Arc::new(MemoryStore::new());
+    let permissions = [Permission::ListsRead, Permission::ListsManage];
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &permissions,
+        true,
+        true,
+    )
+    .await;
+    let written = lost.w.switch.lock().shared.records.clone();
+    lost.next.lock().admission_staged = true;
+    let (_, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(!has(&events, |e| matches!(
+        e,
+        AppEvent::EvidenceRefused { .. }
+    )));
+    let next = lost.next.lock();
+    assert!(!next.admission_staged);
+    // The record written before the loss is taken at the version the lost switch's proof
+    // gave it, with no proof of its own.
+    let (key, before) = written.iter().next().expect("the record");
+    let taken = next.shared.records.get(key).expect("taken");
+    assert_eq!(taken.state, before.state);
+    assert_eq!((taken.uploaded, taken.proof.as_ref()), (Some(true), None));
+    assert!(next.shared.contacts.contains(&lost.carol));
+    assert!(next.shared.deny.contains(&lost.dave));
+    // A fork of that write, built on the same version in another batch, is kept divergent:
+    // the record stays, its view `divergent` (Switch wire 7.4.14).
+    let op = pubky_switch_core::ops::SignedOp::peek(&taken.op).unwrap();
+    let fork = pubky_switch_core::ops::sign_batch(
+        &app_keys("wallet"),
+        &lost.w.alice.public(),
+        Some(app_keys("wallet").app_id_bytes()),
+        op.body().generation,
+        [99; 16],
+        vec![(Vec::new(), op.body().kind.clone())],
+    )
+    .unwrap();
+    let cert = taken.cert.clone().unwrap();
+    let state = taken.state.clone();
+    drop(next);
+    let body = json!({ "records": [{ "op": fork[0].signed(), "cert": cert }] });
+    let (status, answer) = upload_at_next(&lost, &body.to_string());
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        answer["result"]["divergent"],
+        json!([pubky_switch_core::enc::b64(key)])
+    );
+    let next = lost.next.lock();
+    assert_eq!(next.shared.records[key].state, state);
+    assert_eq!(next.shared.divergent[key].len(), 1);
+}
+
+#[tokio::test]
+async fn test_loss_upload_from_manage_holding_no_contacts_sends_them_empty() {
+    // An app with `lists.manage` whose lists hold nothing still sends `contacts: []`: that
+    // upload ends staged admission (Switch spec 12.6 step 2).
+    let store = Arc::new(MemoryStore::new());
+    let permissions = [Permission::ListsRead, Permission::ListsManage];
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &permissions,
+        false,
+        false,
+    )
+    .await;
+    lost.next.lock().admission_staged = true;
+    follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let lists = lost
+        .next
+        .uploads()
+        .into_iter()
+        .find_map(|(body, _)| body.get("lists").cloned())
+        .expect("the lists' upload");
+    assert_eq!(lists["contacts"], json!([]), "{lists}");
+    assert!(!lost.next.lock().admission_staged);
+}
+
+#[tokio::test]
+async fn test_loss_upload_without_manage_sends_no_contacts() {
+    // An app with `lists.read` alone uploads its deny list and no contacts, which it may not
+    // send (`403` for the whole upload): staged admission stays for the signer to end.
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &[Permission::ListsRead],
+        false,
+        true,
+    )
+    .await;
+    lost.next.lock().admission_staged = true;
+    let (_, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(!has(&events, |e| matches!(
+        e,
+        AppEvent::EvidenceRefused { .. }
+    )));
+    let lists = lost
+        .next
+        .uploads()
+        .into_iter()
+        .find_map(|(body, _)| body.get("lists").cloned())
+        .expect("the lists' upload");
+    assert!(lists.get("contacts").is_none(), "{lists}");
+    let next = lost.next.lock();
+    assert!(next.admission_staged);
+    assert!(next.shared.contacts.is_empty());
+    assert!(next.shared.deny.contains(&lost.dave));
+}
+
+/// The wallet's `POST /recovery/upload` of `body` at the lost world's next switch.
+fn upload_at_next(lost: &Lost, body: &str) -> (u16, serde_json::Value) {
+    let request = crate::transport::Request {
+        method: "POST".into(),
+        origin: NEXT.into(),
+        path_and_query: format!("/v1/{}/recovery/upload", lost.w.alice.id()),
+        headers: vec![crate::transport::Header::new(
+            "switch-app",
+            &pubky_switch_core::enc::zbase32_encode(&app_keys("wallet").app_id_bytes()),
+        )],
+        body: body.as_bytes().to_vec(),
+    };
+    let answer = lost.next.handle(&request).unwrap();
+    (answer.status, serde_json::from_slice(&answer.body).unwrap())
+}
+
+#[tokio::test]
+async fn test_loss_upload_refusals_come_in_the_services_order() {
+    // As at the service (Switch wire 7.2, 7.4.14): the caller's own checks before the body,
+    // so an app not current at the next switch yet gets `403 not_current` for a body that
+    // doesn't read; once it is current, `400`.
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let (status, body) = upload_at_next(&lost, "not json");
+    assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
+    follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let (status, body) = upload_at_next(&lost, "not json");
+    assert_eq!((status, body["code"].as_str()), (400, Some("bad_request")));
+}
+
+#[tokio::test]
+async fn test_loss_upload_is_limited_per_hour_and_the_lists_are_capped() {
+    // As at the service (Switch wire 7.4.14, 9.4): past `uploads_per_app_per_hour` an upload
+    // is `429 rate_limited` until the next hour of the switch's clock, and list entries past
+    // `max_deny` are dropped.
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    {
+        let mut next = lost.next.lock();
+        next.uploads_per_app_per_hour = 2;
+        next.max_deny = 0;
+    }
+    let (_, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    // The evidence and the lists both went, the two the hour takes.
+    assert!(!has(&events, |e| matches!(
+        e,
+        AppEvent::EvidenceRefused { .. }
+    )));
+    {
+        let next = lost.next.lock();
+        assert!(next.shared.contacts.contains(&lost.carol));
+        assert!(next.shared.deny.is_empty(), "past max_deny");
+    }
+    let (status, body) = upload_at_next(&lost, "{}");
+    assert_eq!((status, body["code"].as_str()), (429, Some("rate_limited")));
+    let wait = body["retry_after"].as_u64().unwrap();
+    assert!((1..=3600).contains(&wait), "{wait}");
+    lost.w.clock.advance_ms(wait * 1000);
+    assert_eq!(upload_at_next(&lost, "{}").0, 200);
+}
+
+#[tokio::test]
+async fn test_loss_upload_answered_503_is_sent_again_and_staging_ends() {
+    // A `503` the service may lift fails the step, which the next read sends again: the
+    // lists' upload that ends staged admission isn't given up (Switch wire 7.6, 7.4.14).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    lost.next.lock().admission_staged = true;
+    lost.next.fail_next(Fault::Error {
+        path: "recovery/upload".into(),
+        code: ErrorCode::Unavailable,
+        current: json!({}),
+    });
+    let error = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Unavailable), "{error:?}");
+    assert!(lost.next.lock().admission_staged);
+    let (_, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(!has(&events, |e| matches!(
+        e,
+        AppEvent::EvidenceRefused { .. }
+    )));
+    assert!(
+        !lost.next.lock().admission_staged,
+        "the lists went, and ended it"
+    );
+}
+
+#[tokio::test]
+async fn test_loss_upload_answered_429_waits_its_retry_after() {
+    // The lists' upload answered `429 rate_limited` is sent again only once its
+    // `retry_after` has passed by the device clock (Switch wire 7.6).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    {
+        let mut next = lost.next.lock();
+        next.admission_staged = true;
+        next.uploads_per_app_per_hour = 1;
+    }
+    let mut app = App::load(
+        lost.router
+            .env(&lost.w, Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    app.refresh_identity().await.unwrap();
+    let error = app.receive(None).await.unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::RateLimited), "{error:?}");
+    let sent = lost.next.uploads().len();
+    let error = app.receive(None).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(crate::app::Refusal::NotNow(_))),
+        "{error:?}"
+    );
+    assert_eq!(
+        lost.next.uploads().len(),
+        sent,
+        "nothing sent while it waits"
+    );
+    lost.w.clock.advance_ms(3_600_000);
+    app.receive(None).await.unwrap();
+    assert!(!lost.next.lock().admission_staged);
 }
 
 #[tokio::test]
@@ -4608,6 +4880,205 @@ async fn test_apps_answer_reports_what_the_switch_holds() {
     assert_eq!(
         apps["recovery"]["declared_at"],
         pubky_switch_core::time::rfc3339(declared)
+    );
+}
+
+#[tokio::test]
+async fn test_loss_claim_changed_by_an_upload_after_an_entry_here_is_read() {
+    // After the loss the app writes an attempt at the new switch (an entry at step 0).
+    // Another app's recovery upload then changes the claim as the core merge does (an
+    // attempt beside it: divergent, step 2, no entry). The switch lists the one entry, and
+    // the app reads the gapped claim without an alarm (Switch wire 7.4.8).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &Permission::ALL,
+        false,
+        true,
+    )
+    .await;
+    let (mut app, _) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    if app.reconcile_mode() {
+        app.end_reconcile(UserConfirmed::new()).await.unwrap();
+    }
+    app.write_claim(
+        ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+    upload_beside(&lost.next);
+    let read = app.read_claim(&CLAIM).await;
+    assert!(read.is_ok(), "the gapped claim is read: {read:?}");
+    assert!(app.alarm().is_none(), "{:?}", app.alarm());
+}
+
+#[tokio::test]
+async fn test_loss_claim_step_before_its_last_entry_is_a_rollback() {
+    // Even after a provider loss, a claim's step is never before its last entry's: a switch
+    // that shows one contradicts its answer (Switch wire 7.4.8).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &Permission::ALL,
+        false,
+        true,
+    )
+    .await;
+    let (mut app, _) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    if app.reconcile_mode() {
+        app.end_reconcile(UserConfirmed::new()).await.unwrap();
+    }
+    app.write_claim(
+        ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+    if let Some(claim) = lost.next.lock().shared.claims.get_mut(&CLAIM) {
+        claim.step = 0;
+    }
+    assert!(app.read_claim(&CLAIM).await.is_err());
+    assert!(
+        matches!(app.alarm(), Some(crate::app::Alarm::Rollback { .. })),
+        "{:?}",
+        app.alarm()
+    );
+}
+
+/// Another app's uploaded attempt beside the one `switch` holds at [`CLAIM`], merged as the
+/// core merges an upload: divergent, one step on, no entry.
+fn upload_beside(switch: &ScriptedSwitch) {
+    let mut next = switch.lock();
+    let held = next.shared.claims.get(&CLAIM).cloned();
+    let entry = pubky_switch_core::recovery::UploadedEntry {
+        entry: pubky_switch_core::claims::ClaimEntry {
+            claim_key: CLAIM,
+            attempt_id: [77; 16],
+            expected_step: 0,
+            kind: pubky_switch_core::claims::EntryKind::Attempt {
+                orphan_after: 60,
+                deadline: None,
+            },
+        },
+        writer: [9; 16],
+        proof: None,
+    };
+    let merge =
+        pubky_switch_core::recovery::merge_upload_claim(held.as_ref(), None, &[entry], START, 64);
+    assert!(merge.changed && merge.divergent, "{merge:?}");
+    next.shared.claims.insert(CLAIM, merge.claim.unwrap());
+}
+
+#[tokio::test]
+async fn test_claim_step_past_its_last_entry_outside_a_loss_is_a_rollback() {
+    // Outside a generation that began with a provider loss, a claim whose step is past its
+    // last entry's contradicts the answer: the read alarms.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &Permission::ALL,
+    )
+    .await;
+    app.write_claim(
+        ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+    upload_beside(&w.switch);
+    assert!(app.read_claim(&CLAIM).await.is_err());
+    assert!(
+        matches!(app.alarm(), Some(crate::app::Alarm::Rollback { .. })),
+        "{:?}",
+        app.alarm()
+    );
+}
+
+/// The lost world followed by an app holding every permission, which wrote an attempt at
+/// [`CLAIM`] at the new switch; then another app's upload changed the claim beside it.
+async fn gapped_after_a_loss() -> (Lost, App) {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &Permission::ALL,
+        false,
+        true,
+    )
+    .await;
+    let (mut app, _) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    if app.reconcile_mode() {
+        app.end_reconcile(UserConfirmed::new()).await.unwrap();
+    }
+    app.write_claim(
+        ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+    upload_beside(&lost.next);
+    (lost, app)
+}
+
+#[tokio::test]
+async fn test_gapped_claim_read_by_an_app_without_a_loss_record() {
+    // An app that holds no loss record, as one that joined at the new switch after the
+    // loss: the identity's identity.json carries `recovery_from`, so the rebuilt claim's gap
+    // is read without an alarm (Switch wire 7.4.8).
+    let (_lost, mut app) = gapped_after_a_loss().await;
+    let mut tx = app.tx().unwrap();
+    tx.delete(crate::app::recovery::keys::LOSS).unwrap();
+    app.commit(tx).await.unwrap();
+    assert!(app.state.own_doc.body().recovery_from.is_some());
+    let read = app.read_claim(&CLAIM).await;
+    assert!(read.is_ok(), "the gapped claim is read: {read:?}");
+    assert!(app.alarm().is_none(), "{:?}", app.alarm());
+}
+
+#[tokio::test]
+async fn test_gapped_claim_read_at_a_generation_after_the_loss() {
+    // An app whose loss record names an earlier generation than the one it serves now, as
+    // after a later move or key change: the claim's gap is still read (Switch wire 7.4.8,
+    // 10.5).
+    let (_lost, mut app) = gapped_after_a_loss().await;
+    let mut loss = app.loss_record().await.unwrap().unwrap();
+    loss.generation -= 1;
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::recovery::keys::LOSS, &loss).unwrap();
+    app.commit(tx).await.unwrap();
+    let read = app.read_claim(&CLAIM).await;
+    assert!(read.is_ok(), "the gapped claim is read: {read:?}");
+    assert!(app.alarm().is_none(), "{:?}", app.alarm());
+}
+
+#[tokio::test]
+async fn test_gapped_claim_that_isnt_rebuilt_is_a_rollback_after_a_loss() {
+    // Even at an identity that had a provider loss, a claim whose view isn't `rebuilt` and
+    // whose step is past its last entry's contradicts the answer: a service that dropped its
+    // newest entries (Switch wire 7.4.8).
+    let (lost, mut app) = gapped_after_a_loss().await;
+    if let Some(claim) = lost.next.lock().shared.claims.get_mut(&CLAIM) {
+        claim.rebuilt = false;
+    }
+    assert!(app.read_claim(&CLAIM).await.is_err());
+    assert!(
+        matches!(app.alarm(), Some(crate::app::Alarm::Rollback { .. })),
+        "{:?}",
+        app.alarm()
     );
 }
 

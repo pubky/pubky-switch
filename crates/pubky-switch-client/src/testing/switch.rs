@@ -25,6 +25,7 @@ use pubky_switch_core::ops::{
     sign_batch,
 };
 use pubky_switch_core::records::{AppCert, Freeze, IdentityDoc};
+use pubky_switch_core::recovery::{UploadBody, UploadChanges, UploadContext, check_upload};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::signing::Signs;
@@ -300,6 +301,14 @@ pub(crate) struct Inner {
     /// Admission is staged after a provider loss (Switch spec 12.6 step 2): a sender it can't
     /// otherwise admit gets `503 staged`.
     pub(crate) admission_staged: bool,
+    /// `POST /recovery/upload` calls per app per hour after a provider loss, and the most
+    /// contacts and deny entries an upload adds up to (Switch wire 9.2): the wire's defaults
+    /// unless a test sets them.
+    pub(crate) uploads_per_app_per_hour: u32,
+    pub(crate) max_contacts: u64,
+    pub(crate) max_deny: u64,
+    /// The uploads each app made in the hour of the switch's clock: the hour and the count.
+    upload_counts: BTreeMap<[u8; 16], (u64, u32)>,
     /// The `directory_version`: it moves whenever the directory changes.
     pub(crate) directory_version: u64,
     /// The origin the switch serves at, which an enrollment names (Switch wire 3.7).
@@ -389,6 +398,10 @@ impl Inner {
             reachable_since: BTreeMap::new(),
             open_admission: false,
             admission_staged: false,
+            uploads_per_app_per_hour: 60,
+            max_contacts: 100_000,
+            max_deny: 100_000,
+            upload_counts: BTreeMap::new(),
             directory_version: 0,
             origin: SWITCH_ORIGIN.to_owned(),
             enrolled: Some(signer::Enrolled::default()),
@@ -2207,6 +2220,32 @@ impl Inner {
         request: &Request,
         caller: Option<[u8; 16]>,
     ) -> Result<Answer, ScriptError> {
+        // In the service's order: the caller's own checks, then the stage, then the body
+        // (Switch wire 7.2, 7.4.14). A staged service takes an app's evidence before the app
+        // registers there (Switch spec 12.5 step 3).
+        let Some(app) = caller else {
+            return Ok(bad(
+                ErrorCode::PermissionMissing,
+                "an own app uploads",
+                json!(null),
+            ));
+        };
+        let cert = if self.staged {
+            None
+        } else {
+            match self.own_call(&app) {
+                Ok(cert) => Some(cert),
+                Err(refusal) => return Ok(batch::refused(&refusal)),
+            }
+        };
+        // Neither after a provider loss nor in a move (Switch wire 7.4.14 "Which stage").
+        if !self.staged && self.recovery_from.is_none() && self.continued_from.is_none() {
+            return Ok(bad(
+                ErrorCode::NotFound,
+                "neither after a provider loss nor in a move",
+                json!(null),
+            ));
+        }
         let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
             return Ok(bad(ErrorCode::BadRequest, "upload", json!(null)));
         };
@@ -2217,26 +2256,96 @@ impl Inner {
         if self.staged {
             return Ok((200, json!({ "heads": heads, "proofs": proofs })));
         }
+        if let (Some(recovery_from), Some(cert)) = (self.recovery_from, cert) {
+            return self.loss_upload(&request.body, app, &cert, recovery_from);
+        }
         let changes = json!({ "records": [], "divergent": [], "claims": [],
                               "divergent_claims": [], "unverified": 0, "distrusted": 0,
                               "refused": 0, "heads": heads,
                               "lists": body.get("lists").is_some() });
-        if self.recovery_from.is_some() {
-            let at = self.now();
-            let proof = self.service_transition(ServiceTransition::Upload {
-                by: caller.unwrap_or_default(),
-                changes: changes.clone(),
-                proofs,
-                at,
-            })?;
-            return Ok((
-                200,
-                json!({ "result": changes, "proof": proof, "head": self.head().to_value() }),
-            ));
-        }
         Ok((
             200,
             json!({ "heads": heads, "proofs": proofs, "merged": changes,
+                    "head": self.head().to_value() }),
+        ))
+    }
+
+    /// An upload after the loss of generation `recovery_from` (Switch wire 7.4.14), checked
+    /// by the core and merged as the service merges it, ending staged admission for
+    /// contacts from an app holding `lists.manage`: one `upload` transition, and `{ result,
+    /// proof, head }`.
+    fn loss_upload(
+        &mut self,
+        body: &[u8],
+        app: [u8; 16],
+        cert: &AppCert,
+        recovery_from: u64,
+    ) -> Result<Answer, ScriptError> {
+        let upload = match UploadBody::parse(body).and_then(|upload| {
+            upload.check_permissions(cert)?;
+            Ok(upload)
+        }) {
+            Ok(upload) => upload,
+            Err(refusal) => return Ok(batch::refused(&refusal)),
+        };
+        // Past `uploads_per_app_per_hour` in the hour of the switch's clock: `429`, with the
+        // seconds to the next hour (Switch wire 7.4.14, 9.4).
+        let (now, hour_ms) = (self.now(), 3_600_000);
+        let hour = now / hour_ms;
+        let count = self.upload_counts.entry(app).or_insert((hour, 0));
+        if count.0 < hour {
+            *count = (hour, 0);
+        }
+        if count.1 >= self.uploads_per_app_per_hour {
+            let next = count.0.saturating_add(1).saturating_mul(hour_ms);
+            let mut limited = bad(ErrorCode::RateLimited, "recovery uploads", json!(null));
+            limited.1["retry_after"] = json!(next.saturating_sub(now).div_ceil(1000).max(1));
+            return Ok(limited);
+        }
+        count.1 += 1;
+        let removed = self
+            .doc
+            .as_ref()
+            .map(|doc| doc.body().removed.clone())
+            .unwrap_or_default();
+        let identity = self.identity.public();
+        let checked = check_upload(
+            &upload,
+            &UploadContext {
+                identity: &identity,
+                recovery_from,
+                removed: &removed,
+            },
+        );
+        let mut changes = UploadChanges {
+            unverified: checked.unverified,
+            distrusted: checked.distrusted,
+            heads: checked.heads,
+            ..UploadChanges::default()
+        };
+        // The transition's `seq`, the next: a record taken from the upload is at it.
+        let seq = self.seq + 1;
+        let caps = (self.max_contacts, self.max_deny);
+        self.shared.merge_upload(
+            &checked,
+            upload.lists.as_ref(),
+            caps,
+            seq,
+            now,
+            &mut changes,
+        );
+        if upload.ends_staged_admission(cert) {
+            self.admission_staged = false;
+        }
+        let proof = self.service_transition(ServiceTransition::Upload {
+            by: app,
+            changes: changes.to_value(),
+            proofs: checked.proofs,
+            at: now,
+        })?;
+        Ok((
+            200,
+            json!({ "result": changes.to_value(), "proof": proof,
                     "head": self.head().to_value() }),
         ))
     }

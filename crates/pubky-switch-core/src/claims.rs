@@ -622,6 +622,7 @@ impl Claim {
                 })
                 .collect(),
             tombstone: self.tombstone,
+            rebuilt: self.rebuilt,
             deadline: self.pin.deadline(),
             divergent: self.divergent,
             next_possibly_duplicate: self.next_possibly_duplicate(),
@@ -683,6 +684,9 @@ pub struct ClaimView {
     pub divergent: bool,
     /// The next `attempt` would be flagged `possibly_duplicate`.
     pub next_possibly_duplicate: bool,
+    /// Rebuilt from uploads after a provider loss: its upload steps have no entry. Written
+    /// only when `true`.
+    pub rebuilt: bool,
 }
 
 impl ClaimView {
@@ -727,6 +731,9 @@ impl ClaimView {
             }
             if let Some(deadline) = self.deadline {
                 map.insert("deadline".into(), rfc3339(deadline).into());
+            }
+            if self.rebuilt {
+                map.insert("rebuilt".into(), true.into());
             }
         }
         view
@@ -792,6 +799,7 @@ impl ClaimView {
                 .transpose()?,
             divergent: flag(v, "divergent")?,
             next_possibly_duplicate: flag(v, "next_possibly_duplicate")?,
+            rebuilt: flag(v, "rebuilt")?,
         })
     }
 

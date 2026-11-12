@@ -64,6 +64,29 @@ pub fn recovery_clears() -> Vec<&'static str> {
     tables
 }
 
+impl super::Store {
+    /// The generation declared lost at `id`, read without the account's lock, while it
+    /// serves the generation a recovery began; `None` otherwise. A recovery upload judged
+    /// with it compares it with what it reads under the lock before it takes the judgment.
+    pub async fn recovery_from_of(&self, id: &str) -> Result<Option<u64>, StoreError> {
+        let row = sqlx::query("SELECT recovery_from, generation FROM accounts WHERE id = $1")
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(StoreError::from_db)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let from: Option<i64> = row.try_get("recovery_from")?;
+        let generation: i64 = row.try_get("generation")?;
+        let Some(from) = from else {
+            return Ok(None);
+        };
+        let from = from_db(from, "recovery_from")?;
+        Ok((from.checked_add(1) == Some(from_db(generation, "generation")?)).then_some(from))
+    }
+}
+
 impl AccountTxn {
     /// The recovery the generation the account serves began with, if it began with one: a
     /// recovery the account records for an earlier generation counts for nothing.

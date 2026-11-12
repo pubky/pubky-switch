@@ -20,6 +20,7 @@ use crate::claims::{
 };
 use crate::enc::b64;
 use crate::ops::RecordVersion;
+use crate::shared::RecordState;
 use crate::{Error, Result};
 
 /// The version an uploaded `record.put` is merged at (Switch wire 7.4.14 "Records").
@@ -42,10 +43,16 @@ impl UploadVersion {
 
     /// The lower bound of a write without a proof: the least version of the operation's own
     /// generation above the one it built on, `expected_version` (Switch wire 7.4.14). `None`
-    /// when it built on a later generation than its own, which no service applies.
+    /// when it built on a later generation than its own, which no service applies, or when
+    /// the bound would be past 2^53 - 1, which no record view carries and no operation names
+    /// (Switch wire 1.1).
     pub fn bound(op_generation: u64, built_on: RecordVersion) -> Option<Self> {
         let version = if built_on.generation == op_generation {
-            RecordVersion::new(op_generation, built_on.version.checked_add(1)?)
+            let next = built_on.version.checked_add(1)?;
+            if next > crate::json::MAX_INT {
+                return None;
+            }
+            RecordVersion::new(op_generation, next)
         } else if built_on.generation < op_generation {
             RecordVersion::new(op_generation, 1)
         } else {
@@ -189,6 +196,37 @@ pub fn merge_record(
             } else {
                 RecordMerge::Unchanged
             }
+        }
+    }
+}
+
+/// Merge a checked upload into the record the service holds at its key, whose state is
+/// `state` (`None` when it lacks one): [`merge_record`], except that an upload whose
+/// collection or policy isn't the record's is divergent, since a write with them is refused
+/// (Switch wire 6.2): it can't build on the record.
+pub fn merge_checked_record(
+    held: &HeldRecord<'_>,
+    state: Option<&RecordState>,
+    upload: &CheckedRecord,
+    max_divergent: usize,
+) -> RecordMerge {
+    let other_shape = state.is_some_and(|state| {
+        state.collection != upload.put.collection || state.policy != upload.put.policy
+    });
+    if !other_shape {
+        return merge_record(held, &upload.uploaded, max_divergent);
+    }
+    let kept = match *held {
+        HeldRecord::FromUpload { divergent, .. } | HeldRecord::WrittenHere { divergent, .. } => {
+            divergent
+        }
+        HeldRecord::Lacking => &[],
+    };
+    if kept.contains(&upload.uploaded.op_hash) {
+        RecordMerge::Unchanged
+    } else {
+        RecordMerge::Divergent {
+            kept: kept.len() < max_divergent,
         }
     }
 }
@@ -535,6 +573,49 @@ pub fn tombstone_from_proof(view: &ClaimView, at: u64) -> Option<Claim> {
     })
 }
 
+/// Merge an upload's evidence for one claim key: on an obligation the service holds nothing
+/// for, a SETTLED proof among the upload's `proofs` (`settled`, the view and the proof's
+/// time) first rebuilds its tombstone (Switch wire 7.4.14 "`heads` and `proofs`"), and the
+/// entries then merge into it as into any claim ([`merge_claim`]). On one it holds open and
+/// unsettled after the entries, the proof makes it divergent (doubtful), so an app that
+/// attempted again here is warned by another app's settled evidence, as after a move; one
+/// it holds settled the proof doesn't change.
+pub fn merge_upload_claim(
+    held: Option<&Claim>,
+    settled: Option<&(ClaimView, u64)>,
+    entries: &[UploadedEntry],
+    now: u64,
+    max_attempts: u64,
+) -> ClaimMerge {
+    let rebuilt = match (held, settled) {
+        (None, Some((view, at))) => tombstone_from_proof(view, *at),
+        _ => None,
+    };
+    let Some(tombstone) = rebuilt else {
+        let mut merge = merge_claim(held, entries, now, max_attempts);
+        if held.is_some()
+            && settled.is_some()
+            && let Some(claim) = merge.claim.as_mut()
+            && !claim.settled
+            && !claim.tombstone
+            && !claim.divergent
+        {
+            claim.divergent = true;
+            if !merge.changed {
+                claim.rebuilt = true;
+                claim.step = claim.step.saturating_add(1);
+                claim.last_entry = Some(now);
+                merge.changed = true;
+            }
+            merge.divergent = true;
+        }
+        return merge;
+    };
+    let mut merge = merge_claim(Some(&tombstone), entries, now, max_attempts);
+    merge.changed = true;
+    merge
+}
+
 /// What an upload changed, as the `upload` transition and the upload's answer list it (Switch
 /// wire 7.4.14 "Answer", 6.5).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -640,6 +721,13 @@ impl UploadChanges {
         })
     }
 }
+
+mod upload;
+
+pub use upload::{
+    CheckedRecord, CheckedUpload, UploadBody, UploadContext, UploadLists, UploadedOp, check_upload,
+    proved_version,
+};
 
 #[cfg(test)]
 mod tests;
