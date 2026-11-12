@@ -154,15 +154,27 @@ pub enum Alert {
     /// to remove. The user renews or reduces it again, or revokes it.
     ///
     /// Raised whichever call met it, the renewal's own or a later [`crate::Signer::resume`]
-    /// or [`crate::Signer::run_due`], for a renewal the user asked for and for an automatic
-    /// one, which the next run tries again; a later one for the same app updates it in its
-    /// place. Not raised for an app being revoked, whose removal tells of it. Cleared once a
-    /// version removing the app is delivered, or, for a renewal the user asked for
-    /// (`by_user`), once a renewal the user asks for is delivered for it: an automatic
-    /// renewal, which keeps the app's scopes, doesn't clear that one. One raised for an
-    /// automatic renewal goes once any renewal of the app is delivered. A user who clears it
-    /// doesn't see it again. It is this install's own: a restore, in place or on a new
-    /// install, doesn't bring it back, since the listed certificate shows what the app holds.
+    /// or [`crate::Signer::run_due`], for a renewal the user asked for (`by_user`) and for an
+    /// automatic one, which the next run tries again. One per app, kept in its place, and the
+    /// user's wins: a refused automatic renewal leaves the user's alert as it is, and a second
+    /// refused renewal the user asked for adds what it asks to the first's. Not raised for an
+    /// app being revoked, whose removal tells of it.
+    ///
+    /// Whether it holds is judged from the certificate `identity.json` lists for the app,
+    /// whoever's renewal listed it, against what the user asked, which the records keep
+    /// beside the alert:
+    ///
+    /// - a reduction the user asked for stays while that certificate still holds a scope the
+    ///   user asked to remove, or expires later than they asked;
+    /// - another renewal the user asked for stays until a certificate holding what they asked
+    ///   is listed, or a later renewal they ask for is delivered for the app;
+    /// - an automatic renewal's stays until the app is renewed;
+    /// - each goes once a version removing the app is delivered.
+    ///
+    /// A user who clears it doesn't see it again, and what they asked goes with it. It is this
+    /// install's own: a restore, in place or on a new install, doesn't bring it back, nor what
+    /// the user asked, which only this install knew; the listed certificate shows what the app
+    /// holds.
     RenewalRefused {
         /// The app.
         app_id: [u8; 16],

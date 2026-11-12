@@ -553,6 +553,8 @@ impl Signer {
         }
         let mut state = self.state.clone();
         state.alerts.retain(|held| held != alert);
+        // What the user asked of a refused renewal goes with its alert (Switch spec 3.2).
+        renewal::keep_asked_with_alerts(&mut state);
         // An erased account has no switch to deliver to or read: the alert goes, nothing else
         // (Switch spec 12.7).
         if self.state.erased {
@@ -1448,20 +1450,35 @@ impl Signer {
         // the app, or a version removing it: an automatic renewal keeps the scopes the user
         // may have asked to remove (Switch spec 3.2).
         if let Ok(delivered) = &verified {
-            let asked = std::mem::take(&mut state.user_renewals);
+            let renewed_by_user = std::mem::take(&mut state.user_renewals);
             let before = state.newest_doc()?;
+            let asked = state.asked_renewals.clone();
+            let certs = self.held_certs()?;
             state.alerts.retain(|alert| match alert {
                 Alert::RenewalRefused {
                     app_id, by_user, ..
                 } => delivered.listed_cert(app_id).is_some_and(|now| {
-                    if *by_user {
-                        !asked.contains(&(*app_id, now))
-                    } else {
-                        before.as_ref().and_then(|b| b.listed_cert(app_id)) == Some(now)
+                    if !*by_user {
+                        // An automatic renewal's: until the app is renewed.
+                        return before.as_ref().and_then(|b| b.listed_cert(app_id)) == Some(now);
                     }
+                    // The user's: judged from the certificate listed now, whoever renewed it.
+                    let Some(asked) = asked.iter().find(|a| a.app_id == *app_id) else {
+                        return true;
+                    };
+                    let met = certs
+                        .iter()
+                        .find(|cert| cert.hash() == now)
+                        .is_some_and(|cert| asked.met_by(cert));
+                    // Another renewal the user asks for, delivered, ends one that reduces
+                    // nothing: it is the user's newest choice.
+                    let superseded =
+                        !asked.reduction() && renewed_by_user.contains(&(*app_id, now));
+                    !(met || superseded)
                 }),
                 _ => true,
             });
+            renewal::keep_asked_with_alerts(&mut state);
         }
         // How close the version comes to the most a delivery, or a move's enrollment, may
         // carry (Switch wire 3.7, 7.1).

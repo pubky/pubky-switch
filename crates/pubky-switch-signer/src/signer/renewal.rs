@@ -53,7 +53,7 @@ use crate::alert::{Alert, RenewalSkip};
 use crate::error::{Refusal, Result, SignerError};
 use crate::key::SigningKey;
 use crate::protocol::Protocols;
-use crate::state::{Bytes, DeliverStep, Flow, PendingClaim, RenewBatch, SignerState};
+use crate::state::{AskedRenewal, Bytes, DeliverStep, Flow, PendingClaim, RenewBatch, SignerState};
 
 /// The most signed operations in one batch (Switch wire 6.4).
 const MAX_OPS: usize = 8;
@@ -191,7 +191,8 @@ impl Signer {
                 if let Err(error) = self.complete_epoch(&statuses, switch_time).await {
                     if matches!(by, RenewedBy::User) {
                         let mut state = self.state.clone();
-                        refused_in(&mut state, app_id, is_reduction(&old, &new), true);
+                        let asked = AskedRenewal::between(app_id, &old, &new);
+                        refused_in(&mut state, app_id, Some(asked));
                         self.commit(state, self.flow.clone()).await?;
                     }
                     return Err(error);
@@ -571,12 +572,21 @@ impl Signer {
             if listed == app.cert || cut_off {
                 continue;
             }
-            let reduction = match (held(listed), held(app.cert)) {
-                (Some(old), Some(new)) => is_reduction(old, new),
-                _ => false,
-            };
-            let by_user = asked.contains(&(app.app_id, app.cert));
-            refused_in(state, app.app_id, reduction, by_user);
+            // What the user asked, judged from the two certificates; an automatic renewal's
+            // asks nothing of the user's.
+            let by_user = asked.contains(&(app.app_id, app.cert)).then(|| {
+                match (held(listed), held(app.cert)) {
+                    (Some(old), Some(new)) => AskedRenewal::between(app.app_id, old, new),
+                    _ => AskedRenewal {
+                        app_id: app.app_id,
+                        remove: Vec::new(),
+                        expires_by: None,
+                        add: Vec::new(),
+                        expires_from: None,
+                    },
+                }
+            });
+            refused_in(state, app.app_id, by_user);
         }
         Ok(())
     }
@@ -1149,12 +1159,36 @@ pub(super) fn push_parts(
 }
 
 /// Raise [`Alert::RenewalRefused`] for `app_id` in `state`, or bring the one held up to date
-/// in its place (Switch spec 3.2).
-fn refused_in(state: &mut SignerState, app_id: [u8; 16], reduction: bool, by_user: bool) {
-    let fresh = Alert::RenewalRefused {
-        app_id,
-        reduction,
-        by_user,
+/// in its place (Switch spec 3.2). `asked` is what the user asked of the renewal, `None` for an
+/// automatic one. One alert per app, and the user's wins: an automatic renewal's refusal
+/// leaves the user's alert and what they asked as they are, while a second renewal the user
+/// asked for adds what it asks to the first's.
+pub(super) fn refused_in(state: &mut SignerState, app_id: [u8; 16], asked: Option<AskedRenewal>) {
+    keep_asked_with_alerts(state);
+    let fresh = match asked {
+        None if state.asked_renewals.iter().any(|a| a.app_id == app_id) => return,
+        None => Alert::RenewalRefused {
+            app_id,
+            reduction: false,
+            by_user: false,
+        },
+        Some(asked) => {
+            let merged = match state.asked_renewals.iter_mut().find(|a| a.app_id == app_id) {
+                Some(held) => {
+                    held.merge(&asked);
+                    held.clone()
+                }
+                None => {
+                    state.asked_renewals.push(asked.clone());
+                    asked
+                }
+            };
+            Alert::RenewalRefused {
+                app_id,
+                reduction: merged.reduction(),
+                by_user: true,
+            }
+        }
     };
     let held = state.alerts.iter_mut().find(
         |alert| matches!(alert, Alert::RenewalRefused { app_id: held, .. } if *held == app_id),
@@ -1163,4 +1197,16 @@ fn refused_in(state: &mut SignerState, app_id: [u8; 16], reduction: bool, by_use
         Some(held) => *held = fresh,
         None => state.alert(fresh),
     }
+}
+
+/// Keep what the user asked only beside the alert it goes with: an alert cleared, by the user
+/// or by its rule, takes it along (Switch spec 3.2).
+pub(super) fn keep_asked_with_alerts(state: &mut SignerState) {
+    let alerts = &state.alerts;
+    state.asked_renewals.retain(|asked| {
+        alerts.iter().any(|alert| {
+            matches!(alert, Alert::RenewalRefused { app_id, by_user: true, .. }
+                if *app_id == asked.app_id)
+        })
+    });
 }

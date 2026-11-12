@@ -2653,8 +2653,9 @@ async fn test_renewal_refused_tells_the_user_whichever_call_meets_it() {
 
 #[tokio::test]
 async fn test_renewal_refused_alert_goes_once_the_app_is_renewed_or_removed() {
-    // The alert stays through other apps' renewals and runs, a later refusal for the same app
-    // replacing it, and goes once a version that renews the app, or removes it, is delivered. One the user cleared isn't raised again by
+    // The alert stays through other apps' renewals and runs, a later refused renewal the user
+    // asked for adding to it, and goes once the app's listed certificate holds none of the
+    // scopes the user asked to remove, or the app is removed. One the user cleared isn't raised again by
     // the runs after (Switch spec 3.2).
     for ending in ["renewed", "removed", "cleared"] {
         let world = World::new();
@@ -2668,7 +2669,8 @@ async fn test_renewal_refused_alert_goes_once_the_app_is_renewed_or_removed() {
             .renew(a_id, reduce(&["notes_sync"]))
             .await
             .unwrap_err();
-        // A second refusal for the same app replaces the first alert.
+        // A second refused renewal the user asked for adds to what the first asked: the
+        // alert stays a reduction's, in its place.
         world.switch.fail_next(refusal("/identity"));
         signer
             .renew(
@@ -2682,12 +2684,12 @@ async fn test_renewal_refused_alert_goes_once_the_app_is_renewed_or_removed() {
             .unwrap_err();
         assert_eq!(
             refused_renewals(&signer),
-            [(a_id, false)],
-            "{ending}: replaced"
+            [(a_id, true)],
+            "{ending}: merged"
         );
         let held = Alert::RenewalRefused {
             app_id: a_id,
-            reduction: false,
+            reduction: true,
             by_user: true,
         };
         signer
@@ -2701,7 +2703,7 @@ async fn test_renewal_refused_alert_goes_once_the_app_is_renewed_or_removed() {
             .await
             .unwrap();
         signer.run_due().await.unwrap();
-        assert_eq!(refused_renewals(&signer), [(a_id, false)], "{ending}: kept");
+        assert_eq!(refused_renewals(&signer), [(a_id, true)], "{ending}: kept");
         // A renewal issued after the certificate the refused delivery stored with `cert.put`.
         world.clock.advance_ms(1_000);
         match ending {
@@ -2794,12 +2796,34 @@ async fn test_renewal_refused_survives_a_crash_before_its_commit() {
             .await
             .unwrap();
         // When the flow is still there, its batch meets the same refusal again.
-        world.switch.fail_next(refusal("/ops"));
-        let _ = restarted.resume().await;
+        if restarted.set_record_max_age(Some(3_600)).await == Err(Refusal::FlowInProgress.into()) {
+            world.switch.fail_next(refusal("/ops"));
+            restarted.resume().await.unwrap_err();
+        }
         assert_eq!(refused_renewals(&restarted), [(id, true)], "{n}");
+        assert!(
+            restarted.alerts().contains(&Alert::RenewalRefused {
+                app_id: id,
+                reduction: true,
+                by_user: true,
+            }),
+            "{n}: the user's, across the restart"
+        );
         let doc = restarted.identity_doc().unwrap().unwrap();
-        assert_eq!(doc.hash(), before.hash(), "{n}");
+        assert_eq!(
+            doc.listed_cert(&id),
+            before.listed_cert(&id),
+            "{n}: not reduced"
+        );
         restarted.set_record_max_age(Some(86_400)).await.unwrap();
+        // What the user asked was kept across the restart: another request removing `notes`
+        // ends the alert.
+        world.clock.advance_ms(1_000);
+        restarted
+            .renew(id, reduce(&["notes_sync", "notes_tags"]))
+            .await
+            .unwrap();
+        assert!(refused_renewals(&restarted).is_empty(), "{n}: met");
     }
 }
 
@@ -2893,8 +2917,9 @@ async fn test_renewal_refused_by_a_stale_identity_tells_the_user() {
 
 #[tokio::test]
 async fn test_renewal_refused_again_keeps_the_alerts_place() {
-    // A second refusal for an app brings its alert up to date where it is, after which the
-    // other app's still comes (Switch spec 3.2).
+    // A second refused renewal for an app adds to what the first asked and keeps its alert
+    // where it is, a reduction's still, after which the other app's still comes (Switch spec
+    // 3.2).
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let (a, b) = two_apps(&["notes", "notes_sync"], &["notes", "notes_sync"]);
@@ -2922,7 +2947,7 @@ async fn test_renewal_refused_again_keeps_the_alerts_place() {
         )
         .await
         .unwrap_err();
-    assert_eq!(refused_renewals(&signer), [(a_id, false), (b_id, true)]);
+    assert_eq!(refused_renewals(&signer), [(a_id, true), (b_id, true)]);
 }
 
 #[tokio::test]
@@ -3032,4 +3057,200 @@ async fn test_renewal_of_an_app_revoked_meanwhile_isnt_told_as_refused() {
     assert!(refused_renewals(&signer).is_empty());
     let doc = signer.identity_doc().unwrap().unwrap();
     assert!(doc.listed_cert(&id).is_none(), "removed");
+}
+
+#[tokio::test]
+async fn test_renewal_refused_automatic_refusal_leaves_the_users_alert() {
+    // The user's reduction is refused. The next run's automatic renewal is refused too, and
+    // leaves the user's alert as it is; the one after goes through, keeping `notes`, and the
+    // alert stays, since the app still holds the scope the user asked to remove (Switch spec
+    // 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes", "notes_sync"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    let users = Alert::RenewalRefused {
+        app_id: id,
+        reduction: true,
+        by_user: true,
+    };
+    world.clock.advance_ms(LIFETIME_MS / 2 - DAY_MS);
+    world.switch.fail_next(refusal("/ops"));
+    signer.renew(id, reduce(&["notes_sync"])).await.unwrap_err();
+    assert_eq!(signer.alerts(), std::slice::from_ref(&users));
+    world.clock.advance_ms(2 * DAY_MS);
+    world.switch.fail_next(refusal("/identity"));
+    signer.run_due().await.unwrap_err();
+    assert_eq!(
+        signer.alerts(),
+        std::slice::from_ref(&users),
+        "the user's wins"
+    );
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(
+        listed_cert(&signer, &doc, &id)
+            .scopes()
+            .iter()
+            .any(|s| s == "notes")
+    );
+    assert!(signer.alerts().contains(&users), "notes still held");
+}
+
+#[tokio::test]
+async fn test_renewal_refused_reduction_stays_through_the_users_renewal_that_keeps_the_scope() {
+    // A later renewal the user asks for that only extends the expiry keeps `notes`, which the
+    // refused reduction asked to remove: the alert stays (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes", "notes_sync"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.fail_next(refusal("/ops"));
+    signer.renew(id, reduce(&["notes_sync"])).await.unwrap_err();
+    world.clock.advance_ms(1_000);
+    signer
+        .renew(
+            id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(START_MS + 400 * DAY_MS),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused_renewals(&signer), [(id, true)]);
+}
+
+#[tokio::test]
+async fn test_renewal_refused_reduction_is_judged_by_the_listed_certificate() {
+    // The refused reduction asked to remove `notes`. A later request removing `notes_tags`
+    // only leaves `notes` held, and the alert stays; another that removes `notes`, whatever
+    // else it asks, ends it (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes", "notes_sync", "notes_tags"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.fail_next(refusal("/ops"));
+    signer
+        .renew(id, reduce(&["notes_sync", "notes_tags"]))
+        .await
+        .unwrap_err();
+    assert_eq!(refused_renewals(&signer), [(id, true)]);
+    world.clock.advance_ms(1_000);
+    signer
+        .renew(id, reduce(&["notes", "notes_sync"]))
+        .await
+        .unwrap();
+    assert_eq!(refused_renewals(&signer), [(id, true)], "notes still held");
+    world.clock.advance_ms(1_000);
+    signer.renew(id, reduce(&["notes_sync"])).await.unwrap();
+    assert!(refused_renewals(&signer).is_empty(), "notes removed");
+}
+
+#[tokio::test]
+async fn test_renewal_refused_plain_renewal_is_met_by_what_it_asked() {
+    // The user's renewal adding `notes_tags` is refused. An automatic renewal, which doesn't
+    // add it, leaves the alert; a certificate holding it ends it (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    world.clock.advance_ms(LIFETIME_MS / 2 - DAY_MS);
+    world.switch.fail_next(refusal("/ops"));
+    signer
+        .renew(id, reduce(&["notes", "notes_tags"]))
+        .await
+        .unwrap_err();
+    assert_eq!(refused_renewals(&signer), [(id, false)]);
+    world.clock.advance_ms(2 * DAY_MS);
+    signer.run_due().await.unwrap();
+    assert_eq!(refused_renewals(&signer), [(id, false)], "not added");
+    world.clock.advance_ms(1_000);
+    signer
+        .renew(id, reduce(&["notes", "notes_tags"]))
+        .await
+        .unwrap();
+    assert!(refused_renewals(&signer).is_empty(), "added");
+}
+
+#[tokio::test]
+async fn test_renewal_refused_earlier_expiry_stays_until_the_certificate_expires_by_then() {
+    // The user's reduction to an earlier expiry is refused. A later renewal the user asks for
+    // that keeps the later expiry leaves the alert; one expiring by the time asked ends it
+    // (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    let by = START_MS + 30 * DAY_MS;
+    world.switch.fail_next(refusal("/ops"));
+    signer
+        .renew(
+            id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(by),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused_renewals(&signer), [(id, true)]);
+    world.clock.advance_ms(1_000);
+    signer
+        .renew(
+            id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(START_MS + 200 * DAY_MS),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused_renewals(&signer), [(id, true)], "expires later");
+    world.clock.advance_ms(1_000);
+    signer
+        .renew(
+            id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(by - DAY_MS),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(refused_renewals(&signer).is_empty(), "expires by then");
+}
+
+#[tokio::test]
+async fn test_renewal_refused_plain_renewal_ends_at_the_users_next_renewal() {
+    // The user's renewal adding `notes_tags` is refused. A later renewal the user asks for
+    // that doesn't add it is the user's newest choice, and ends the alert (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.fail_next(refusal("/ops"));
+    signer
+        .renew(id, reduce(&["notes", "notes_tags"]))
+        .await
+        .unwrap_err();
+    assert_eq!(refused_renewals(&signer), [(id, false)]);
+    world.clock.advance_ms(1_000);
+    signer
+        .renew(
+            id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(START_MS + 400 * DAY_MS),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(refused_renewals(&signer).is_empty());
 }

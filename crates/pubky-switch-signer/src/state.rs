@@ -13,9 +13,10 @@
 use pubky_switch_client::store::{StoreHandle, WriteBatch};
 use pubky_switch_core::enc::zbase32_encode;
 use pubky_switch_core::records::{
-    DEFAULT_CERT_LIFETIME_MS, IdentityDoc, IdentityPolicy, Limits, SignerBackup, SignerHandover,
-    StoredPart,
+    AppCert, DEFAULT_CERT_LIFETIME_MS, IdentityDoc, IdentityPolicy, Limits, SignerBackup,
+    SignerHandover, StoredPart,
 };
+use pubky_switch_core::scopes;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,92 @@ pub fn signer_namespace(identity: &[u8; 32]) -> String {
 }
 
 /// The switch the identity is enrolled at (Switch wire 3.7).
+/// What the user asked of an app's renewal that didn't happen (Switch spec 3.2): the scopes
+/// to remove and an earlier expiry, which make it a reduction, and the scopes to add and a
+/// later expiry. A second one the user asks for the same app adds to it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AskedRenewal {
+    /// The app.
+    pub(crate) app_id: [u8; 16],
+    /// The scopes the user asked to remove.
+    pub(crate) remove: Vec<String>,
+    /// The earliest expiry the user asked for, when earlier than the certificate's.
+    pub(crate) expires_by: Option<u64>,
+    /// The scopes the user asked to add.
+    pub(crate) add: Vec<String>,
+    /// The latest expiry the user asked for, when later than the certificate's.
+    pub(crate) expires_from: Option<u64>,
+}
+
+impl AskedRenewal {
+    /// What renewing `old` into `new` asks of the app `app_id`.
+    pub(crate) fn between(app_id: [u8; 16], old: &AppCert, new: &AppCert) -> Self {
+        let missing = |held: &AppCert, from: &AppCert| -> Vec<String> {
+            from.scopes()
+                .iter()
+                .filter(|scope| !scopes::holds(held.scopes(), scope))
+                .cloned()
+                .collect()
+        };
+        Self {
+            app_id,
+            remove: missing(new, old),
+            expires_by: (new.expires_at() < old.expires_at()).then(|| new.expires_at()),
+            add: missing(old, new),
+            expires_from: (new.expires_at() > old.expires_at()).then(|| new.expires_at()),
+        }
+    }
+
+    /// Add what `later` asks: every scope either asks to remove or to add, the earlier of the
+    /// two earlier expiries and the later of the two later ones.
+    pub(crate) fn merge(&mut self, later: &AskedRenewal) {
+        for scope in &later.remove {
+            if !self.remove.contains(scope) {
+                self.remove.push(scope.clone());
+            }
+        }
+        for scope in &later.add {
+            if !self.add.contains(scope) {
+                self.add.push(scope.clone());
+            }
+        }
+        self.expires_by = match (self.expires_by, later.expires_by) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.expires_from = match (self.expires_from, later.expires_from) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+    }
+
+    /// Whether the user asked to reduce the app: to remove a scope or expire it earlier.
+    pub(crate) fn reduction(&self) -> bool {
+        !self.remove.is_empty() || self.expires_by.is_some()
+    }
+
+    /// Whether `cert` holds what the user asked: for a reduction, none of the scopes to
+    /// remove, by the scope hierarchy, and an expiry no later than asked; otherwise every
+    /// scope to add and an expiry no earlier than asked, when something was asked.
+    pub(crate) fn met_by(&self, cert: &AppCert) -> bool {
+        if self.reduction() {
+            self.remove
+                .iter()
+                .all(|scope| !scopes::holds(cert.scopes(), scope))
+                && self.expires_by.is_none_or(|by| cert.expires_at() <= by)
+        } else {
+            (!self.add.is_empty() || self.expires_from.is_some())
+                && self
+                    .add
+                    .iter()
+                    .all(|scope| scopes::holds(cert.scopes(), scope))
+                && self
+                    .expires_from
+                    .is_none_or(|from| cert.expires_at() >= from)
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Service {
     /// The switch origin, exactly as `identity.json` names it.
@@ -225,10 +312,16 @@ pub(crate) struct SignerState {
     #[serde(default)]
     pub(crate) revoke_at_service: bool,
     /// The renewals the user asked for, each as its app and the new certificate's hash, whose
-    /// flow is in progress: the one delivered ends that app's [`Alert::RenewalRefused`], which
-    /// an automatic renewal doesn't (Switch spec 3.2). Emptied once the flow ends.
+    /// flow is in progress: one delivered ends that app's [`Alert::RenewalRefused`] for a
+    /// renewal that reduced nothing, as the user's newest choice, and one refused is the
+    /// user's, with what it asked (Switch spec 3.2). Emptied once the flow ends.
     #[serde(default)]
     pub(crate) user_renewals: Vec<([u8; 16], [u8; 32])>,
+    /// What the user asked of each renewal that didn't happen, beside its
+    /// [`Alert::RenewalRefused`]: whether the alert holds is judged from the certificate
+    /// `identity.json` lists against it (Switch spec 3.2). One per app; it goes with the alert.
+    #[serde(default)]
+    pub(crate) asked_renewals: Vec<AskedRenewal>,
     /// Some version of the identity was published on the Homeserver, by this install or,
     /// for records restored or received, by the install they came from (Switch spec 4.3). A
     /// missing `identity.json` is explained without it only by an erasure (Switch spec 12.6
@@ -456,6 +549,7 @@ impl SignerState {
             homeserver_copy_waived: false,
             revoke_at_service: false,
             user_renewals: Vec::new(),
+            asked_renewals: Vec::new(),
             ever_published: false,
             recovery_origin: None,
             recovery_services: Vec::new(),
