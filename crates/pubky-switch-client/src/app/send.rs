@@ -1306,7 +1306,6 @@ impl App {
         Ok(())
     }
 
-    /// A complete item leaves the outbox; its sent message is kept from its acceptance.
     /// Give up the record job of `item`, still owed [`SENT_RETENTION_MS`] after its first
     /// acceptance, such as one whose held value waits for a key that never comes: in one
     /// commit with [`AppEvent::RecordJobDropped`], the item kept only while a re-send of it
@@ -1329,6 +1328,7 @@ impl App {
         self.commit(tx).await
     }
 
+    /// A complete item leaves the outbox; its sent message is kept from its acceptance.
     async fn finish_item(&mut self, item: &OutboxItem) -> Result<(), AppError> {
         let mut tx = self.tx()?;
         tx.delete(&out_key(&item.msg_id))?;

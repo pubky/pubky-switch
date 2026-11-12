@@ -1094,7 +1094,8 @@ impl App {
     /// batches", Switch wire 6.4 step 6). Its original proofs, or `409 conflict` after an
     /// import, show it applied: what it settles commits and nothing is signed again. `409
     /// stale_generation` shows it never applied: its operations are signed again for the
-    /// generation followed, under a new batch ID, and sent, but only while the answer can
+    /// generation followed, their bytes under a new wire batch ID while the batch stays kept
+    /// under its first one (`kept.rs`), and sent, but only while the answer can
     /// tell: one kept longer than the service holds batch IDs is dropped instead, and
     /// reported with each `attempt` in it. Another refusal for good drops it; any other
     /// failure keeps it, and is the caller's error.

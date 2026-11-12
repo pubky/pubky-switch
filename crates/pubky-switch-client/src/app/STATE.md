@@ -230,7 +230,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   switch, since the record and the newest key go in the re-registration. A kept
   `pending/effect` or `opq/<batch_id>` whose batch ID the old chain holds was applied: its
   outcome commits at the switch. Otherwise the effect goes, and its entry is read again;
-  a kept `opq/` batch is signed again for the new generation under a new batch ID. A
+  a kept `opq/` batch is signed again for the new generation, its bytes under a new wire
+  batch ID, still kept under the ID it was first kept under. A
   frozen service's `410 moved` keeps them for the switch. A move the app never saw frozen,
   or a key change in place, didn't read the old feed to its end: its kept batches and
   effect stay unchanged and go again first, and the answer decides (original proofs or
@@ -293,8 +294,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `clread/<claim_key>` | a claim the app holds and doesn't hold as finished (SETTLED with every attempt `done` or `failed`), to read again, with the device time it was marked; read at the end of a read, at most `CLAIM_REREADS_PER_READ` (16) per read, oldest mark first, and removed in the commit of any read of the claim, a `404` included, or when its evidence goes | |
 
 Deleting the keys on a leave also removes `rec/`, `hw/`, `recname/`, `out/`, `sent/`,
-`sentt/`, `invite/` and `opq/`; the ends of kept batches and their indexes (`kb/`, `kbt/`,
-`kbm/`, `kba/`) hold no content and stay, answered until their retention. A restore replaces the namespace, these keys included, but
+`sentt/`, `invite/` and `opq/`, and the ends of kept batches and their indexes (`kb/`,
+`kbt/`, `kbm/`, `kba/`): a left app flushes no outbox, so nothing would prune them after. A restore replaces the namespace, these keys included, but
 for the `out/` records its backup carries, and sets `list_due`. `rec/`, `clent/` and `claim/` hold the evidence of the shared state that
 uploads carry (`App::shared_evidence`).
 

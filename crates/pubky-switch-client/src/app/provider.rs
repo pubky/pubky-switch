@@ -1117,7 +1117,8 @@ impl App {
     ///   processed again and an effect without conditions is never applied twice; otherwise
     ///   it goes, and its entry is read again and its effect signed anew.
     /// - **`opq/<batch_id>`:** applied, what it settles commits and it goes; otherwise its
-    ///   operations are signed again for the new generation and kept under a new batch ID,
+    ///   operations are signed again for the new generation, their bytes under a new wire
+    ///   batch ID, and stay kept under the ID the batch was first kept under (`kept.rs`),
     ///   sent with the next write. After a loss, one holding an `attempt` goes instead: no
     ///   automatic attempt is made on an obligation from before the loss (Switch spec 12.6
     ///   step 5).

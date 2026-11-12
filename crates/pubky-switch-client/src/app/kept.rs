@@ -64,8 +64,12 @@ pub enum KeptBatchStatus {
         /// The batch ID its signed bytes carry now: the one it is kept under, or another
         /// once it was signed again ([`super::AppEvent::KeptBatchSignedAgain`]).
         wire_batch_id: [u8; 16],
-        /// When its first send left, at a verified service time; `None` while it was never
-        /// sent, so it was never applied.
+        /// When the first send of its current bytes left, at a verified service time;
+        /// `None` while they were never sent. Bytes signed again at a provider change start
+        /// unsent, though earlier bytes may have been sent: after a move that read the old
+        /// chain to its end, they weren't applied; after a provider loss, a batch without
+        /// an `attempt` is signed again even if it was sent at the lost service, so whether
+        /// those earlier bytes applied there can't be told.
         sent_at_ms: Option<u64>,
     },
     /// Applied: what it settles is committed.

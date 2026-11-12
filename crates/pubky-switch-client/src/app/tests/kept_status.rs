@@ -908,3 +908,23 @@ async fn test_kept_batch_status_prune_keeps_an_index_a_later_batch_took_over() {
         Some(later)
     );
 }
+
+/// A leave deletes the ends of kept batches and their indexes with the keys: no flush of a
+/// left app would prune them after.
+#[tokio::test]
+async fn test_kept_batch_status_ends_go_with_a_leave() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let (_, _, me) = sent_past_the_window(&w, &router).await;
+    let mut app = load_on(&w, &router, Arc::clone(&w.store) as Arc<dyn StateStore>, me)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    assert!(end_keys(&app).await > 0);
+    app.leave(crate::app::LeaveMode::Immediate(
+        crate::app::UserConfirmed::new(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(end_keys(&app).await, 0);
+}

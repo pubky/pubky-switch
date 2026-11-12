@@ -2107,7 +2107,8 @@ pub(crate) fn record_put(
 }
 
 /// Delete, with the keys on a leave, every record of the shared state, the outbox and the
-/// sent messages that holds content or a bearer secret (Switch spec 3.1, 12.3).
+/// sent messages that holds content or a bearer secret (Switch spec 3.1, 12.3), and the
+/// kept batches with their ends and indexes, which no flush of a left app would prune.
 pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
     for prefix in [
         RECORD_PREFIX,
@@ -2118,6 +2119,10 @@ pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
         "sentt/",
         "invite/",
         "opq/",
+        "kb/",
+        "kbt/",
+        "kbm/",
+        "kba/",
     ] {
         tx.delete_prefix(prefix)?;
     }
