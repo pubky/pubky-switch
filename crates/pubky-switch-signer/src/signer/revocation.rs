@@ -81,9 +81,12 @@ impl Signer {
     /// does the backup of a later declaration. The backup isn't written again for it, since
     /// the recovery's delivery sends again, byte for byte, the backup it sealed.
     ///
-    /// When neither the switch's copy nor the backup can be read, this install goes on with
-    /// its records alone (Switch spec 12.2), so an install another one took over from can
-    /// still send a revocation the user confirmed on it. The switch takes it, since it is a
+    /// Before the revocation goes, a backup or a switch's copy that is read and shows a
+    /// take-over or records behind stops it. A backup that can't be read, is missing or
+    /// doesn't open, and a switch's copy that can't be read or doesn't verify for the
+    /// identity, add nothing. With neither copy read, this install goes on with its records
+    /// alone (Switch spec 12.2), so an install another one took over from can still send a
+    /// revocation the user confirmed on it. The switch takes it, since it is a
     /// request of the identity key; the version that removes the app is then the signer's,
     /// dated by the switch's revocation time, and the `distrust_from` picked here isn't used.
     pub async fn revoke(
@@ -369,15 +372,18 @@ impl Signer {
     /// it: a revocation signs nothing new, and goes out while an alarm holds signing back.
     ///
     /// The copy of the version a flow in progress delivers, as after a lost answer, is this
-    /// install's own: it is left for [`Signer::resume`], never taken as records behind. A
-    /// backup that is read and shows a take-over or records behind stops the revocation,
-    /// alarm or not, and so does a switch's copy that can't be read, whatever the switch
-    /// answered instead, a signed error included, or one that doesn't verify for the
-    /// identity: the revocation is the user's confirmed safety step, it may answer a
-    /// compromise (Switch spec 12.2), and it signs nothing new. A take-over shows at the
-    /// switch first, as a newer copy, which stops it whenever that copy is read (Switch wire
-    /// 3.13); with neither copy read, it goes on with the records alone. The version that
-    /// removes the app is signed only after a read of the switch's copy that does succeed.
+    /// install's own: it is left for [`Signer::resume`], never taken as records behind.
+    ///
+    /// - A backup or a switch's copy that is read and shows a take-over or records behind
+    ///   stops the revocation, alarm or not. A take-over shows at the switch first, as a
+    ///   newer copy (Switch wire 3.13).
+    /// - A backup that can't be read, is missing or doesn't open adds nothing. Nor does a
+    ///   switch's copy that can't be read, whatever the switch answered instead, a signed
+    ///   error included, or that doesn't verify for the identity. With neither copy read, the
+    ///   revocation goes on with the records alone: it is the user's confirmed safety step,
+    ///   it may answer a compromise (Switch spec 12.2), and it signs nothing new.
+    /// - The version that removes the app is signed only after a read of the switch's copy
+    ///   that succeeds.
     async fn named_for_revoking(&mut self) -> Result<Named> {
         self.check_named()?;
         let held = match self.read_apps().await {
