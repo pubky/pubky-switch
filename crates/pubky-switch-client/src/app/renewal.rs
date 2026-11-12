@@ -131,11 +131,15 @@ impl App {
     /// the switch applied and holds without its proofs (Switch wire 6.4 step 5), so the
     /// switch's directory decides it: a directory that shows this very record makes it
     /// delivered; one that shows a later record of the app, which another device put after
-    /// it, makes it superseded, so the kept record is dropped, neither noted as accepted
-    /// nor published, and not signed again, which would put this older body over the later
-    /// record (Switch spec 4.2 "The later `updated_at` wins"); otherwise it is refused, and
-    /// nothing is noted or published. Once the switch holds the record, an app that
-    /// publishes owes it to the Homeserver, in the commit that records the answer.
+    /// it, makes it superseded (Switch spec 4.2 "The later `updated_at` wins"). The kept
+    /// record is then dropped, and the later record taken in the same commit as the newest
+    /// the switch accepted, and as the record the app presents when it carries the
+    /// certificate the app presents: the app's next record builds on it, so this older body
+    /// is never signed again over it. A later record carrying a renewal another device
+    /// took is presented with that renewal once the newest `identity.json` lists it
+    /// ([`App::take_superseding`]). Otherwise it is refused, and nothing is noted or
+    /// published. Once the switch holds the record, an app that publishes owes it to the
+    /// Homeserver, in the commit that records the answer.
     pub(crate) async fn deliver_pending_record(&mut self) -> Result<bool, AppError> {
         let Some(pending) = self.state.pending_record.clone() else {
             return Ok(false);
@@ -157,11 +161,8 @@ impl App {
                 if named.is_none() {
                     match Box::pin(self.switch_holds(&batch)).await? {
                         Held::This => {}
-                        Held::Later => {
-                            let mut tx = self.tx()?;
-                            tx.delete(key::PENDING_RECORD)?;
-                            self.commit(tx).await?;
-                            self.state.pending_record = None;
+                        Held::Later(later) => {
+                            Box::pin(self.take_superseding(*later)).await?;
                             return Ok(false);
                         }
                         Held::Other => return Err(error),
@@ -207,6 +208,45 @@ impl App {
         Ok(true)
     }
 
+    /// Drop the kept record that `later`, a record of the app the switch holds, superseded,
+    /// and take `later` in the same commit: as the newest record the switch accepted, and as
+    /// the record the app presents when it carries the certificate the app presents. Nothing
+    /// is owed to the Homeserver for it: the device that put it publishes it, and the next
+    /// check compares the copy with it.
+    ///
+    /// A `later` carrying another certificate, a renewal another device took, whose
+    /// `cert.put` the feed shows only as a stub once the record carries it, is presented
+    /// with that certificate as after a restore ([`App::take_listed_cert`], Switch spec 3.2
+    /// step 3): when the newest own `identity.json` lists it and it renews the one held
+    /// under the app's own keys. A switch takes an `app.put` only with the listed
+    /// certificate (Switch wire 6.2), and the directory's `identity.json` lists it, so an
+    /// honest switch gives no other case. Otherwise `later` stays the accepted record only,
+    /// never published over, and the next record call signs the record held again, later
+    /// than it, as for a `409 conflict` naming it.
+    async fn take_superseding(&mut self, later: AppRecord) -> Result<(), AppError> {
+        let signed = later.signed().clone();
+        let presented = later.cert().hash() == self.state.cert.hash();
+        let mut tx = self.tx()?;
+        tx.delete(key::PENDING_RECORD)?;
+        tx.put(key::ACCEPTED_RECORD, &signed)?;
+        if presented {
+            tx.put(key::RECORD, &signed)?;
+        }
+        self.commit(tx).await?;
+        self.state.pending_record = None;
+        if presented {
+            self.state.record = signed.clone();
+        }
+        self.state.accepted = Some(signed);
+        self.published_checked_ms = None;
+        if !presented {
+            // A document that removes the app or names another generation is taken there,
+            // and the next read stops on it.
+            self.take_listed_cert().await?;
+        }
+        Ok(())
+    }
+
     /// What the switch's directory shows it holds for this app, beside the record `batch`
     /// delivers.
     async fn switch_holds(&mut self, batch: &Batch) -> Result<Held, AppError> {
@@ -221,7 +261,7 @@ impl App {
         Ok(if entry.record.signed() == &record {
             Held::This
         } else if entry.record.updated_at() > mine.updated_at() {
-            Held::Later
+            Held::Later(Box::new(entry.record.clone()))
         } else {
             Held::Other
         })
@@ -288,8 +328,9 @@ impl App {
 enum Held {
     /// That very record, byte for byte.
     This,
-    /// A record of the app with a later `updated_at`.
-    Later,
+    /// A record of the app with a later `updated_at`, verified for the identity and the
+    /// App ID as every directory entry is.
+    Later(Box<AppRecord>),
     /// Another record, or none.
     Other,
 }
