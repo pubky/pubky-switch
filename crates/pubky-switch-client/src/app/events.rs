@@ -11,7 +11,8 @@
 //! "Kept batches"); a kept batch dropped at a provider change and each `attempt` in it
 //! (Switch spec 12.5 "Kept batches", 12.6 step 5); a kept batch refused for good, with its
 //! local writes and outbox messages (Switch spec 6.4); a message deleted from the outbox
-//! undelivered (Switch spec 11); the account taken as erased (Switch spec 12.7). Each carries a stable [`EventId`] and is kept in the
+//! undelivered (Switch spec 11), or the record write a sent message named given up; the
+//! account taken as erased (Switch spec 12.7). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
 //! the two. It is reported once that commit is done, or, for a commit whose answer can't
 //! tell whether it was applied, by the reload after it; again by every [`super::App::load`],
@@ -637,6 +638,19 @@ pub enum AppEvent {
         /// Whether it was a re-send of a message accepted before.
         resend: bool,
     },
+    /// The shared record write a sent message named ([`super::RecordJob`]) was given up:
+    /// still not made [`super::SENT_RETENTION_MS`] after the message's first acceptance,
+    /// such as for a held value whose key never came. The app no longer builds it, so the
+    /// record doesn't reflect the message unless a batch of an earlier try, kept
+    /// unanswered, still applies, which its end tells ([`super::App::kept_batch`]). The
+    /// outbox no longer keeps the message, plaintext and all, once nothing else of it is
+    /// owed. A duty event, in the commit that gives the write up.
+    RecordJobDropped {
+        /// The duty event's ID.
+        id: EventId,
+        /// The message ID.
+        msg_id: String,
+    },
     /// The local writes the protocol answered `call` with were over
     /// [`super::MAX_STEP_LOCAL_BYTES`]: they weren't committed, and the call isn't made
     /// again, since the same answer would come. The read went on. The protocol acts on what
@@ -756,6 +770,7 @@ impl AppEvent {
             | Self::RestoreLeftBehind { id, .. }
             | Self::AttemptDropped { id, .. }
             | Self::MessageUndelivered { id, .. }
+            | Self::RecordJobDropped { id, .. }
             | Self::RecordUncheckable { id, .. }
             | Self::LocalWritesRefused { id, .. }
             | Self::AccountGone { id } => Some(*id),
@@ -900,6 +915,9 @@ pub(crate) enum Duty {
         msg_id: String,
         resend: bool,
     },
+    RecordJobDropped {
+        msg_id: String,
+    },
     LocalWritesRefused {
         call: KeptRefusal,
     },
@@ -1020,6 +1038,7 @@ impl Duty {
             Self::MessageUndelivered { msg_id, resend } => {
                 AppEvent::MessageUndelivered { id, msg_id, resend }
             }
+            Self::RecordJobDropped { msg_id } => AppEvent::RecordJobDropped { id, msg_id },
             Self::LocalWritesRefused { call } => AppEvent::LocalWritesRefused {
                 id,
                 call: call.call(),

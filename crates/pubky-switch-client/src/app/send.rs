@@ -20,7 +20,10 @@
 //!    `identity.json` delivered and the append retried; `410 moved` has the counterparty's
 //!    `identity.json` read again; `429` and `503` wait for the next flush.
 //! 5. **The record job** builds the record's next value through the protocol
-//!    ([`super::Protocol::sent_record`]), compare-and-swap.
+//!    ([`super::Protocol::sent_record`]), compare-and-swap. One still not made
+//!    [`SENT_RETENTION_MS`] after the message's first acceptance, such as one whose held
+//!    value waits for a key that never comes, is given up, and the protocol told
+//!    ([`AppEvent::RecordJobDropped`]): the outbox doesn't keep the message for ever.
 //!
 //! The acceptance is committed as soon as the append is answered, before anything else is
 //! done with the answer, so a crash never sends the same bytes again: with it the message
@@ -1166,10 +1169,14 @@ impl App {
                 }
             }
         }
-        if item.accepted_at_ms.is_some()
+        if let Some(accepted) = item.accepted_at_ms
             && !item.record_done
             && let Some(job) = item.record.clone()
         {
+            if accepted <= self.now().saturating_sub(SENT_RETENTION_MS) {
+                self.drop_record_job(item).await?;
+                return Ok(false);
+            }
             match self.record_job(&item, &job).await {
                 Ok(()) => item.record_done = true,
                 Err(error) if is_local(&error) => return Err(error),
@@ -1287,6 +1294,27 @@ impl App {
     }
 
     /// A complete item leaves the outbox; its sent message is kept from its acceptance.
+    /// Give up the record job of `item`, still owed [`SENT_RETENTION_MS`] after its first
+    /// acceptance, such as one whose held value waits for a key that never comes: in one
+    /// commit with [`AppEvent::RecordJobDropped`], the item kept only while a re-send of it
+    /// is owed, so its plaintext doesn't stay, nor go into every later backup, for ever.
+    async fn drop_record_job(&mut self, mut item: OutboxItem) -> Result<(), AppError> {
+        item.record = None;
+        let mut tx = self.tx()?;
+        if item.complete() {
+            tx.delete(&out_key(&item.msg_id))?;
+        } else {
+            tx.put(&out_key(&item.msg_id), &item)?;
+        }
+        self.keep_duty(
+            &mut tx,
+            Duty::RecordJobDropped {
+                msg_id: item.msg_id.clone(),
+            },
+        )?;
+        self.commit(tx).await
+    }
+
     async fn finish_item(&mut self, item: &OutboxItem) -> Result<(), AppError> {
         let mut tx = self.tx()?;
         tx.delete(&out_key(&item.msg_id))?;

@@ -5639,3 +5639,52 @@ async fn test_records_read_fresh_tells_a_refusal_from_an_unreachable_switch() {
         }
     ));
 }
+
+/// A sent message's record job whose held value waits for a key that never comes is tried
+/// at every flush only until [`crate::app::SENT_RETENTION_MS`] after the message's first
+/// acceptance: then it is given up, with a duty event naming the message, and the outbox
+/// forgets the message, plaintext and all.
+#[tokio::test]
+async fn test_records_record_job_waiting_for_a_key_ends_at_the_retention() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let key = record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    wallet.receive(None).await.unwrap();
+    assert_eq!(
+        wallet.shared_record(&key).await.unwrap().unwrap().content,
+        RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 }),
+    );
+    let signed = wallet
+        .sign_message(s.note("hello"))
+        .unwrap()
+        .with_record(crate::app::RecordJob {
+            target: s.target("n1"),
+            tag: b"sent".to_vec(),
+        });
+    let msg_id = wallet.queue_signed(signed).await.unwrap();
+    wallet.flush_outbox().await.unwrap();
+    let Some(Delivery::Accepted { accepted_at_ms }) = wallet.delivery(&msg_id).await.unwrap()
+    else {
+        panic!("accepted");
+    };
+    let out = format!("out/{msg_id}");
+    let told = |events: &[AppEvent]| {
+        events.iter().any(|e| {
+            matches!(e, AppEvent::RecordJobDropped { msg_id: m, .. } if *m == msg_id) && e.is_duty()
+        })
+    };
+    // Still owed, the value waiting for its key, just inside the retention.
+    s.w.clock
+        .set_ms(accepted_at_ms + crate::app::SENT_RETENTION_MS - 1);
+    wallet.flush_outbox().await.unwrap();
+    assert!(wallet.reader().exists(&out).await.unwrap());
+    assert!(!told(&wallet.unacknowledged_events().await.unwrap()));
+    // At it: given up and told, and the message forgotten.
+    s.w.clock
+        .set_ms(accepted_at_ms + crate::app::SENT_RETENTION_MS);
+    wallet.flush_outbox().await.unwrap();
+    assert!(!wallet.reader().exists(&out).await.unwrap());
+    assert!(told(&wallet.unacknowledged_events().await.unwrap()));
+    assert_eq!(wallet.delivery(&msg_id).await.unwrap(), None);
+}
