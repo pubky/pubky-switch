@@ -44,7 +44,7 @@ use crate::store::KeyValue;
 
 /// What a newer write of a record builds on, as the reading app sees it
 /// ([`Protocol::record_regression_on`], Switch spec 8.2, 10.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WriteBase {
     /// The version the write builds on: the `expected_version` its operation signed,
@@ -59,6 +59,11 @@ pub struct WriteBase {
     /// record view's word, and whether its value opened doesn't count: a write held not
     /// open ([`super::RecordContent::Unreadable`]) is held at its version.
     pub held: bool,
+    /// The conditions the write's operation signed (Switch wire 6.3), in its order, such as
+    /// a `claim_step` on a claim its change depends on. The service checked them when it
+    /// applied the write; a protocol's reader rule may require one, such as a condition on
+    /// the claim of what the write drops, and flag a write without it (Switch spec 8.2).
+    pub conditions: Vec<Condition>,
 }
 
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
@@ -791,9 +796,11 @@ pub trait Protocol: Send + Sync {
     }
 
     /// [`Protocol::record_regression`], told what the newer write builds on
-    /// ([`WriteBase`]): its `expected_version`, and whether the app holds that version. A
-    /// protocol whose rules hold only for a writer that built on the value the app holds,
-    /// such as one that may drop only what it held itself, applies them when `base.held`.
+    /// ([`WriteBase`]): its `expected_version`, whether the app holds that version, and the
+    /// conditions its operation signed. A protocol whose rules hold only for a writer that
+    /// built on the value the app holds, such as one that may drop only what it held itself,
+    /// applies them when `base.held`; one whose rule fences a change on a condition, such as
+    /// a `claim_step` on the claim of what the write drops, finds it in `base.conditions`.
     /// The app calls this one; by default it calls [`Protocol::record_regression`], so a
     /// protocol that implements only that keeps its rules as they are.
     ///

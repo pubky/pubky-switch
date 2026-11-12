@@ -1473,7 +1473,8 @@ async fn test_records_regression_check_sees_the_write_base() {
         *s.protocol.bases.lock().unwrap(),
         vec![WriteBase {
             expected_version: first,
-            held: true
+            held: true,
+            conditions: Vec::new(),
         }]
     );
     // Two writes later, the phone reads only the record's current view: it builds on the
@@ -1493,7 +1494,8 @@ async fn test_records_regression_check_sees_the_write_base() {
         s.protocol.bases.lock().unwrap().last(),
         Some(&WriteBase {
             expected_version: third,
-            held: false
+            held: false,
+            conditions: Vec::new(),
         })
     );
 }
@@ -1517,12 +1519,13 @@ async fn test_records_regression_base_of_a_create_over_a_held_delete_is_held() {
         .await
         .unwrap();
     phone.receive(None).await.unwrap();
-    let last = *s.protocol.bases.lock().unwrap().last().unwrap();
+    let last = s.protocol.bases.lock().unwrap().last().unwrap().clone();
     assert_eq!(
         last,
         WriteBase {
             expected_version: RecordVersion::NONE,
-            held: true
+            held: true,
+            conditions: Vec::new(),
         }
     );
 }
@@ -1553,14 +1556,50 @@ async fn test_records_regression_base_of_a_write_on_a_flagged_one_isnt_held() {
         .await
         .unwrap();
     phone.receive(None).await.unwrap();
-    let last = *s.protocol.bases.lock().unwrap().last().unwrap();
+    let last = s.protocol.bases.lock().unwrap().last().unwrap().clone();
     assert_eq!(
         last,
         WriteBase {
             expected_version: flagged,
-            held: false
+            held: false,
+            conditions: Vec::new(),
         }
     );
+}
+
+/// The later-write check is told the conditions the write's operation signed, in order, so
+/// a protocol's reader rule can require one, such as a `claim_step` on the claim of what the
+/// write drops (Switch spec 8.2).
+#[tokio::test]
+async fn test_records_regression_check_sees_the_write_conditions() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    let now = s.w.clock.now_ms();
+    let conditions = vec![
+        Condition::ClaimStep {
+            claim_key: [9; 32],
+            step: 0,
+        },
+        Condition::ServerTimeIn {
+            start: None,
+            end: Some(now + HOUR),
+        },
+    ];
+    wallet
+        .put_record(&target, &value(&["a", "b"]), conditions.clone())
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    let last = s.protocol.bases.lock().unwrap().last().unwrap().clone();
+    assert_eq!(last.conditions, conditions);
+    assert!(last.held);
 }
 
 async fn version_of(app: &App, key: &[u8; 32]) -> RecordVersion {

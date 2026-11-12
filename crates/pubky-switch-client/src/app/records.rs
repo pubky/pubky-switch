@@ -1778,6 +1778,11 @@ impl App {
         let new_value = accepted.content.value();
         // What the write builds on, and whether the app holds it (Switch spec 8.2, 10.3).
         let expected_version = accepted.version.expected_version;
+        // The write was verified before it got here, so its operation reads; its conditions
+        // are the ones it signed (Switch wire 6.3).
+        let conditions = SignedOp::peek(&accepted.op)
+            .map(|op| op.body().conditions.clone())
+            .unwrap_or_default();
         let base = WriteBase {
             expected_version,
             held: match &held {
@@ -1787,6 +1792,7 @@ impl App {
                 Some(held) => held.version == expected_version,
                 None => expected_version.is_none(),
             },
+            conditions,
         };
         if !own
             && let Some(mark) = &seen
