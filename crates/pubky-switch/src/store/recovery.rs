@@ -21,8 +21,8 @@ pub struct Recovery {
 
 /// The tables of an account's state for one generation at this service, which a recovery in
 /// place empties (Switch wire 3.3): its chain, its own apps and what they wrote, its lists,
-/// invites, batches and inbox, its flagged senders, a hand-over, the counterparties' copies
-/// and their floors.
+/// invites, batches and inbox, its flagged senders and pending connect requests, a hand-over,
+/// the counterparties' copies and their floors.
 const GENERATION_STATE: &[&str] = &[
     "chain_items",
     "apps",
@@ -39,6 +39,7 @@ const GENERATION_STATE: &[&str] = &[
     "app_listings",
     "peer_copies",
     "peer_floors",
+    "connect_requests",
 ];
 
 /// Every table with an account column that a recovery in place keeps (Switch wire 3.3,
