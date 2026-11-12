@@ -814,30 +814,55 @@ impl Signer {
     /// newest version again where the Homeserver's copy is older, missing or unreadable
     /// (Switch wire 3.3).
     ///
-    /// A run is bounded, so the host can call it often and never waits long on it. Each step
-    /// does a bounded amount: at most four renewals, four full-bundle answers and 32 record
-    /// deletions, the rest left for the next run. And once 30 seconds have passed on the
-    /// device clock since the run began, no further step starts: the removals always run,
-    /// since cutting an app off is the safe step, and the steps after them wait for the next
-    /// run. How long one request may take is the host's, through its Pubky client's timeout.
+    /// Returns what the run left because one of its bounds cut it short ([`RunDue`]): a host
+    /// that sees [`RunDue::more_due`] may run again soon.
+    ///
+    /// A run is bounded, so the host can call it often and never waits long on it:
+    ///
+    /// - **Work.** Each step does a bounded amount: at most four renewals, four full-bundle
+    ///   answers, 32 checks of owed deletions and 32 record deletions, the rest left for the
+    ///   next run. The removals aren't capped: they are one version, whatever the number of
+    ///   apps removed, and one `POST /revoke` for each revocation pending, at most the apps
+    ///   listed, so no app the user removed stays current for want of a run.
+    /// - **Time.** Once 30 seconds have passed on the device clock since the run began, no
+    ///   further step starts after the removals, which always run, since cutting an app off is
+    ///   the safe step. One of the later steps always runs, the next run going on from the
+    ///   step this one didn't start, and a clock that goes back, which can't be read as time
+    ///   spent, counts as the time passed: so a device clock that jumps or goes back holds no
+    ///   step back for good, and a run that never sees its time pass is still bounded by its
+    ///   work.
+    /// - **Requests.** With N the apps the newest version lists, at most the switch's app
+    ///   limit, and B(k) the `POST /ops` batches k operations take, eight to a batch, a run
+    ///   makes at most: the flow in progress and a closing owed, as below; the removals, N
+    ///   revocations and one version of B(N) batches; the cooperative closings, one version;
+    ///   four renewals, each B(1 + P) batches for its certificate and full key bundle of P
+    ///   parts; four full-bundle answers, each B(1 + P) batches and the newest version's
+    ///   delivery again; 32 + 32 Homeserver reads and deletions; and one republication. Each
+    ///   version is its delivery and, on the Homeserver, its backup and its publication; each
+    ///   step reads `GET /apps` and the Homeserver's copy first, a renewal four times. In the
+    ///   tests, with one-part bundles, four renewals take 28 switch requests and eight
+    ///   Homeserver writes. How long one request may take is the host's, through its Pubky
+    ///   client's timeout, so a run takes at most that many requests times it.
     ///
     /// # Errors
     ///
     /// As [`Signer::resume`].
-    pub async fn run_due(&mut self) -> Result<()> {
+    pub async fn run_due(&mut self) -> Result<RunDue> {
         let began = self.env.clock.now_ms();
+        self.left = RunDue::default();
         // While a hand-over or a take-over is in progress, only its own step runs: nothing
         // routine is signed, and what is owed stays owed (Switch wire 3.12).
         self.refresh().await?;
         if self.state.handing_over.is_some() || self.state.taking_over {
-            return self.resume().await;
+            self.resume().await?;
+            return Ok(self.left);
         }
         // A publication that failed doesn't hold back the closings owed at the switch.
         let erased_before = self.state.erased;
         let resumed = self.resume().await;
         // The run that completes an erasure has nothing more to do (Switch spec 12.7).
         if self.state.erased && !erased_before {
-            return resumed;
+            return resumed.map(|()| self.left);
         }
         if let Err(error) = &resumed
             && (self.flow.is_some() || !matches!(error, SignerError::Homeserver(_)))
@@ -845,27 +870,36 @@ impl Signer {
             // A pending revocation still goes to the switch: it signs nothing new, and
             // cutting the app off is the safe step. What it can't send stays pending.
             let _ = self.revoke_at_switch().await;
-            return resumed;
+            return resumed.map(|()| self.left);
         }
         self.complete_removals().await?;
-        // The later steps start only within the run's time, and the next run does the rest.
-        for step in [
-            Later::Closings,
-            Later::FullBundles,
-            Later::Renewals,
-            Later::Publication,
-        ] {
-            if self.env.clock.now_ms().saturating_sub(began) >= super::RUN_DUE_STEPS_MS {
+        // The later steps start only within the run's time, and the next run does the rest,
+        // from the step this one didn't start. One of them always runs, in turn, so a device
+        // clock that jumps, or goes back and so can't be read as time spent, holds none of
+        // them back for good.
+        let from = usize::from(self.state.due_from) % LATER.len();
+        let mut next = 0;
+        for n in 0..LATER.len() {
+            let now = self.env.clock.now_ms();
+            let past = now < began || now - began >= super::RUN_DUE_STEPS_MS;
+            if n > 0 && past {
+                self.left.steps_left = true;
+                next = (from + n) % LATER.len();
                 break;
             }
-            match step {
+            match LATER[(from + n) % LATER.len()] {
                 Later::Closings => drop(self.complete_renewals().await?),
                 Later::FullBundles => drop(self.serve_full_bundles().await?),
                 Later::Renewals => drop(self.renew_expiring().await?),
                 Later::Publication => self.republish().await?,
             }
         }
-        resumed
+        if usize::from(self.state.due_from) != next {
+            let mut state = self.state.clone();
+            state.due_from = u8::try_from(next).unwrap_or(0);
+            self.commit(state, self.flow.clone()).await?;
+        }
+        resumed.map(|()| self.left)
     }
 
     /// Renew the certificate of every current app once less than half its lifetime remains,
@@ -1012,7 +1046,10 @@ impl Signer {
         }
         // The soonest to expire first, a bounded number each run: the rest are due at the next.
         due.sort_by_key(|(_, _, expires_at)| *expires_at);
-        due.truncate(RENEWALS_PER_RUN);
+        if due.len() > RENEWALS_PER_RUN {
+            self.left.renewals_left = true;
+            due.truncate(RENEWALS_PER_RUN);
+        }
         let mut renewed = Vec::new();
         for (app_id, lifetime, _) in due {
             self.ready().await?;
@@ -1248,4 +1285,36 @@ enum Later {
     FullBundles,
     Renewals,
     Publication,
+}
+
+/// [`Later`]'s steps in their order, a run starting from the one the last run didn't start.
+const LATER: [Later; 4] = [
+    Later::Closings,
+    Later::FullBundles,
+    Later::Renewals,
+    Later::Publication,
+];
+
+/// What a [`Signer::run_due`] left for the next run because one of its bounds cut it short
+/// (design note, section 4.5): a host that sees [`RunDue::more_due`] may run again soon
+/// instead of waiting for its schedule. Work owed for another reason, such as a switch that
+/// can't be reached, isn't counted: the errors and alerts say that.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RunDue {
+    /// More certificates were due for renewal than one run renews.
+    pub renewals_left: bool,
+    /// More full-bundle requests were pending than one run answers.
+    pub full_bundles_left: bool,
+    /// More removed apps' records were owed, to check or to delete, than one run handles.
+    pub deletions_left: bool,
+    /// The run's time passed before all its later steps started.
+    pub steps_left: bool,
+}
+
+impl RunDue {
+    /// Whether any bound cut the run short.
+    pub fn more_due(&self) -> bool {
+        self.renewals_left || self.full_bundles_left || self.deletions_left || self.steps_left
+    }
 }

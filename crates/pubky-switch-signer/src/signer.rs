@@ -66,7 +66,7 @@ mod vector_cases;
 pub use approval::{AppReview, ApprovedRequest};
 use clients::{RequestClient, SigningClient, Target};
 pub use handover::AbortOutcome;
-pub use renewal::CertChange;
+pub use renewal::{CertChange, RunDue};
 pub use revocation::UserConfirmed;
 pub use takeover::ReceivingApp;
 
@@ -215,6 +215,8 @@ pub struct Signer {
     /// A commit answered that the store can't tell whether it applied: the records and the
     /// flow are read again before the next step.
     unsure: bool,
+    /// What the [`Signer::run_due`] in progress left because a bound cut it short.
+    left: RunDue,
 }
 
 impl std::fmt::Debug for Signer {
@@ -272,6 +274,7 @@ impl Signer {
             state,
             flow: Some(flow),
             unsure: false,
+            left: RunDue::default(),
         })
     }
 
@@ -294,6 +297,7 @@ impl Signer {
             state,
             flow,
             unsure: false,
+            left: RunDue::default(),
         };
         // Records of a hand-over that took effect: the deletion is finished now.
         if let Some(install) = handed_over {

@@ -72,6 +72,7 @@ impl Signer {
             state: SignerState::new(identity, install),
             flow: None,
             unsure: false,
+            left: super::RunDue::default(),
         };
         signer.restore_records(false, confirmed).await?;
         Ok(signer)
@@ -604,6 +605,9 @@ impl Signer {
     pub(super) async fn check_owed_deletions(&mut self) -> Result<()> {
         if self.state.deletion_checks.is_empty() {
             return Ok(());
+        }
+        if self.state.deletion_checks.len() > DELETION_CHECKS_PER_RUN {
+            self.left.deletions_left = true;
         }
         let mut state = self.state.clone();
         let batch: Vec<[u8; 16]> = state

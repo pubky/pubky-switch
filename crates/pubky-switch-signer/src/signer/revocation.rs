@@ -575,12 +575,14 @@ impl Signer {
             .copied()
             // Once no version lists the app: removed, or purged from `removed` since.
             .filter(|app| newest.listed_cert(app).is_none())
-            // A bounded number each run; the rest stay owed for the next.
-            .take(RECORD_DELETIONS_PER_RUN)
             .collect();
+        // A bounded number each run; the rest stay owed for the next.
+        if done.len() > RECORD_DELETIONS_PER_RUN {
+            self.left.deletions_left = true;
+        }
         // The grant reminder is raised once for each owed deletion, whether or not the record
         // goes now; a deletion that fails stays owed, and doesn't hold back the next app's.
-        for app_id in done {
+        for app_id in done.into_iter().take(RECORD_DELETIONS_PER_RUN) {
             let deleted = self
                 .env
                 .homeserver
@@ -663,9 +665,6 @@ impl Signer {
             .collect();
         asking.sort_by_key(|(_, _, requested)| *requested);
         for (listed, status, requested) in asking {
-            if requests.len() >= FULL_BUNDLES_PER_RUN {
-                break;
-            }
             let request = RefusedRequest {
                 app_id: listed.app_id,
                 requested,
@@ -691,6 +690,11 @@ impl Signer {
                     scopes: unowned,
                 });
                 continue;
+            }
+            // One more request to answer than the run answers: the next run does.
+            if requests.len() >= FULL_BUNDLES_PER_RUN {
+                self.left.full_bundles_left = true;
+                break;
             }
             // Every epoch from 1, whatever the parts stored for its certificate already cover:
             // the app may have lost its copy, and asks again until a put completes the range,
