@@ -1629,6 +1629,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_feed_page_with_no_items_ends_where_it_starts() {
+        // A page with no items reads none and covers no position: it ends where it starts,
+        // `more` when anything follows (Switch wire 7.4.4).
+        for (start, last_seq, more) in [
+            (0, 9, true),
+            (4, 9, true),
+            (9, 9, false),
+            (12, 9, false),
+            (0, 0, false),
+        ] {
+            let snapshot = snapshot(start, last_seq.min(start + 1000), last_seq);
+            let reader = reader(&["tasks"], &[Permission::ClaimsRead]);
+            let mut builder = PageBuilder::new(reader, 0, usize::MAX);
+            assert!(!builder.begin(&snapshot), "reads no item");
+            let page = builder.finish(&snapshot).expect("page");
+            assert_eq!(
+                (page.items.len(), page.scanned_through, page.more),
+                (0, start, more),
+                "after {start}"
+            );
+        }
+    }
+
     fn query(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
             .iter()
