@@ -385,8 +385,9 @@ impl App {
     /// feed and the rereads. Once it is spent each of them starts no further unit after its
     /// first, a kept batch, a listing page, a stored entry, a page or a reread, which it
     /// makes whatever the time with the requests that unit needs (a kept batch's time
-    /// sample and its send again after `409 stale_generation`, a stored entry's own
-    /// requests, as a feed item's), so no step waits for ever behind a slow one. It doesn't
+    /// sample, its send again after `409 stale_generation`, and its attempts' checks, the
+    /// claim reads and, for a proof of another state, the `failed` write; a stored entry's
+    /// own requests, as a feed item's), so no step waits for ever behind a slow one. It doesn't
     /// bound the whole read:
     /// - an item processed after it still makes its own requests, its sender's
     ///   `identity.json` and its effect's batch;
@@ -478,7 +479,8 @@ impl App {
         budget: &'a super::CallBudget,
     ) -> crate::transport::BoxFuture<'a, Result<ReceiveReport, AppError>> {
         // A read's large steps are boxed one by one, so that no poll frame holds the state
-        // of the step under it and a read runs on a host's small stack (a 1 MiB thread).
+        // of the step under it. In a debug build, the paths
+        // `test_receive_runs_on_a_one_mebibyte_stack` runs fit in a 1 MiB thread.
         Box::pin(self.receive_inner_body(wait, budget))
     }
 
