@@ -22,14 +22,19 @@ use super::{BoxFuture, Header, Request, Response, Transport, TransportError};
 /// The settings of an [`HttpTransport`].
 ///
 /// Each call has a timeout for the whole of it, from connecting to the last byte of the
-/// answer. A call that can carry megabytes gets the long one, [`HttpConfig::long_timeout_ms`]:
+/// answer, sized by what it can carry (Switch wire 7.1 "Answer sizes"). A call whose
+/// request or answer can pass a mebibyte gets the long one, [`HttpConfig::long_timeout_ms`]:
 /// a feed read, whose long poll holds it up to 25 s and whose page may take 8 MiB (Switch
-/// wire 7.4.4), a records listing of up to 1,000 records (7.4.9), a recovery upload of up
-/// to 16 MiB (7.4.14), and the export's manifest and chunks (10.3). Every other call gets
-/// [`HttpConfig::request_timeout_ms`]. Other answers may still run to megabytes at the
-/// limits, such as a directory, a claim's entries or the admission lists (Switch wire 7.1
-/// "Answer sizes"): a host on a slow network raises the setting.
+/// wire 7.4.4), a records listing (7.4.9), the directory (7.4.10), the apps and an app's
+/// key bundle parts (7.4.11, 7.4.12), a claim's entries (7.4.8), the admission lists
+/// (7.4.6), a batch of operations (6.4), an append, whose `409 stale_key` carries the
+/// directory (7.6), a recovery upload (7.4.14), the handover (7.4.17), an enrollment
+/// (7.4.1), and a move's export and import (10.2 to 10.4). Every other call gets
+/// [`HttpConfig::request_timeout_ms`], the time sample a write takes first included: a feed
+/// read of one item with no wait. At the limits some long calls carry tens of megabytes: a
+/// host on a slow network raises the settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HttpConfig {
     /// The timeout of every call but the long ones, in milliseconds: 10 s by default.
     pub request_timeout_ms: u64,
@@ -100,13 +105,18 @@ pub struct HttpTransport {
     long_timeout: Duration,
 }
 
-/// Whether `request` is a call that can carry megabytes, or the feed's long poll
-/// ([`HttpConfig`]): judged by its method and its path after `/v1/{id}/`.
+/// Whether `request` is a call whose request or answer can pass a mebibyte, or the feed's
+/// long poll ([`HttpConfig`]): judged by its method, its path after `/v1/{id}/` and, for a
+/// feed read, its query.
 fn is_long_call(request: &Request) -> bool {
-    let path = request
+    let (path, query) = request
         .path_and_query
         .split_once('?')
-        .map_or(request.path_and_query.as_str(), |(path, _)| path);
+        .unwrap_or((request.path_and_query.as_str(), ""));
+    // An enrollment may name thousands of purged App IDs (Switch wire 7.1 "Answer sizes").
+    if path == "/v1/enroll" {
+        return true;
+    }
     let Some(rest) = path
         .strip_prefix("/v1/")
         .and_then(|rest| rest.split_once('/'))
@@ -115,10 +125,25 @@ fn is_long_call(request: &Request) -> bool {
         return false;
     };
     match request.method.as_str() {
-        "GET" => {
-            matches!(rest, "feed" | "records" | "export") || rest.starts_with("export/chunks/")
+        // A feed read of one item with no wait, the time sample a write takes first, is
+        // short: one item is under 1 MiB (Switch wire 7.1 "Answer sizes").
+        "GET" if rest == "feed" => {
+            let mut params = query.split('&');
+            params.clone().any(|param| param.starts_with("wait="))
+                || !params.any(|param| param == "limit=1")
         }
-        "POST" => rest == "recovery/upload",
+        "GET" => {
+            matches!(
+                rest,
+                "records" | "directory" | "apps" | "allow" | "handover" | "export"
+            ) || rest.starts_with("export/chunks/")
+                || rest.starts_with("claims/")
+                || (rest.starts_with("apps/") && rest.ends_with("/keys"))
+        }
+        // A batch's items take up to 5 MiB; an append's `409 stale_key` carries the
+        // directory, and an import's start its manifest.
+        "POST" => matches!(rest, "ops" | "inbox" | "recovery/upload" | "import"),
+        "PUT" => rest == "handover" || rest.starts_with("import/chunks/"),
         _ => false,
     }
 }
@@ -458,27 +483,55 @@ mod tests {
     fn test_http_long_timeout_is_for_the_feed_and_the_large_calls() {
         for (method, path) in [
             ("GET", "/v1/x/feed?after=1:2&limit=100&wait=25"),
+            ("GET", "/v1/x/feed?after=1:2&limit=1&wait=25"),
+            ("GET", "/v1/x/feed?after=1:2&limit=100"),
+            ("GET", "/v1/x/feed?after=1:2&limit=10"),
             ("GET", "/v1/x/feed"),
             ("GET", "/v1/x/records?collection=c&after=k&limit=1000"),
+            ("GET", "/v1/x/directory"),
+            ("GET", "/v1/x/apps"),
+            ("GET", "/v1/x/apps/a/keys"),
+            ("GET", "/v1/x/claims/k"),
+            ("GET", "/v1/x/allow"),
+            ("GET", "/v1/x/handover"),
+            ("PUT", "/v1/x/handover"),
+            ("POST", "/v1/x/ops"),
+            ("POST", "/v1/x/inbox?apps_version=1"),
             ("POST", "/v1/x/recovery/upload"),
+            ("POST", "/v1/enroll"),
             ("GET", "/v1/x/export"),
             ("GET", "/v1/x/export/chunks/c1"),
+            ("POST", "/v1/x/import"),
+            ("PUT", "/v1/x/import/chunks/c1"),
         ] {
             assert!(is_long_call(&call(method, path)), "{method} {path}");
         }
-        // Every other call has the short one.
+        // Every other call has the short one, the time sample a write takes first included.
         for (method, path) in [
-            ("GET", "/v1/x/directory"),
+            ("GET", "/v1/x/feed?after=1:2&limit=1"),
             ("GET", "/v1/x/records/k"),
-            ("POST", "/v1/x/inbox?apps_version=1"),
-            ("POST", "/v1/x/ops"),
             ("PUT", "/v1/x/identity"),
+            ("POST", "/v1/x/apps/a/keys"),
+            ("POST", "/v1/x/apps/a/leave"),
+            ("POST", "/v1/x/connect"),
+            ("POST", "/v1/x/import/activate"),
             ("POST", "/v1/x/feed"),
             ("GET", "/v1/x/feeds"),
             ("GET", "/feed"),
         ] {
             assert!(!is_long_call(&call(method, path)), "{method} {path}");
         }
+        // The time sample, as a write sends it.
+        let sample = crate::client::answers::FeedQuery {
+            after: Some(pubky_switch_core::ops::Position {
+                generation: 1,
+                seq: 2,
+            }),
+            limit: Some(1),
+            wait: None,
+        };
+        let path = format!("/v1/x/{}", sample.path());
+        assert!(!is_long_call(&call("GET", &path)), "{path}");
     }
 
     #[tokio::test]
@@ -498,8 +551,15 @@ mod tests {
             ..HttpConfig::default()
         })
         .unwrap();
+        // The time sample a write takes first: a feed read of one item with no wait.
         let started = std::time::Instant::now();
-        let error = transport.send(request(&origin)).await.unwrap_err();
+        let error = transport
+            .send(Request {
+                origin: origin.clone(),
+                ..call("GET", "/v1/x/feed?after=1:0&limit=1")
+            })
+            .await
+            .unwrap_err();
         assert!(matches!(error, TransportError::Timeout), "{error:?}");
         assert!(started.elapsed() < Duration::from_millis(1_000));
         let started = std::time::Instant::now();
