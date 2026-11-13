@@ -6348,3 +6348,78 @@ async fn test_records_listing_at_a_missed_item_fetches_the_key_and_reads_on() {
     assert_eq!(handed(&s, &note.msg_id), 1, "{:?}", report.events);
     assert!(!app.listing_owed().await.unwrap());
 }
+
+/// A listing stopped on the read's page budget has listed the family `sample.items` to its
+/// end under the kiosk sub-scope and stopped inside `sample.big`. A renewal that adds the
+/// till sub-scope is taken before the next read, from the Homeserver. The till record of
+/// `sample.items` came as a stub in the feed, so only a listing brings it: the renewal owes
+/// a listing from the beginning, the family included.
+#[tokio::test]
+async fn test_records_renewal_widening_a_listing_under_way_lists_from_the_beginning() {
+    renewal_widening_a_listing(true).await;
+}
+
+/// The same with the listing made in one read: the widening owes a listing of its own.
+#[tokio::test]
+async fn test_records_renewal_widening_after_a_whole_listing_lists_again() {
+    renewal_widening_a_listing(false).await;
+}
+
+async fn renewal_widening_a_listing(split: bool) {
+    let s = Setup::new();
+    let family = Collection::with_sub_scopes("sample.items", Policy::new("scope-a", &["scope-a"]));
+    let big = Collection::with_sub_scopes("sample.big", Policy::new("scope-a", &["scope-a"]));
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone(), big.clone()]);
+    let mut wallet = join_scoped(&s, "wallet", &["scope-a:kiosk"]).await;
+    let mut phone = s.join("phone").await;
+    let till = RecordTarget::new(family.sub_scope("till").unwrap(), b"t1");
+    phone
+        .put_record(&till, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&till).unwrap();
+    for n in 0..6 {
+        let target = RecordTarget::new(big.sub_scope("kiosk").unwrap(), format!("b{n}").as_bytes());
+        phone
+            .put_record(&target, &value(&["b"]), vec![])
+            .await
+            .unwrap();
+    }
+    wallet.receive(None).await.unwrap();
+    s.w.clock.advance_ms(3_000);
+    wallet.receive(None).await.unwrap();
+    assert!(!wallet.listing_owed().await.unwrap());
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+    // The renewal is stored at the switch: the wallet sees it in its feed and keeps it.
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-a:kiosk", "scope-a:till"]);
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cert().hash(), earlier.hash());
+    // A missed item owes a listing; with one record a page, the family's one page, then
+    // three of the six of `sample.big`.
+    if split {
+        s.w.switch.lock().max_page_bytes = 1;
+    }
+    s.w.switch.push_missed(1, START, START);
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(report.more, split, "{:?}", report.events);
+    assert_eq!(wallet.listing_owed().await.unwrap(), split);
+    // The document listing the renewal, taken from the Homeserver before the next read.
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    wallet.refresh_identity().await.unwrap();
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    assert!(wallet.listing_owed().await.unwrap());
+    store_parts_for(&s, &renewed);
+    for _ in 0..8 {
+        let report = wallet.receive(None).await.unwrap();
+        if !report.more && !wallet.listing_owed().await.unwrap() {
+            break;
+        }
+    }
+    assert!(!wallet.listing_owed().await.unwrap(), "the listing ended");
+    assert!(
+        wallet.shared_record(&key).await.unwrap().is_some(),
+        "the till record of the family listed before the renewal is listed"
+    );
+}

@@ -2209,7 +2209,7 @@ impl App {
             // but still owes the listing (Switch spec 8.2, wire 7.4.4).
             if self.state.asked.insert(seq) {
                 read.tx.put(&key::asked(seq), &())?;
-                read.tx.put(super::records::LIST_DUE, &true)?;
+                super::records::owe_listing(&mut read.tx)?;
                 read.list_first = true;
             }
             return Ok(Step::Pass);
@@ -2243,7 +2243,7 @@ impl App {
                 )?,
             }
             read.tx.put(&key::asked(seq), &())?;
-            read.tx.put(super::records::LIST_DUE, &true)?;
+            super::records::owe_listing(&mut read.tx)?;
             read.list_first = true;
             self.events.push(AppEvent::Missed { seq, entries });
         }

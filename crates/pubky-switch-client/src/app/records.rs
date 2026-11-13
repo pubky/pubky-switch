@@ -55,6 +55,16 @@ pub(crate) const LIST_DUE: &str = "list_due";
 /// How far an owed listing got ([`ListProgress`]), while it is owed.
 const LIST_AT: &str = "list_at";
 
+/// Owe a listing of the collections from their beginning, in `tx`: `list_due` set and
+/// `list_at` deleted. Every new obligation starts the listing over, so a collection a
+/// listing under way already listed to its end is listed again: it may read members it
+/// didn't, such as after a renewal that widens the certificate (Switch spec 8.2, 8.3).
+pub(crate) fn owe_listing(tx: &mut Tx) -> Result<(), AppError> {
+    tx.put(LIST_DUE, &true)?;
+    tx.delete(LIST_AT)?;
+    Ok(())
+}
+
 /// The most listing pages one read of the feed asks for while it makes an owed listing
 /// ([`App::receive`]): a listing that needs more goes on at the next read from the page
 /// it reached, and the read stops before any entry meanwhile (Switch spec 8.2, wire

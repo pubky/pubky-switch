@@ -874,7 +874,7 @@ impl App {
             tx.put(key::DEVICE, &app.state.device)?;
             tx.put(key::CURSOR, &app.state.cursor)?;
             tx.put(key::JOIN, &app.state.join)?;
-            tx.put(records::LIST_DUE, &true)?;
+            records::owe_listing(&mut tx)?;
             tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
             tx.commit(&app.env.store).await?;
             app.finish_join().await?;
@@ -1722,7 +1722,7 @@ impl App {
                 for (sender, msg_id, record) in &processed {
                     feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
                 }
-                tx.put(records::LIST_DUE, &true)?;
+                records::owe_listing(&mut tx)?;
                 // The entries it brings back are told to the protocol again, in steps after
                 // the restore commits (Switch spec 12.4).
                 parked::Retell::start(&app.state, &mut tx)?;
