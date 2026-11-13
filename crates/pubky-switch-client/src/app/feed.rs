@@ -91,8 +91,8 @@ use super::provider::TakeOver;
 use super::records::{Collection, LISTING_PAGES_PER_READ, Listing, pending_name_key};
 use super::rotation::RegistrationStep;
 use super::state::{
-    CachedDoc, HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, PendingEffect, Processed,
-    RetryEntry, Tx, encode, key,
+    CachedDoc, HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, ParkedRound, PendingEffect,
+    Processed, RetryEntry, Tx, encode, key,
 };
 use super::{App, AppError, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
@@ -2250,9 +2250,12 @@ impl App {
     /// At most [`PARKED_RETRIES_PER_READ`] each read, starting where the last read stopped
     /// and going round, so none waits for ever behind others the store keeps failing.
     ///
-    /// Past the call's time budget it stops; the entries the round left go at the next
-    /// turn. No `more` is said for them: an entry the store keeps failing comes again at
-    /// every read, so the host's next read, not one at once, tries it.
+    /// Past the call's time budget it stops once it has tried one, and the round moves on
+    /// only past the entries it reached: the next read starts at the first one it left. So
+    /// with the budget spent at every read, each read still tries one entry, and every
+    /// entry due is tried within two rounds of one read per entry. No `more` is said for
+    /// them: an entry the store keeps failing comes again at every read, so the host's next
+    /// read, not one at once, tries it.
     async fn retry_parked(&mut self, budget: Option<&super::CallBudget>) -> Result<(), AppError> {
         let gaps = self.key_gaps();
         let keys_held = self.keys_held();
@@ -2272,14 +2275,31 @@ impl App {
         if due.is_empty() {
             return Ok(());
         }
-        let (ids, round) = self.state.parked_round.turn(&due, PARKED_RETRIES_PER_READ);
+        let before = self.state.parked_round;
+        let (ids, round) = before.turn(&due, PARKED_RETRIES_PER_READ);
+        // Committed before the retries, so an entry whose retry fails the read doesn't
+        // hold the round at it.
+        self.commit_parked_round(round).await?;
+        let given = ids.len();
+        let reached = self.retry_stored(ids, budget).await?;
+        if reached < given {
+            // A smaller turn takes the same first entries: the round stands past those
+            // reached, and the next read starts at the first one left.
+            self.commit_parked_round(before.turn(&due, reached).1)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Keep where the retries of entries stored locally stand (`parkn`), when it changed.
+    async fn commit_parked_round(&mut self, round: ParkedRound) -> Result<(), AppError> {
         if round != self.state.parked_round {
             self.state.parked_round = round;
             let mut tx = self.tx()?;
             tx.put(key::PARKED_NEXT, &round)?;
             self.commit(tx).await?;
         }
-        self.retry_stored(ids, budget).await
+        Ok(())
     }
 
     /// The entries waiting for a scope key that a fetch in the read brought the keys of,
@@ -2302,7 +2322,7 @@ impl App {
             .filter(|id| !due_at_start.contains(id))
             .take(PARKED_RETRIES_PER_READ)
             .collect();
-        self.retry_stored(ids, budget).await
+        self.retry_stored(ids, budget).await.map(|_| ())
     }
 
     /// The local IDs of the entries waiting for a scope key that are due now, in order.
@@ -2338,16 +2358,18 @@ impl App {
     }
 
     /// The entries stored locally at `ids`, each checked and applied again in a commit of
-    /// its own.
-    /// Past the call's time budget, once one is tried, it stops: the rest go at a later read.
+    /// its own. Past the call's time budget, once one is tried, it stops: the rest go at a
+    /// later read. Returns how many of `ids` it reached, in order, those it passed over
+    /// included.
     async fn retry_stored(
         &mut self,
         ids: Vec<u64>,
         budget: Option<&super::CallBudget>,
-    ) -> Result<(), AppError> {
+    ) -> Result<usize, AppError> {
+        let given = ids.len();
         for (index, id) in ids.into_iter().enumerate() {
             if index > 0 && budget.is_some_and(|budget| self.spent(budget)) {
-                break;
+                return Ok(index);
             }
             let Some(stored) = self.state.parked.get(&id).cloned() else {
                 continue;
@@ -2381,7 +2403,7 @@ impl App {
                 });
             }
         }
-        Ok(())
+        Ok(given)
     }
 
     /// The sender's newest `identity.json` for check 7: the own one, or a copy at most 10
