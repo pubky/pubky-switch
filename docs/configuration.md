@@ -168,7 +168,7 @@ Push (Switch wire 8).
 |---|---|---|
 | `enabled` | `false` | take push registrations (`PUT /v1/{id}/push`); off, every one is answered `400`, as a service that sends no pushes answers (Switch wire 8.1). Off by default while no push is sent, so a service that can't deliver says so |
 
-The service keeps each own app's registration: its relay URL, at most 8 handles and a push key the service mints for it. Nothing is sent to a relay yet. The relay URL must be `https://` on port 443 without user info, and its host must resolve only to public addresses, which the service checks with its system resolver at each registration, within 5 seconds; delivery will check the host again at each connection. Neither relay URLs, handles nor keys are logged.
+The service keeps each own app's registration: its relay URL, at most 8 handles and a push key the service mints for it. Nothing is sent to a relay yet. The relay URL must be `https://` on port 443 without user info, and its host must resolve only to public addresses, which the service checks with its system resolver at each registration, within 5 seconds; delivery will check the host again at each connection. Neither relay URLs, handles nor keys are logged. Turn it on only once every instance runs a version that has it: an older instance's sweep would read a push key owed deleting as an erasure's and delete the key without its row's lock.
 
 ### `[keys]`
 
