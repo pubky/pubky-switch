@@ -6,7 +6,7 @@
 
 **Conventions.**
 
-- "Section N" means this document; "spec N" means the Pubky Switch spec; "Paykit spec N" and "Paykit wire N" mean Paykit's documents.
+- "Section N" means this document; "spec N" means the Pubky Switch spec.
 - Field tables have the columns Field, Type, Req (required), Constraints and Notes.
 - Types:
 
@@ -242,13 +242,12 @@ A list with a name not among them, one repeated or out of order is malformed, an
 
 **Scope roots** (spec 3.3). A scope's root is its `name`, the part before any `:`. Each protocol has a name, the one it uses under `protocols` in app records (3.2) and as the prefix of its kinds (5.1), and each root belongs to one protocol, so a reader never takes one protocol's scope for another's:
 
-- Paykit's roots are reserved for Paykit: `pay`, `request`, `allowance`, `allowance_execute`, `contacts`, `manage_contacts` and `ext` (Paykit spec 3.1). Its name is `paykit`. `spec/reserved-roots.json` holds this list in machine-readable form, with the same name and roots.
-- Every other protocol's roots are its name, or its name followed by `_` or `-` and more characters, such as `chat` and `chat_read` for a protocol named `chat`.
-- A protocol's name other than Paykit's is 1 to 32 characters of `a-z` and `0-9`, starting with a letter, without `_` or `-`, so no protocol's root is another's; it isn't `paykit` or a reserved root, and no reserved root is it followed by `_` or `-` and more characters (so `manage` isn't one, since `manage_contacts` is reserved).
+- A protocol's name is 1 to 32 characters of `a-z` and `0-9`, starting with a letter, without `_` or `-`. The rule is the same for every protocol: no name or root is set aside for one.
+- Its roots are its name, or its name followed by `_` or `-` and more characters, such as `chat` and `chat_read` for a protocol named `chat`. A root's protocol is therefore the part before its first `_` or `-`, so no protocol's root is another's.
 - A signer refuses to take a protocol whose name breaks these rules, or that claims a root other than its own, so two independent signers can't give one root to two protocols, even where only one of them is installed.
-- A reader takes a root that is neither reserved nor one of its own protocols' as another protocol's.
+- A reader takes a root that isn't one of its own protocols' as another protocol's.
 
-Kind prefixes follow the same rule: a kind's prefix, the part before its first `.`, is its protocol's name, or, for Paykit's extension kinds, an extension prefix, which always holds a `-` (Paykit wire 4.3), so it is never another protocol's name.
+Kind prefixes follow the same rule: a kind's prefix, the part before its first `.`, is its protocol's name, or its name followed by `-` and more characters, such as `tasks-cap` for a protocol named `tasks`. A kind's protocol is therefore the part of its prefix before any `-`, so no protocol's kind is another's.
 
 
 Example (`wallet`):
