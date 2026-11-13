@@ -406,6 +406,16 @@ impl App {
         {
             match self.take_listed_cert().await? {
                 super::renewal::Listed::Key(current) => {
+                    // That was this read's look for a listed renewal: none again just after.
+                    let me = self.state.meta.app_id;
+                    if self
+                        .state
+                        .own_doc
+                        .listed_cert(&me)
+                        .is_some_and(|listed| listed != self.state.cert.hash())
+                    {
+                        self.renewal_looked_ms = Some(self.now());
+                    }
                     self.check_key_after_restore(current).await?;
                 }
                 // A newer own document the directory brought: the next read follows it.
