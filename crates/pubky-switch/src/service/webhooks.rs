@@ -18,15 +18,18 @@
 //!   not repeat one. It is signed with the registration's push key, never the service key.
 //! - **One deadline:** an attempt ends within 10 s of its claim, 20 s before its lease does.
 //!   Its hold, key loads and signing get the first 5 s, and past them the webhook isn't sent
-//!   and the attempt fails; the connection gets the next 5 s. At most a quarter of the
-//!   request pool's connections hold registrations at once, so requests keep the rest.
+//!   and the attempt fails; the connection gets the next 5 s. Attempts keep running while the
+//!   worker waits on its own statements (the claim, the drops, the settles), so their
+//!   deadlines and holds don't wait for those. At most a quarter of the request pool's
+//!   connections hold registrations at once, and the worker's own statements take one more,
+//!   so requests keep the rest.
 //! - **Connecting:** the relay's host is resolved again, refused if any address isn't public
 //!   (`check_addresses`, as at registration), and the connection goes to an address checked,
 //!   on port 443, with TLS checking the host name, never through a proxy the environment
 //!   names. Redirects aren't followed. The connection, resolution included, has 5 s.
 //! - **Outcomes:** any 2xx is a delivery and the row goes. Anything else, a redirect or a
-//!   timeout is a failure, retried 20 s later, at most 3 attempts within 1 minute of the
-//!   entry; then the row goes.
+//!   timeout is a failure, retried 20 s later, at most 3 attempts, each claimed within 1
+//!   minute of the entry, so the last ends at most 70 s after it; then the row goes.
 //! - **Without trusted time** nothing is sent: `ts` would be a time the service doesn't
 //!   trust (Switch wire 7.3). The rows wait, and go once their minute has passed by the
 //!   database's clock, which needs no trusted time.
@@ -74,6 +77,26 @@ const SEND_BY: Duration =
 /// How long the worker waits for due rows when it found fewer than it can send, and how
 /// often rows past their minute are dropped.
 const POLL: Duration = Duration::from_secs(1);
+
+/// Await `work`, a statement of the worker's own, while still running the attempts under
+/// way, keeping those that end in `ended`: so an attempt's deadline and its registration's
+/// hold don't wait for the worker's statements, which may wait for a connection.
+async fn polling<T, A>(
+    work: impl Future<Output = T>,
+    attempts: &mut FuturesUnordered<A>,
+    ended: &mut Vec<A::Output>,
+) -> T
+where
+    A: Future,
+{
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            out = &mut work => return out,
+            Some(done) = attempts.next(), if !attempts.is_empty() => ended.push(done),
+        }
+    }
+}
 
 /// Where webhooks connect in tests: the plain-HTTP listener a checked address maps to.
 #[cfg(any(test, feature = "test-util"))]
@@ -189,10 +212,14 @@ impl Service {
         }
         let mut dropped_at: Option<Instant> = None;
         let mut attempts = FuturesUnordered::new();
+        // Attempts that ended while the worker waited on the database, to settle.
+        let mut ended = Vec::new();
         loop {
             if dropped_at.is_none_or(|at| at.elapsed() >= POLL) {
                 dropped_at = Some(Instant::now());
-                match self.store.drop_stale_pushes().await {
+                let dropped =
+                    polling(self.store.drop_stale_pushes(), &mut attempts, &mut ended).await;
+                match dropped {
                     Ok(gone) => {
                         round.dropped += usize::try_from(gone).unwrap_or(usize::MAX);
                     }
@@ -204,7 +231,8 @@ impl Service {
             if free > 0 && self.time.read().trusted {
                 // Before the claim, so each deadline ends before its lease does.
                 let claimed_at = Instant::now();
-                match self.store.claim_pushes(free).await {
+                let claim = self.store.claim_pushes(free);
+                match polling(claim, &mut attempts, &mut ended).await {
                     Ok(claimed) => {
                         for push in claimed {
                             attempts.push(async move {
@@ -216,15 +244,17 @@ impl Service {
                     Err(error) => tracing::warn!(%error, "push deliveries: claiming rows"),
                 }
             }
+            while let Some((push, outcome)) = ended.pop() {
+                let settle = self.settle(&push, outcome, &mut round);
+                polling(settle, &mut attempts, &mut ended).await;
+            }
             if attempts.is_empty() {
                 break;
             }
             // The next attempt to end frees a slot; without one within a second, rows due
             // meanwhile are looked for.
             tokio::select! {
-                Some((push, outcome)) = attempts.next() => {
-                    self.settle(&push, outcome, &mut round).await;
-                }
+                Some(done) = attempts.next() => ended.push(done),
                 () = tokio::time::sleep(POLL) => {}
             }
         }

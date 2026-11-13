@@ -415,7 +415,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   client flow sees it, and an app learns of the entry by reading its feed at either switch.
   The same as the service: the body goes through
   the core's checks (`parse_push_body`, `400`), the signer is `403 permission_missing`, an
-  app that isn't current `403 not_current`, a staged account `503 staged`, 8.1's start and handle cases and their `409 conflict`s, one registration per
+  app that isn't current `403 not_current`, a staged account `503 staged`, 8.1's start and handle cases and their `409 conflict`s, the `400` for more than 8 handles at one relay host across the account's apps, one registration per
   app, and the registration dropped when its app stops being current (a revocation, a
   departure, a delivery that no longer lists it) and with the generation at a recovery. What
   differs: the relay's host isn't resolved, so a name that resolves to a private address is

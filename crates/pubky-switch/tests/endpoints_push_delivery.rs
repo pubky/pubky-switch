@@ -1438,11 +1438,11 @@ async fn test_push_delivery_past_its_time_to_send_sends_nothing() {
         async move { service.deliver_pushes().await }
     });
     gate.paused.notified().await;
-    // The key loads after 6 s.
+    // The key loads after 9 s.
     tokio::spawn({
         let gate = gate.clone();
         async move {
-            tokio::time::sleep(Duration::from_secs(6)).await;
+            tokio::time::sleep(Duration::from_secs(9)).await;
             gate.release.notify_one();
         }
     });
@@ -1454,7 +1454,8 @@ async fn test_push_delivery_past_its_time_to_send_sends_nothing() {
             ..PushRound::default()
         }
     );
-    assert!(started.elapsed() < Duration::from_secs(6));
+    // Failed at 5 s, before the key loads at 9 s, with room for a loaded runner.
+    assert!(started.elapsed() < Duration::from_secs(8));
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert!(setup.relay.seen().is_empty(), "sent past its time");
     assert_eq!(queued(&setup.replay).await[0].1, 1);
@@ -1551,5 +1552,342 @@ async fn test_push_delivery_one_entry_queues_at_most_8_toward_a_host() {
     let toward = |prefix: &str| rows.iter().filter(|row| row.0.starts_with(prefix)).count();
     assert_eq!(toward("wallet-") + toward("executor-"), 8);
     assert_eq!(toward("phone-"), 8);
+    setup.replay.db.drop_database().await.expect("drop");
+}
+
+/// alice's apps have queued `rows` webhooks, 8 of them in flight; 500 other accounts have 8
+/// due each, queued a second earlier, as on a service with many accounts.
+async fn large_queue(setup: &Setup, rows: u32) {
+    let replay = &setup.replay;
+    queue_rows(replay, &alice_id(), rows).await;
+    let alice = alice_id();
+    for statement in [
+        "UPDATE push_deliveries SET attempts = 1, next_attempt_ms = \
+         (extract(epoch FROM statement_timestamp()) * 1000)::bigint + 28000 \
+         WHERE id IN (SELECT id FROM push_deliveries ORDER BY id LIMIT 8)"
+            .to_string(),
+        format!(
+            "INSERT INTO accounts SELECT (jsonb_populate_record(NULL::accounts, to_jsonb(a) \
+             || jsonb_build_object('id', 'many-' || g))).* FROM accounts a, \
+             generate_series(1, 500) g WHERE a.id = '{alice}'"
+        ),
+        format!(
+            "INSERT INTO push_registrations (account_id, app_id, relay_url, push_key_id, \
+             push_public, handles, set_at_ms) SELECT 'many-' || g, app_id, relay_url, \
+             'many-key-' || g, push_public, handles, set_at_ms FROM push_registrations, \
+             generate_series(1, 500) g WHERE account_id = '{alice}'"
+        ),
+        "INSERT INTO push_deliveries (account_id, app_id, push_key_id, handle, \
+         entry_at_ms, next_attempt_ms) SELECT r.account_id, r.app_id, r.push_key_id, \
+         r.handles[1], t - 1000, t - 1000 FROM push_registrations r, \
+         generate_series(1, 8), \
+         (SELECT (extract(epoch FROM statement_timestamp()) * 1000)::bigint AS t) now \
+         WHERE r.account_id LIKE 'many-%'"
+            .to_string(),
+        "ANALYZE push_deliveries".to_string(),
+    ] {
+        sql(replay, &statement).await;
+    }
+}
+
+#[tokio::test]
+async fn test_push_delivery_claim_stays_quick_with_a_large_queue_of_one_account() {
+    // A claim, which every instance's claims wait for in turn, stays well inside the 5 s an
+    // attempt has from just before its claim, however many rows one account has queued.
+    let Some((setup, _)) = registered(&[H1]).await else {
+        return;
+    };
+    large_queue(&setup, 25_000).await;
+    let store = setup.replay.db.store();
+    let mut took = Vec::new();
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let claimed = store.claim_pushes(16).await.expect("claim");
+        took.push((started.elapsed(), claimed.len()));
+    }
+    setup.replay.db.drop_database().await.expect("drop");
+    assert!(
+        took.iter().all(|(took, _)| *took < Duration::from_secs(1)),
+        "claims took {took:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_push_delivery_large_queue_of_one_account_holds_up_no_other() {
+    // Another account's webhook, due before every other row, still goes within about a
+    // second while alice has 35,000 queued.
+    let Some((setup, _)) = registered(&[H1]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    let other = other_account(&setup).await;
+    large_queue(&setup, 35_000).await;
+    queue_rows(replay, &other, 1).await;
+    sql(
+        replay,
+        &format!(
+            "UPDATE push_deliveries SET entry_at_ms = entry_at_ms - 2000, \
+             next_attempt_ms = next_attempt_ms - 2000 WHERE account_id = '{other}'"
+        ),
+    )
+    .await;
+    let service = Arc::new(setup.instance());
+    let running = tokio::spawn({
+        let service = service.clone();
+        async move { service.deliver_pushes().await }
+    });
+    let started = std::time::Instant::now();
+    while setup.fast.seen().is_empty() && started.elapsed() < Duration::from_secs(12) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let waited = started.elapsed();
+    running.abort();
+    let rows: Vec<(i32,)> = {
+        let mut conn = conn(replay).await;
+        let rows = sqlx::query_as("SELECT attempts FROM push_deliveries WHERE account_id = $1")
+            .bind(&other)
+            .fetch_all(&mut conn)
+            .await
+            .expect("rows");
+        conn.close().await.expect("close");
+        rows
+    };
+    setup.replay.db.drop_database().await.expect("drop");
+    assert!(
+        waited < Duration::from_secs(3),
+        "the other account's webhook unsent after {waited:?}, its row's attempts {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_push_delivery_concurrent_claims_never_claim_a_row_twice() {
+    // Eight claimers at once over 40 accounts' due rows: no row is claimed twice, and no
+    // account has more than 8 claimed.
+    let Some((setup, _)) = registered(&[H1]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    let mut accounts = vec![alice_id()];
+    for n in 0..39 {
+        accounts.push(silent_account(&setup, &format!("account-{n}")).await);
+    }
+    for account in &accounts {
+        queue_rows(replay, account, 20).await;
+    }
+    let store = replay.db.store().clone();
+    let claimers: Vec<_> = (0..8)
+        .map(|_| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let mut mine = Vec::new();
+                let mut errors = 0;
+                loop {
+                    match store.claim_pushes(3).await {
+                        Ok(claimed) if claimed.is_empty() => break,
+                        Ok(claimed) => {
+                            mine.extend(claimed.into_iter().map(|push| (push.id, push.account)));
+                        }
+                        Err(_) => errors += 1,
+                    }
+                }
+                (mine, errors)
+            })
+        })
+        .collect();
+    let mut all = Vec::new();
+    let mut errors = 0;
+    for claimer in claimers {
+        let (mine, failed) = claimer.await.expect("claimer");
+        all.extend(mine);
+        errors += failed;
+    }
+    setup.replay.db.drop_database().await.expect("drop");
+    let mut ids: Vec<i64> = all.iter().map(|claim| claim.0).collect();
+    ids.sort_unstable();
+    let claims = ids.len();
+    ids.dedup();
+    let mut per_account: std::collections::BTreeMap<String, usize> = Default::default();
+    for (_, account) in &all {
+        *per_account.entry(account.clone()).or_default() += 1;
+    }
+    assert_eq!(
+        ids.len(),
+        claims,
+        "a row claimed twice ({errors} claims failed)"
+    );
+    assert!(
+        per_account.values().all(|n| *n == 8),
+        "{per_account:?} ({errors} claims failed)"
+    );
+}
+
+#[tokio::test]
+async fn test_push_delivery_rows_waiting_for_a_retry_count_against_no_cap() {
+    // 8 of alice's rows failed a second ago and wait for their retry, 8 are due: the 8 due
+    // are claimed, since a row waiting for its retry isn't in flight. Rows in flight do
+    // count: with 8 leased, none is.
+    let Some((setup, _)) = registered(&[H1]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    queue_rows(replay, &alice_id(), 16).await;
+    let first_8 = |next_ms: i64| {
+        format!(
+            "UPDATE push_deliveries SET attempts = 1, next_attempt_ms = \
+             (extract(epoch FROM statement_timestamp()) * 1000)::bigint + {next_ms} \
+             WHERE id IN (SELECT id FROM push_deliveries ORDER BY id LIMIT 8)"
+        )
+    };
+    sql(replay, &first_8(19_000)).await;
+    let store = replay.db.store();
+    assert_eq!(store.claim_pushes(16).await.expect("claim").len(), 8);
+    sql(
+        replay,
+        "UPDATE push_deliveries SET attempts = 0, next_attempt_ms = 0",
+    )
+    .await;
+    sql(replay, &first_8(28_000)).await;
+    assert_eq!(store.claim_pushes(16).await.expect("claim").len(), 0);
+    setup.replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_push_delivery_hold_waits_at_most_a_second_for_a_locked_registration() {
+    // A request holds the registration's row: the attempt's hold gives up after about a
+    // second instead of sitting on a connection behind it.
+    let Some((setup, _)) = registered(&[H1]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    queue_rows(replay, &alice_id(), 1).await;
+    let store = replay.db.store();
+    let push = store.claim_pushes(1).await.expect("claim").remove(0);
+    let mut locker = conn(replay).await;
+    sql_on(&mut locker, "BEGIN").await;
+    sql_on(&mut locker, "SELECT 1 FROM push_registrations FOR UPDATE").await;
+    let started = std::time::Instant::now();
+    let held = store.hold_push_registration(&push).await;
+    let waited = started.elapsed();
+    sql_on(&mut locker, "ROLLBACK").await;
+    locker.close().await.expect("close");
+    assert!(
+        store
+            .hold_push_registration(&push)
+            .await
+            .expect("held")
+            .is_some()
+    );
+    setup.replay.db.drop_database().await.expect("drop");
+    assert!(held.is_err(), "held behind the lock");
+    assert!(waited < Duration::from_secs(3), "waited {waited:?}");
+}
+
+async fn sql_on(conn: &mut sqlx::PgConnection, query: &str) {
+    sqlx::query(query).execute(&mut *conn).await.expect("sql");
+}
+
+#[tokio::test]
+async fn test_push_delivery_holds_take_at_most_a_quarter_of_the_pool() {
+    // 16 attempts of two accounts wait for their registrations, which a request holds: at
+    // most a quarter of the request pool's connections wait at once, the rest of the pool
+    // left to requests.
+    let Some((setup, _)) = registered(&[H1]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    let second = silent_account(&setup, "second-account").await;
+    queue_rows(replay, &alice_id(), 8).await;
+    queue_rows(replay, &second, 8).await;
+    let pool = replay.db.store().max_connections();
+    let holds = (pool / 4).max(1);
+    let mut locker = conn(replay).await;
+    sql_on(&mut locker, "BEGIN").await;
+    sql_on(&mut locker, "SELECT 1 FROM push_registrations FOR UPDATE").await;
+    let service = Arc::new(setup.instance());
+    let running = tokio::spawn({
+        let service = service.clone();
+        async move { service.deliver_pushes().await }
+    });
+    let mut watcher = conn(replay).await;
+    let mut most = 0;
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(3) {
+        let (waiting,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+             AND wait_event_type = 'Lock' AND query LIKE '%FOR SHARE OF r%'",
+        )
+        .fetch_one(&mut watcher)
+        .await
+        .expect("activity");
+        most = most.max(waiting);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    watcher.close().await.expect("close");
+    sql_on(&mut locker, "ROLLBACK").await;
+    locker.close().await.expect("close");
+    running.abort();
+    setup.replay.db.drop_database().await.expect("drop");
+    assert!(most >= 1, "no hold seen waiting");
+    assert!(
+        most <= i64::from(holds),
+        "{most} holds at once, of a pool of {pool}"
+    );
+}
+
+#[tokio::test]
+async fn test_push_handles_past_8_at_one_relay_host_are_refused() {
+    // The executor holds 5 handles at the wallet's relay host, spelt otherwise: the wallet
+    // may set 3 there, not 4, since an entry sends at most 8 webhooks toward one host. At
+    // another host the executor's handles don't count.
+    let Some((setup, key)) = registered(&[]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    let keys = vectors("keys.json");
+    let executor = pubky_switch_core::enc::app_id_decode(
+        app(&keys, "executor")["app_id"].as_str().expect("id"),
+    )
+    .expect("app id");
+    let executor_key = replay.keys.generate().await.expect("push key");
+    let mut conn = conn(replay).await;
+    sqlx::query(
+        "INSERT INTO push_registrations (account_id, app_id, relay_url, push_key_id, \
+         push_public, handles, set_at_ms) VALUES ($1, $2, 'https://PUSH.example/v1/other', \
+         $3, $4, $5, 0)",
+    )
+    .bind(alice_id())
+    .bind(executor.as_slice())
+    .bind(executor_key.id.as_str())
+    .bind(executor_key.public.as_slice())
+    .bind((0..5).map(|n| format!("executor-{n}")).collect::<Vec<_>>())
+    .execute(&mut conn)
+    .await
+    .expect("registration");
+    let set = |count: usize| {
+        let handles: Vec<String> = (0..count).map(|n| format!("wallet-{n}")).collect();
+        json!({ "relay_url": RELAY, "handles": handles, "push_key": b64(&key) })
+    };
+    let status = move |push: Value| async move {
+        replay
+            .service
+            .handle(app_request(
+                app(&vectors("keys.json"), "wallet"),
+                "PUT",
+                &format!("/v1/{}/push", alice_id()),
+                push.to_string().into_bytes(),
+                ms(&at()),
+            ))
+            .await
+            .status
+    };
+    assert_eq!(status(set(4)).await, 400);
+    assert_eq!(status(set(3)).await, 200);
+    sqlx::query("UPDATE push_registrations SET relay_url = 'https://fast.example/v1/hook' WHERE app_id = $1")
+        .bind(executor.as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("moved");
+    conn.close().await.expect("close");
+    assert_eq!(status(set(8)).await, 200);
     setup.replay.db.drop_database().await.expect("drop");
 }

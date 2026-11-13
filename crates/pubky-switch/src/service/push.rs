@@ -18,7 +18,9 @@
 //!   registration held. A start is idempotent without a nonce: the same relay without
 //!   `replaces` answers the registration unchanged, `replaces` naming its key replaces it with
 //!   the minted one, and anything else is `409 conflict` naming the current key, or `null`.
-//!   Setting handles needs the current key and relay (`409` otherwise) and replaces the list.
+//!   Setting handles needs the current key and relay (`409` otherwise) and replaces the list;
+//!   a list that would take the account past 8 handles at one relay host, across its apps, is
+//!   `400`, since an entry sends at most 8 webhooks toward one host (8.2).
 //! - **After it:** a key minted but not taken, and the replaced key, are deleted from the key
 //!   store; one whose deletion fails stays owed for the next sweep. A request dropped on the
 //!   way (a client that hangs up) leaves neither: the mint, and the commit with the
@@ -27,6 +29,7 @@
 //!
 //! Nothing of the relay URL, the handles or a key is logged.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -45,7 +48,7 @@ use super::{
 use crate::{
     http::error::{ApiError, ErrorCode},
     keys::{KeyId, KeyStore, ServiceKey, ServiceSigner},
-    store::{AccountTxn, PushRegistration, Store, StoreError},
+    store::{AccountTxn, PUSH_PER_HOST, PushRegistration, Store, StoreError},
 };
 
 /// How long resolving a relay's host may take (Switch wire 8.2: 5 s).
@@ -282,6 +285,21 @@ impl Service {
             (Some(reg), Some(named))
                 if named == reg.push_public && reg.relay_url == body.relay_url =>
             {
+                // An entry sends at most 8 webhooks toward one relay host (8.2), so handles
+                // past 8 there, across the account's apps, would never get one.
+                let host = check_url(&body.relay_url, &UrlUse::Relay)
+                    .map_err(|e| ApiError::bad_request(e.to_string()))?
+                    .host;
+                let others = txn
+                    .push_handles_at_host(&host, &app)
+                    .await
+                    .map_err(|e| store_error(&e))?;
+                let handles = body.handles.iter().collect::<HashSet<_>>().len();
+                if others + handles > PUSH_PER_HOST {
+                    return Err(ApiError::bad_request(
+                        "8.1: more than 8 handles at one relay host across the account's apps",
+                    ));
+                }
                 txn.set_push_handles(&app, &body.handles, time_ms)
                     .await
                     .map_err(|e| store_error(&e))?;

@@ -286,6 +286,11 @@ impl Service {
     }
 
     /// A service at `origin`, the switch origin `identity.json` names.
+    ///
+    /// Push is on, as `push.enabled` defaults: a service that takes registrations must also
+    /// run [`Service::deliver_pushes_until`], as the binary does, or the webhooks its
+    /// `notify` entries queue are neither sent nor dropped. [`Service::with_push`] turns it
+    /// off.
     pub fn new(
         origin: String,
         store: Store,

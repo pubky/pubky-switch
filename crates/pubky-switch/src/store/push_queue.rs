@@ -78,6 +78,11 @@ pub const PUSH_PER_HOST: usize = 8;
 /// lock, before it gives up and fails: short, since each holds a connection while it waits.
 pub const HOLD_LOCK_TIMEOUT_MS: u64 = 1_000;
 
+/// The longest a claim's statement may run: well inside the 5 s an attempt has from just
+/// before its claim to send, so no claim holds the claims' lock past it, whatever plan the
+/// database picks. A claim cut short claims nothing and is tried again.
+pub const CLAIM_TIMEOUT_MS: u64 = 2_000;
+
 /// The advisory lock every instance's claims take (the module's doc), apart from every other
 /// advisory lock of the service, as `store::keying` derives its keys.
 fn claims_lock_key() -> i64 {
@@ -213,10 +218,15 @@ impl Store {
         // Statement 1: the claims' lock, in a READ COMMITTED transaction whatever the pool's
         // default, so the claim below, a statement of its own, sees every claim committed
         // while it waited. The numbers are formatted, as `SET` takes no bind parameters.
+        // The claim counts each account's rows in flight once, by a join, never once per due
+        // row: those rows are at most `push.concurrency` per instance, so a claim reads the
+        // due rows and the rows in flight, and an account with a large queue costs it no more
+        // than as many rows of many accounts.
         tx.execute(
             format!(
                 "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
                  SET LOCAL lock_timeout = {HOLD_LOCK_TIMEOUT_MS}; \
+                 SET LOCAL statement_timeout = {CLAIM_TIMEOUT_MS}; \
                  SELECT pg_advisory_xact_lock({})",
                 claims_lock_key()
             )
@@ -228,16 +238,17 @@ impl Store {
             "UPDATE push_deliveries SET attempts = attempts + 1, next_attempt_ms = ",
             db_now_ms!(),
             " + $2 WHERE id IN (SELECT p.id FROM push_deliveries p JOIN (\
-             SELECT ranked.id, ranked.n + (SELECT count(*) FROM push_deliveries l \
-             WHERE l.account_id = ranked.account_id AND l.next_attempt_ms > ",
+             SELECT d.id, row_number() OVER (PARTITION BY d.account_id \
+             ORDER BY d.next_attempt_ms, d.id) + coalesce(f.n, 0) AS place \
+             FROM push_deliveries d LEFT JOIN (SELECT l.account_id, count(*) AS n \
+             FROM push_deliveries l WHERE l.next_attempt_ms > ",
             db_now_ms!(),
-            " + $4) AS place FROM (SELECT d.id, d.account_id, row_number() OVER \
-             (PARTITION BY d.account_id ORDER BY d.next_attempt_ms, d.id) AS n \
-             FROM push_deliveries d WHERE d.next_attempt_ms <= ",
+            " + $4 GROUP BY l.account_id) f ON f.account_id = d.account_id \
+             WHERE d.next_attempt_ms <= ",
             db_now_ms!(),
             " AND d.attempts < 3 AND d.entry_at_ms + $3 > ",
             db_now_ms!(),
-            ") ranked) c ON c.id = p.id WHERE c.place <= $5 \
+            ") c ON c.id = p.id WHERE c.place <= $5 \
              ORDER BY c.place, p.next_attempt_ms, p.id LIMIT $1 FOR UPDATE OF p SKIP LOCKED) \
              RETURNING id, account_id, app_id, push_key_id, handle, attempts"
         ))

@@ -2817,6 +2817,28 @@ impl Inner {
                 json!({ "push_key": current.map(|k| b64(&k)) }),
             )
         };
+        // An entry sends at most 8 webhooks toward one relay host (8.2): the handles the
+        // other apps hold at this one count against them.
+        let host = |url: &str| {
+            pubky_switch_core::net::check_url(url, &pubky_switch_core::net::UrlUse::Relay)
+                .ok()
+                .map(|checked| checked.host)
+        };
+        let at_host = host(&body.relay_url);
+        let held_there: usize = self
+            .push
+            .iter()
+            .filter(|(id, other)| {
+                **id != app && at_host.is_some() && host(&other.relay_url) == at_host
+            })
+            .map(|(_, other)| {
+                other
+                    .handles
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+            })
+            .sum();
         let answer = |reg: &PushReg| {
             (
                 200,
@@ -2835,6 +2857,17 @@ impl Inner {
             },
             Some(named) => match self.push.get_mut(&app) {
                 Some(reg) if Some(named) == current && reg.relay_url == body.relay_url => {
+                    let listed = body
+                        .handles
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>();
+                    if held_there + listed.len() > 8 {
+                        return bad(
+                            ErrorCode::BadRequest,
+                            "more than 8 handles at one relay host across the account's apps",
+                            json!(null),
+                        );
+                    }
                     reg.handles = body.handles;
                     let reg = reg.clone();
                     answer(&reg)

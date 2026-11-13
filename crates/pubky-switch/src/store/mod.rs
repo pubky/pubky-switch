@@ -225,14 +225,38 @@ pub enum StoreError {
 /// PostgreSQL's code for a lock that wasn't free within `lock_timeout`.
 const LOCK_NOT_AVAILABLE: &str = "55P03";
 
+/// Whether an answer of `ERROR` severity (`error`) with SQLSTATE `code` proves nothing was
+/// committed ([`StoreError::is_refused`]): not a connection's failure (class `08`), an
+/// operator's intervention such as a shutdown (`57`), a system error (`58`) or an internal
+/// one (`XX`).
+fn refused_answer(error: bool, code: &str) -> bool {
+    error
+        && !["08", "57", "58", "XX"]
+            .iter()
+            .any(|class| code.starts_with(class))
+}
+
 impl StoreError {
-    /// Whether the database answered with an error, so what failed is known not to have
-    /// committed; otherwise (a lost connection, a protocol failure) a commit may have landed.
+    /// Whether the database refused what failed, so it is known not to have committed: an
+    /// `ERROR` of the statement or the commit itself (a constraint, a deferred trigger, a
+    /// serialization failure, a lock timeout). Anything else may follow a commit that landed:
+    /// a lost connection, a protocol failure, and the answers a server or a pooler between
+    /// it and the service gives when a connection breaks or the server stops (`FATAL` or
+    /// `PANIC`, and SQLSTATE classes `08`, `57`, `58` and `XX`: PgBouncer answers `08P01`
+    /// for a server connection it lost, perhaps after the commit).
     pub fn is_refused(&self) -> bool {
-        matches!(
-            self,
-            Self::Database(sqlx::Error::Database(_)) | Self::LockTimeout
-        )
+        match self {
+            Self::LockTimeout => true,
+            Self::Database(sqlx::Error::Database(db)) => db
+                .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+                .is_some_and(|pg| {
+                    refused_answer(
+                        matches!(pg.severity(), sqlx::postgres::PgSeverity::Error),
+                        pg.code(),
+                    )
+                }),
+            _ => false,
+        }
     }
 
     /// Map a database error, telling a lock timeout apart.
@@ -666,6 +690,21 @@ mod tests {
             synchronous_commit: commit.into(),
             synchronous_standby_names: standbys.into(),
         }
+    }
+
+    #[test]
+    fn test_store_refused_answer_only_an_error_of_the_statement() {
+        // A constraint, a deferred trigger at the commit, a serialization failure: nothing
+        // committed.
+        for code in ["23505", "P0001", "40001", "55P03"] {
+            assert!(refused_answer(true, code), "{code}");
+        }
+        // A lost connection, as PgBouncer answers one (`08P01`), a shutdown or an internal
+        // error may follow a commit that landed, and so may a `FATAL` of any class.
+        for code in ["08P01", "08006", "57P01", "57014", "58030", "XX000"] {
+            assert!(!refused_answer(true, code), "{code}");
+        }
+        assert!(!refused_answer(false, "23505"));
     }
 
     #[test]

@@ -18,6 +18,9 @@
 //! An owed row is locked while its key is minted or deleted, so a sweep never deletes the key
 //! of a start that is about to claim it, and a start never claims a key a sweep deleted.
 
+use std::collections::HashSet;
+
+use pubky_switch_core::net::{UrlUse, check_url};
 use sqlx::{Postgres, Row, Transaction};
 
 use super::{AccountTxn, Store, StoreError, from_db, to_db};
@@ -237,6 +240,36 @@ impl AccountTxn {
         // 8.2): none is sent with the new key, which has no handles yet.
         self.drop_pushes_except(&registration.app_id, &registration.handles)
             .await
+    }
+
+    /// How many handles the account's registrations other than `app`'s hold at the relay
+    /// `host`, the host as `check_url` spells it: what an entry's webhooks toward that host
+    /// count against [`super::PUSH_PER_HOST`] (`store::push_queue`).
+    pub async fn push_handles_at_host(
+        &mut self,
+        host: &str,
+        app: &[u8; 16],
+    ) -> Result<usize, StoreError> {
+        let id = self.head().id.clone();
+        let rows = sqlx::query(
+            "SELECT relay_url, handles FROM push_registrations \
+             WHERE account_id = $1 AND app_id <> $2",
+        )
+        .bind(id)
+        .bind(app.as_slice())
+        .fetch_all(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        let mut held = 0;
+        for row in &rows {
+            let relay_url: String = row.try_get("relay_url")?;
+            let at_host = check_url(&relay_url, &UrlUse::Relay).is_ok_and(|url| url.host == host);
+            if at_host {
+                let handles: Vec<String> = row.try_get("handles")?;
+                held += handles.iter().collect::<HashSet<_>>().len();
+            }
+        }
+        Ok(held)
     }
 
     /// Replace the handles of `app`'s registration, at `at_ms`; the deliveries queued for a
