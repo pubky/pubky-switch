@@ -201,11 +201,13 @@ pub struct AppConfig {
     /// needs public data does (Switch spec 4.2); such an app leaves in two steps (Switch spec
     /// 12.3). It needs [`AppEnv::homeserver_writer`].
     pub publishes_record: bool,
-    /// The time budget of one call, in milliseconds by the app's clock: 20 s by default.
-    /// Once it has passed since a bounded call began, the call starts no further request
-    /// and returns as when its request budget runs out, with what is left kept for the next
-    /// call ([`ReceiveReport::more`], a write's batch kept). A call so ends within the
-    /// budget and one more request's timeout ([`crate::transport::HttpConfig`]).
+    /// The time budget of [`App::receive`] and [`App::update_record`], in milliseconds by
+    /// the app's clock: 20 s by default. Once it has passed since the call began, a read's
+    /// looping steps start no further request, each after its first, and the read says
+    /// [`ReceiveReport::more`], what is left kept for the next read; `update_record` tries
+    /// no further write. It bounds when those steps stop, not the call's whole time: each
+    /// call's docs state what it may still send after the budget ran out. A write
+    /// ([`App::submit_batch`]) doesn't take it: its bound is the requests it sends.
     pub call_budget_ms: u64,
 }
 
@@ -2603,7 +2605,6 @@ impl App {
         }
     }
 
-    /// Reload after a failed commit, and refuse calls the app's state forbids.
     /// The time budget of a call that begins now ([`AppConfig::call_budget_ms`]).
     pub(crate) fn begin_budget(&self) -> CallBudget {
         CallBudget {
@@ -2617,6 +2618,7 @@ impl App {
         budget.spent(self.now())
     }
 
+    /// Reload after a failed commit, and refuse calls the app's state forbids.
     async fn ready_local(&mut self) -> Result<(), AppError> {
         // Each call takes a service time of its own before it judges a kept batch's age.
         self.time_fresh_at = None;

@@ -131,9 +131,13 @@ pub struct ReceiveReport {
     /// The read stopped on one of its per-call budgets with more to do now, all of it
     /// left for the next read, nothing lost or reordered: kept batches beyond
     /// [`KEPT_RESENDS_PER_READ`](super::KEPT_RESENDS_PER_READ), an owed listing of the
-    /// collections beyond [`LISTING_PAGES_PER_READ`] pages, or a second `missed` item,
-    /// whose listing the next read makes. The host calls [`App::receive`] again without
-    /// waiting.
+    /// collections beyond [`LISTING_PAGES_PER_READ`] pages, a second `missed` item, whose
+    /// listing the next read makes, feed pages beyond [`FEED_PAGES_PER_READ`], claims or
+    /// records to read again beyond [`CLAIM_REREADS_PER_READ`](super::CLAIM_REREADS_PER_READ)
+    /// or [`RECORD_REREADS_PER_READ`](super::RECORD_REREADS_PER_READ), or any of these left
+    /// once the time budget was spent ([`super::AppConfig::call_budget_ms`]). Entries stored
+    /// locally that a read didn't retry don't set it: they are retried at the next read
+    /// whenever it comes. The host calls [`App::receive`] again without waiting.
     pub more: bool,
 }
 
@@ -374,13 +378,34 @@ impl App {
     /// ([`AppEvent::KeptBatchesWaiting`]), and the read goes on. A read that stops on a
     /// budget says so ([`ReceiveReport::more`]).
     ///
-    /// **Worst case.** A read reads at most [`FEED_PAGES_PER_READ`] pages and starts no
-    /// further request once its time budget is spent ([`super::AppConfig::call_budget_ms`],
-    /// 20 s by default), stopping between two items, never inside a batch's items; the
-    /// next read goes on from where it got (`feed_at`). Each of its steps, the kept batches,
-    /// the listing, the stored entries, the feed and the rereads, makes its first request
-    /// whatever the time, so no step waits for ever behind a slow one: a read ends within
-    /// the budget and one request for each step after it ran out.
+    /// **Worst case.** A read reads at most [`FEED_PAGES_PER_READ`] pages, and stops between
+    /// two items, never inside a batch's items; the next read goes on from where it got
+    /// (`feed_at`). The time budget ([`super::AppConfig::call_budget_ms`], 20 s by default)
+    /// bounds the steps that loop: the kept batches, the listing, the stored entries, the
+    /// feed and the rereads. Once it is spent each of them starts no further request after
+    /// its first, which it makes whatever the time, so no step waits for ever behind a slow
+    /// one. It doesn't bound the whole read:
+    /// - an item processed after it still makes its own requests, its sender's
+    ///   `identity.json` and its effect's batch;
+    /// - the read's other steps take no budget and make their requests whatever the time,
+    ///   among them the admission lists' refresh, the kept effect, the owed record
+    ///   delivery, the owed calls, the scope keys and key bundle parts, the records'
+    ///   reopening, the entries' writers, the own record's publication, the receive key
+    ///   rotation and the cursor move;
+    /// - a move or provider change met during the read is followed, which the budget doesn't
+    ///   bound either, and the read then goes on once more under the same budget.
+    ///
+    /// So a read ends after its budget, one request of each looping step and the requests
+    /// of the item it stopped on and of those other steps, each request within its timeout.
+    /// Once the budget is spent, the rest of a page already downloaded is dropped, past the
+    /// one item or batch processed, and the next read downloads that page again.
+    ///
+    /// **Order.** The kept batches go before the feed, oldest first, and no later write of
+    /// the host overtakes them ([`App::submit_batch`]). The read's own writes aren't kept
+    /// batches: the effects of the messages it processes, its cursor moves and a rotation
+    /// go as the read makes them, also when it left kept batches unsent, on its budget or
+    /// because their resend failed. So a read's own write may reach the switch before a
+    /// host's write kept from an earlier call.
     ///
     /// # Errors
     ///

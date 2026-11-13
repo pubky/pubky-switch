@@ -323,18 +323,27 @@ impl App {
     /// builds the batch again ([`App::record_op`] seals at the epoch the app holds then).
     ///
     /// **Kept batches ahead, and the worst case.** A batch kept from an earlier call goes
-    /// before any later write, oldest first, and no write overtakes it (Switch wire 6.4 step
-    /// 5). A write sends at most one of them again ([`KEPT_RESENDS_PER_WRITE`]) before its
-    /// own. With more kept, its own batch is kept unsent behind them and the call fails with
+    /// before any later write, in the order the calls kept them, and no later write of the
+    /// host overtakes it; this is the client's rule, the switch orders only what reaches it.
+    /// A write sends at most one of them again ([`KEPT_RESENDS_PER_WRITE`]) before its own.
+    /// With more kept, its own batch is kept unsent behind them and the call fails with
     /// [`AppError::Kept`] around [`Refusal::KeptBatchesAhead`], which names the oldest and
     /// when it was first sent: the host reads ([`App::receive`]), which sends them again in
-    /// order. A kept batch whose resend fails blocks the ones behind it until its answer
+    /// order. When the one sent again is answered `410 moved`, its own batch is kept unsent
+    /// behind it too, and the call fails with [`AppError::Kept`] around that `410 moved`. A
+    /// kept batch whose resend fails otherwise blocks the ones behind it until its answer
     /// window ends ([`super::KEPT_BATCH_ANSWER_MS`], 30 days less an hour from its first
-    /// send), and is then dropped and reported. So a write sends at most three requests: the
-    /// kept batch, a time sample and its own batch, each under the short timeout for a batch
-    /// under a mebibyte (10 s by default), and ends within about 30 s at the default
-    /// timeouts; a batch over a mebibyte takes the long one. A `409 stale_epoch` adds the
-    /// newer `identity.json`, the key bundle and one more send.
+    /// send), and is then dropped and reported; the write fails meanwhile with
+    /// [`AppError::Ahead`], keeping nothing of its own.
+    ///
+    /// So a write sends at most three requests to the switch: a time sample, the kept batch
+    /// and its own batch. The time sample has the short timeout (10 s by default), and each
+    /// batch the short timeout and a share of the long one in proportion to its body
+    /// ([`crate::transport::HttpConfig`]): a write of batches of a few KiB ends within about
+    /// 30 s at the default timeouts, one of batches near a mebibyte within about 90 s. A
+    /// kept batch signed for a generation before a move and answered `409 stale_generation`
+    /// is signed again and sent once more, a fourth request; a `409 stale_epoch` of the own
+    /// batch adds the newer `identity.json`, the key bundle and one more send.
     ///
     /// # Errors
     ///
@@ -352,14 +361,16 @@ impl App {
     /// [`AppError::Kept`] with the batch's ID, wrapping the cause, for any failure that leaves
     /// the batch kept, as the store shows it when the call returns (the network, `429`,
     /// `503`, an answer that doesn't verify, a refusal about the caller before its first
-    /// send, an alarm, a failed commit): the batch is sent again, the same bytes, by the
-    /// next call that writes and by the next read ([`App::receive`]) before its feed. A
-    /// batch kept from an
-    /// earlier call that still can't be sent fails the call with its bare error
-    /// ([`AppError::Transport`], [`AppError::Switch`]) before the new batch is signed, so
-    /// nothing of this call is kept. [`AppError::InvalidData`] when an attempt's proof shows another
-    /// state: the batch was applied and its outcome committed, and the attempt is written
-    /// `failed`; a rollback for an attempt stamped at or after its deadline.
+    /// send, an alarm, a failed commit, and the two cases above where it is kept unsent
+    /// behind the batches from earlier calls, [`Refusal::KeptBatchesAhead`] and `410
+    /// moved`): the batch is sent again, the same bytes, by the next call that writes and by
+    /// the next read ([`App::receive`]) before its feed. A batch kept from an earlier call
+    /// whose resend fails on the network or the switch, other than `410 moved`, fails the
+    /// call with [`AppError::Ahead`] around that error before the new batch is signed, so
+    /// nothing of this call is kept. [`AppError::InvalidData`] when an attempt's proof
+    /// shows another state: the batch was applied and its outcome committed, and the
+    /// attempt is written `failed`; a rollback for an attempt stamped at or after its
+    /// deadline.
     pub async fn submit_batch(&mut self, batch: OpBatch) -> Result<Submitted, AppError> {
         Box::pin(async move { Ok(self.submit_checked(batch, false).await?.0) }).await
     }

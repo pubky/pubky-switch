@@ -2260,11 +2260,16 @@ impl App {
     /// for the key (Switch spec 3.5, 8.2). The outbox's record jobs go through here, so a
     /// message's record job waits the same way.
     ///
-    /// **Worst case.** At most four tries, a further one only within the call's time budget
-    /// ([`super::AppConfig::call_budget_ms`], 20 s by default). The call takes one time
-    /// sample and sends at most one kept batch again in all ([`App::submit_batch`]); each try
-    /// sends its batch, and after a conflict reads the record again: two short calls. So it
-    /// ends within the budget and one try, about 40 s at the default timeouts.
+    /// **Worst case.** At most four tries, a further one only while the call's time budget
+    /// isn't spent ([`super::AppConfig::call_budget_ms`], 20 s by default). The call takes
+    /// one time sample and sends at most one kept batch again in all
+    /// ([`App::submit_batch`]): the first try sends at most four requests, those two, its
+    /// own batch and, after a conflict, a read of the record; a further try two, its batch
+    /// and that read. So with batches of a few KiB it ends within about 40 s at the default
+    /// timeouts, whether the first try took them or a further one began just inside the
+    /// budget; a larger batch's send has a longer timeout
+    /// ([`crate::transport::HttpConfig`]), and the cases [`App::submit_batch`] names add
+    /// their requests.
     ///
     /// # Errors
     ///

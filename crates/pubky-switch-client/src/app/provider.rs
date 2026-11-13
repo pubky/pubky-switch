@@ -230,11 +230,11 @@ pub const KEPT_BATCH_ANSWER_MS: u64 =
     pubky_switch_core::ops::BATCH_PROOFS_MS - KEPT_BATCH_MARGIN_MS;
 
 /// How much sooner than the service's 30 days a kept batch's window ends. A resend sent just
-/// inside the window, measured at the later of the device clock and a verified service time, reaches the service within the
-/// device clock's tolerance of the service's (5 minutes, the clock tolerance), plus the
-/// 5 minutes a request's signed time is accepted for (Switch wire 7.1), after the app kept
-/// it, and the service applied it no sooner than the app kept it: some 20 minutes in the
-/// worst case. An hour leaves room past that.
+/// inside the window, measured at the later of the device clock and a verified service
+/// time, reaches the service within the device clock's tolerance of the service's (5
+/// minutes, the clock tolerance), plus the 5 minutes a request's signed time is accepted for
+/// (Switch wire 7.1), after the app kept it, and the service applied it no sooner than the
+/// app kept it: some 20 minutes in the worst case. An hour leaves room past that.
 pub const KEPT_BATCH_MARGIN_MS: u64 = 60 * 60 * 1000;
 
 /// Whether a resend of a batch kept at `kept_ms` still tells whether it was applied, at

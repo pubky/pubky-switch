@@ -120,10 +120,10 @@ pub enum Refusal {
     /// safely, or no longer fits. Nothing was written and no event raised.
     WontDeliver(WontDeliver),
     /// A write waits behind batches kept from earlier calls, which a write sends again
-    /// first, one per call, and none of which it overtakes (Switch wire 6.4 step 5): its
-    /// own batch is kept unsent behind them ([`AppError::Kept`]), to go after them. The
-    /// host reads ([`super::App::receive`]), which sends the kept batches again oldest
-    /// first, and finds its batch's fate with [`super::App::kept_batch`].
+    /// first, one per call, and none of which it overtakes: its own batch is kept unsent
+    /// behind them ([`AppError::Kept`]), to go after them. The host reads
+    /// ([`super::App::receive`]), which sends the kept batches again oldest first, and finds
+    /// its batch's fate with [`super::App::kept_batch`].
     KeptBatchesAhead(KeptAhead),
 }
 
@@ -151,9 +151,10 @@ pub enum WontDeliver {
 ///
 /// While its resend fails it blocks the batches behind it, since no write overtakes
 /// another. That lasts at most until its answer window ends, [`super::KEPT_BATCH_ANSWER_MS`]
-/// after it was kept (`answer_until_ms`): past it no answer tells whether the switch
+/// after its first send (`answer_until_ms`): past it no answer tells whether the switch
 /// applied it, so it isn't sent again, and goes, reported with its attempts
-/// ([`super::AppEvent::KeptBatchDropped`]). Until then a host waits, and reads.
+/// ([`super::AppEvent::KeptBatchDropped`]). Until then a host waits, and reads. One never
+/// sent has no window: it goes at its first send that the switch answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct KeptAhead {
@@ -193,11 +194,18 @@ impl std::fmt::Display for Refusal {
             Refusal::WontDeliver(WontDeliver::TooLarge) => {
                 f.write_str("not queued: the message's outbox record is over the store's sizes")
             }
-            Refusal::KeptBatchesAhead(ahead) => write!(
-                f,
-                "kept behind {} batches kept from earlier calls, the oldest kept since {:?}",
-                ahead.kept, ahead.kept_since_ms
-            ),
+            Refusal::KeptBatchesAhead(ahead) => match ahead.kept_since_ms {
+                Some(since) => write!(
+                    f,
+                    "kept behind {} batches kept from earlier calls, the oldest first sent at {since}",
+                    ahead.kept
+                ),
+                None => write!(
+                    f,
+                    "kept behind {} batches kept from earlier calls, the oldest never sent",
+                    ahead.kept
+                ),
+            },
             Refusal::CarriedTooLarge {
                 duty_events,
                 owed_calls,
@@ -274,11 +282,11 @@ pub enum AppError {
     /// The store decides it: a call of [`super::App::submit_batch`] or
     /// [`super::App::write_claim`], or one that writes through them such as
     /// [`super::App::put_record`], fails with this exactly when its own batch is still kept
-    /// under `opq/` when it returns. A bare error means the batch isn't kept: it was never
-    /// signed or stored, a batch kept from an earlier call couldn't be sent first, or it was
-    /// refused for good and dropped. When the store can't be read to tell, the call fails
-    /// with that store error, bare: whether the batch is kept can't be told then, and a
-    /// kept one goes again with the next write or read.
+    /// under `opq/` when it returns. Any other error means the batch isn't kept: it was
+    /// never signed or stored, a batch kept from an earlier call couldn't be sent first
+    /// ([`AppError::Ahead`]), or it was refused for good and dropped. When the store can't
+    /// be read to tell, the call fails with that store error, bare: whether the batch is
+    /// kept can't be told then, and a kept one goes again with the next write or read.
     /// Other calls keep their own signed artifacts elsewhere and may fail bare after keeping
     /// one: [`super::App::rotate`] its receive key registration, a join its batch, and the
     /// delivery of the app record its batch; each is sent again by itself (`STATE.md`).
@@ -290,9 +298,10 @@ pub enum AppError {
         /// Why it couldn't be settled now.
         error: Box<AppError>,
     },
-    /// A write's resend of the oldest batch kept from an earlier call failed with `error`:
-    /// nothing of the write was kept or sent, since no write overtakes a kept batch. `ahead`
-    /// names that batch and how long it has been kept ([`KeptAhead`]).
+    /// A write's resend of the oldest batch kept from an earlier call failed with `error`,
+    /// on the network or the switch, other than `410 moved`: nothing of the write was kept
+    /// or sent, since no write overtakes a kept batch. `ahead` names that batch and how long
+    /// it has been kept ([`KeptAhead`]).
     /// [`AppError::code`] and [`AppError::unkept`] see through this variant.
     #[error("a batch kept from an earlier call is ahead and couldn't be sent: {error}")]
     Ahead {
