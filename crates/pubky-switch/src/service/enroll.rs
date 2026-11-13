@@ -1,5 +1,7 @@
 //! `POST /v1/enroll` (Switch wire 3.7, 7.4.1).
 
+use std::sync::Arc;
+
 use pubky_switch_core::{
     Error as CoreError,
     enc::pubky_key,
@@ -14,6 +16,7 @@ use super::{
     rules::{
         AccountState, Caller, EnrollmentKey, decode_claim, enrollment_key, names_this_service,
     },
+    erase::to_the_end,
     store_error,
 };
 use crate::{
@@ -21,7 +24,7 @@ use crate::{
         SwitchRequest, SwitchResponse,
         error::{ApiError, ErrorCode},
     },
-    keys::{KeyId, ServiceKey},
+    keys::{KeyId, KeyStore, ServiceKey},
     limits::{Limits, fixed},
     store::NewAccount,
 };
@@ -178,30 +181,45 @@ impl Service {
             .map_err(|e| store_error(&e))?
             .is_none()
         {
-            let key = self.keys.generate().await.map_err(|_| unavailable())?;
-            let account = NewAccount {
-                id: identity_text.to_string(),
-                identity_key: enrollment.body().identity,
-                generation: enrollment.identity_doc().map_or(1, IdentityDoc::generation),
-                service_key: key.id.clone(),
-                created_at_ms: base_ms,
-                limits: announced_limits(&self.limits),
-                identity_doc: enrollment.identity_doc().map(|doc| doc.signed().clone()),
-                revoked_apps: enrollment.revoked_apps().to_vec(),
-                enrollment_hash,
-            };
-            let created = self
-                .store
-                .create_account(&account)
-                .await
-                .map_err(|e| store_error(&e))?;
-            if created {
-                return Ok((key, base_ms, account.limits));
+            let (store, keys) = (self.store.clone(), self.keys.clone());
+            let (id, identity_key) = (identity_text.to_string(), enrollment.body().identity);
+            let generation = enrollment.identity_doc().map_or(1, IdentityDoc::generation);
+            let limits = announced_limits(&self.limits);
+            let identity_doc = enrollment.identity_doc().map(|doc| doc.signed().clone());
+            let revoked_apps = enrollment.revoked_apps().to_vec();
+            // The key is made and the account created with it, or the key deleted when
+            // another enrollment made the account first, in a task of its own: a signer that
+            // hangs up between them leaves no key no account names. A creation whose result
+            // is lost may have committed, so its key stays.
+            let made = to_the_end(async move {
+                let key = keys.generate().await.ok()?;
+                let account = NewAccount {
+                    id,
+                    identity_key,
+                    generation,
+                    service_key: key.id.clone(),
+                    created_at_ms: base_ms,
+                    limits,
+                    identity_doc,
+                    revoked_apps,
+                    enrollment_hash,
+                };
+                let created = store.create_account(&account).await;
+                if matches!(created, Ok(false))
+                    && let Err(failure) = keys.delete(&key.id).await
+                {
+                    tracing::warn!(%failure, "dropping an unused service key");
+                }
+                Some((key, created))
+            })
+            .await
+            .flatten()
+            .ok_or_else(unavailable)?;
+            let (key, created) = made;
+            if created.map_err(|e| store_error(&e))? {
+                return Ok((key, base_ms, limits));
             }
             // Another enrollment made the account first: its key answers.
-            if let Err(failure) = self.keys.delete(&key.id).await {
-                tracing::warn!(%failure, "dropping an unused service key");
-            }
         }
         let mut txn = self
             .store
@@ -277,15 +295,23 @@ impl Service {
             )
             .with_current(serde_json::json!({ "limit": "enrollments" })));
         }
+        // A pending key made here is deleted if the request ends, or is dropped, before its
+        // commit is under way ([`MadeKey`]).
+        let mut made = None;
         let key_id: KeyId = match choice {
             EnrollmentKey::NewAccount | EnrollmentKey::AccountKey => account_key,
             EnrollmentKey::PendingKey { exists: true } => pending.ok_or_else(unavailable)?,
             EnrollmentKey::PendingKey { exists: false } => {
-                let key = self.keys.generate().await.map_err(|_| unavailable())?;
-                txn.set_pending_key(&key.id)
+                let key = to_the_end(MadeKey::generate(self.keys.clone()))
+                    .await
+                    .flatten()
+                    .ok_or_else(unavailable)?;
+                txn.set_pending_key(key.id())
                     .await
                     .map_err(|e| store_error(&e))?;
-                key.id
+                let id = key.id().clone();
+                made = Some(key);
+                id
             }
         };
         // An enrollment answered with the pending key: its `revoked_apps` join the account's
@@ -304,12 +330,69 @@ impl Service {
         )
         .await
         .map_err(|e| store_error(&e))?;
-        txn.commit().await.map_err(|e| store_error(&e))?;
+        // The commit runs to its end in a task of its own, and the pending key made here is
+        // kept once it is under way: a commit whose result is lost may have landed.
+        to_the_end(async move {
+            let committed = txn.commit().await;
+            made.map(MadeKey::keep);
+            committed
+        })
+        .await
+        .ok_or_else(unavailable)?
+        .map_err(|e| store_error(&e))?;
         let public = self
             .keys
             .public_key(&key_id)
             .await
             .map_err(|_| unavailable())?;
         Ok((ServiceKey { id: key_id, public }, time_ms, limits))
+    }
+}
+
+/// A service key made for one request: deleted from the key store by a task of its own when
+/// this drops, unless [`MadeKey::keep`] took it. Made in a task of its own
+/// ([`MadeKey::generate`] under [`to_the_end`]), so a request dropped while the key is
+/// written leaves no key behind: the task's output drops, and deletes it.
+struct MadeKey {
+    keys: Arc<dyn KeyStore>,
+    key: ServiceKey,
+    kept: bool,
+}
+
+impl MadeKey {
+    /// A new key; `None` when the key store fails.
+    async fn generate(keys: Arc<dyn KeyStore>) -> Option<Self> {
+        let key = keys.generate().await.ok()?;
+        Some(Self {
+            keys,
+            key,
+            kept: false,
+        })
+    }
+
+    /// The key's ID.
+    fn id(&self) -> &KeyId {
+        &self.key.id
+    }
+
+    /// Keep the key: the request's commit names it, or may.
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for MadeKey {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        let (keys, id) = (self.keys.clone(), self.key.id.clone());
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(failure) = keys.delete(&id).await {
+                    tracing::warn!(%failure, "dropping an unused service key");
+                }
+            });
+        }
     }
 }

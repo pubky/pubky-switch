@@ -20,7 +20,10 @@
 //!   the minted one, and anything else is `409 conflict` naming the current key, or `null`.
 //!   Setting handles needs the current key and relay (`409` otherwise) and replaces the list.
 //! - **After it:** a key minted but not taken, and the replaced key, are deleted from the key
-//!   store; one whose deletion fails stays owed for the next sweep.
+//!   store; one whose deletion fails stays owed for the next sweep. A request dropped on the
+//!   way (a client that hangs up) leaves neither: the mint, and the commit with the
+//!   deletions it owes, run to their end in tasks of their own, and the minted key's debt
+//!   deletes it as it drops.
 //!
 //! Nothing of the relay URL, the handles or a key is logged.
 
@@ -34,11 +37,15 @@ use pubky_switch_core::{
 };
 use serde_json::json;
 
-use super::{Answer, Service, store_error};
+use super::{
+    Answer, Service,
+    erase::{OwedKeys, to_the_end},
+    store_error,
+};
 use crate::{
     http::error::{ApiError, ErrorCode},
-    keys::{KeyId, ServiceKey, ServiceSigner},
-    store::{AccountTxn, PushRegistration, StoreError},
+    keys::{KeyId, KeyStore, ServiceKey, ServiceSigner},
+    store::{AccountTxn, PushRegistration, Store, StoreError},
 };
 
 /// How long resolving a relay's host may take (Switch wire 8.2: 5 s).
@@ -66,17 +73,64 @@ pub(super) fn system_resolver() -> Resolver {
 pub(super) struct PreparedPush {
     /// The body, or its `400`.
     body: Result<PushBody, ApiError>,
-    /// The ID owed for a push key minted for a start, minted or not.
-    reserved: Option<KeyId>,
+    /// The key owed for a start, minted or not: deleted once the request is over, or as soon
+    /// as it is dropped, unless a committed registration took it.
+    reserved: Option<OwedKeys>,
     /// The key minted.
     minted: Option<ServiceKey>,
 }
 
 impl PreparedPush {
-    /// The key ID owed for a start, to delete once the request is over unless a committed
-    /// registration took it.
-    pub(super) fn reserved(&self) -> Option<&KeyId> {
-        self.reserved.as_ref()
+    /// The request is over: the key owed for a start goes unless a committed registration
+    /// took it.
+    pub(super) async fn done(self) {
+        if let Some(reserved) = self.reserved {
+            reserved.delete().await;
+        }
+    }
+}
+
+/// Owe deleting a new push key of `account` at `at_ms`, then mint it under its row's lock
+/// (`store::push`). Run in a task of its own ([`to_the_end`]), so a request dropped meanwhile
+/// stops it neither between the debt and the key nor while the key is written: its debt, the
+/// returned [`OwedKeys`], is then dropped with the task's output and deletes the key.
+async fn mint_push_key(
+    store: Store,
+    keys: Arc<dyn KeyStore>,
+    account: String,
+    at_ms: u64,
+) -> (Option<OwedKeys>, Option<ServiceKey>) {
+    let Ok(id) = KeyId::random() else {
+        return (None, None);
+    };
+    if let Err(error) = store.owe_push_key(&account, &id, at_ms).await {
+        let _ = store_error(&error);
+        return (None, None);
+    }
+    let minted = mint_owed(&store, keys.as_ref(), &id).await;
+    let owed = OwedKeys::new(store, keys, vec![id]);
+    (Some(owed), minted)
+}
+
+/// Mint push key `id` while its owed row is locked; `None` when no row owes it any more: a
+/// sweep that took the row first deleted it, and a key minted after that would be owed by
+/// no row.
+async fn mint_owed(store: &Store, keys: &dyn KeyStore, id: &KeyId) -> Option<ServiceKey> {
+    match store.lock_owed_key(id).await {
+        Ok(Some(row)) => {
+            let minted = keys
+                .generate_as(id)
+                .await
+                .inspect_err(|failure| tracing::error!(%failure, "minting a push key"))
+                .ok();
+            drop(row);
+            minted
+        }
+        Ok(None) => None,
+        Err(error) => {
+            let _ = store_error(&error);
+            None
+        }
     }
 }
 
@@ -136,28 +190,15 @@ impl Service {
         if !needs_key(current, body.replaces) {
             return prepared;
         }
-        let Ok(id) = KeyId::random() else {
-            return prepared;
-        };
-        if let Err(error) = self.store.owe_push_key(account, &id, at_ms).await {
-            let _ = store_error(&error);
-            return prepared;
-        }
-        prepared.reserved = Some(id.clone());
-        // Minted only while its row is owed and locked: a sweep that took the row first
-        // deleted it, and the start mints nothing.
-        match self.store.lock_owed_key(&id).await {
-            Ok(Some(row)) => {
-                match self.keys.generate_as(&id).await {
-                    Ok(key) => prepared.minted = Some(key),
-                    Err(failure) => tracing::error!(%failure, "minting a push key"),
-                }
-                drop(row);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                let _ = store_error(&error);
-            }
+        let minting = mint_push_key(
+            self.store.clone(),
+            self.keys.clone(),
+            account.to_string(),
+            at_ms,
+        );
+        if let Some((reserved, minted)) = to_the_end(minting).await {
+            prepared.reserved = reserved;
+            prepared.minted = minted;
         }
         prepared
     }
@@ -273,6 +314,28 @@ mod tests {
         assert!(needs_key(Some([1; 32]), Some([1; 32])));
         assert!(!needs_key(Some([1; 32]), Some([2; 32])));
         assert!(!needs_key(Some([1; 32]), None));
+    }
+
+    #[tokio::test]
+    async fn test_push_mint_of_a_key_no_longer_owed_mints_nothing() {
+        // A sweep that took the row first deleted the key: minting it anyway would leave a
+        // key no row owes, which nothing would ever delete.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let keys = crate::keys::FileKeyStore::open(dir.path()).expect("key store");
+        let id = KeyId::random().expect("key id");
+        assert!(mint_owed(db.store(), &keys, &id).await.is_none());
+        assert!(keys.public_key(&id).await.is_err(), "nothing minted");
+        // Owed, it is minted.
+        db.store()
+            .owe_push_key("account", &id, 1)
+            .await
+            .expect("owed");
+        let minted = mint_owed(db.store(), &keys, &id).await.expect("minted");
+        assert_eq!(keys.public_key(&id).await.expect("kept"), minted.public);
+        db.drop_database().await.expect("drop");
     }
 
     #[test]
