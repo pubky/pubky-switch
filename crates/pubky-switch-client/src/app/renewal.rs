@@ -338,6 +338,12 @@ impl App {
             Ok(found) => found,
             Err(AppError::Transport(_) | AppError::Switch(_) | AppError::InvalidData(_)) => {
                 self.renewal_looked_ms = Some(now);
+                // The look may have failed after it took a newer own document, such as at
+                // the key fetch an epoch rise makes, refused for an app that document
+                // removes: the read stops at that document all the same.
+                if self.not_current_here().is_some() {
+                    return Ok(Some(Listed::NotCurrentHere));
+                }
                 return Ok(None);
             }
             Err(error) => return Err(error),

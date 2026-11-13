@@ -80,7 +80,7 @@ pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION
 pub use kept::{KeptBatch, KeptBatchDrop, KeptBatchStatus};
 pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
 pub use parked::{ParkedMessage, ParkedSummary};
-pub use peek::{PeekReport, Peeked};
+pub use peek::{PEEK_PAGES, PeekReport, Peeked};
 pub use protocol::{
     Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
     MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need,
@@ -115,13 +115,13 @@ pub use directory::{
     SwitchAnswer, SwitchCopy, SwitchLookup,
 };
 pub use records::{
-    Collection, FlaggedWrite, KeptOp, KeptReason, LISTING_PAGES_PER_READ, PolicyFamily,
-    RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord, Unopened,
+    Collection, CollectionListed, FlaggedWrite, KeptOp, KeptReason, LISTING_PAGES_PER_READ,
+    PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord, Unopened,
 };
 pub use send::{
-    Delivery, MAX_CARRIED_OUTBOX_BYTES, OutboxReport, OutgoingMessage, RecordJob,
-    SENT_RETENTION_MS, SentMessage, SignedMessage, UNDELIVERABLE_MAX_MS, UNDELIVERABLE_MS,
-    UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
+    Delivery, MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH, OutboxReport, OutgoingMessage,
+    RecordJob, SENT_RETENTION_MS, SentMessage, SignedMessage, UNDELIVERABLE_MAX_MS,
+    UNDELIVERABLE_MS, UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -201,13 +201,22 @@ pub struct AppConfig {
     /// needs public data does (Switch spec 4.2); such an app leaves in two steps (Switch spec
     /// 12.3). It needs [`AppEnv::homeserver_writer`].
     pub publishes_record: bool,
-    /// The time budget of [`App::receive`] and [`App::update_record`], in milliseconds by
-    /// the app's clock: 20 s by default. Once it has passed since the call began, a read's
-    /// looping steps start no further request, each after its first, and the read says
-    /// [`ReceiveReport::more`], what is left kept for the next read; `update_record` tries
-    /// no further write. It bounds when those steps stop, not the call's whole time: each
-    /// call's docs state what it may still send after the budget ran out. A write
-    /// ([`App::submit_batch`]) doesn't take it: its bound is the requests it sends.
+    /// The time budget of each bounded call, in milliseconds by the app's clock: 20 s by
+    /// default. Once it has passed since the call began:
+    /// - [`App::receive`]'s looping steps start no further request, each after its first,
+    ///   and the read says [`ReceiveReport::more`], what is left kept for the next read;
+    /// - [`App::update_record`] tries no further write;
+    /// - [`App::flush_outbox`] starts no further unit after its first, and says
+    ///   [`OutboxReport::more`];
+    /// - [`App::list_collection`] and [`App::list_collections`] ask for no further page
+    ///   after their first, and [`App::peek`] reads no further page.
+    ///
+    /// It bounds when those steps stop, not the call's whole time: each call's docs state
+    /// what it may still send after the budget ran out. A write ([`App::submit_batch`])
+    /// doesn't take it: its bound is the requests it sends. One message's try
+    /// ([`App::send`], [`App::resend`], [`App::flush_message`]) starts no retry of its
+    /// delivery once the budget has passed since the delivery began, and its record job is
+    /// an [`App::update_record`], with a budget of its own.
     pub call_budget_ms: u64,
 }
 
@@ -2106,6 +2115,15 @@ impl App {
             self.duty_handed = self.duty_handed.max(id.counter());
         }
         events
+    }
+
+    /// Queue `event`, a stop the host acts on (`Removed`, `ProviderChanged`), unless it is
+    /// already queued and not yet taken: several steps of one call may find the same stop,
+    /// and the host is told once.
+    pub(crate) fn push_once(&mut self, event: AppEvent) {
+        if !self.events.contains(&event) {
+            self.events.push(event);
+        }
     }
 
     /// Queue duty events for the host, in order, and keep how far they go.

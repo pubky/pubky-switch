@@ -2403,3 +2403,100 @@ async fn test_own_record_look_that_fails_lets_the_read_go_on() {
     );
     assert!(app.renewal_looked_ms.is_some());
 }
+
+/// A look whose directory carries a newer own `identity.json` that removes the app and
+/// raises the data epoch, and the key fetch the epoch rise makes fails after the document
+/// is taken. The read still stops at the removal, before its feed, and hands nothing over.
+#[tokio::test]
+async fn test_take_listed_renewal_removal_with_an_epoch_rise_stops_the_read() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    app.receive(None).await.unwrap();
+    let old = app.cert().clone();
+    w.clock.advance_ms(1_000);
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["scope-a"],
+    );
+    list_renewal(&w, id, &old, &renewed);
+    app.refresh_identity().await.unwrap();
+    // A batch kept from an earlier call, which a read sends again before its feed.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    app.submit_batch(
+        crate::app::OpBatch::new().op(pubky_switch_core::ops::OpKind::AllowPut {
+            pubky: [10; 32],
+            kind: pubky_switch_core::ops::AllowKind::Conversation,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    let (note, _) = w.note(id, "hello");
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != id);
+        body.removed.push(pubky_switch_core::records::RemovedApp {
+            app_id: id,
+            distrust_from: w.clock.now_ms(),
+        });
+        body.data_epoch += 1;
+    });
+    // The key fetch the epoch rise makes fails, after the look took the document.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/keys".into(),
+        after: 0,
+    });
+    // The kept batch, sent again after the removal, would meet this fault.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    let reads = w.switch.lock().feed_reads;
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped, "{:?}", report.events);
+    let left: Vec<String> = w
+        .switch
+        .lock()
+        .faults
+        .iter()
+        .map(|fault| match fault {
+            Fault::Unreachable { path, .. } => path.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert_eq!(
+        left,
+        ["/ops"],
+        "the key fetch failed, and nothing was sent after it"
+    );
+    // Told once: the read stops at the removal rather than going on to find it again.
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .filter(|e| matches!(e, AppEvent::Removed))
+            .count(),
+        1,
+        "{:?}",
+        report.events
+    );
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::MessageReceived { seq, .. } if *seq == note)),
+        "{:?}",
+        report.events
+    );
+    // It stops at the document the look took, before its feed.
+    assert_eq!(
+        w.switch.lock().feed_reads,
+        reads,
+        "no feed read after the removal"
+    );
+}
