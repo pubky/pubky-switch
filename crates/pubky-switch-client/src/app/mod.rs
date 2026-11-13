@@ -629,15 +629,19 @@ pub struct App {
     /// only.
     directory_failed_ms: Option<u64>,
     events: Vec<AppEvent>,
-    /// Whether a deny list change is owed, `None` until read from `owed/`; kept as calls
-    /// are owed and made again. In memory only.
-    deny_owed_known: Option<bool>,
-    /// How many reads in a row stopped at a deny list change or gap the protocol didn't
-    /// take ([`AppEvent::DenyListHeld`]). In memory only.
-    deny_held_reads: u32,
-    /// The writers of deny list changes the own directory was read for, once each while the
-    /// app runs. In memory only.
-    deny_writers_asked: Vec<[u8; 16]>,
+    /// Whether an owed call holds the read, as the last retry of `owed/` left it, and set as
+    /// calls are owed. In memory only.
+    owed_known: Option<bool>,
+    /// How many reads in a row stopped at an owed call or deny list gap the protocol didn't
+    /// take ([`AppEvent::OwedCallHeld`]). In memory only.
+    owed_held_reads: u32,
+    /// The first owed call past the cursor, by its item's `seq` in the cursor's generation,
+    /// as a restore in place carries it: the feed stops before any later item, so the call
+    /// goes in feed order, once. Set at each read's start. In memory only.
+    owed_ahead: Option<u64>,
+    /// The read (by [`App::receive`]'s count) the own directory was read in for a deny list
+    /// change's writer, and whether it answered: once a read. In memory only.
+    deny_directory_read: Option<(u64, bool)>,
     /// The highest duty event counter queued in `events` since the app was made: a kept one
     /// above it is queued after a reload (`events` module, "Duty events").
     duty_queued: u64,
@@ -910,9 +914,10 @@ impl App {
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
                 events: Vec::new(),
-                deny_owed_known: None,
-                deny_held_reads: 0,
-                deny_writers_asked: Vec::new(),
+                owed_known: None,
+                owed_held_reads: 0,
+                owed_ahead: None,
+                deny_directory_read: None,
                 duty_queued: 0,
                 duty_handed: 0,
                 time_fresh_at: None,
@@ -1054,9 +1059,10 @@ impl App {
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
                 events: Vec::new(),
-                deny_owed_known: None,
-                deny_held_reads: 0,
-                deny_writers_asked: Vec::new(),
+                owed_known: None,
+                owed_held_reads: 0,
+                owed_ahead: None,
+                deny_directory_read: None,
                 duty_queued: 0,
                 duty_handed: 0,
                 time_fresh_at: None,
@@ -1773,9 +1779,7 @@ impl App {
                 ns: ns.clone(),
                 store: env.store.clone(),
             };
-            let carried = Self::kept_for_protocol(&old, backup.cursor)
-                .await?
-                .unwrap_or_default();
+            let carried = Self::kept_for_protocol(&old).await?.unwrap_or_default();
             // A restore in place keeps the store's holds beside the backup's: a hold the host
             // set after the backup still holds (`App::hold_queued`).
             let old_holds: Vec<String> = old
@@ -1813,9 +1817,10 @@ impl App {
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
                 events: Vec::new(),
-                deny_owed_known: None,
-                deny_held_reads: 0,
-                deny_writers_asked: Vec::new(),
+                owed_known: None,
+                owed_held_reads: 0,
+                owed_ahead: None,
+                deny_directory_read: None,
                 duty_queued: 0,
                 duty_handed: 0,
                 time_fresh_at: None,
@@ -2284,10 +2289,7 @@ impl App {
     /// failed store read is the error: the restore can be tried again. A value that reads
     /// but doesn't decode is left behind and counted; a damaged epoch or counter starts a
     /// new epoch, since the kept counters may then be below IDs the host acknowledged.
-    async fn kept_for_protocol(
-        reader: &Reader,
-        backup_cursor: state::Cursor,
-    ) -> Result<Option<Carried>, AppError> {
+    async fn kept_for_protocol(reader: &Reader) -> Result<Option<Carried>, AppError> {
         let Some(epoch) = reader.get_raw(key::DUTY_EPOCH.as_bytes()).await? else {
             return Ok(None);
         };
@@ -2317,16 +2319,6 @@ impl App {
             }
         }
         for (rest, bytes) in reader.scan_raw(key::OWED_PREFIX).await? {
-            // A deny list change past the backup's cursor comes again from the feed, which
-            // the restore reads from there, in order: carried too, it would come twice and
-            // first (Switch spec 8.3).
-            if let Ok(feed::OwedCall::Deny {
-                generation, seq, ..
-            }) = state::decode::<feed::OwedCall>(&bytes)
-                && (generation, seq) > (backup_cursor.generation, backup_cursor.seq)
-            {
-                continue;
-            }
             let read = state::decode::<feed::OwedCall>(&bytes)
                 .and_then(|_| state::decode::<serde_json::Value>(&bytes));
             match read {

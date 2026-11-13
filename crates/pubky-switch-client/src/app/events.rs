@@ -369,14 +369,27 @@ pub enum AppEvent {
         /// owed then, and asked by a later read.
         resend_asked: bool,
     },
-    /// A read stopped before handing anything, because a deny list change or gap the
-    /// protocol must take first failed again ([`super::Protocol::deny_list_changed`],
-    /// [`super::Protocol::deny_list_gap`]): raised from the [`super::RETRY_EVENT_READS`]th
-    /// such read in a row on, on each. Nothing after it is handed until the protocol takes
-    /// it; the host repairs or frees the protocol's store.
-    DenyListHeld {
+    /// A read stopped before handing anything, because a call the protocol must take first
+    /// failed again (an owed re-send, missed-entries or deny list call, a deny list change
+    /// whose writer couldn't be looked up yet, or a deny list gap): raised from the
+    /// [`super::RETRY_EVENT_READS`]th such read in a row on, on each, the read where it
+    /// first failed included. Nothing after it is handed until the protocol takes it; the
+    /// host repairs or frees the protocol's store, or its connection.
+    OwedCallHeld {
         /// The reads in a row that stopped there, this one included.
         reads: u32,
+    },
+    /// A deny list operation the feed showed that isn't the identity's own (Switch wire
+    /// 6.2): signed by no app holding `lists.manage`, by a removed app after its
+    /// `distrust_from`, or of another identity. Neither applied to the copy of the lists
+    /// nor handed to the protocol. A faulty or hostile service showed it.
+    DenyListChangeRefused {
+        /// The generation of the feed item.
+        generation: u64,
+        /// Its `seq`.
+        seq: u64,
+        /// The rule it broke.
+        reason: String,
     },
     /// Entries the service deleted while the app was lagging (Switch spec 8.2).
     Missed {

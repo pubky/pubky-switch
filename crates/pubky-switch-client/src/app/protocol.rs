@@ -584,8 +584,12 @@ pub struct DenyListGap {
     pub generation: u64,
     /// That position's `seq`.
     pub seq: u64,
-    /// The deny list now.
+    /// The deny list now, empty when `list_read` is false.
     pub denied: Vec<[u8; 32]>,
+    /// Whether the lists were read for the gap. `false` when the service's answer couldn't
+    /// be read: the protocol then knows only that the history has a gap, and fails closed
+    /// for it.
+    pub list_read: bool,
 }
 
 /// A protocol on the Switch, as the app layer uses it. Object-safe; the app holds an
@@ -712,7 +716,8 @@ pub trait Protocol: Send + Sync {
     /// A [`StoreFailure`] when the protocol can't build its writes now, such as when its own
     /// state can't be read, of either kind. The cursor still passes the entries, and the app
     /// keeps `needed` in that same commit and calls this again with it at the start of each
-    /// later read, across loads, until it returns writes
+    /// later read, across loads, before anything else is handed, until it returns writes;
+    /// while it fails, the read hands nothing after it, of any kind (Switch spec 8.3)
     /// ([`super::App::owed_protocol_calls`]).
     fn resend_needed(&self, needed: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure>;
 
@@ -743,7 +748,7 @@ pub trait Protocol: Send + Sync {
     /// As [`Protocol::resend_needed`]. A failed change is owed and made again at the start
     /// of each later read, before anything else is handed; the read stops there while it
     /// fails, and after [`RETRY_EVENT_READS`] such reads the app tells the host
-    /// ([`super::AppEvent::DenyListHeld`]). Writes over [`MAX_STEP_LOCAL_BYTES`] aren't
+    /// ([`super::AppEvent::OwedCallHeld`]). Writes over [`MAX_STEP_LOCAL_BYTES`] aren't
     /// committed and the change isn't made again, with
     /// [`super::AppEvent::LocalWritesRefused`].
     fn deny_list_changed(&self, change: &DenyListChange) -> Result<Vec<LocalWrite>, StoreFailure> {

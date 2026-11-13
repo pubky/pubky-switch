@@ -6845,6 +6845,8 @@ async fn test_records_owed_listing_goes_before_the_protocols_owed_calls() {
     // The protocol fails its missed-entries call once: the call is owed.
     *s.protocol.sample.failing.lock().unwrap() = 1;
     s.w.switch.push_missed(3, START, START + 1);
+    // The read that fails the call stops after the item, the listing owed.
+    assert!(app.receive(None).await.unwrap().stopped);
     for _ in 0..2 {
         s.w.switch.fail_next(Fault::Unreachable {
             path: "records?collection".into(),

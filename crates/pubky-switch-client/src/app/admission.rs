@@ -355,7 +355,10 @@ impl App {
             return Ok(());
         }
         let reader = self.reader();
+        // A deny list gap owed reads the lists itself, once the owed calls are made, and
+        // takes the copy from that answer (`App::tell_deny_gap_if_owed`).
         if reader.exists(LISTS_AT).await?
+            || reader.exists(super::feed::DENY_GAP).await?
             || reader.exists(super::provider::keys::MOVE).await?
             || self.loss_record().await?.is_some_and(|loss| !loss.done())
         {
@@ -387,27 +390,32 @@ impl App {
         Box::pin(async move {
             let result = self.client.allow().await;
             let list = self.take(result).await?;
-            // The answer's own stamped time (Switch spec 10.1). For an answer without one, the
-            // highest service time verified before it, which is older, so a protocol refreshes
-            // no later than it means to; the device clock only when the app verified none.
-            let as_of = self
-                .client
-                .latest_server_time()
-                .or_else(|| self.highest_service_time())
-                .unwrap_or_else(|| self.now());
-            match self.replace_lists(&list, as_of).await {
-                Err(error @ AppError::Store(StoreError::TooLarge { .. })) => {
-                    // Kept, in a commit of its own, so the reads don't fetch the same lists
-                    // again before [`LISTS_TOO_LARGE_RETRY_MS`].
-                    let mut tx = self.tx()?;
-                    tx.put(LISTS_TOO_LARGE, &as_of)?;
-                    self.commit(tx).await?;
-                    Err(error)
-                }
-                replaced => replaced.map(|()| list),
-            }
+            self.take_lists(&list).await.map(|()| list)
         })
         .await
+    }
+
+    /// The copy of the lists replaced from `list`, the answer just read, in one commit: too
+    /// large for one, `lc/too_large` is kept instead, in a commit of its own, so the reads
+    /// don't fetch the same lists again before [`LISTS_TOO_LARGE_RETRY_MS`].
+    pub(crate) async fn take_lists(&mut self, list: &AllowList) -> Result<(), AppError> {
+        // The answer's own stamped time (Switch spec 10.1). For an answer without one, the
+        // highest service time verified before it, which is older, so a protocol refreshes
+        // no later than it means to; the device clock only when the app verified none.
+        let as_of = self
+            .client
+            .latest_server_time()
+            .or_else(|| self.highest_service_time())
+            .unwrap_or_else(|| self.now());
+        match self.replace_lists(list, as_of).await {
+            Err(error @ AppError::Store(StoreError::TooLarge { .. })) => {
+                let mut tx = self.tx()?;
+                tx.put(LISTS_TOO_LARGE, &as_of)?;
+                self.commit(tx).await?;
+                Err(error)
+            }
+            replaced => replaced,
+        }
     }
 
     /// The copy of the lists replaced from `list`, answered at `as_of`, in one commit.
@@ -439,38 +447,6 @@ impl App {
         tx.put(LISTS_AT, &as_of)?;
         for code in list.invite_codes.iter().filter(|c| c.written_by == me) {
             tx.put(&code_key(&code.code_hash), &())?;
-        }
-        // A gap in the deny list's history is told with this copy, in its commit, before
-        // anything later is handed (Switch spec 8.3). A protocol that fails leaves the copy
-        // as it was, still owed, and the read hands nothing meanwhile.
-        if self.state.cert.has_permission(Permission::ListsRead)
-            && let Some((generation, seq)) = self
-                .reader()
-                .get::<(u64, u64)>(super::feed::DENY_GAP)
-                .await?
-        {
-            let gap = super::protocol::DenyListGap {
-                generation,
-                seq,
-                denied: list.deny.clone(),
-            };
-            match self.protocol.deny_list_gap(&gap) {
-                Ok(writes)
-                    if super::protocol::local_writes_bytes(&writes)
-                        > super::protocol::MAX_STEP_LOCAL_BYTES =>
-                {
-                    self.keep_duty(
-                        &mut tx,
-                        super::events::Duty::LocalWritesRefused {
-                            call: super::events::KeptRefusal::DenyGap { generation, seq },
-                        },
-                    )?;
-                }
-                Ok(writes) => tx.local(&writes)?,
-                Err(failure) => return Err(AppError::Protocol(failure)),
-            }
-            tx.delete(super::feed::DENY_GAP)?;
-            tx.put(super::feed::DENY_GAP_TOLD, &(generation, seq))?;
         }
         self.commit(tx).await
     }
