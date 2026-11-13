@@ -5686,3 +5686,63 @@ async fn test_feed_wait_across_a_move_followed_outside_a_read() {
     let shown = format!("{:?}", app.feed_wait(25));
     assert!(shown.contains(&format!("\"{cursor}\"")), "{shown}");
 }
+
+#[tokio::test]
+async fn test_move_sends_writes_kept_during_the_freeze_once_in_order() {
+    // Three writes while the account is frozen: the first is sent and answered `410 moved`,
+    // the next two are kept unsent behind it. At the next service each goes once, in the
+    // order the calls kept them, and nothing more goes to the old one.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let pubkys: Vec<[u8; 32]> = ["carol", "erin", "dave"]
+        .iter()
+        .map(|name| IdentityKey::from_secret(seed(&format!("{name}/identity"))).public())
+        .collect();
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let mut kept = Vec::new();
+    for pubky in &pubkys {
+        w.clock.advance_ms(1_000);
+        let error = app.submit_batch(contact_batch(*pubky)).await.unwrap_err();
+        assert_eq!(error.code(), Some(ErrorCode::Moved), "{error:?}");
+        kept.push(error.kept_batch().expect("kept"));
+    }
+    let old_ops = w.switch.applied().len();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    assert!(app.receive(None).await.unwrap().stopped);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    for _ in 0..6 {
+        if !app.receive(None).await.unwrap().more {
+            break;
+        }
+    }
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    for id in &kept {
+        assert!(
+            matches!(
+                app.kept_batch(*id).await.unwrap(),
+                Some(crate::app::KeptBatchStatus::Applied { .. })
+            ),
+            "{:?}",
+            app.kept_batch(*id).await.unwrap()
+        );
+    }
+    let order: Vec<[u8; 32]> = next
+        .applied()
+        .iter()
+        .filter_map(|op| match op.body().kind {
+            OpKind::AllowPut { pubky, .. } if pubkys.contains(&pubky) => Some(pubky),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, pubkys, "each once, in the order kept");
+    assert_eq!(w.switch.applied().len(), old_ops);
+}
