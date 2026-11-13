@@ -424,7 +424,7 @@
     }
   ],
   "record_delete": {
-    "description": "A record.put that deletes (wire 6.2): the wallet deletes the record of seq 8, expected_version (1, 8), in a batch of one chained after seq 9 at 2026-01-01T00:00:05.000Z. Its value_sealed.ct is the tag alone, so the switch takes it as a delete without opening it, and its transition proof's state shows deleted true (wire 6.5). No other file continues the chain this way: export.json freezes the account after seq 9, and operations.json's executor batch takes seqs 10 and 11.",
+    "description": "A record.put that deletes (wire 6.2): the wallet deletes the record of seq 8, expected_version (1, 8), in a batch of one chained after seq 9 at 2026-01-01T00:00:05.000Z. Its value_sealed.ct is the tag alone, so the switch takes it as a delete without opening it, and its transition proof's state shows deleted true (wire 6.5). No other file continues the chain this way: export.json freezes the account after seq 9, and operations.json's done batch takes seqs 10 and 11.",
     "item": {
       "chain_hash": "Z4SE7G9V7cq8vFpu7KwRBfsNse5kZsy7tQCRmgwZaG8",
       "envelope_json": "{\"chain_version\":1,\"generation\":1,\"seq\":10,\"prev_chain_hash\":\"muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA\",\"server_time\":\"2026-01-01T00:00:05.000Z\",\"item_type\":\"op\",\"item_hash\":\"4A5pxIWxKtvEgeWGy_3bM92mSUSSUAyydUinoJQJV6U\",\"batch_id\":\"OcdKAWCYsBXHV_8IqEMGIA\",\"batch_count\":1}",

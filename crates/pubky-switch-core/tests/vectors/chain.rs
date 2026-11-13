@@ -584,7 +584,7 @@ fn check_record_delete(
              value_sealed.ct is the tag alone, so the switch takes it as a delete without \
              opening it, and its transition proof's state shows deleted true (wire 6.5). No \
              other file continues the chain this way: export.json freezes the account after \
-             seq 9, and operations.json's executor batch takes seqs 10 and 11.",
+             seq 9, and operations.json's done batch takes seqs 10 and 11.",
             rfc3339(at)
         ),
         "item": item,

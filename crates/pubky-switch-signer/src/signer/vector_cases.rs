@@ -498,7 +498,7 @@ async fn test_vectors_old_signer_abort_is_the_vectors_version_5() {
 }
 
 /// `documents.json`'s wallet renewal (Switch spec 3.2; Switch wire 3.8 Reductions): alice's
-/// signer renews the wallet without `manage_contacts`, a scope with keys, and expiring earlier,
+/// signer renews the wallet without `tasks_people_admin`, a scope with keys, and expiring earlier,
 /// at 00:02. The switch takes the renewing version at 00:03. The renewed certificate, the
 /// renewing version 4 at data epoch 3, and the closing version 5 with `until` 00:08 are the
 /// vectors' byte for byte, and the full bundle stored for the wallet holds the keys of
