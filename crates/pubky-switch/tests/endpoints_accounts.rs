@@ -423,6 +423,122 @@ async fn test_public_identity_staged_and_limits() {
     replay.db.drop_database().await.expect("drop");
 }
 
+/// The ID of alice's service key, from her account's row.
+async fn alice_key_id(replay: &Replay) -> String {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let key: String = sqlx::query_scalar("SELECT service_key FROM accounts WHERE id = $1")
+        .bind(&alice_keys().id)
+        .fetch_one(&mut conn)
+        .await
+        .expect("key");
+    conn.close().await.expect("close");
+    key
+}
+
+#[tokio::test]
+async fn test_state_whose_mark_is_lost_fails_stop() {
+    // The key store is restored without alice's key's mark (or its `marks` directory is
+    // lost): after a restart the mark is missing, never read as a key that signed nothing,
+    // so every call fails stop with `503` and no head, as behind the mark (Switch spec 6.5,
+    // wire 7.3 step 10).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    serving(&replay).await;
+    let alice = alice_keys();
+    let mark = replay
+        .key_dir()
+        .join("marks")
+        .join(alice_key_id(&replay).await);
+    std::fs::remove_file(&mark).expect("lose the mark");
+    replay.service = replay.restarted();
+    let read = request(
+        "GET",
+        &format!("/v1/{}/identity", alice.id),
+        &[],
+        Vec::new(),
+    );
+    let refused = replay.service.handle(read).await;
+    assert_eq!(
+        (refused.status, code(&refused).as_str()),
+        (503, "unavailable")
+    );
+    for request in [
+        signer_request(
+            "PUT",
+            &format!("/v1/{}/identity", alice.id),
+            delivery(version("alice identity.json"), None),
+            ms(T),
+        ),
+        signer_request("GET", &format!("/v1/{}/apps", alice.id), Vec::new(), ms(T)),
+    ] {
+        let answer = replay.service.handle(request).await;
+        assert_eq!(code(&answer), "unavailable");
+        assert!(
+            !answer
+                .headers
+                .iter()
+                .any(|(name, _)| name.as_str() == header::HEAD),
+            "no head without the mark"
+        );
+    }
+    assert!(!mark.exists(), "no mark is written in its place");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_state_ahead_of_an_older_mark_is_served() {
+    // A mark older than the state, as a key store restored from a backup with a newer
+    // database leaves it, can't be told from a commit whose mark move failed: the state
+    // isn't behind what the key signed, so the account serves and signs its head (Switch
+    // wire 7.3 step 10). This is why marks are never restored (docs/configuration.md).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let chain = vectors("chain.json");
+    let at = item_time(chain_item(&chain, 9));
+    let mark = {
+        replay_chain_through_revoke(&replay).await;
+        replay
+            .key_dir()
+            .join("marks")
+            .join(alice_key_id(&replay).await)
+    };
+    let held: pubky_switch::keys::Mark =
+        serde_json::from_slice(&std::fs::read(&mark).expect("mark")).expect("a head");
+    assert_eq!(held.seq, 9, "the account served through seq 9");
+    let first = &chain["items"][0];
+    let older = pubky_switch::keys::Mark {
+        generation: held.generation,
+        seq: 1,
+        chain_hash: pubky_switch_core::enc::unb64(first["chain_hash"].as_str().expect("hash"))
+            .expect("b64")
+            .try_into()
+            .expect("32"),
+    };
+    std::fs::write(&mark, serde_json::to_vec(&older).expect("json")).expect("an older mark");
+    replay.service = replay.restarted();
+    let apps = replay
+        .service
+        .handle(signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_keys().id),
+            Vec::new(),
+            ms(&at),
+        ))
+        .await;
+    assert_eq!(apps.status, 200, "{}", String::from_utf8_lossy(&apps.body));
+    assert!(
+        apps.headers
+            .iter()
+            .any(|(name, _)| name.as_str() == header::HEAD),
+        "its head signed"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
 #[tokio::test]
 async fn test_state_behind_the_mark_fails_stop() {
     let Some(replay) = replay().await else { return };

@@ -328,11 +328,17 @@ impl AccountTxn {
     }
 
     /// Compare the account's chain head with its service key's mark. A state behind the
-    /// mark, or beside it, is lost committed state: the account fails stop with
+    /// mark, or beside it, is lost committed state, and a mark that is missing hides whether
+    /// it is: the account fails stop with
     /// `503 unavailable` until the signer starts a new generation (Switch spec 6.5,
     /// Switch wire 7.3 step 10). Only a serving account is held to its mark.
     pub async fn mark_check(&self, keys: &dyn KeyStore) -> Result<MarkCheck, KeyStoreError> {
-        let mark = keys.mark(&self.head.service_key).await?;
+        // A lost mark fails stop as a state behind it does: what the key signed is unknown.
+        let mark = match keys.mark(&self.head.service_key).await {
+            Ok(mark) => mark,
+            Err(KeyStoreError::MarkLost) => return Ok(MarkCheck::Lost),
+            Err(failure) => return Err(failure),
+        };
         Ok(match (self.loaded.head_mark(), mark) {
             (Some(head), mark) => check_mark(mark.as_ref(), &head),
             (None, None) => MarkCheck::Unmarked,

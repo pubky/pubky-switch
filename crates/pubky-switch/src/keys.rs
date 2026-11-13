@@ -43,7 +43,8 @@ const MAX_IDENTITY_LEN: usize = 64;
 #[serde(default, deny_unknown_fields)]
 pub struct KeysConfig {
     /// The directory of the file key store. Required to run the service. Put it on a disk
-    /// that database backups don't cover, and back it up on its own.
+    /// that database backups don't cover; back up its keys and erasure ledger on their own,
+    /// and never restore its marks (docs/configuration.md, "Backing up the key store").
     pub path: Option<PathBuf>,
 }
 
@@ -155,6 +156,9 @@ pub enum MarkCheck {
     Fork,
     /// The head belongs to another generation than the key's.
     OtherGeneration,
+    /// The key's mark is missing: lost, as when the key was restored without it, so what the
+    /// key signed is unknown.
+    Lost,
 }
 
 impl MarkCheck {
@@ -192,6 +196,10 @@ pub enum KeyStoreError {
     /// The key would sign a head behind its mark or beside it.
     #[error("the head is {0:?} the key's mark")]
     Refused(MarkCheck),
+    /// The key's mark is missing: every service key has one from its creation, so it was lost
+    /// (Switch spec 6.5). The key signs no head until the account starts a new generation.
+    #[error("the service key's mark is missing")]
+    MarkLost,
     /// Stored key material or a mark that doesn't decode.
     #[error("corrupt key store entry: {0}")]
     Corrupt(String),
@@ -211,7 +219,8 @@ pub type KeyFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, KeyStoreError>
 /// Every write is durable when its future resolves. A write runs to its end, in order with
 /// the store's other writes, even if its caller stops waiting.
 pub trait KeyStore: Send + Sync {
-    /// Generate a new service key.
+    /// Generate a new service key, with its mark: "signed no head yet", durable before the
+    /// key is, so a service key whose mark is missing has lost it ([`KeyStoreError::MarkLost`]).
     fn generate(&self) -> KeyFuture<'_, ServiceKey>;
 
     /// Generate a new key under `id`, an ID the caller chose ([`KeyId::random`]), so the
@@ -231,7 +240,12 @@ pub trait KeyStore: Send + Sync {
     /// such as one to an unknown account (Switch wire 7.1). No client knows it.
     fn operator(&self) -> KeyFuture<'_, ServiceSigner>;
 
-    /// The newest head `id` signed, if any.
+    /// The newest head `id` signed, `None` if it has signed none yet.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyStoreError::MarkLost`] for a key whose mark is missing: never read as a key that
+    /// has signed nothing, so the account fails stop (Switch spec 6.5).
     fn mark<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, Option<Mark>>;
 
     /// Move the mark of `id` to `head` if `head` extends it. An older head, from an
@@ -334,13 +348,16 @@ pub fn sign_checkpoint(
 /// A key store in files under one directory:
 ///
 /// - `keys/<id>`: the key's 32-byte secret seed, readable by the owner only;
-/// - `marks/<id>`: its mark, as JSON;
+/// - `marks/<id>`: a service key's mark, as JSON: `null` until it signs its first head,
+///   written before the key itself, so a service key without one has lost it; push keys and
+///   the operator key, which sign no head, have none;
 /// - `erasures/<identity>`: the time of the identity's erasure, in Unix milliseconds.
 ///
 /// Every file is written to a temporary file, synced, renamed into place and its directory
 /// synced, so a crash leaves the old content or the new, never a mix. Put the directory on
-/// a disk that database backups don't cover, and back it up on its own: losing it loses
-/// every account's service key.
+/// a disk that database backups don't cover. Back up `keys/` and `erasures/` on their own
+/// and restore them by merging; never restore `marks/`, since an older mark restored with an
+/// older database passes every check (docs/configuration.md, "Backing up the key store").
 ///
 /// One process at a time may use a directory.
 #[derive(Clone)]
@@ -450,20 +467,33 @@ impl Inner {
         if let Some(mark) = self.marks.lock().get(id) {
             return Ok(*mark);
         }
+        // `null` until the key signs its first head; a missing file is a lost mark, never one
+        // that signed nothing.
         let mark = match fs::read(self.mark_path(id)) {
-            Ok(bytes) => Some(
-                serde_json::from_slice::<Mark>(&bytes)
-                    .map_err(|error| KeyStoreError::Corrupt(format!("mark {id}: {error}")))?,
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(bytes) => serde_json::from_slice::<Option<Mark>>(&bytes)
+                .map_err(|error| KeyStoreError::Corrupt(format!("mark {id}: {error}")))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(KeyStoreError::MarkLost);
+            }
             Err(error) => return Err(error.into()),
         };
         self.marks.lock().insert(id.clone(), mark);
         Ok(mark)
     }
 
+    /// A service key: its mark first, then the key. A crash between the two leaves a mark no
+    /// key has, which signs nothing and no account names; never a key without its mark.
     fn generate_sync(&self) -> Result<ServiceKey, KeyStoreError> {
-        self.generate_as_sync(KeyId::random()?)
+        let id = KeyId::random()?;
+        self.write_first_mark(&id)?;
+        self.generate_as_sync(id)
+    }
+
+    /// The mark of a service key not made yet: `null`, signed no head.
+    fn write_first_mark(&self, id: &KeyId) -> Result<(), KeyStoreError> {
+        write_atomic(&self.mark_path(id), b"null", true)?;
+        self.marks.lock().insert(id.clone(), None);
+        Ok(())
     }
 
     fn generate_as_sync(&self, id: KeyId) -> Result<ServiceKey, KeyStoreError> {
@@ -483,7 +513,8 @@ impl Inner {
         let id = match fs::read_to_string(&path) {
             Ok(text) => KeyId::parse(text.trim())?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let key = self.generate_sync()?;
+                // It signs no head, so it has no mark.
+                let key = self.generate_as_sync(KeyId::random()?)?;
                 write_atomic(&path, key.id.as_str().as_bytes(), true)?;
                 key.id
             }
@@ -498,6 +529,7 @@ impl Inner {
         let mut raw = [0u8; 16];
         getrandom::fill(&mut raw).map_err(|_| KeyStoreError::Random)?;
         let id = KeyId(hex::encode(raw));
+        self.write_first_mark(&id)?;
         write_atomic(&self.key_path(&id), seed, true)?;
         let key = SigningKey::from_bytes(seed);
         let public = key.verifying_key().to_bytes();
@@ -523,7 +555,10 @@ impl Inner {
                 self.marks.lock().insert(id.clone(), Some(head));
                 Ok(check)
             }
-            MarkCheck::Fork | MarkCheck::OtherGeneration => Err(KeyStoreError::Refused(check)),
+            // `check_mark` never answers `Lost`: a lost mark fails `load_mark` above.
+            MarkCheck::Fork | MarkCheck::OtherGeneration | MarkCheck::Lost => {
+                Err(KeyStoreError::Refused(check))
+            }
         }
     }
 
@@ -1091,15 +1126,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_key_store_service_key_is_made_with_its_mark() {
+        // A service key's mark is written with it, `null` until its first head, and read so
+        // across a reopen, as a restart does (Switch spec 6.5).
+        let (dir, store) = open();
+        let key = store.generate().await.expect("generate");
+        let path = dir.path().join("marks").join(key.id.as_str());
+        assert_eq!(fs::read(&path).expect("mark file"), b"null");
+        assert_eq!(store.mark(&key.id).await.expect("mark"), None);
+        let store = FileKeyStore::open(dir.path()).expect("reopen");
+        assert_eq!(store.mark(&key.id).await.expect("mark"), None);
+        assert_eq!(
+            store
+                .advance_mark(&key.id, mark(5, 1))
+                .await
+                .expect("advance"),
+            MarkCheck::Unmarked
+        );
+        let store = FileKeyStore::open(dir.path()).expect("reopen");
+        assert_eq!(store.mark(&key.id).await.expect("mark"), Some(mark(5, 1)));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_key_whose_mark_is_lost_signs_no_head() {
+        // A service key restored without its mark: the mark is lost, never read as one that
+        // signed nothing, and no head moves it back into place (Switch spec 6.5).
+        let (dir, store) = open();
+        let key = store.generate().await.expect("generate");
+        store
+            .advance_mark(&key.id, mark(5, 1))
+            .await
+            .expect("advance");
+        let path = dir.path().join("marks").join(key.id.as_str());
+        fs::remove_file(&path).expect("lose the mark");
+        let store = FileKeyStore::open(dir.path()).expect("reopen");
+        assert!(matches!(
+            store.mark(&key.id).await,
+            Err(KeyStoreError::MarkLost)
+        ));
+        for head in [mark(1, 1), mark(5, 1), mark(9, 2)] {
+            assert!(matches!(
+                store.advance_mark(&key.id, head).await,
+                Err(KeyStoreError::MarkLost)
+            ));
+        }
+        assert!(!path.exists(), "no mark is written in its place");
+        // The key itself is still there: it signs answers, never a head.
+        assert_eq!(store.public_key(&key.id).await.expect("public"), key.public);
+    }
+
+    #[tokio::test]
+    async fn test_key_store_crash_between_mark_and_key_leaves_no_key() {
+        // A crash after a new key's mark is written and before the key is leaves a mark with
+        // no key: no key to sign with, and no account names its ID (Switch spec 6.5).
+        let (dir, store) = open();
+        let id = KeyId::random().expect("id");
+        fs::write(dir.path().join("marks").join(id.as_str()), b"null").expect("mark only");
+        drop(store);
+        let store = FileKeyStore::open(dir.path()).expect("reopen");
+        assert!(matches!(
+            store.public_key(&id).await,
+            Err(KeyStoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.mark(&id).await,
+            Err(KeyStoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.signer(&id).await,
+            Err(KeyStoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
     async fn test_key_store_generate_as_takes_the_id_once() {
         // A key generated under an ID the caller chose, owed before it exists: signs, has no
-        // mark, and a second key under the same ID is refused.
+        // mark, since it signs no head, and a second key under the same ID is refused.
         let (_dir, store) = open();
         let id = KeyId::random().expect("id");
         let key = store.generate_as(&id).await.expect("generate");
         assert_eq!(key.id, id);
         assert_eq!(store.public_key(&id).await.expect("public"), key.public);
-        assert_eq!(store.mark(&id).await.expect("mark"), None);
+        assert!(matches!(
+            store.mark(&id).await,
+            Err(KeyStoreError::MarkLost)
+        ));
         assert!(store.generate_as(&id).await.is_err());
         assert_eq!(store.public_key(&id).await.expect("public"), key.public);
         store.delete(&id).await.expect("delete");

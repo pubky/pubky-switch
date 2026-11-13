@@ -77,6 +77,25 @@ impl Replay {
         )
     }
 
+    /// The key store's directory.
+    pub fn key_dir(&self) -> &std::path::Path {
+        self._key_dir.path()
+    }
+
+    /// A service on the same database and clock over the key store opened again from its
+    /// directory, as after a restart: nothing it held in memory is kept.
+    pub fn restarted(&self) -> Service {
+        let store = FileKeyStore::open(self._key_dir.path()).expect("key store");
+        let operator = hex32(&Value::String(OPERATOR_SEED_HEX.into()));
+        Service::new(
+            ORIGIN.into(),
+            self.db.store().clone(),
+            Arc::new(FixedKeys::new(store, Vec::new(), Some(operator))),
+            self.time.clone(),
+            Limits::default(),
+        )
+    }
+
     /// Another service on the same database, keys and clock, that needs trusted time and
     /// has no sample.
     pub fn without_trusted_time(&self) -> Service {

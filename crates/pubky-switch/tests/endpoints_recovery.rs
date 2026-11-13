@@ -803,6 +803,41 @@ async fn test_recovery_in_place_gets_past_a_state_behind_the_mark() {
 }
 
 #[tokio::test]
+async fn test_recovery_in_place_gets_past_a_lost_mark() {
+    // The account's key lost its mark, as a key store restored without it does: every call
+    // fails stop, and the way out is the one a state behind the mark has, the recovery naming
+    // the pending key (Switch spec 6.5, wire 7.3 step 10).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let old_key = service_key_id(&replay).await;
+    let before = held(&replay).await;
+    std::fs::remove_file(replay.key_dir().join("marks").join(old_key.as_str()))
+        .expect("lose the mark");
+    replay.service = replay.restarted();
+    let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
+    assert_eq!(
+        code(&replay.service.handle(request).await),
+        (503, "unavailable".into())
+    );
+    let recovery = next_generation(&before, pending, Some(1));
+    let (answer, signature) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(signed_by(&answer, &pending, &signature));
+    assert_eq!(
+        chain(&replay).await,
+        [(2, 1, "service".into()), (2, 2, "identity".into())]
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_recovery_exemption_from_the_mark_is_only_for_a_recovery() {
     // Behind the mark, only the recovery under the pending key gets through (Switch wire 7.3
     // step 10): an ordinary next version, a rotation without `recovery_from` and a recovery

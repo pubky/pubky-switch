@@ -1300,7 +1300,7 @@ impl Service {
         let mut behind = false;
         if serving && *call != Call::Erase {
             match txn.mark_check(self.keys.as_ref()).await {
-                Ok(MarkCheck::Behind | MarkCheck::Fork) => {
+                Ok(MarkCheck::Behind | MarkCheck::Fork | MarkCheck::Lost) => {
                     // The signer's own delivery only: an own app or another identity's has
                     // no app or certificate of its own here.
                     let by_signer = verified.is_none() && other.is_none();
