@@ -44,12 +44,13 @@ impl App {
     /// Fetch, read and merge the app's key bundle parts (Switch wire 7.4.11), then ask for a
     /// full bundle if a key is still missing, and reopen the records held `Unreadable` that
     /// a key taken opens: a reopening that fails stays owed and is reported
-    /// ([`super::AppEvent::ReopeningOwed`]), never this call's error.
+    /// ([`super::AppEvent::ReopeningOwed`]), never this call's error, but for an alarm.
     ///
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app; a failed
-    /// call or commit. A `404` (no part stored) isn't one.
+    /// call or commit; an alarm, the reopening's included. A `404` (no part stored) isn't
+    /// one.
     ///
     /// [`Refusal::Stopped`]: super::Refusal::Stopped
     /// [`Refusal::Left`]: super::Refusal::Left

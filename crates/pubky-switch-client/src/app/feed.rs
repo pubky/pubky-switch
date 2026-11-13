@@ -356,6 +356,7 @@ impl App {
     pub async fn receive(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
+            self.reopen_failures = 0;
             let result = self.receive_once(wait).await;
             // A move, a provider change, a revocation or an erasure met during the read is
             // followed (`provider.rs`), and the read goes on once at the service followed.
@@ -363,6 +364,8 @@ impl App {
                 TakeOver::Done(result) => result,
                 TakeOver::ReadAgain => self.receive_once(None).await,
             };
+            // A reopening outside a read is tried whenever it is asked for.
+            self.reopen_failures = 0;
             if result.is_err() {
                 self.reload = true;
             }
@@ -490,7 +493,8 @@ impl App {
         let unfinished = listing == Listing::Unfinished;
         let mut listed = listing == Listing::Listed;
         // The reopening a key taken owes, a failure's from before included, before anything
-        // is handed over that may read the records it opens; it never fails the read.
+        // is handed over that may read the records it opens; only an alarm it raises fails
+        // the read.
         self.reopen_if_due().await?;
         let mut report = ReceiveReport {
             more: kept_left || unfinished,

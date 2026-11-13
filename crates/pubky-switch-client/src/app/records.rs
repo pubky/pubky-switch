@@ -56,6 +56,10 @@ pub(crate) const LIST_DUE: &str = "list_due";
 /// a reopening ([`App::reopen_unreadable`]): cleared in the commit of a reopening that
 /// finished, so a store that fails between the two loses nothing.
 pub(crate) const REOPEN_DUE: &str = "reopen";
+/// The most times one read makes an owed reopening that fails ([`App::reopen_if_due`]):
+/// the first failure and one more try, such as after the page whose commit failed. The
+/// next read tries again.
+pub(crate) const REOPEN_TRIES_PER_READ: u32 = 2;
 
 /// How far an owed listing got ([`ListProgress`]), while it is owed.
 const LIST_AT: &str = "list_at";
@@ -1243,13 +1247,25 @@ impl App {
     /// ([`App::reopen_unreadable`]), never while a page's writes are open. It owes nothing
     /// to the read: a reopening that fails keeps the mark, is reported
     /// ([`AppEvent::ReopeningOwed`]) and is made again at the next read, and the read goes
-    /// on, from the store as committed when a commit failed. Only a store that can't be
-    /// read is this call's error.
+    /// on, from the store as committed when a commit failed. One read tries it at most
+    /// [`REOPEN_TRIES_PER_READ`] times once it fails.
+    ///
+    /// # Errors
+    ///
+    /// A store that can't be read, and an alarm the reopening raised, or any failure once
+    /// one is raised: the app is stopped, and the read ends there, so nothing is handed
+    /// over or sent after the alarm.
     pub(crate) async fn reopen_if_due(&mut self) -> Result<(), AppError> {
-        if !self.reader().exists(REOPEN_DUE).await? {
+        if self.reopen_failures >= REOPEN_TRIES_PER_READ
+            || !self.reader().exists(REOPEN_DUE).await?
+        {
             return Ok(());
         }
         if let Err(error) = self.reopen_unreadable().await {
+            if matches!(error, AppError::Alarm(_)) || self.state.alarm.is_some() {
+                return Err(error);
+            }
+            self.reopen_failures = self.reopen_failures.saturating_add(1);
             self.events.push(AppEvent::ReopeningOwed {
                 error: error.to_string(),
             });
