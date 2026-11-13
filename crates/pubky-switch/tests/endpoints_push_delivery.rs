@@ -1574,7 +1574,7 @@ async fn large_queue(setup: &Setup, rows: u32) {
         format!(
             "INSERT INTO push_registrations (account_id, app_id, relay_url, push_key_id, \
              push_public, handles, set_at_ms) SELECT 'many-' || g, app_id, relay_url, \
-             'many-key-' || g, push_public, handles, set_at_ms FROM push_registrations, \
+             lpad(to_hex(g), 32, '0'), push_public, handles, set_at_ms FROM push_registrations, \
              generate_series(1, 500) g WHERE account_id = '{alice}'"
         ),
         "INSERT INTO push_deliveries (account_id, app_id, push_key_id, handle, \
@@ -1593,7 +1593,9 @@ async fn large_queue(setup: &Setup, rows: u32) {
 #[tokio::test]
 async fn test_push_delivery_claim_stays_quick_with_a_large_queue_of_one_account() {
     // A claim, which every instance's claims wait for in turn, stays well inside the 5 s an
-    // attempt has from just before its claim, however many rows one account has queued.
+    // attempt has from just before its claim, however many rows one account has queued, and
+    // takes the other accounts' rows. About 20 ms here, so 1 s leaves room for a loaded
+    // runner; the rows are inserted by SQL, so the test takes about a second.
     let Some((setup, _)) = registered(&[H1]).await else {
         return;
     };
@@ -1607,7 +1609,8 @@ async fn test_push_delivery_claim_stays_quick_with_a_large_queue_of_one_account(
     }
     setup.replay.db.drop_database().await.expect("drop");
     assert!(
-        took.iter().all(|(took, _)| *took < Duration::from_secs(1)),
+        took.iter()
+            .all(|(took, claimed)| *took < Duration::from_secs(1) && *claimed == 16),
         "claims took {took:?}"
     );
 }
