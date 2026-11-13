@@ -77,12 +77,14 @@ pub(crate) struct RestoreCursor {
     /// When the restore ran, app clock: only a page read once the own `identity.json` was
     /// confirmed after it settles the verdict.
     pub(crate) restored_at_ms: u64,
-    /// `None` until a page settled it.
+    /// `None` until a page settled it. Always written, and required on read.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub(crate) verdict: Option<HeldCursor>,
 }
 
-/// `hgap`: the gap ahead last handed to the protocol as a `missed` item, by generation
-/// and held `seq`, so each occurrence is handed once, across loads.
+/// `hgap`: the gap ahead last handed to the protocol as a `missed` item, by sequence (the
+/// generation `recovery_from` names, 0 before any loss) and held `seq`, so each occurrence
+/// is handed once, across loads and the generations a sequence continues through.
 const GAP_HANDED: &str = "hgap";
 
 /// What comparing a page's `cursor` came to ([`App::compare_held_cursor`]).
@@ -102,7 +104,8 @@ impl App {
     ///
     /// The verdict settles at the first feed page read once the app confirmed its newest
     /// own `identity.json` after the restore ([`App::refresh_identity`]): the host refreshes
-    /// it after a restore, as before any attempt. Before that the app may be reading an
+    /// it after a restore and before the first [`App::receive`]. A read before that may send
+    /// the restored cursor move, which leaves the verdict [`HeldCursor::Unknown`]. Before that the app may be reading an
     /// old service that still answers, so a page settles nothing, and the verdict is
     /// `None`, never [`HeldCursor::Clean`].
     ///
@@ -212,29 +215,41 @@ impl App {
             self.held_ahead_told = None;
             return Ok(Compared { gap: None, restore });
         };
-        // Told once for each higher report in a generation while the app runs, and not while
-        // a restore's verdict is open or at the page that settles it: the host knows of the
-        // restore (Switch spec 8.3, "at a read other than a restore's").
+        // Told once for each higher report in a sequence while the app runs. A cooperative
+        // move or a key change in place continues the sequence, so only a provider loss
+        // starts the count again. The restore's own ahead isn't told: the host knows of the
+        // restore (Switch spec 8.3, "at a read other than a restore's"). While its verdict is
+        // open nothing is told or marked, so a report seen then is told once it settles.
+        let sequence = self.sequence();
         let told = self
             .held_ahead_told
-            .is_some_and(|(g, told)| g == generation && told >= held);
+            .is_some_and(|(s, told)| s == sequence && told >= held);
         if !told {
-            self.held_ahead_told = Some((generation, held));
-            if !settles && !restoring {
+            if settles {
+                self.held_ahead_told = Some((sequence, held));
+            } else if !restoring {
+                self.held_ahead_told = Some((sequence, held));
                 self.events
                     .push(AppEvent::HeldCursorAhead { held, position });
             }
         }
         let handed: Option<(u64, u64)> = self.reader().get(GAP_HANDED).await?;
         let gap = handed
-            .is_none_or(|(g, last)| g != generation || held > last)
+            .is_none_or(|(s, last)| s != sequence || held > last)
             .then_some((held, position));
         Ok(Compared { gap, restore })
     }
 
+    /// The current sequence, as the generation the newest own `identity.json`'s
+    /// `recovery_from` names, 0 before any provider loss (Switch spec 8.3): a cooperative
+    /// move or a key change in place continues it.
+    fn sequence(&self) -> u64 {
+        self.state.own_doc.body().recovery_from.unwrap_or(0)
+    }
+
     /// Note a gap ahead handed to the protocol, in `tx`.
     pub(crate) fn gap_handed(&self, held: u64, tx: &mut Tx) -> Result<(), AppError> {
-        tx.put(GAP_HANDED, &(self.state.cursor.generation, held))
+        tx.put(GAP_HANDED, &(self.sequence(), held))
     }
 
     /// A batch carrying a cursor move is about to be sent: a restore whose verdict isn't

@@ -663,7 +663,7 @@ pub struct App {
     /// The worst held-cursor verdict of the read under way's pages ([`HeldCursor::worse`]),
     /// taken into its report. In memory only.
     held_cursor_read: Option<HeldCursor>,
-    /// The generation and highest held cursor reported ahead with
+    /// The sequence and highest held cursor reported ahead with
     /// [`AppEvent::HeldCursorAhead`], so a report isn't told again at every page; cleared by
     /// a page that isn't ahead. In memory only.
     held_ahead_told: Option<(u64, u64)>,
@@ -1515,6 +1515,10 @@ impl App {
     /// predates a renewal, another device's included, checks its receive key
     /// record, registers a fresh key if it rotated after the backup, and asks the user
     /// about registrations it can't account for ([`App::restore_question`]).
+    ///
+    /// The host calls [`App::refresh_identity`] after the restore and before the first
+    /// [`App::receive`]: only a page read once the newest `identity.json` is confirmed
+    /// settles the restore's held cursor ([`App::restore_held_cursor`]).
     ///
     /// The backup's outbox goes back in, to be delivered by the next flush with the same
     /// `msg_id` and bytes; past [`SENT_RETENTION_MS`] from the backup, a delivery still

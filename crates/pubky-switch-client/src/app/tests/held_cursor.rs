@@ -487,3 +487,77 @@ async fn test_held_cursor_ahead_hands_the_gap_to_the_protocol_once() {
     app.receive(None).await.unwrap();
     assert_eq!(gaps().len(), 2);
 }
+
+#[test]
+fn test_held_cursor_restore_record_without_its_key_check_is_refused() {
+    // A stored shape no current writer produces is refused: every `restore` record this
+    // build writes carries `key_current`, null before the key check.
+    let state = crate::app::state::RestoreState {
+        n_floor: 1,
+        key_checked: false,
+        own_key_n: None,
+        reconcile: true,
+        key_current: None,
+    };
+    let bytes = crate::app::state::encode(&state).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    fn strip(value: &mut serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.remove("key_current").is_some() || map.values_mut().any(strip)
+            }
+            _ => false,
+        }
+    }
+    assert!(strip(&mut value), "{value}");
+    let older = serde_json::to_vec(&value).unwrap();
+    assert!(
+        crate::app::state::decode::<crate::app::state::RestoreState>(&older).is_err(),
+        "read as {:?}",
+        crate::app::state::decode::<crate::app::state::RestoreState>(&older)
+    );
+}
+
+#[tokio::test]
+async fn test_held_cursor_gap_is_handed_once_across_a_key_change() {
+    // A key change in place continues the sequence: the same gap ahead, shown again by the
+    // service at the next generation, isn't handed again.
+    use super::moves::{self, Router};
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = moves::join(&w, &router).await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let position = app.cursor().seq;
+    let gaps = || -> usize {
+        w.protocol
+            .missed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.entries == 0)
+            .count()
+    };
+    w.switch.set_held_cursor(&me, position + 4);
+    app.receive(None).await.unwrap();
+    assert_eq!(gaps(), 1);
+    let pending = ed25519_dalek::SigningKey::from_bytes(&seed("service/alice/pending"));
+    let changed = w.switch.import_into(pending.to_bytes());
+    router.add(crate::testing::SWITCH_ORIGIN, &changed);
+    moves::publish_at(
+        &w,
+        &changed,
+        Inbox::new(
+            crate::testing::SWITCH_ORIGIN,
+            pending.verifying_key().to_bytes(),
+        ),
+        2,
+        None,
+    );
+    for _ in 0..2 {
+        app.receive(None).await.unwrap();
+    }
+    assert_eq!(app.cursor().generation, 2);
+    assert_eq!(changed.app(&me).cursor, position + 4);
+    assert_eq!(gaps(), 1);
+}
