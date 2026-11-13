@@ -11,7 +11,8 @@
 //! "Kept batches"); a kept batch dropped at a provider change and each `attempt` in it
 //! (Switch spec 12.5 "Kept batches", 12.6 step 5); a kept batch refused for good, with its
 //! local writes and outbox messages (Switch spec 6.4); a message deleted from the outbox
-//! undelivered (Switch spec 11), or the record write a sent message named given up; the
+//! undelivered (Switch spec 11), or the record write a sent message named given up; a
+//! shared record a view first shows divergent after a provider loss (Switch spec 12.6); the
 //! account taken as erased (Switch spec 12.7). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
 //! the two. It is reported once that commit is done, or, for a commit whose answer can't
@@ -25,9 +26,11 @@
 //!
 //! Nothing in the app bounds the stored duty events: only the host's acknowledgements
 //! remove them, apart from an [`AppEvent::AccountGone`] the account's return no longer
-//! makes true ([`AppEvent::AccountBack`]). Each is written once, for one entry stored for good, one kept batch or
-//! `attempt` dropped, or one outbox message given up, so they grow with those facts, and
-//! without limit for a host that never acknowledges. The app sets no cap, since a cap would
+//! makes true ([`AppEvent::AccountBack`]). Each is written once, for one entry stored for
+//! good, one kept batch or `attempt` dropped, one outbox message given up, or one record
+//! whose views turned divergent ([`AppEvent::RecordDivergent`]: each time a held record's
+//! views go from not divergent to divergent, which the switch's views drive), so they grow
+//! with those facts, and without limit for a host that never acknowledges. The app sets no cap, since a cap would
 //! have to lose a duty event or stop the work that makes them: reading the feed, which never
 //! stalls (Switch spec 8.2), giving up an undeliverable message (Switch spec 11), or
 //! following a provider change (Switch spec 12.5, 12.6). A host acknowledges each duty
@@ -302,11 +305,14 @@ pub enum AppEvent {
         conflicting: bool,
     },
     /// An entry stored because its sender's standing couldn't be checked
-    /// ([`ParkReason::Unverifiable`]) was dropped without being processed, past the bounds
-    /// Switch spec 8.2 sets ([`super::MAX_UNVERIFIED_AGE_MS`],
+    /// ([`ParkReason::Unverifiable`]), or because it waits for a scope key
+    /// ([`ParkReason::AwaitingKey`]), was dropped without being processed, past the bounds
+    /// Switch spec 8.2 sets for both together ([`super::MAX_UNVERIFIED_AGE_MS`],
     /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]). The protocol
     /// may ask the sender to send it again while the sender still keeps it (Switch spec
-    /// 11). A duty event, kept in the commit that deletes the entry.
+    /// 11). A duty event, kept in the commit that deletes the entry. Later versions may
+    /// add members: a pattern on it ends in `..`.
+    #[non_exhaustive]
     StoredEntryDropped {
         /// The duty event's ID.
         id: EventId,
@@ -323,6 +329,18 @@ pub enum AppEvent {
         accepted_at_ms: u64,
         /// Which bound it was past.
         reason: DropReason,
+        /// The data epoch whose scope key the entry waited for
+        /// ([`ParkReason::AwaitingKey`]); `None` for an entry whose sender couldn't be
+        /// checked.
+        awaited_epoch: Option<u64>,
+        /// The `msg_id` of the message given up: named only for an entry that waited for a
+        /// scope key, which passed the recipient checks before it was stored, so its sender
+        /// signed it, and only when nothing else may still apply the message: no other entry
+        /// stored locally holds it, no kept effect is its, and it isn't processed. A copy
+        /// dropped while another still waits names none; the last to go names it. `None` too
+        /// for an entry whose sender couldn't be checked, whose `msg_id` no check stands
+        /// behind.
+        msg_id: Option<String>,
     },
     /// An entry stored locally was processed.
     Unparked {
@@ -385,6 +403,26 @@ pub enum AppEvent {
     RestoreQuestion {
         /// The registrations' numbers.
         n: Vec<u64>,
+    },
+    /// Entries stored locally wait for scope keys the app doesn't hold yet
+    /// ([`ParkReason::AwaitingKey`], Switch spec 3.5, 8.2): the data epochs they wait for,
+    /// in order, and how many entries wait. Raised in the report of every read while any
+    /// waits; informational, since the entries are kept and each later read tells it again.
+    /// Each is processed once a key bundle brings its key, or dropped past the bounds
+    /// ([`AppEvent::StoredEntryDropped`]).
+    AwaitingKeys {
+        /// The data epochs waited for, each once, lowest first.
+        epochs: Vec<u64>,
+        /// How many entries wait.
+        entries: u64,
+    },
+    /// The records held `Unreadable` that a scope key taken opens couldn't be reopened now,
+    /// such as for a store that refused a commit (Switch spec 3.5): the reopening stays owed
+    /// and is made again at the next read, and the read went on. Informational: what is
+    /// owed is in the store, so the next read that fails again tells it again.
+    ReopeningOwed {
+        /// Why, without content.
+        error: String,
     },
     /// The app holds every scope key through this data epoch (Switch spec 3.5).
     KeysThrough {
@@ -730,10 +768,23 @@ pub enum AppEvent {
     },
     /// Uploads after a provider loss conflict with the current write of a record the app
     /// holds (Switch spec 12.6): raised once per change, when a view first shows it so, not
-    /// again while it stays so. [`super::SharedRecord::divergent`] is the durable truth: the
-    /// event lives in memory only, so one raised in the commit that writes the flag is lost
-    /// if the app stops before its host takes the report, while the flag stays.
+    /// again while it stays so, short of a restore (below). A duty event, kept in the commit that writes the flag
+    /// ([`super::SharedRecord::divergent`]): delivered until acknowledged, also after a crash
+    /// before the host took the report, and after the flag was cleared since, by a newer
+    /// write in the same read or a later one. The flag says whether the record is divergent
+    /// now; the event, that it was. A restore, in place or from a backup, replaces the marks:
+    /// the listing it owes reads the records again, and a view that still shows a record
+    /// divergent raises the event again, with a new ID. A restore in place also keeps the
+    /// unacknowledged ones, so one divergence may come with two IDs.
+    ///
+    /// Delivery is at least once, and one divergence may carry two IDs: a protocol goes by
+    /// the record key and the record's current flag, not by the event ID. The event has no
+    /// order against the informational events of the same commit, such as the
+    /// [`AppEvent::RecordChanged`] of a newer write that already cleared the flag: read
+    /// [`super::SharedRecord::divergent`] for the record's state now.
     RecordDivergent {
+        /// The duty event's ID.
+        id: EventId,
         /// The record key.
         key: [u8; 32],
     },
@@ -791,6 +842,7 @@ impl AppEvent {
             | Self::MessageUndelivered { id, .. }
             | Self::RecordJobDropped { id, .. }
             | Self::RecordUncheckable { id, .. }
+            | Self::RecordDivergent { id, .. }
             | Self::LocalWritesRefused { id, .. }
             | Self::AccountGone { id } => Some(*id),
             _ => None,
@@ -914,6 +966,10 @@ pub(crate) enum Duty {
         sender: [u8; 32],
         accepted_at_ms: u64,
         reason: DropReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        awaited_epoch: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg_id: Option<String>,
     },
     KeptBatchDropped {
         #[serde(with = "serde_b64")]
@@ -956,6 +1012,10 @@ pub(crate) enum Duty {
         owed_calls: u64,
     },
     AccountGone,
+    RecordDivergent {
+        #[serde(with = "serde_b64")]
+        key: [u8; 32],
+    },
 }
 
 impl Duty {
@@ -1037,6 +1097,8 @@ impl Duty {
                 sender,
                 accepted_at_ms,
                 reason,
+                awaited_epoch,
+                msg_id,
             } => AppEvent::StoredEntryDropped {
                 id,
                 stored_id,
@@ -1045,6 +1107,8 @@ impl Duty {
                 sender,
                 accepted_at_ms,
                 reason,
+                awaited_epoch,
+                msg_id,
             },
             Self::KeptBatchDropped { batch_id } => AppEvent::KeptBatchDropped { id, batch_id },
             Self::BatchRefused { batch_id, code } => AppEvent::BatchRefused { id, batch_id, code },
@@ -1082,6 +1146,7 @@ impl Duty {
                 version: pubky_switch_core::ops::RecordVersion::new(generation, version),
                 mark_bytes,
             },
+            Self::RecordDivergent { key } => AppEvent::RecordDivergent { id, key },
             Self::RestoreLeftBehind {
                 duty_events,
                 owed_calls,
@@ -1104,8 +1169,9 @@ pub enum BackupRefusal {
     TooLarge,
 }
 
-/// Which of the bounds on entries stored as [`ParkReason::Unverifiable`] an entry was
-/// dropped past (Switch spec 8.2, [`AppEvent::StoredEntryDropped`]).
+/// Which of the bounds on entries stored as [`ParkReason::Unverifiable`] or
+/// [`ParkReason::AwaitingKey`], counted together, an entry was dropped past (Switch spec
+/// 8.2, [`AppEvent::StoredEntryDropped`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum DropReason {
@@ -1113,10 +1179,10 @@ pub enum DropReason {
     /// judged on the highest service time the app verified.
     Age,
     /// Its sender identity held more than [`super::MAX_UNVERIFIED_PER_SENDER`] such
-    /// entries, and it was that sender's accepted earliest.
+    /// entries, of both reasons, and it was that sender's accepted earliest.
     PerSender,
-    /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries were stored, and it was the
-    /// one accepted earliest of the sender identity that held the most.
+    /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries, of both reasons, were stored,
+    /// and it was the one accepted earliest of the sender identity that held the most.
     Total,
 }
 
@@ -1171,13 +1237,28 @@ pub enum ParkReason {
     /// A build earlier than schema 3 (`STATE.md`) refuses a store that holds this reason, or
     /// [`ParkReason::EffectTooLarge`], from the schema version alone, so neither is misread.
     Released,
+    /// Its receive step needs a scope key of `data_epoch` that the app doesn't hold yet
+    /// (Switch spec 3.5, 8.2): the step answered [`super::Outcome::AwaitKey`], or applied an
+    /// effect with a write the context couldn't seal for want of the current data epoch's
+    /// key, after the key bundle was fetched once. It is stored at once, with no bounded
+    /// wait and no [`AppEvent::StoreFailing`]. It is tried again once the app holds every
+    /// key of `data_epoch` its certificate is given and a key came since its step last ran,
+    /// and not before, so an entry whose key never comes, or one its certificate is never
+    /// given, costs a read no request and no step. It is bounded together with the entries
+    /// stored as [`ParkReason::Unverifiable`], and dropped past the bounds
+    /// ([`AppEvent::StoredEntryDropped`]).
+    AwaitingKey {
+        /// The data epoch whose key the step waits for.
+        data_epoch: u64,
+    },
 }
 
 impl ParkReason {
     /// Whether an entry stored for this reason is processed again by a later read: one
     /// whose sender couldn't be checked, whose write hit a quota, whose receive step the
-    /// store kept from finishing, or that the host released. The others stay stored until
-    /// the protocol or the host acts on them ([`super::App::forget_parked`]).
+    /// store kept from finishing, that waits for a scope key (once the key is held), or that
+    /// the host released. The others stay stored until the protocol or the host acts on
+    /// them ([`super::App::forget_parked`]).
     pub fn tried_again(self) -> bool {
         matches!(
             self,
@@ -1186,6 +1267,22 @@ impl ParkReason {
                 | Self::StoreUnavailable
                 | Self::StoreRejected
                 | Self::Released
+                | Self::AwaitingKey { .. }
         )
+    }
+
+    /// Whether entries stored for this reason count against the bounds of Switch spec 8.2
+    /// (`unverified.rs`): those whose sender couldn't be checked and those that wait for a
+    /// scope key, together.
+    pub(crate) fn bounded(self) -> bool {
+        matches!(self, Self::Unverifiable | Self::AwaitingKey { .. })
+    }
+
+    /// The data epoch an entry stored for this reason waits for, if it waits for a key.
+    pub(crate) fn awaited_epoch(self) -> Option<u64> {
+        match self {
+            Self::AwaitingKey { data_epoch } => Some(data_epoch),
+            _ => None,
+        }
     }
 }

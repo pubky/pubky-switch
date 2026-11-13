@@ -42,16 +42,32 @@ pub(crate) const KEY_REQUEST_RETRY_MS: u64 = 60 * 60 * 1000;
 
 impl App {
     /// Fetch, read and merge the app's key bundle parts (Switch wire 7.4.11), then ask for a
-    /// full bundle if a key is still missing.
+    /// full bundle if a key is still missing, and reopen the records held `Unreadable` that
+    /// a key taken opens: a reopening that fails stays owed and is reported
+    /// ([`super::AppEvent::ReopeningOwed`]), never this call's error, but for an alarm.
     ///
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app; a failed
-    /// call or commit. A `404` (no part stored) isn't one.
+    /// call or commit; an alarm, the reopening's included. A `404` (no part stored) isn't
+    /// one.
     ///
     /// [`Refusal::Stopped`]: super::Refusal::Stopped
     /// [`Refusal::Left`]: super::Refusal::Left
     pub async fn fetch_key_bundle(&mut self) -> Result<(), AppError> {
+        Box::pin(async move {
+            self.fetch_key_parts().await?;
+            self.reopen_if_due().await
+        })
+        .await
+    }
+
+    /// [`App::fetch_key_bundle`] without the reopening: the commit that takes a key only
+    /// marks the records held `Unreadable` as owed one ([`super::records::REOPEN_DUE`]). For
+    /// a fetch made while a page's writes are open, which may hold a record taken
+    /// `Unreadable` that the store doesn't show yet: the read reopens once they are
+    /// committed.
+    pub(crate) async fn fetch_key_parts(&mut self) -> Result<(), AppError> {
         Box::pin(async move {
             self.ready_local().await?;
             // A full-bundle request is a write through the service (Switch spec 3.5).
@@ -121,11 +137,12 @@ impl App {
             }
             let missing = self.update_keys_through();
             tx.put(key::BUNDLE, &self.state.bundle)?;
-            self.commit(tx).await?;
-            // A record held unreadable for want of a key taken now opens.
+            // The records held unreadable are owed a reopening from the commit that takes
+            // the key, until one finishes.
             if took {
-                self.reopen_unreadable().await?;
+                tx.put(super::records::REOPEN_DUE, &())?;
             }
+            self.commit(tx).await?;
             if missing && self.state.bundle.full_requested_ms.is_none() {
                 self.request_full_bundle().await?;
             }
@@ -212,6 +229,72 @@ impl App {
             self.fetch_key_bundle().await?;
         }
         Ok(())
+    }
+}
+
+/// The data epochs at which the app lacks a scope key its certificate is given (Switch
+/// spec 3.5), as ranges, from epoch 1 through the epoch they were worked out to.
+pub(crate) struct KeyGaps {
+    gaps: Vec<(u64, u64)>,
+}
+
+impl KeyGaps {
+    /// Whether a key of `data_epoch` is missing.
+    pub(crate) fn covers(&self, data_epoch: u64) -> bool {
+        self.gaps
+            .iter()
+            .any(|(first, last)| *first <= data_epoch && data_epoch <= *last)
+    }
+}
+
+impl App {
+    /// The keys missing through `through`.
+    fn key_gaps_through(&self, through: u64) -> KeyGaps {
+        let protocol = std::sync::Arc::clone(&self.protocol);
+        let gaps = missing_keys(
+            &self.state.scope_keys,
+            &self.state.cert,
+            &|scope| protocol.has_keys(scope),
+            through,
+        )
+        .iter()
+        .map(|gap| (gap.first_epoch, gap.last_epoch))
+        .collect();
+        KeyGaps { gaps }
+    }
+
+    /// The keys missing through the current data epoch, or the highest epoch an entry stored
+    /// locally waits for ([`super::ParkReason::AwaitingKey`]) when that is later.
+    pub(crate) fn key_gaps(&self) -> KeyGaps {
+        let through = self
+            .state
+            .parked
+            .values()
+            .filter_map(|stored| stored.reason.awaited_epoch())
+            .fold(self.state.own_doc.data_epoch(), u64::max);
+        self.key_gaps_through(through)
+    }
+
+    /// How many scope keys the app holds: it only grows while the app runs, a key once taken
+    /// being kept until the app leaves.
+    pub(crate) fn keys_held(&self) -> u64 {
+        u64::try_from(self.state.scope_keys.keys.len()).unwrap_or(u64::MAX)
+    }
+
+    /// Whether the app holds every key of `data_epoch` its certificate is given.
+    pub(crate) fn holds_epoch_keys(&self, data_epoch: u64) -> bool {
+        let through = data_epoch.max(self.state.own_doc.data_epoch());
+        !self.key_gaps_through(through).covers(data_epoch)
+    }
+
+    /// Whether fetching the key bundle now may bring a key of `data_epoch` (Switch spec
+    /// 3.5): one is missing at that epoch, which is the current one or before it, and no
+    /// full bundle is asked for. While one is asked for, the signer's answer comes as a part
+    /// the feed shows, which fetches it; a later epoch's keys come once the epoch rises.
+    pub(crate) fn key_may_come_by_fetch(&self, data_epoch: u64) -> bool {
+        data_epoch <= self.state.own_doc.data_epoch()
+            && self.state.bundle.full_requested_ms.is_none()
+            && !self.holds_epoch_keys(data_epoch)
     }
 }
 

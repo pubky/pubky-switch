@@ -38,6 +38,7 @@ mod push_queue;
 mod records;
 mod recovery;
 mod snapshot;
+mod sweeps;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 

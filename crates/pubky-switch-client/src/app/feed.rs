@@ -27,6 +27,13 @@
 //!   [`RETRY_EVENT_READS`]th read in a row the app raises [`AppEvent::StoreFailing`]. After
 //!   the wait, or at once when the store fails for that entry, it is stored and passed, and
 //!   tried again at every read: never dropped.
+//! - **An entry whose receive step waits for a scope key** the app doesn't hold yet
+//!   ([`Outcome::AwaitKey`], or an effect with a write the context couldn't seal for want of
+//!   the current data epoch's key) is stored and passed at once, after at most one fetch of
+//!   the key bundle, which asks for a full bundle if a key is still missing. It is tried
+//!   again once the app holds its epoch's keys, in the read whose fetch brought them, after
+//!   any listing owed, or at a later read; until then it costs a read nothing. It is bounded
+//!   with the entries whose sender couldn't be checked (Switch spec 3.5, 8.2).
 //! - **An entry no held key opens** is passed; the protocol is asked to request a re-send,
 //!   never for a time before the cursor's less the clock tolerance. So is an entry a departed
 //!   own app left unread, accepted at or before a departure the app verified in its chain;
@@ -316,6 +323,17 @@ pub(crate) struct SenderReread {
     reached: bool,
 }
 
+/// Whether `stored` is tried again now: an entry tried again at all, and, for one that
+/// waits for a scope key, once no key of its epoch is missing (`gaps`) and the keys held
+/// (`keys_held`) changed since its step last ran: a step whose key the certificate is never
+/// given, or whose keys the app holds already, runs again only once a key comes.
+fn due_again(stored: &ParkedEntry, gaps: &super::keys::KeyGaps, keys_held: u64) -> bool {
+    stored.reason.tried_again()
+        && stored.reason.awaited_epoch().is_none_or(|data_epoch| {
+            !gaps.covers(data_epoch) && stored.keys_at.is_none_or(|at| at != keys_held)
+        })
+}
+
 impl App {
     /// Read the feed to its end and process it (Switch spec 8.2, 8.3), then delete the
     /// retired receive keys the cursor passed, rotate if due, and send a deferred cursor
@@ -338,6 +356,7 @@ impl App {
     pub async fn receive(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
+            self.reopen_failures = 0;
             let result = self.receive_once(wait).await;
             // A move, a provider change, a revocation or an erasure met during the read is
             // followed (`provider.rs`), and the read goes on once at the service followed.
@@ -345,10 +364,15 @@ impl App {
                 TakeOver::Done(result) => result,
                 TakeOver::ReadAgain => self.receive_once(None).await,
             };
+            // A reopening outside a read is tried whenever it is asked for.
+            self.reopen_failures = 0;
             if result.is_err() {
                 self.reload = true;
             }
             let mut report = result?;
+            if let Some(notice) = self.awaiting_keys_notice() {
+                self.events.push(notice);
+            }
             // A read that stopped stops at the same place until something no wait on the
             // feed shows changes ([`super::Woken::ReadLater`]).
             if report.stopped {
@@ -462,12 +486,16 @@ impl App {
         if listing == Listing::WaitsForKey {
             // The key a listing waits for comes in a key bundle part, which the feed would
             // show only past this point: fetched here, then the listing tried once more.
-            self.fetch_key_bundle().await?;
+            self.fetch_key_parts().await?;
             listing = self.list_collections_if_due(&mut pages).await?;
         }
         let waits_for_key = listing == Listing::WaitsForKey;
         let unfinished = listing == Listing::Unfinished;
         let mut listed = listing == Listing::Listed;
+        // The reopening a key taken owes, a failure's from before included, before anything
+        // is handed over that may read the records it opens; only an alarm it raises fails
+        // the read.
+        self.reopen_if_due().await?;
         let mut report = ReceiveReport {
             more: kept_left || unfinished,
             ..ReceiveReport::default()
@@ -477,6 +505,9 @@ impl App {
         // The read's listing waits for a scope key: no wait on the feed shows the key
         // arrive, so the host reads again after a pause ([`super::Woken::ReadLater`]).
         let mut key_wait = waits_for_key;
+        // The entries waiting for a key that are due when the retries begin; those a fetch
+        // later in the read brings the key of are tried again at its end.
+        let mut due_at_start = Vec::new();
         if waits_for_key {
             // Receiving waits for the key, and the read says so. The feed item that would
             // answer the full-bundle request isn't read meanwhile, so the request is made
@@ -486,6 +517,10 @@ impl App {
             self.events.push(AppEvent::ListingWaitsForKey);
         } else if !unfinished {
             // The stored entries' retries, the owed calls, and the feed to its end.
+            // None while a reopening is owed: the retries here skip them then.
+            if !self.reader().exists(super::records::REOPEN_DUE).await? {
+                due_at_start = self.awaiting_due();
+            }
             self.retry_parked().await?;
             self.retry_owed().await?;
             let mut wait = wait.map(|seconds| self.long_poll_seconds(seconds).0);
@@ -531,7 +566,7 @@ impl App {
                         }
                         let mut listing = self.list_collections_if_due(&mut pages).await?;
                         if listing == Listing::WaitsForKey {
-                            self.fetch_key_bundle().await?;
+                            self.fetch_key_parts().await?;
                             listing = self.list_collections_if_due(&mut pages).await?;
                         }
                         match listing {
@@ -555,6 +590,9 @@ impl App {
             }
         }
         if self.state.alarm.is_none() {
+            // What a fetch between pages owes, such as at a `missed` item's listing, before
+            // the entries a key brought are tried again.
+            self.reopen_if_due().await?;
             // A stopped read leaves the claims and records it marked for the next one, and so
             // do one that waits for a key and one whose listing goes on at the next read. A
             // read that read its feed publishes once the feed shows the app current. One that
@@ -566,6 +604,10 @@ impl App {
                     self.publish_owed(false, false).await?;
                 }
             } else if !report.stopped {
+                // Nothing is handed over while a listing is owed (Switch spec 8.2).
+                if !self.reader().exists(super::records::LIST_DUE).await? {
+                    self.retry_awaited(&due_at_start).await?;
+                }
                 self.reread_claims().await?;
                 self.reread_records().await?;
                 self.fetch_entry_writers().await?;
@@ -738,8 +780,11 @@ impl App {
         *blocked = read.blocked;
         self.end_page(read).await?;
         if epoch_rose && self.state.alarm.is_none() {
-            self.fetch_key_bundle().await?;
+            self.fetch_key_parts().await?;
         }
+        // A key a fetch took on the page opens what the page's committed writes hold
+        // `Unreadable` (Switch spec 3.5).
+        self.reopen_if_due().await?;
         if stopped.is_some() {
             return Ok(None);
         }
@@ -1029,7 +1074,6 @@ impl App {
             return Ok(self.dropped(entry.seq, 10, reason));
         }
         let mut tries = 0usize;
-        let mut keys_fetched = false;
         // The claims read from the switch at the step's request, for this entry.
         let mut fetched: Vec<([u8; 32], ClaimFetch)> = Vec::new();
         loop {
@@ -1069,18 +1113,23 @@ impl App {
                 // Passed, not processed: no processed pair, so a re-send is delivered again
                 // (`Outcome::Pass`). Nothing is unparked: an entry stored locally stays so.
                 Outcome::Pass => return Ok(Step::Pass),
+                Outcome::AwaitKey { data_epoch } => {
+                    match self.await_key(entry, &received, data_epoch, read).await? {
+                        Some(step) => return Ok(step),
+                        None => continue,
+                    }
+                }
                 Outcome::Apply(effect) => effect,
             };
             if writes.not_now.is_some() {
-                // A write the effect needs can't be built yet, for want of a scope key: the
-                // key bundle is fetched and the effect built again once; without the key
-                // still, the entry waits (Switch spec 3.5).
-                if keys_fetched {
-                    return Ok(Step::Hold);
+                // A write the effect needs can't be sealed yet, for want of the current data
+                // epoch's key: the entry waits for it as for `Outcome::AwaitKey` (Switch spec
+                // 3.5, 8.2).
+                let data_epoch = self.state.own_doc.data_epoch();
+                match self.await_key(entry, &received, data_epoch, read).await? {
+                    Some(step) => return Ok(step),
+                    None => continue,
                 }
-                keys_fetched = true;
-                self.fetch_key_bundle().await?;
-                continue;
             }
             let ContextWrites {
                 ops,
@@ -1183,7 +1232,7 @@ impl App {
                     }
                 }
                 Sent::StaleEpoch => {
-                    self.fetch_key_bundle().await?;
+                    self.fetch_key_parts().await?;
                     return Ok(Step::Hold);
                 }
                 Sent::Quota => {
@@ -1263,6 +1312,62 @@ impl App {
             fetched.push((claim_key, fetch));
         }
         Ok(Needs::Read)
+    }
+
+    /// A receive step that waits for a scope key of `data_epoch` (Switch spec 3.5, 8.2).
+    /// When a key the certificate is given is missing at that epoch, up to the current one,
+    /// and no full bundle is asked for yet, the key bundle is fetched: the fetch asks for a
+    /// full bundle if a key is still missing, so a key that never comes costs that one
+    /// request, and later entries fetch nothing while it is asked for. `None` when the fetch
+    /// brought the epoch's keys: the step runs again. After a fetch no other can come for
+    /// the entry, since either the epoch's keys are held or a full bundle is asked for
+    /// ([`App::key_may_come_by_fetch`]), so the step runs at most twice.
+    /// Otherwise the entry is stored locally and passed at once, with no bounded wait
+    /// ([`ParkReason::AwaitingKey`]); one stored already for the same epoch stays as it
+    /// is. Nothing of the step is committed.
+    async fn await_key(
+        &mut self,
+        entry: &Entry,
+        received: &Received,
+        data_epoch: u64,
+        read: &mut Read,
+    ) -> Result<Option<Step>, AppError> {
+        if self.key_may_come_by_fetch(data_epoch) {
+            self.fetch_key_parts().await?;
+            if self.holds_epoch_keys(data_epoch) {
+                return Ok(None);
+            }
+        }
+        let reason = ParkReason::AwaitingKey { data_epoch };
+        // The keys its step ran with, so it is due again only once they change. While a
+        // reopening is owed, which a key this page or this step's fetch took leaves until
+        // the page's end, the record the step read may be one it opens: no count then, and
+        // the entry, held while the reopening is owed, is due once it is done.
+        let keys_at = if self.reader().exists(super::records::REOPEN_DUE).await? {
+            None
+        } else {
+            Some(self.keys_held())
+        };
+        // Stored already for the same epoch: it stays as it is, but for that count. No
+        // event: nothing new.
+        if let Some(id) = entry.stored
+            && let Some(stored) = self.state.parked.get_mut(&id)
+            && stored.reason == reason
+        {
+            if stored.keys_at != keys_at {
+                stored.keys_at = keys_at;
+                read.tx.put(&key::parked(id), &*stored)?;
+            }
+            return Ok(Some(Step::Hold));
+        }
+        let id = self.park(entry, &received.plaintext, reason, read)?;
+        if keys_at.is_none()
+            && let Some(stored) = self.state.parked.get_mut(&id)
+        {
+            stored.keys_at = None;
+            read.tx.put(&key::parked(id), &*stored)?;
+        }
+        Ok(Some(Step::Pass))
     }
 
     fn received_event(&mut self, entry: &Entry, received: &Received) {
@@ -1606,6 +1711,7 @@ impl App {
                     reason,
                     round: self.state.parked_round.number,
                     released: false,
+                    keys_at: None,
                 },
             ),
         };
@@ -1833,6 +1939,8 @@ impl App {
                 .stored
                 .and_then(|id| self.state.parked.get(&id))
                 .is_some_and(ParkedEntry::was_released),
+            // The step of an entry that waits for a key ran with the keys held now.
+            keys_at: reason.awaited_epoch().map(|_| self.keys_held()),
         };
         read.tx.put(&key::parked(id), &parked)?;
         // An entry read from the feed may have been held there; a stored one's `seq` names
@@ -1843,10 +1951,18 @@ impl App {
         }
         self.state.parked.insert(id, parked);
         if reason.tried_again() {
-            // Its count of the store's retries goes with it, under its local ID.
-            if entry.stored.is_none()
+            if reason.awaited_epoch().is_some() {
+                // Its step finished, waiting for a key: a count of the store's retries at it
+                // ends, and none is kept while it waits.
+                self.drop_retries(
+                    entry.stored.is_none().then_some(entry.seq),
+                    id,
+                    &mut read.tx,
+                )?;
+            } else if entry.stored.is_none()
                 && let Some(retry) = self.state.retries.remove(&entry.seq)
             {
+                // Its count of the store's retries goes with it, under its local ID.
                 read.tx.delete(&key::retry(entry.seq))?;
                 read.tx.put(&key::stored_retry(id), &retry)?;
                 self.state.stored_retries.insert(id, retry);
@@ -1962,16 +2078,26 @@ impl App {
     }
 
     /// Entries stored locally, checked and applied again now (Switch spec 8.2); the cursor is
-    /// past them.
+    /// past them. One that waits for a scope key is due only once the app holds every key of
+    /// its epoch the certificate is given ([`App::holds_epoch_keys`]): until then it costs
+    /// a read nothing.
     ///
     /// At most [`PARKED_RETRIES_PER_READ`] each read, starting where the last read stopped
     /// and going round, so none waits for ever behind others the store keeps failing.
     async fn retry_parked(&mut self) -> Result<(), AppError> {
+        let gaps = self.key_gaps();
+        let keys_held = self.keys_held();
+        // An entry that waits for a key may read the records a reopening still owes: it
+        // waits for that too, its count of keys untouched, so it is due once it is done.
+        let reopen_owed = self.reader().exists(super::records::REOPEN_DUE).await?;
         let due: Vec<(u64, u64)> = self
             .state
             .parked
             .iter()
-            .filter(|(_, stored)| stored.reason.tried_again())
+            .filter(|(_, stored)| {
+                due_again(stored, &gaps, keys_held)
+                    && !(reopen_owed && stored.reason.awaited_epoch().is_some())
+            })
             .map(|(id, stored)| (*id, stored.round))
             .collect();
         if due.is_empty() {
@@ -1984,6 +2110,63 @@ impl App {
             tx.put(key::PARKED_NEXT, &round)?;
             self.commit(tx).await?;
         }
+        self.retry_stored(ids).await
+    }
+
+    /// The entries waiting for a scope key that a fetch in the read brought the keys of,
+    /// tried again at the end of the read: those due now that weren't when the read's
+    /// retries began (`due_at_start`), at most [`PARKED_RETRIES_PER_READ`] in local ID order;
+    /// the rest are due at the next read's retries. The caller makes sure no listing is
+    /// owed, so nothing is handed to the protocol before one (Switch spec 8.2).
+    async fn retry_awaited(&mut self, due_at_start: &[u64]) -> Result<(), AppError> {
+        // Not while a reopening is owed, which their steps may read (`retry_parked`).
+        if self.reader().exists(super::records::REOPEN_DUE).await? {
+            return Ok(());
+        }
+        let ids: Vec<u64> = self
+            .awaiting_due()
+            .into_iter()
+            .filter(|id| !due_at_start.contains(id))
+            .take(PARKED_RETRIES_PER_READ)
+            .collect();
+        self.retry_stored(ids).await
+    }
+
+    /// The local IDs of the entries waiting for a scope key that are due now, in order.
+    fn awaiting_due(&self) -> Vec<u64> {
+        let gaps = self.key_gaps();
+        let keys_held = self.keys_held();
+        self.state
+            .parked
+            .iter()
+            .filter(|(_, stored)| {
+                stored.reason.awaited_epoch().is_some() && due_again(stored, &gaps, keys_held)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// The report's notice of the entries waiting for scope keys
+    /// ([`AppEvent::AwaitingKeys`]), if any wait.
+    fn awaiting_keys_notice(&self) -> Option<AppEvent> {
+        let mut epochs: Vec<u64> = self
+            .state
+            .parked
+            .values()
+            .filter_map(|stored| stored.reason.awaited_epoch())
+            .collect();
+        if epochs.is_empty() {
+            return None;
+        }
+        let entries = u64::try_from(epochs.len()).unwrap_or(u64::MAX);
+        epochs.sort_unstable();
+        epochs.dedup();
+        Some(AppEvent::AwaitingKeys { epochs, entries })
+    }
+
+    /// The entries stored locally at `ids`, each checked and applied again in a commit of
+    /// its own.
+    async fn retry_stored(&mut self, ids: Vec<u64>) -> Result<(), AppError> {
         for id in ids {
             let Some(stored) = self.state.parked.get(&id).cloned() else {
                 continue;
@@ -2009,6 +2192,7 @@ impl App {
                 .check_and_apply(&entry, plaintext, true, &mut read)
                 .await?;
             self.commit(read.tx).await?;
+            self.reopen_if_due().await?;
             if step == Step::Pass && !self.state.parked.contains_key(&id) {
                 self.events.push(AppEvent::Unparked {
                     seq: stored.seq,
@@ -2335,7 +2519,7 @@ impl App {
                         // Fetched before the cursor passes the part (Switch spec 3.5). A
                         // part stored after the full-bundle request answers it.
                         self.part_stored(envelope.server_time);
-                        self.fetch_key_bundle().await?;
+                        self.fetch_key_parts().await?;
                         Ok(Step::Pass)
                     }
                     OpKind::CertPut {
