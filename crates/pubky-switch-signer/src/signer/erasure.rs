@@ -48,8 +48,8 @@
 //! them, which a later enrollment names again. What only the erased account could settle is
 //! dropped: the alerts of revocations not yet sent there and of an owed closing, and an owed
 //! backup. Nothing more is signed for the account, and a revocation or a restore is refused.
-//! The signer backup on the Homeserver stays, with the identity secret sealed to the
-//! identity's own backup key, naming the erased switch. Enrolling again after an erasure
+//! The signer backup on the Homeserver stays, sealed to the identity's own backup key,
+//! naming the erased switch. Enrolling again after an erasure
 //! starts the account as after a provider loss (Switch wire 7.4.16):
 //! [`Signer::declare_provider_loss`], at the same service or another.
 

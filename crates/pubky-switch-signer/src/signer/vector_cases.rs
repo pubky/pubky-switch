@@ -343,12 +343,22 @@ fn app_keys(keys: &Value, name: &str) -> AppKeys {
     )
 }
 
-/// `signer_handover`'s records with `doc` in place of version 3, and `prev`, as JSON bytes:
-/// the records of a backup holding `doc` (Switch wire 3.13).
+/// `signer_handover`'s records with `doc` in place of version 3, and `prev`, as a backup's
+/// plaintext in JSON bytes: its own `kind` and no `identity_secret` (Switch wire 3.13).
 fn records_with(plaintext: &[u8], doc: &SignedDoc, prev: [u8; 32]) -> Vec<u8> {
     let v3 = document("alice identity.json");
+    let handover: Value = serde_json::from_slice(plaintext).unwrap();
+    let secret = format!(
+        ",\"identity_secret\":\"{}\"",
+        text(&handover, "identity_secret")
+    );
     let mut records = std::str::from_utf8(plaintext)
         .unwrap()
+        .replace(
+            "\"kind\":\"pubky-switch.signer_handover\"",
+            "\"kind\":\"pubky-switch.signer_backup\"",
+        )
+        .replace(&secret, "")
         .replace(&v3.body, &doc.body)
         .replace(&v3.sig, &doc.sig);
     assert_eq!(records.pop(), Some('}'));
@@ -445,7 +455,7 @@ async fn test_vectors_old_signer_abort_is_the_vectors_version_5() {
     let backup: SignerBackup =
         serde_json::from_slice(&old.homeserver.0.lock().unwrap()[SIGNER_BACKUP_PATH]).unwrap();
     assert_eq!(
-        *backup.open(&old.key).unwrap().to_json().unwrap(),
+        *backup.open(&old.key).unwrap().to_backup_json().unwrap(),
         *records_with(&old.plaintext, &abort, v3.hash()),
         "the vector's records, with the abort built on version 3"
     );

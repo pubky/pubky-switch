@@ -1413,8 +1413,8 @@ impl Signer {
         Ok(self.keyring.open_backup(&backup)?)
     }
 
-    /// Seal the signer's records, holding `doc`, to the backup key (Switch wire 3.13). The
-    /// identity secret goes into it, so it is the backup's export (Switch spec 12.8).
+    /// Seal the signer's records, holding `doc`, to the backup key (Switch wire 3.13). It holds
+    /// no identity secret (Switch spec 12.8).
     fn seal_backup(&self, doc: &SignedDoc, prev: Option<[u8; 32]>) -> Result<SignerBackup> {
         let identity = self.state.identity;
         let doc = IdentityDoc::verify(doc, &identity)?;

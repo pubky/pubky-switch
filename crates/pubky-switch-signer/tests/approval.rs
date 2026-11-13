@@ -316,7 +316,9 @@ async fn test_review_refuses_a_grant_that_covers_identity_json() {
     for covering in [
         "/pub/pubky-switch/",
         "/pub/",
-        "/pub/pubky-switch/v1/signer-backup.json",
+        "/priv/pubky-switch/",
+        "/priv/",
+        "/priv/pubky-switch/v1/signer-backup.json",
     ] {
         let app = App::new(&["notes"], Some(format!("{record},{covering}:rw")), [9; 32]);
         let error = signer.review(&app.request, &app.auth).unwrap_err();

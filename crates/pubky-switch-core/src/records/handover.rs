@@ -1,9 +1,10 @@
 //! The signer hand-over and the signer backup (Switch wire 3.12, 3.13; Switch spec 12.8).
 //!
-//! Both carry the signer's records, [`SignerRecords`]: the identity key, the newest
-//! `identity.json` a service accepted, the App IDs revoked for good, the certificates that
-//! document references, the switch's limits and the key bundle parts stored for its apps.
-//! Their JSON is split into 1 to 128 parts, each sealed in its own envelope:
+//! Both carry the signer's records, [`SignerRecords`]: the newest `identity.json` a service
+//! accepted, the App IDs revoked for good, the certificates that document references, the
+//! switch's limits and the key bundle parts stored for its apps. A hand-over also carries the
+//! identity key; a backup doesn't, since only a holder of the key opens it. Their JSON is split
+//! into 1 to 128 parts, each sealed in its own envelope:
 //!
 //! - a hand-over to the new signer's certified bundle key, signed over `lp(label, identity,
 //!   the new signer's App ID, u32_be(n), envelope_1, ..., envelope_n)`;
@@ -15,8 +16,9 @@
 //! the deliveries and the reads of the switch's and the Homeserver's copies are the
 //! signer's.
 //!
-//! Security: the plaintext holds the identity secret. It is zeroized when dropped, never
-//! shown by `Debug`, and opened only after the signature verifies.
+//! Security: a hand-over's plaintext holds the identity secret. It is zeroized when dropped,
+//! never shown by `Debug`, and opened only after the signature verifies. A backup's plaintext
+//! holds no secret: a restore opens it with the identity key it already holds.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -30,8 +32,11 @@ use crate::keys::IdentityKey;
 use crate::labels;
 use crate::sig::{self, SignedDoc};
 
-/// The `kind` of a hand-over's and a backup's plaintext (Switch wire 3.12, 3.13).
+/// The `kind` of a hand-over's plaintext (Switch wire 3.12).
 pub const HANDOVER_KIND: &str = "pubky-switch.signer_handover";
+
+/// The `kind` of a backup's plaintext (Switch wire 3.13).
+pub const BACKUP_KIND: &str = "pubky-switch.signer_backup";
 
 /// The most envelopes a hand-over or a backup holds (Switch wire 3.12).
 pub const MAX_HANDOVER_ENVELOPES: usize = 128;
@@ -42,9 +47,10 @@ pub const MAX_BUNDLE_PARTS: usize = 2048;
 /// The signer's records (Switch wire 3.12, 3.13): the plaintext of a hand-over and of a
 /// backup.
 ///
-/// Holding one means its checks 1 and 2 held: the secret is the identity's, `identity_doc`
+/// Holding one means its checks 1 and 2 held: the key is the identity's, `identity_doc`
 /// verifies for it, and every certificate it references is among `certs` and verifies.
-/// It holds the identity key, so its `Debug` shows only the identity and the version.
+/// It holds the identity key, from a hand-over's plaintext or, for a backup, from the
+/// restoring install, so its `Debug` shows only the identity and the version.
 #[derive(Clone)]
 pub struct SignerRecords {
     key: IdentityKey,
@@ -68,13 +74,15 @@ impl std::fmt::Debug for SignerRecords {
     }
 }
 
-/// The plaintext as it is read; unknown members are ignored (Switch wire 1.1).
+/// The plaintext as it is read; unknown members are ignored (Switch wire 1.1). A hand-over
+/// carries `identity_secret`, a backup doesn't.
 #[derive(Deserialize)]
 struct RecordsIn {
     v: u64,
     kind: String,
     identity: String,
-    identity_secret: String,
+    #[serde(default)]
+    identity_secret: Option<String>,
     identity_doc: SignedDoc,
     revoked_apps: Vec<String>,
     certs: Vec<SignedDoc>,
@@ -88,19 +96,22 @@ struct RecordsIn {
 
 impl Drop for RecordsIn {
     fn drop(&mut self) {
-        self.identity_secret.zeroize();
+        if let Some(secret) = &mut self.identity_secret {
+            secret.zeroize();
+        }
     }
 }
 
-/// The plaintext as the signer writes it: the members in the order of Switch wire 3.12.
+/// The plaintext as the signer writes it: the members in the order of Switch wire 3.12, the
+/// secret only in a hand-over.
 #[derive(Serialize)]
 struct RecordsOut<'a> {
     v: u64,
     kind: &'a str,
     #[serde(with = "fmt::pubky")]
     identity: [u8; 32],
-    #[serde(with = "serde_b64")]
-    identity_secret: [u8; 32],
+    #[serde(skip_serializing_if = "Option::is_none", with = "secret_b64")]
+    identity_secret: Option<[u8; 32]>,
     identity_doc: &'a SignedDoc,
     revoked_apps: Vec<String>,
     certs: Vec<&'a SignedDoc>,
@@ -114,7 +125,22 @@ struct RecordsOut<'a> {
 
 impl Drop for RecordsOut<'_> {
     fn drop(&mut self) {
-        self.identity_secret.zeroize();
+        if let Some(secret) = &mut self.identity_secret {
+            secret.zeroize();
+        }
+    }
+}
+
+/// `identity_secret` as base64url, written only when present.
+mod secret_b64 {
+    use serde::Serializer;
+
+    #[allow(clippy::ref_option)] // serde's `with` passes the field by reference
+    pub fn serialize<S: Serializer>(secret: &Option<[u8; 32]>, s: S) -> Result<S::Ok, S::Error> {
+        match secret {
+            Some(bytes) => crate::enc::serde_b64::serialize(bytes, s),
+            None => s.serialize_none(),
+        }
     }
 }
 
@@ -184,24 +210,41 @@ impl SignerRecords {
     /// [`Error::Invalid`] or [`Error::Signature`] naming the check that failed; the text
     /// never quotes the plaintext.
     pub fn parse(json: &[u8], identity: &[u8; 32]) -> Result<Self> {
-        let wire: RecordsIn = parse_json(json).map_err(|e| at_check(1, e))?;
-        if wire.v != 1 {
-            return invalid("Switch wire 3.12 check 1: v isn't 1");
-        }
-        if wire.kind != HANDOVER_KIND {
-            return invalid("Switch wire 3.12 check 1: kind isn't pubky-switch.signer_handover");
-        }
-        if crate::enc::pubky_key(&wire.identity).ok().as_ref() != Some(identity) {
-            return invalid("Switch wire 3.12 check 1: another identity");
-        }
+        let wire = read_plaintext(json, HANDOVER_KIND, identity)?;
+        let Some(text) = wire.identity_secret.as_deref() else {
+            return invalid("Switch wire 3.12 check 1: no identity_secret");
+        };
         let secret = Zeroizing::new(
-            unb64_array::<32>(&wire.identity_secret)
+            unb64_array::<32>(text)
                 .map_err(|_| Error::Invalid("Switch wire 3.12 check 1: identity_secret".into()))?,
         );
         let key = IdentityKey::from_secret(*secret);
         if &key.public() != identity {
             return invalid("Switch wire 3.12 check 1: identity_secret isn't the identity key's");
         }
+        Self::from_wire(&wire, key)
+    }
+
+    /// Read a backup's records from their JSON, the parts concatenated, with `key`, the
+    /// identity key the restoring install holds (Switch wire 3.13 "Parts and plaintext"):
+    /// the checks of [`SignerRecords::parse`], with `kind` `pubky-switch.signer_backup` and
+    /// no `identity_secret`.
+    ///
+    /// # Errors
+    ///
+    /// As [`SignerRecords::parse`]; [`Error::Invalid`] for a plaintext that holds
+    /// `identity_secret`.
+    pub fn parse_backup(json: &[u8], key: &IdentityKey) -> Result<Self> {
+        let wire = read_plaintext(json, BACKUP_KIND, &key.public())?;
+        if wire.identity_secret.is_some() {
+            return invalid("Switch wire 3.13: a backup holds no identity_secret");
+        }
+        Self::from_wire(&wire, key.clone())
+    }
+
+    /// Check 2 and the records, from a plaintext whose check 1 held for `key`'s identity.
+    fn from_wire(wire: &RecordsIn, key: IdentityKey) -> Result<Self> {
+        let identity = &key.public();
         let identity_doc =
             IdentityDoc::verify(&wire.identity_doc, identity).map_err(|e| at_check(2, e))?;
         let all = wire
@@ -237,18 +280,33 @@ impl SignerRecords {
         })
     }
 
-    /// The records' JSON, compact, with the members in the order of Switch wire 3.12, `prev`
-    /// only when present. It holds the identity secret, so it is zeroized when dropped.
+    /// The records' JSON as a hand-over's plaintext, compact, with the members in the order of
+    /// Switch wire 3.12, `prev` only when present. It holds the identity secret, so it is
+    /// zeroized when dropped.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] if it can't be written.
     pub fn to_json(&self) -> Result<Zeroizing<Vec<u8>>> {
+        self.write(HANDOVER_KIND, Some(self.key.secret_bytes()))
+    }
+
+    /// The records' JSON as a backup's plaintext (Switch wire 3.13): as [`Self::to_json`],
+    /// with `kind` `pubky-switch.signer_backup` and without `identity_secret`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] if it can't be written.
+    pub fn to_backup_json(&self) -> Result<Zeroizing<Vec<u8>>> {
+        self.write(BACKUP_KIND, None)
+    }
+
+    fn write(&self, kind: &str, identity_secret: Option<[u8; 32]>) -> Result<Zeroizing<Vec<u8>>> {
         let out = RecordsOut {
             v: 1,
-            kind: HANDOVER_KIND,
+            kind,
             identity: self.key.public(),
-            identity_secret: self.key.secret_bytes(),
+            identity_secret,
             identity_doc: self.identity_doc.signed(),
             revoked_apps: self
                 .revoked_apps
@@ -308,6 +366,24 @@ impl SignerRecords {
     pub fn pending_distrust(&self) -> &[RemovedApp] {
         &self.pending_distrust
     }
+}
+
+/// Check 1 of a plaintext that needs no envelope: it parses, `v` is 1, `kind` is `kind`, and
+/// `identity` is `identity` (Switch wire 3.12, 3.13).
+fn read_plaintext(json: &[u8], kind: &str, identity: &[u8; 32]) -> Result<RecordsIn> {
+    let wire: RecordsIn = parse_json(json).map_err(|e| at_check(1, e))?;
+    if wire.v != 1 {
+        return invalid("Switch wire 3.12 check 1: v isn't 1");
+    }
+    if wire.kind != kind {
+        return Err(Error::Invalid(format!(
+            "Switch wire 3.12 check 1: kind isn't {kind}"
+        )));
+    }
+    if crate::enc::pubky_key(&wire.identity).ok().as_ref() != Some(identity) {
+        return invalid("Switch wire 3.12 check 1: another identity");
+    }
+    Ok(wire)
 }
 
 /// The entries of `picked` for App IDs of `revoked` that `doc` still lists, each once,
@@ -808,10 +884,10 @@ pub fn succeeded(
     version > handed_over.version() && !delivered.contains(hash)
 }
 
-/// A signer backup (Switch wire 3.13): the signer's records sealed in parts to the identity's
-/// backup key and signed, kept on the Homeserver at
-/// [`super::SIGNER_BACKUP_PATH`]. It is public ciphertext: anyone sees its size and when it
-/// changes.
+/// A signer backup (Switch wire 3.13): the signer's records, without the identity key, sealed
+/// in parts to the identity's backup key and signed, kept on the Homeserver at
+/// [`super::SIGNER_BACKUP_PATH`], which the Homeserver serves to the identity's own session
+/// only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SignerBackup(SealedParts);
@@ -828,7 +904,7 @@ impl SignerBackup {
         if records.key.public() != key.public() {
             return invalid("Switch wire 3.13: the records are of another identity");
         }
-        let json = records.to_json()?;
+        let json = records.to_backup_json()?;
         SealedParts::seal(key, None, &Recipient::new(key.backup_public()), &json).map(Self)
     }
 
@@ -881,9 +957,10 @@ impl SignerBackup {
     }
 
     /// Open the backup with the identity key, as a restore checks it (Switch wire 3.13
-    /// "Restoring"): a new signer's checks 1 and 2 with the backup's label and fields and the
-    /// backup key derived from `key`, without asking that `identity_doc` list an app of the
-    /// restoring install's own. Check 3 is [`check_restore_copies`].
+    /// "Restoring"): a new signer's checks 1 and 2 with the backup's label, fields and
+    /// plaintext ([`SignerRecords::parse_backup`]) and the backup key derived from `key`,
+    /// without asking that `identity_doc` list an app of the restoring install's own. The
+    /// records hold `key`. Check 3 is [`check_restore_copies`].
     ///
     /// # Errors
     ///
@@ -893,7 +970,7 @@ impl SignerBackup {
         self.verify(&identity)?;
         let secret = Zeroizing::new(key.backup_secret());
         let json = self.0.open(&identity, &secret)?;
-        SignerRecords::parse(&json, &identity)
+        SignerRecords::parse_backup(&json, key)
     }
 }
 
@@ -1437,7 +1514,10 @@ mod tests {
         let r = records(Some(first_hash));
         let backup = SignerBackup::seal(&identity(), &r).unwrap();
         let opened = backup.open(&identity()).unwrap();
-        assert_eq!(*opened.to_json().unwrap(), *r.to_json().unwrap());
+        assert_eq!(
+            *opened.to_backup_json().unwrap(),
+            *r.to_backup_json().unwrap()
+        );
         assert!(backup.open(&IdentityKey::from_secret([9; 32])).is_err());
         // A hand-over's signature isn't a backup's.
         let (mine, _) = certs();
@@ -1505,6 +1585,71 @@ mod tests {
         ] {
             assert!(!kind.backup_before());
         }
+    }
+
+    #[test]
+    fn test_backup_plaintext_holds_no_identity_secret() {
+        let r = records(Some([4; 32]));
+        let secret = b64(&identity().secret_bytes());
+        let json = r.to_backup_json().unwrap();
+        let text = std::str::from_utf8(&json).unwrap();
+        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-switch.signer_backup","identity":""#));
+        assert!(!text.contains("identity_secret") && !text.contains(&secret));
+        assert!(text.ends_with(&format!(r#","prev":"{}"}}"#, b64(&[4; 32]))));
+        // The sealed backup holds the same plaintext, and the key it opens with comes from the
+        // restoring install.
+        let backup = SignerBackup::seal(&identity(), &r).unwrap();
+        let sealed = backup
+            .0
+            .open(&identity().public(), &identity().backup_secret())
+            .unwrap();
+        assert_eq!(*sealed, *json);
+        let opened = SignerRecords::parse_backup(&json, &identity()).unwrap();
+        assert_eq!(opened.key().public(), identity().public());
+        assert_eq!(*opened.to_backup_json().unwrap(), *json);
+        // The hand-over keeps its secret.
+        let handover = r.to_json().unwrap();
+        assert!(std::str::from_utf8(&handover).unwrap().contains(&secret));
+    }
+
+    #[test]
+    fn test_backup_plaintext_refuses_another_shape() {
+        let r = records(Some([4; 32]));
+        let backup = r.to_backup_json().unwrap();
+        let handover = r.to_json().unwrap();
+        // Each kind's reader refuses the other's plaintext.
+        let error = SignerRecords::parse_backup(&handover, &identity()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("kind isn't pubky-switch.signer_backup")
+        );
+        let error = SignerRecords::parse(&backup, &identity().public()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("kind isn't pubky-switch.signer_handover")
+        );
+        // A backup that holds the secret is refused.
+        let mut with_secret: serde_json::Value = serde_json::from_slice(&backup).unwrap();
+        with_secret["identity_secret"] = b64(&identity().secret_bytes()).into();
+        let error =
+            SignerRecords::parse_backup(&serde_json::to_vec(&with_secret).unwrap(), &identity())
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a backup holds no identity_secret")
+        );
+        // Another identity's key doesn't read it.
+        assert!(SignerRecords::parse_backup(&backup, &IdentityKey::from_secret([9; 32])).is_err());
+        // A hand-over without its secret is refused.
+        let mut without: serde_json::Value = serde_json::from_slice(&handover).unwrap();
+        without.as_object_mut().unwrap().remove("identity_secret");
+        let error =
+            SignerRecords::parse(&serde_json::to_vec(&without).unwrap(), &identity().public())
+                .unwrap_err();
+        assert!(error.to_string().contains("no identity_secret"));
     }
 
     #[test]
