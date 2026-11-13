@@ -562,7 +562,7 @@ async fn test_receive_context_claim_goes_in_the_effect_and_is_checked() {
     let w = World::new();
     let protocol = ApiProtocol::new(Mode::Attempt);
     let mut app = join(&w, &protocol, "wallet").await;
-    let (seq, _) = w.note(app.app_id(), "pay");
+    let (seq, _) = w.note(app.app_id(), "done");
     let report = app.receive(None).await.unwrap();
     assert!(protocol.seen()[0].writes[0].is_ok());
     assert!(
@@ -591,7 +591,7 @@ async fn test_receive_context_attempt_refused_in_reconcile_mode() {
         .await
         .unwrap();
     assert!(app.reconcile_mode());
-    w.note(app.app_id(), "pay");
+    w.note(app.app_id(), "done");
     app.receive(None).await.unwrap();
     let refused = protocol.seen()[0].writes[0].clone().unwrap_err();
     assert!(refused.contains("no attempt"), "{refused}");
