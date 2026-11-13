@@ -155,10 +155,86 @@ fn conditional_erasures(keys: &Keys) {
     generated("http.json", &generated_cases);
 }
 
+/// The `cursor` of the two feed pages (Switch wire 7.4.4), which `pubky-switch-core` added to
+/// the prototype's pages (README "How the files were generated"): alice's wallet after `1:4`,
+/// before its first cursor move, holds 0, and the long-poll's page at `1:41` an app whose
+/// cursor is at the head. Each page holds the member before its `head`, and its answer is
+/// signed again with her account's fixed service key, at the page's own request signature and
+/// server time.
+fn feed_page_cursors(keys: &Keys) {
+    use pubky_switch_core::enc;
+    let alice_id = enc::pubky_id(&keys.identity("alice"));
+    let service = keys.service_key(&alice_id);
+    let service_key = ed25519_dalek::SigningKey::from_bytes(&keys.secret(&service).unwrap());
+    let file = load("http.json");
+    let mut generated_cases = Vec::new();
+    let mut signature_case = None;
+    for (name, cursor) in [
+        ("own app: feed page with an entry and chain items", 0),
+        ("own app: feed page, with the head header", 41),
+    ] {
+        let mut case = arr(&file, "responses")
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("{name}"))
+            .clone();
+        assert_eq!(st(&case, "public_key"), enc::b64(&service), "{name}");
+        // The page as the prototype wrote it, then with the member before its `head`, the
+        // last `"head":` of the body, since a page's items come before it.
+        let held = st(&case, "body");
+        let page = match held.find("\"cursor\":") {
+            Some(start) => {
+                let end = start + held[start..].find(',').unwrap() + 1;
+                format!("{}{}", &held[..start], &held[end..])
+            }
+            None => held.to_owned(),
+        };
+        let at = page.rfind("\"head\":{").unwrap();
+        let body = format!("{}\"cursor\":{cursor},{}", &page[..at], &page[at..]);
+        let request_signature = b64n::<64>(st(&case, "request_signature"));
+        let server_time = header(&case, http::header::SERVER_TIME).unwrap().to_owned();
+        let fields =
+            http::response_fields(200, Some(&request_signature), &server_time, body.as_bytes());
+        let signature = sig::sign(&service_key, labels::sig::HTTP_RESPONSE, &refs(&fields));
+        case["body"] = Value::String(body);
+        case["fields"] = named_fields(&RESPONSE_FIELDS, &fields);
+        case["headers"][http::header::SERVICE_SIGNATURE] = Value::String(enc::b64(&signature));
+        case["signature"] = Value::String(enc::b64(&signature));
+        case["signed_bytes_hex"] = Value::String(hex::encode(sig::signed_bytes(
+            labels::sig::HTTP_RESPONSE,
+            &refs(&fields),
+        )));
+        if cursor == 41 {
+            signature_case = Some(serde_json::json!({
+                "fields": named_fields(&RESPONSE_FIELDS, &fields),
+                "label": labels::sig::HTTP_RESPONSE,
+                "public_key": enc::b64(&service),
+                "signature": enc::b64(&signature),
+                "signed_bytes_hex": case["signed_bytes_hex"].clone(),
+                "signer": "service key",
+            }));
+        }
+        generated_cases.push((Place::Case("/responses"), case));
+    }
+    generated("http.json", &generated_cases);
+    // `signatures.json`'s one response signature is the long-poll page's.
+    let signatures = load("signatures.json");
+    let index = arr(&signatures, "signatures")
+        .iter()
+        .position(|c| c["label"] == labels::sig::HTTP_RESPONSE)
+        .unwrap();
+    let pointer = format!("/signatures/{index}");
+    generated(
+        "signatures.json",
+        &[(Place::Element(&pointer), signature_case.unwrap())],
+    );
+}
+
 #[test]
 fn test_vectors_http() {
     let keys = keys();
     conditional_erasures(&keys);
+    feed_page_cursors(&keys);
     let v = load("http.json");
     let mut transfer_requests = 0;
     for r in arr(&v, "requests") {

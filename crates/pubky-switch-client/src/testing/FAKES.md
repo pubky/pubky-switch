@@ -207,6 +207,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `wait` (at most 25) and the inbox's `apps_version` are digits only. A feed page scans
   every item to the end unless a test bounds the items or batches it scans
   (`max_page_scan`), which gives pages of items the reader isn't shown, with `more`.
+  Each page carries `cursor`, the `seq` of the reader's own cursor, 0 before its first
+  move, as the service's does (Switch spec 8.3, wire 7.4.4); the client doesn't read it yet.
 - **Injected entries**: `send` and `send_envelope` add entries without admission, quotas,
   size buckets or `409 stale_key`; entry IDs are made up from the `seq`.
 - **`POST /inbox`** (Switch wire 7.4.3), in `switch/inbox.rs`, from apps of other
