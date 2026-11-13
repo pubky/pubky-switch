@@ -174,6 +174,10 @@ mod tests {
         let config = Config::from_toml("").expect("empty config");
         assert_eq!(config, Config::default());
         assert!(config.trusted_time.required);
+        // Push is on unless the operator turns it off.
+        assert!(config.push.enabled);
+        let off = Config::from_toml("[push]\nenabled = false\n").expect("push off");
+        assert!(!off.push.enabled);
     }
 
     #[test]
