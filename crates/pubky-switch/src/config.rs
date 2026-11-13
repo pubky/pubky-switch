@@ -33,7 +33,7 @@ pub struct Config {
 }
 
 /// Push (Switch spec 9, Switch wire 8): registrations, and the webhooks a `notify` entry
-/// queues for them, sent by a background worker in each instance.
+/// queues for them, sent by the service's background worker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PushConfig {
@@ -41,7 +41,7 @@ pub struct PushConfig {
     /// registration is answered `400`, as a service that sends no pushes answers (Switch
     /// wire 8.1), and nothing is queued or sent. On by default.
     pub enabled: bool,
-    /// The most webhooks one instance sends at once; 0 is taken as 1.
+    /// The most webhooks the service sends at once; 0 is taken as 1.
     pub concurrency: usize,
 }
 

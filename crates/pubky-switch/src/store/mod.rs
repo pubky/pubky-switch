@@ -30,6 +30,7 @@ mod feed;
 mod handover;
 mod identity;
 mod inbox;
+mod instance;
 mod keying;
 mod ops;
 mod peers;
@@ -62,6 +63,7 @@ pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
 pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
+pub use instance::InstanceLock;
 pub use keying::{Keyed, keying_lock_key};
 pub use ops::{
     DivergentUpload, ListName, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry,
@@ -224,6 +226,9 @@ pub enum StoreError {
     /// No database URL is configured.
     #[error("no database URL: set database.url or {DATABASE_URL_ENV}")]
     NoUrl,
+    /// Another process serves this database ([`Store::hold_instance_lock`]).
+    #[error("another process serves this database")]
+    InUse,
 }
 
 /// PostgreSQL's code for a lock that wasn't free within `lock_timeout`.

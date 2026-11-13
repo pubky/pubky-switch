@@ -190,6 +190,9 @@ pub enum KeyStoreError {
     /// No key with this ID.
     #[error("no such service key")]
     NotFound,
+    /// Another process holds the key store's directory ([`FileKeyStore::lock_dir`]).
+    #[error("the key store at {0} is in use by another process")]
+    InUse(String),
     /// A key ID or identity that isn't well formed.
     #[error("invalid key ID or identity")]
     InvalidId,
@@ -420,6 +423,41 @@ impl FileKeyStore {
     pub fn root(&self) -> &Path {
         &self.inner.root
     }
+
+    /// Hold the directory for this process alone, as long as the lock lives: an exclusive
+    /// lock on its `lock` file, which the operating system releases when the process ends.
+    /// The service's binary takes it at start, so a second process on the same directory
+    /// refuses to start (docs/configuration.md, "Topology").
+    ///
+    /// # Errors
+    ///
+    /// [`KeyStoreError::InUse`] while another process holds it; [`KeyStoreError::Io`] when
+    /// the file can't be opened.
+    pub fn lock_dir(&self) -> Result<KeyDirLock, KeyStoreError> {
+        let path = self.inner.root.join("lock");
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(KeyDirLock { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => {
+                Err(KeyStoreError::InUse(self.inner.root.display().to_string()))
+            }
+            Err(fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+}
+
+/// A key store directory held by this process alone ([`FileKeyStore::lock_dir`]); dropped,
+/// the directory is free again.
+#[derive(Debug)]
+pub struct KeyDirLock {
+    _file: File,
 }
 
 impl Inner {
@@ -1086,6 +1124,18 @@ mod tests {
             store.operator().await.expect("operator").public_key(),
             first
         );
+    }
+
+    #[test]
+    fn test_key_store_directory_is_held_by_one_lock_at_a_time() {
+        // A second lock on a held directory is refused, as a second process's is; once the
+        // first is dropped the directory is free again.
+        let (dir, store) = open();
+        let held = store.lock_dir().expect("lock");
+        let other = FileKeyStore::open(dir.path()).expect("open");
+        assert!(matches!(other.lock_dir(), Err(KeyStoreError::InUse(_))));
+        drop(held);
+        let _again = other.lock_dir().expect("free again");
     }
 
     #[tokio::test]

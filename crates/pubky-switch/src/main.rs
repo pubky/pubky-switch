@@ -121,7 +121,18 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .ok_or("no key store: set keys.path")?;
     let keys = FileKeyStore::open(&key_dir)?;
+    // One process serves a key store and a database (docs/configuration.md, "Topology"):
+    // a second one refuses to start here, before it migrates or serves anything.
+    let _key_dir_lock = keys.lock_dir()?;
     let store = Store::connect(&config.database).await?;
+    let instance = store.hold_instance_lock().await?;
+    // The database's lock lives with its connection: once another process holds it, after
+    // a database restart or a failover, this one stops at once.
+    tokio::spawn(async move {
+        let lost = instance.keep(std::time::Duration::from_secs(5)).await;
+        tracing::error!(failure = %lost, "the instance lock: stopping");
+        std::process::exit(1);
+    });
     if config.database.migrate_on_start {
         store
             .migrate(&pubky_switch::service::announced_limits(&config.limits))
