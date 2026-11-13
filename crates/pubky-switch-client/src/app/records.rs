@@ -1162,7 +1162,16 @@ impl App {
     /// next call goes on from there, the collections listed to their end skipped. Records
     /// written meanwhile come on the feed past the item that owed the listing, which no
     /// read processes before the listing ends (Switch spec 8.2).
-    pub(crate) async fn list_collections_if_due(
+    pub(crate) fn list_collections_if_due<'a>(
+        &'a mut self,
+        pages: &'a mut u32,
+        budget: Option<&'a super::CallBudget>,
+    ) -> crate::transport::BoxFuture<'a, Result<Listing, AppError>> {
+        // Boxed, as `App::receive_inner` says.
+        Box::pin(self.list_collections_if_due_body(pages, budget))
+    }
+
+    async fn list_collections_if_due_body(
         &mut self,
         pages: &mut u32,
         budget: Option<&super::CallBudget>,
@@ -1289,7 +1298,14 @@ impl App {
     /// A store that can't be read, and an alarm the reopening raised, or any failure once
     /// one is raised: the app is stopped, and the read ends there, so nothing is handed
     /// over or sent after the alarm.
-    pub(crate) async fn reopen_if_due(&mut self) -> Result<(), AppError> {
+    pub(crate) fn reopen_if_due(
+        &mut self,
+    ) -> crate::transport::BoxFuture<'_, Result<(), AppError>> {
+        // Boxed, as `App::receive_inner` says.
+        Box::pin(self.reopen_if_due_body())
+    }
+
+    async fn reopen_if_due_body(&mut self) -> Result<(), AppError> {
         if self.reopen_failures >= REOPEN_TRIES_PER_READ
             || !self.reader().exists(REOPEN_DUE).await?
         {
