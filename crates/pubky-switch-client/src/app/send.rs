@@ -1202,7 +1202,8 @@ impl App {
     /// Try the jobs of the queued message `msg_id` once, as [`App::flush_outbox`] does for
     /// every message, and return where it is; `None` for one the app doesn't keep. The try
     /// is one unit, as [`App::send`]'s, and the call sends no kept batch itself beyond the
-    /// one each write of the try sends first.
+    /// one each write of the try sends first. So it doesn't move a message whose conversation
+    /// entry is in a kept batch: a read, a write or the flushes' passes send that batch.
     ///
     /// # Errors
     ///
@@ -1440,18 +1441,26 @@ impl App {
     ///   ([`super::AppConfig::call_budget_ms`]) is spent, but its first. So its worst case is
     ///   the budget and one unit begun within it.
     /// - One unit is bounded on its own. A delivery of the own `identity.json` is one
-    ///   request. A message's try is its conversation entry (a write: at most three
-    ///   requests), one delivery round (its first attempt, at most four requests, and no
-    ///   retry once the budget has passed since the round began), and its record job
-    ///   ([`super::App::update_record`], bounded the same way). At the default timeouts a
-    ///   try that every request makes wait to the end of its timeout takes about three
-    ///   minutes.
+    ///   request. A message's try is, at the default timeouts with every request waiting to
+    ///   the end of its timeout:
+    ///   - the service-time fetch of a message with a replay deadline, about 10 s;
+    ///   - its conversation entry, a write that may send a kept batch first under the long
+    ///     timeout, about 60 s;
+    ///   - one delivery round: its first attempt, at most four requests with the directory
+    ///     under the long timeout, and no retry once the budget has passed since the round
+    ///     began, about 90 s;
+    ///   - the own `identity.json` delivered after the acceptance asks for it, about 10 s;
+    ///   - its record job ([`super::App::update_record`], bounded the same way), about 40 s.
+    ///
+    ///   So about 3.5 to 4 minutes. A try against switches that answer takes seconds.
     /// - It tries at most [`OUTBOX_TRIES_PER_FLUSH`] messages. What is left stays owed, and
     ///   [`OutboxReport::more`] says so: the host flushes again at once.
     /// - It sends one batch kept from an earlier call again, oldest first, as the first unit
-    ///   of each pass, and none otherwise: a message whose conversation entry is in a kept
-    ///   batch, or that a kept batch would queue, goes in that pass, and a batch past its
-    ///   answer window gets its end ([`super::App::kept_batch`]). Reads send kept batches
+    ///   of each pass, and none otherwise. A message whose conversation entry is in a kept
+    ///   batch, or that a kept batch would queue, goes in the pass that sends its batch: with
+    ///   k kept batches ahead of it, the k-th pass, sooner when a read or another write sends
+    ///   them. A batch past its answer window gets its end in the pass that sends it
+    ///   ([`super::App::kept_batch`]). Reads send kept batches
     ///   too ([`super::App::receive`]), and so does each write a message's try makes, one
     ///   first, as every write does. One that keeps failing holds the others behind it until
     ///   its answer window ends, by design: no write overtakes another.
@@ -2010,7 +2019,9 @@ impl App {
     /// ([`super::AppConfig::call_budget_ms`]) has passed since the round began. Its worst case
     /// is the budget and the attempt under way when it ran out: an attempt is at most the
     /// recipient's `identity.json` from the Homeserver, the own one delivered, the
-    /// directory, and the append, each under its timeout.
+    /// directory, and the append, each under its timeout. A retry left so is recorded, the
+    /// new keys taken and the envelope dropped, or the switch's copy of the own
+    /// `identity.json` taken as unknown, so the next try's first attempt makes it.
     async fn deliver(&mut self, item: &mut OutboxItem) -> Result<Tried, AppError> {
         // The time of this round: it starts no retry once the call's budget has passed.
         let round = self.begin_budget();
@@ -2136,9 +2147,17 @@ impl App {
                     code: ErrorCode::StaleKey,
                     current,
                     ..
-                })) if resealed < RESEALS && !self.spent(round) => {
+                })) if resealed < RESEALS => {
                     resealed = resealed.saturating_add(1);
                     self.take_stale_key(&to, &current).await?;
+                    // Past the round's time the reseal waits for the next try, which seals
+                    // to the keys just taken on its first attempt.
+                    if self.spent(round) {
+                        item.sealed = None;
+                        return Ok(Delivered::Tried(Tried::Queued(
+                            "409 stale_key: sealed again at the next try".into(),
+                        )));
+                    }
                     if let Err(error) = self.seal(item, invite.as_deref()).await {
                         return failed(error);
                     }
@@ -2146,8 +2165,17 @@ impl App {
                 Err(AppError::Switch(ClientError::Switch {
                     code: ErrorCode::IdentityNeeded,
                     ..
-                })) if !redelivered && !own && !self.spent(round) => {
+                })) if !redelivered && !own => {
                     redelivered = true;
+                    // Past the round's time the delivery of the own `identity.json` waits
+                    // for the next try, whose first attempt makes it: the switch's copy is
+                    // taken as unknown.
+                    if self.spent(round) {
+                        self.note_known_version(&to, None).await?;
+                        return Ok(Delivered::Tried(Tried::Queued(
+                            "409 identity_needed: delivered at the next try".into(),
+                        )));
+                    }
                     if let Err(error) = self
                         .deliver_own_identity(&to, invite.as_deref(), true)
                         .await
