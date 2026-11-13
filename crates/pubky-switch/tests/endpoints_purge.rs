@@ -41,42 +41,9 @@ fn json_of(answer: &SwitchResponse) -> Value {
         .unwrap_or_else(|_| panic!("json: {}", String::from_utf8_lossy(&answer.body)))
 }
 
-/// The signer's `GET /apps` status of the vectors' app `name`.
-async fn status(replay: &Replay, name: &str, at_ms: u64) -> Value {
-    let path = format!("/v1/{}/apps", alice_id());
-    let answer = replay
-        .service
-        .handle(signer_request("GET", &path, Vec::new(), at_ms))
-        .await;
-    assert_eq!(
-        answer.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&answer.body)
-    );
-    let id = zbase32_encode(&app_id_of(name));
-    json_of(&answer)["apps"]
-        .as_array()
-        .expect("apps")
-        .iter()
-        .find(|status| status["app_id"] == id.as_str())
-        .unwrap_or_else(|| panic!("no status for {name}"))
-        .clone()
-}
-
 /// Whether the service still holds the wallet's record: its status names its certificate.
 async fn wallet_held(replay: &Replay, at_ms: u64) -> bool {
-    !status(replay, "wallet", at_ms).await["record_cert"].is_null()
-}
-
-/// What the service holds of `app` in the tables a purge empties.
-async fn holdings(replay: &Replay, app: &[u8; 16]) -> [i64; 4] {
-    [
-        rows_naming(replay, "apps", "app_id", app).await,
-        rows_naming(replay, "receive_keys", "app_id", app).await,
-        rows_naming(replay, "key_bundle_parts", "target_app_id", app).await,
-        rows_naming(replay, "app_listings", "app_id", app).await,
-    ]
+    !app_status(replay, "wallet", at_ms).await["record_cert"].is_null()
 }
 
 /// The signer stores the wallet's keys of data epoch 2 (Switch wire 6.2).
@@ -210,7 +177,7 @@ async fn test_purge_at_the_delivery_that_drops_a_revoked_app() {
     // Its App ID stays, with its revocation time; the records and claims it wrote stay, and
     // the chain gains only the delivery.
     assert_eq!(
-        status(&replay, "wallet", at).await,
+        app_status(&replay, "wallet", at).await,
         json!({
             "app_id": wallet_id,
             "current": false,
@@ -262,7 +229,7 @@ async fn test_purge_at_the_delivery_that_drops_a_revoked_app() {
     .execute(&mut conn)
     .await
     .expect("an entry naming the wallet");
-    assert_eq!(status(&replay, "wallet", at).await["unread_entries"], 0);
+    assert_eq!(app_status(&replay, "wallet", at).await["unread_entries"], 0);
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -356,7 +323,7 @@ async fn test_purge_waits_for_the_apps_last_open_attempt() {
         "{}",
         String::from_utf8_lossy(&unknown.body)
     );
-    let held = status(&replay, "wallet", at).await;
+    let held = app_status(&replay, "wallet", at).await;
     assert_eq!(held["open_attempts"][0]["outcome"], "unknown");
     assert!(!held["record_cert"].is_null());
     // Its evidence resolves it: the batch that does purges the wallet.
@@ -370,7 +337,7 @@ async fn test_purge_waits_for_the_apps_last_open_attempt() {
     .await;
     assert_eq!(done.status, 200, "{}", String::from_utf8_lossy(&done.body));
     assert_eq!(holdings(&replay, &wallet).await, [0, 0, 0, 0]);
-    let purged = status(&replay, "wallet", at).await;
+    let purged = app_status(&replay, "wallet", at).await;
     assert_eq!(
         (
             purged["record_cert"].clone(),
@@ -422,7 +389,7 @@ async fn test_purge_waits_for_a_departures_rotation() {
     })
     .await;
     assert_eq!(
-        status(&replay, "wallet", at).await["awaiting_rotation"],
+        app_status(&replay, "wallet", at).await["awaiting_rotation"],
         true
     );
     assert!(wallet_held(&replay, at).await);
@@ -435,12 +402,12 @@ async fn test_purge_waits_for_a_departures_rotation() {
     })
     .await;
     assert_eq!(
-        status(&replay, "wallet", at).await["awaiting_rotation"],
+        app_status(&replay, "wallet", at).await["awaiting_rotation"],
         false
     );
     assert!(wallet_held(&replay, at).await);
     deliver_next(&replay, &rotated, at, |body| body.removed.clear()).await;
-    let purged = status(&replay, "wallet", at).await;
+    let purged = app_status(&replay, "wallet", at).await;
     assert_eq!(
         (
             purged["record_cert"].clone(),

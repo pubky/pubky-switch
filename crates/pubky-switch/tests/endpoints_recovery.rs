@@ -2151,19 +2151,24 @@ async fn test_upload_contact_also_denied_is_denied() {
     replay.db.drop_database().await.expect("drop");
 }
 
-/// The executor, listed in alice's document, current again at generation 2 with its
-/// record: its keys.
-async fn executor_registers(replay: &Replay, at: u64) -> Value {
-    let keys = vectors("keys.json");
-    let executor = app(&keys, "executor").clone();
-    let record: SignedDoc = serde_json::from_value(
+/// The executor's app record from the vectors.
+fn executor_record() -> SignedDoc {
+    serde_json::from_value(
         named(
             &vectors("documents.json")["documents"],
             "executor app record",
         )["signed"]
             .clone(),
     )
-    .expect("record");
+    .expect("record")
+}
+
+/// The executor, listed in alice's document, current again at generation 2 with its
+/// record: its keys.
+async fn executor_registers(replay: &Replay, at: u64) -> Value {
+    let keys = vectors("keys.json");
+    let executor = app(&keys, "executor").clone();
+    let record = executor_record();
     let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(&executor["signing_secret_hex"]));
     let app_id: [u8; 16] = hex::decode(executor["app_id_bytes_hex"].as_str().expect("hex"))
         .expect("hex")
@@ -2606,6 +2611,124 @@ async fn test_upload_known_limit_a_proofless_unknown_applies_to_a_live_attempt()
         read["claim"]["attempts"][0]["outcome"],
         json!("unknown"),
         "{read}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The executor's claim entry `fields`, an operation of the lost generation 1 in the batch
+/// `[id; 16]`, uploaded with its certificate and no proof.
+fn executor_proofless(id: u8, fields: ClaimFields) -> Value {
+    let keys = vectors("keys.json");
+    let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(
+        &app(&keys, "executor")["signing_secret_hex"],
+    ));
+    let batch = pubky_switch_core::ops::sign_batch(
+        &secret,
+        &alice_key().public(),
+        Some(app_id_of("executor")),
+        1,
+        [id; 16],
+        vec![(Vec::new(), OpKind::Claim(fields))],
+    )
+    .expect("batch");
+    let cert =
+        pubky_switch_core::records::AppRecord::verify(&executor_record(), &alice_key().public())
+            .expect("record")
+            .cert()
+            .clone();
+    json!({ "op": batch[0].signed(), "cert": cert.signed() })
+}
+
+#[tokio::test]
+async fn test_purge_at_the_recovery_upload_that_resolves_the_apps_last_attempt() {
+    // The wallet's live attempt keeps it, revoked and in neither list, while the attempt is
+    // open and then `unknown`; the executor's upload of evidence that settles it purges the
+    // wallet, down to its App ID (Switch wire 9.1 "Sweeps", 7.4.14).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let executor = executor_registers(&replay, at).await;
+    let (fields, key) = live_attempt(&replay, at).await;
+    let wallet = wallet_app_id();
+    let keys = vectors("keys.json");
+    let revoke = format!(
+        "/v1/{}/apps/{}/revoke",
+        alice_id(),
+        app(&keys, "wallet")["app_id"].as_str().expect("id")
+    );
+    let revoked = replay
+        .service
+        .handle(signer_request("POST", &revoke, Vec::new(), at))
+        .await;
+    assert_eq!(
+        revoked.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&revoked.body)
+    );
+    let removing = deliver_next(&replay, held(&replay).await.signed(), at, |body| {
+        body.apps.retain(|listed| listed.app_id != wallet);
+        body.removed.push(pubky_switch_core::records::RemovedApp {
+            app_id: wallet,
+            distrust_from: at,
+        });
+        body.data_epoch += 1;
+    })
+    .await;
+    deliver_next(&replay, &removing, at, |body| {
+        body.removed.retain(|removed| removed.app_id != wallet);
+    })
+    .await;
+    // In neither list, but its attempt is open: it keeps everything.
+    assert_eq!(holdings(&replay, &wallet).await, [1, 1, 0, 1]);
+    // An upload that leaves the attempt unresolved, `unknown`, purges nothing.
+    let mut unknown = fields.clone();
+    unknown.kind = ClaimType::Unknown;
+    unknown.expected_step = 1;
+    unknown.orphan_after = None;
+    let body = json!({ "claims": [executor_proofless(93, unknown)] });
+    let answer = upload_as(&replay, &executor, &body, at).await;
+    assert_eq!(
+        json_of(&answer)["result"]["claims"],
+        json!([key]),
+        "{}",
+        json_of(&answer)
+    );
+    assert_eq!(holdings(&replay, &wallet).await, [1, 1, 0, 1]);
+    let kept = app_status(&replay, "wallet", at).await;
+    assert_eq!(kept["open_attempts"][0]["outcome"], "unknown", "{kept}");
+    assert!(!kept["record_cert"].is_null(), "{kept}");
+    // The upload of the evidence that settles it purges the wallet.
+    let mut done = fields;
+    done.kind = ClaimType::Done;
+    done.expected_step = 2;
+    done.orphan_after = None;
+    done.basis = Some(pubky_switch_core::claims::Basis::Evidence);
+    done.evidence_ref = Some(vec![5; 32]);
+    let body = json!({ "claims": [executor_proofless(94, done)] });
+    let answer = upload_as(&replay, &executor, &body, at).await;
+    assert_eq!(
+        json_of(&answer)["result"]["claims"],
+        json!([key]),
+        "{}",
+        json_of(&answer)
+    );
+    assert_eq!(holdings(&replay, &wallet).await, [0, 0, 0, 0]);
+    let purged = app_status(&replay, "wallet", at).await;
+    assert_eq!(
+        (
+            purged["record_cert"].clone(),
+            purged["open_attempts"].clone(),
+            purged["revoked_at"].clone(),
+        ),
+        (Value::Null, json!([]), json!(rfc3339(at)))
+    );
+    // Its App ID stays, and so does the claim it created.
+    assert_eq!(
+        (
+            rows_naming(&replay, "kept_app_ids", "app_id", &wallet).await,
+            rows_naming(&replay, "claims", "creator", &wallet).await,
+        ),
+        (1, 1)
     );
     replay.db.drop_database().await.expect("drop");
 }

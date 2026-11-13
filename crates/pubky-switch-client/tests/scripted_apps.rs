@@ -384,3 +384,115 @@ async fn test_scripted_apps_purge_waits_for_the_apps_open_attempt() {
     assert!(purged.record_cert.is_none() && purged.open_attempts.is_empty());
     assert!(s.alice.switch().app(&id).purged);
 }
+
+#[tokio::test]
+async fn test_scripted_apps_purge_at_the_recovery_upload_that_resolves_its_attempt() {
+    use pubky_switch_client::transport::{Header, Request};
+    use pubky_switch_core::claims::{ClaimFields, ClaimType};
+    use pubky_switch_core::enc::{pubky_id, zbase32_encode};
+    use pubky_switch_core::http::IdentityDelivery;
+    use pubky_switch_core::ops::{OpKind, sign_batch};
+    use serde_json::json;
+    let s = Setup::new();
+    let account = format!("/v1/{}", pubky_id(&s.alice.identity().public()));
+    let request = |method: &str, path: &str, app: Option<[u8; 16]>, body: Vec<u8>| Request {
+        method: method.into(),
+        origin: s.alice.origin().to_owned(),
+        path_and_query: format!("{account}/{path}"),
+        headers: app
+            .map(|app| Header::new(pubky_switch_core::http::header::APP, &zbase32_encode(&app)))
+            .into_iter()
+            .collect(),
+        body,
+    };
+    // The first document starts a recovery from the lost generation 1, delivered through
+    // `PUT /identity` as the service takes it (Switch wire 7.4.2).
+    let first = s
+        .alice
+        .sign_next(|body| {
+            body.generation = 2;
+            body.recovery_from = Some(1);
+        })
+        .unwrap();
+    let delivery = IdentityDelivery {
+        identity: first.signed().clone(),
+        prev: None,
+    }
+    .to_json();
+    let delivered = s
+        .alice
+        .switch()
+        .handle(&request("PUT", "identity", None, delivery))
+        .unwrap();
+    assert_eq!(
+        delivered.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&delivered.body)
+    );
+    let all = AppSpec::new(&["notes"]).with_permissions(&Permission::ALL);
+    let wallet = s.alice.identity().app_keys("wallet");
+    s.alice.register_app(&wallet, &all).unwrap();
+    let executor = s.alice.identity().app_keys("executor");
+    let cert = s.alice.register_app(&executor, &all).unwrap();
+    let id = wallet.app_id_bytes();
+    let (claim_key, attempt_id) = ([5; 32], [6; 16]);
+    s.alice
+        .switch()
+        .open_attempt(claim_key, attempt_id, id)
+        .unwrap();
+    let (_, dropped) = s.revoke_and_purge(id).await;
+    // In neither list, but it owns an open attempt: it keeps everything.
+    assert!(dropped.record_cert.is_some());
+    assert!(!s.alice.switch().app(&id).purged);
+    // The executor uploads an entry of the lost generation on the attempt, without a proof.
+    let upload = |batch: u8, kind: ClaimType, step: u64| {
+        let evidence = kind == ClaimType::Done;
+        let fields = ClaimFields {
+            claim_key: claim_key.to_vec(),
+            kind,
+            expected_step: step,
+            attempt_id: attempt_id.to_vec(),
+            orphan_after: None,
+            deadline: None,
+            basis: evidence.then_some(Basis::Evidence),
+            evidence_ref: evidence.then(|| vec![7; 32]),
+        };
+        let ops = sign_batch(
+            &executor,
+            &s.alice.identity().public(),
+            Some(executor.app_id_bytes()),
+            1,
+            [batch; 16],
+            vec![(vec![], OpKind::Claim(fields))],
+        )
+        .unwrap();
+        let body = json!({ "claims": [{ "op": ops[0].signed(), "cert": cert.signed() }] });
+        let upload = request(
+            "POST",
+            "recovery/upload",
+            Some(executor.app_id_bytes()),
+            body.to_string().into_bytes(),
+        );
+        let answer = s.alice.switch().handle(&upload).unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+        assert_eq!(
+            answer["result"]["claims"].as_array().map(Vec::len),
+            Some(1),
+            "{answer}"
+        );
+    };
+    // An upload that leaves the attempt `unknown` purges nothing.
+    upload(80, ClaimType::Unknown, 1);
+    let kept = s.status(&id).await;
+    assert!(kept.record_cert.is_some());
+    assert_eq!(kept.open_attempts.len(), 1);
+    assert_eq!(kept.open_attempts[0].outcome, "unknown");
+    assert!(!s.alice.switch().app(&id).purged);
+    // The upload of the evidence that settles it purges the wallet, as at the service.
+    upload(81, ClaimType::Done, 2);
+    let purged = s.status(&id).await;
+    assert!(purged.record_cert.is_none() && purged.open_attempts.is_empty());
+    assert_eq!(purged.revoked_at, dropped.revoked_at);
+    assert!(s.alice.switch().app(&id).purged);
+}

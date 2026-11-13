@@ -922,3 +922,42 @@ pub async fn rows_naming(replay: &Replay, table: &str, column: &str, app: &[u8; 
     conn.close().await.expect("close");
     count
 }
+
+/// What the service holds of `app` in the tables a purge of a removed app empties (Switch
+/// wire 9.1): its record, receive keys, key bundle parts and listing.
+pub async fn holdings(replay: &Replay, app: &[u8; 16]) -> [i64; 4] {
+    [
+        rows_naming(replay, "apps", "app_id", app).await,
+        rows_naming(replay, "receive_keys", "app_id", app).await,
+        rows_naming(replay, "key_bundle_parts", "target_app_id", app).await,
+        rows_naming(replay, "app_listings", "app_id", app).await,
+    ]
+}
+
+/// The signer's `GET /apps` status of the vectors' app `name`.
+pub async fn app_status(replay: &Replay, name: &str, at_ms: u64) -> Value {
+    let keys = vectors("keys.json");
+    let path = format!(
+        "/v1/{}/apps",
+        alice(&keys)["pubky_id"].as_str().expect("id")
+    );
+    let answer = replay
+        .service
+        .handle(signer_request("GET", &path, Vec::new(), at_ms))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let id = pubky_switch_core::enc::zbase32_encode(&app_id_of(name));
+    let body: Value = serde_json::from_slice(&answer.body).expect("json");
+    body["apps"]
+        .as_array()
+        .expect("apps")
+        .iter()
+        .find(|status| status["app_id"] == id.as_str())
+        .unwrap_or_else(|| panic!("no status for {name}"))
+        .clone()
+}
