@@ -22,8 +22,10 @@ pub struct Recovery {
 /// The tables of an account's state for one generation at this service, which a recovery in
 /// place empties (Switch wire 3.3): its chain, its own apps and what they wrote, its lists,
 /// invites, batches and inbox, its flagged senders and pending connect requests, a hand-over,
-/// the counterparties' copies and their floors.
+/// the counterparties' copies and their floors, and its apps' push registrations.
 const GENERATION_STATE: &[&str] = &[
+    // Its keys owed first (`start_recovery_in_place`).
+    "push_registrations",
     "chain_items",
     "apps",
     "receive_keys",
@@ -228,7 +230,8 @@ impl AccountTxn {
     /// `max_enrollments`. Everything else of the generation goes (`GENERATION_STATE`),
     /// and so does the held `identity.json`, which the caller replaces in the same
     /// transaction. The outgoing key is owed deleting, retired, not erased: it goes after the
-    /// commit, as an erasure's keys do, and records no erasure.
+    /// commit, as an erasure's keys do, and records no erasure; so are the push keys of the
+    /// registrations that go (Switch wire 8.1).
     pub async fn start_recovery_in_place(
         &mut self,
         new_key: &KeyId,
@@ -242,6 +245,8 @@ impl AccountTxn {
         let generation = recovery_from
             .checked_add(1)
             .ok_or(StoreError::Corrupt("generation overflow"))?;
+        // The push registrations go with the generation, their keys owed (Switch wire 8.1).
+        self.drop_push_registrations(None).await?;
         for table in GENERATION_STATE {
             sqlx::query(&format!("DELETE FROM {table} WHERE account_id = $1"))
                 .bind(&id)

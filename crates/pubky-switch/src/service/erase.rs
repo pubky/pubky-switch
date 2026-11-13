@@ -30,7 +30,7 @@ use crate::{
         SwitchResponse,
         error::{ApiError, ErrorCode},
     },
-    keys::ServiceSigner,
+    keys::{KeyId, ServiceSigner},
     store::AccountTxn,
 };
 
@@ -158,10 +158,12 @@ impl Service {
     }
 
     /// Delete every key an erasure still owes deleting, recording each erasure in the key
-    /// store's ledger first (Switch wire 7.4.16, spec 6.5), and every key a generation change
-    /// retired, which records none (wire 3.3), and drop what is done. A failure
-    /// leaves the key owed for the next sweep: at the next erasure, and at start. Run at
-    /// start by the service's binary.
+    /// store's ledger first (Switch wire 7.4.16, spec 6.5), every key a generation change
+    /// retired, which records none (wire 3.3), and every push key owed (wire 8.1), which
+    /// records none either, and drop what is done. Each row is locked while its key goes, so
+    /// a start claiming the key it minted waits, then finds it gone (`store::push`). A
+    /// failure leaves the key owed for the next sweep: at the next erasure, and at start. Run
+    /// at start by the service's binary.
     ///
     /// Returns the accounts whose keys are still owed, a key not deleted or its erasure not
     /// recorded; `None` when the owed keys can't be read.
@@ -175,6 +177,16 @@ impl Service {
         };
         let mut left = Vec::new();
         for erased in owed {
+            let row = match self.store.lock_owed_key(&erased.key).await {
+                Ok(Some(row)) => row,
+                // Done meanwhile: claimed by a start's commit, or deleted by another sweep.
+                Ok(None) => continue,
+                Err(failure) => {
+                    tracing::error!(%failure, "locking an owed key's row");
+                    left.push(erased.account);
+                    continue;
+                }
+            };
             if !erased.retired
                 && let Err(failure) = self
                     .keys
@@ -186,17 +198,40 @@ impl Service {
                 continue;
             }
             if let Err(failure) = self.keys.delete(&erased.key).await {
-                tracing::error!(%failure, "deleting an erased account's key");
+                tracing::error!(%failure, "deleting an owed key");
                 left.push(erased.account);
                 continue;
             }
             // The key is gone and the erasure recorded: a row left behind is deleted again,
             // which deletes nothing more.
-            if let Err(failure) = self.store.forget_erased_key(&erased.key).await {
+            if let Err(failure) = row.forget().await {
                 tracing::error!(%failure, "dropping a deleted key's row");
             }
         }
         Some(left)
+    }
+
+    /// Delete `keys`, push keys one request owed deleting, once it is over (Switch wire 8.1):
+    /// those still owed go, each under its row's lock; one claimed meanwhile by a committed
+    /// registration stays. A failure leaves the key owed for the next sweep.
+    pub(super) async fn delete_owed_keys(&self, keys: &[KeyId]) {
+        for key in keys {
+            let row = match self.store.lock_owed_key(key).await {
+                Ok(Some(row)) => row,
+                Ok(None) => continue,
+                Err(failure) => {
+                    tracing::error!(%failure, "locking an owed key's row");
+                    continue;
+                }
+            };
+            if let Err(failure) = self.keys.delete(key).await {
+                tracing::error!(%failure, "deleting an owed push key");
+                continue;
+            }
+            if let Err(failure) = row.forget().await {
+                tracing::error!(%failure, "dropping a deleted key's row");
+            }
+        }
     }
 
     /// Forget every count the service keeps for `account` (Switch wire 7.4.16, 9.4).

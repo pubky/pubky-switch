@@ -43,6 +43,7 @@ const ACCOUNT_TABLES: &[(&str, &str)] = &[
     ("pending_revoked_apps", "account_id"),
     ("divergent_uploads", "account_id"),
     ("connect_requests", "account_id"),
+    ("push_registrations", "account_id"),
 ];
 
 fn alice_id() -> String {
@@ -944,6 +945,12 @@ struct Gate {
 impl KeyStore for Gate {
     fn generate(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceKey> {
         self.inner.generate()
+    }
+    fn generate_as<'a>(
+        &'a self,
+        id: &'a KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceKey> {
+        self.inner.generate_as(id)
     }
     fn public_key<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
         self.inner.public_key(id)
@@ -3001,6 +3008,12 @@ impl KeyStore for SignerPause {
     fn generate(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceKey> {
         self.inner.generate()
     }
+    fn generate_as<'a>(
+        &'a self,
+        id: &'a KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceKey> {
+        self.inner.generate_as(id)
+    }
     fn public_key<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
         self.inner.public_key(id)
     }
@@ -3137,6 +3150,12 @@ struct Recorder {
 impl KeyStore for Recorder {
     fn generate(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceKey> {
         self.inner.generate()
+    }
+    fn generate_as<'a>(
+        &'a self,
+        id: &'a KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceKey> {
+        self.inner.generate_as(id)
     }
     fn public_key<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
         self.inner.public_key(id)

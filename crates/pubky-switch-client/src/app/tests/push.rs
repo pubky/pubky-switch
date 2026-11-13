@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use pubky_switch_core::http::{sign_webhook, verify_webhook, webhook_body};
+use pubky_switch_core::http::{ErrorCode, sign_webhook, verify_webhook, webhook_body};
 
 use super::moves::{NEXT, Router, freeze_for, has, join, join_on, next_key, publish_at};
 use super::*;
@@ -560,4 +560,125 @@ fn test_push_registration_debug_shows_no_key() {
         handles: 1,
     };
     assert_eq!(format!("{registration:?}"), "PushRegistration(1 handles)");
+}
+
+/// `PUT /push` sent as the app, straight to the scripted switch: the answer, or the error
+/// code and `current`.
+async fn put_raw(
+    app: &App,
+    relay: &str,
+    handles: &[&str],
+    push_key: Option<[u8; 32]>,
+    replaces: Option<[u8; 32]>,
+) -> Result<crate::client::answers::PushAnswer, (ErrorCode, serde_json::Value)> {
+    let setting = crate::client::answers::PushSetting {
+        relay_url: relay.into(),
+        handles: handles.iter().map(|h| (*h).to_owned()).collect(),
+        push_key,
+        replaces,
+    };
+    app.client
+        .put_push(&setting)
+        .await
+        .map_err(|error| match error {
+            crate::error::ClientError::Switch { code, current, .. } => (code, current),
+            other => panic!("{other:?}"),
+        })
+}
+
+fn current_key(current: &serde_json::Value) -> Option<[u8; 32]> {
+    current["push_key"]
+        .as_str()
+        .map(|text| pubky_switch_core::enc::unb64_array::<32>(text).unwrap())
+}
+
+#[tokio::test]
+async fn test_push_switch_start_and_set_cases_as_the_service() {
+    // The scripted switch answers 8.1's cases as the service does (`endpoints_push.rs`).
+    let w = World::new();
+    let router = Router::of(&w);
+    let app = join(&w, &router).await;
+    let (code, current) = put_raw(&app, RELAY, &[], None, Some([9; 32]))
+        .await
+        .unwrap_err();
+    assert_eq!((code, current_key(&current)), (ErrorCode::Conflict, None));
+    let (code, current) = put_raw(&app, RELAY, &["a"], Some([9; 32]), None)
+        .await
+        .unwrap_err();
+    assert_eq!((code, current_key(&current)), (ErrorCode::Conflict, None));
+    let first = put_raw(&app, RELAY, &[], None, None).await.unwrap();
+    assert_eq!(first.handles, 0);
+    let set = put_raw(&app, RELAY, &["a", "b"], Some(first.push_key), None)
+        .await
+        .unwrap();
+    assert_eq!(set.handles, 2);
+    let again = put_raw(&app, RELAY, &[], None, None).await.unwrap();
+    assert_eq!((again.push_key, again.handles), (first.push_key, 2));
+    for (relay, replaces) in [(OTHER_RELAY, None), (RELAY, Some([9; 32]))] {
+        let (code, current) = put_raw(&app, relay, &[], None, replaces).await.unwrap_err();
+        assert_eq!(code, ErrorCode::Conflict);
+        assert_eq!(current_key(&current), Some(first.push_key));
+    }
+    for (relay, key) in [(RELAY, [9; 32]), (OTHER_RELAY, first.push_key)] {
+        let (code, current) = put_raw(&app, relay, &["x"], Some(key), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code, ErrorCode::Conflict);
+        assert_eq!(current_key(&current), Some(first.push_key));
+    }
+    let rotated = put_raw(&app, OTHER_RELAY, &[], None, Some(first.push_key))
+        .await
+        .unwrap();
+    assert_ne!(rotated.push_key, first.push_key);
+    assert_eq!(
+        (rotated.relay_url.as_str(), rotated.handles),
+        (OTHER_RELAY, 0)
+    );
+    assert_eq!(w.switch.lock().push.len(), 1, "one registration per app");
+}
+
+/// A relay URL, handles, `push_key` and `replaces`.
+type Case<'a> = (&'a str, &'a [&'a str], Option<[u8; 32]>, Option<[u8; 32]>);
+
+#[tokio::test]
+async fn test_push_switch_refuses_what_the_service_refuses() {
+    // The core's checks: handles on a start, more than 8, `replaces` with `push_key`, and
+    // relay URLs that aren't https on 443 without user info or name a private literal.
+    let w = World::new();
+    let router = Router::of(&w);
+    let app = join(&w, &router).await;
+    let nine = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+    let cases: [Case<'_>; 6] = [
+        (RELAY, &["a"], None, None),
+        (RELAY, &nine, Some([9; 32]), None),
+        (RELAY, &[], Some([9; 32]), Some([9; 32])),
+        ("http://push.example/hook", &[], None, None),
+        ("https://user@push.example/hook", &[], None, None),
+        ("https://10.0.0.1/hook", &[], None, None),
+    ];
+    for (relay, handles, push_key, replaces) in cases {
+        let (code, _) = put_raw(&app, relay, handles, push_key, replaces)
+            .await
+            .unwrap_err();
+        assert_eq!(code, ErrorCode::BadRequest, "{relay} {handles:?}");
+    }
+    assert!(w.switch.lock().push.is_empty());
+}
+
+#[tokio::test]
+async fn test_push_switch_drops_the_registration_when_the_app_leaves() {
+    // A departure ends the app's currency, and with it its registration (8.1), as at the
+    // service; a later call is `403 not_current`.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    app.register_push(&FakeRelay::default(), RELAY, "device-1")
+        .await
+        .unwrap();
+    assert!(w.switch.push_of(&me).is_some());
+    w.switch.leave(me).unwrap();
+    assert!(w.switch.push_of(&me).is_none());
+    let (code, _) = put_raw(&app, RELAY, &[], None, None).await.unwrap_err();
+    assert_eq!(code, ErrorCode::NotCurrent);
 }

@@ -2388,7 +2388,8 @@ An own app sets its own relay and handles in two steps (spec 9):
 
 - **Answer:** `{ "relay_url": string, "handles": int, "push_key": b64(32) }`: the handles kept and the registration's push key.
 - **Errors:** `400` for more than 8 handles, handles on a start, `replaces` with `push_key`, a URL that fails the checks, or a service that sends no pushes; `409 conflict` as above.
-- A start naming the current push key in `replaces` is how an app rotates its push key or moves to another relay. The setting belongs to the calling app and is removed when the app stops being current. After a provider change, apps register again with the new service, which mints new push keys (spec 12.5, 12.6).
+- A start naming the current push key in `replaces` is how an app rotates its push key or moves to another relay. The setting belongs to the calling app and is removed when the app stops being current: at its revocation or departure, and at the delivery of an `identity.json` under which it isn't current (7.2). A recovery in place removes every registration with the generation, and an erasure with the account (7.4.16). A replaced or removed registration's push key is deleted with it. No export part carries a registration or a push key (10.3): after a provider change, apps register again with the new service, which mints new push keys (spec 12.5, 12.6).
+- **Checks.** The body's `400`s come after the caller's own checks (7.2) and the staged gate (7.3 step 7), then the `409`s. The service resolves the relay's host at each `PUT /push`, within 5 s, and refuses (`400`) a host that doesn't resolve or resolves to any address that isn't public (8.2); delivery resolves it again at each connection.
 - **What the relay learns** (spec 15): which handles share a push key, so which devices belong to one app, but not the identity, since push keys appear in no public document.
 
 ### 8.2 Webhook

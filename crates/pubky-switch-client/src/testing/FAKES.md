@@ -160,7 +160,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   checks it before the account's lock (`400`, or `401` for a certificate that doesn't
   verify), so a staged or policy-off answer can come first here. A sender the allowlist admits is
   answered `pending` with nothing kept, as at the service. Neither switch sends the push
-  `policy.connect_requests.push` asks for yet: push isn't served.
+  `policy.connect_requests.push` asks for yet: neither sends a webhook.
 - **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
   by a write here, as at the service (Recovery uploads, below). `make_divergent`, public,
   sets it for one record the switch holds, without a loss or an upload (a key it holds no
@@ -351,7 +351,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `revoke`; an app that left is answered as one revoked already, with no proof. `leave` is a
   test call and also a route, `POST /apps/{app_id}/leave`, which checks only that the app
   hasn't departed: it takes any body, departs an app with no record or one whose certificate
-  has expired or isn't listed, keeps the app's invite codes and push registration, and
+  has expired or isn't listed, keeps the app's invite codes, drops its push registration, and
   stamps the test clock's time. The service refuses another app's path and the
   signer with `403 permission_missing`, where this switch answers `404` (Switch wire
   7.4.12). `request_full_bundle` is a test call for the app's own
@@ -395,7 +395,17 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   erasure. The service can owe the erased account's key when its key store fails, and until
   the key is gone it answers a request signed with the identity key, whatever its timestamp,
   with the operator's `503` in place of that `404`; every other caller gets the `404` at once.
-- **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
+- **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay, as at the
+  service, which sends no webhook yet either. The same as the service: the body goes through
+  the core's checks (`parse_push_body`, `400`), the signer is `403 permission_missing`, an
+  app that isn't current `403 not_current`, a staged account `503 staged`, 8.1's start and handle cases and their `409 conflict`s, one registration per
+  app, and the registration dropped when its app stops being current (a revocation, a
+  departure, a delivery that no longer lists it) and with the generation at a recovery. What
+  differs: the relay's host isn't resolved, so a name that resolves to a private address is
+  taken; push keys come from a counter and the service key (`mint`), not the key store, and
+  no secret key is held apart from the registration, so nothing is owed deleting and no
+  sweep runs; it always takes registrations (no `push.enabled`); and a frozen account answers
+  `410 moved`, which the service, holding no freezes yet, never does.
 
 ## Signer flows: what runs against the service too
 

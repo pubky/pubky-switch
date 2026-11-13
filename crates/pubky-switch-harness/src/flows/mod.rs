@@ -306,9 +306,10 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         // A restored app lacks the keys of a part it passed before its loss, which went.
         Call::RequestKeys(_) => Some("restore"),
         Call::PostConnect | Call::GetConnect | Call::DeleteConnect(_) => Some("connect request"),
+        // Served, with no flow yet: the test of served calls lists it as waiting.
+        Call::PutPush => None,
         // Not served yet.
-        Call::PutPush
-        | Call::Freeze
+        Call::Freeze
         | Call::Unfreeze
         | Call::Export
         | Call::ExportChunk(_)

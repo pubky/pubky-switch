@@ -183,9 +183,11 @@ impl Inner {
     /// current before it: an app it no longer makes current stops holding entries, each
     /// entry left with no current target becomes an unreadable item, a departed app's mark
     /// ends, and when the set of current apps changed, and with it the shares, the marks
-    /// are judged again.
+    /// are judged again. An app no longer current loses its push registration (Switch wire
+    /// 8.1).
     pub(super) fn after_departure(&mut self, mut was: Vec<[u8; 16]>) {
         let mut current = self.current_app_ids();
+        self.push.retain(|app, _| current.contains(app));
         self.release_passed(&current, false);
         self.convert_unreadable(&current);
         let gone: Vec<[u8; 16]> = self

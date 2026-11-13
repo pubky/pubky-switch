@@ -385,7 +385,8 @@ pub(super) async fn load_apps_and_rows(
 /// `directory_version` moves, since the directory's `identity` or apps change with it;
 /// `apps_version` moves if the set of reachable apps changed, and an app that became
 /// reachable takes the new version (Switch wire 7.4.10, [`OpsState::settle_directory`]);
-/// and the inbox entries every current target has passed go (9.1). Called before the
+/// the inbox entries every current target has passed go (9.1); and the push registration
+/// of an app no longer current goes, its key owed deleting (8.1). Called before the
 /// revocation is written, so the state before it is read from the store.
 pub(super) async fn settle_change(
     txn: &mut AccountTxn,
@@ -416,6 +417,7 @@ pub(super) async fn settle_change(
     // set of current apps, in this request ([`Release::departed`]): a mark set for the old
     // shares deletes nothing (Switch wire 7.4.4).
     txn.delete_passed_entries(&current, &[]).await?;
+    txn.drop_push_registrations(Some(&current)).await?;
     Ok(CurrentApps {
         changed: was != now_current,
         ids: current,
