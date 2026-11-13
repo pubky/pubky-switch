@@ -1434,7 +1434,7 @@ mod tests {
                 },
             )
         };
-        let mut batches = vec![
+        let mut batches = [
             // Kept by this build: the later one sent first, and at an earlier time.
             kept(1, Some(8), Some(1_000)),
             kept(2, Some(7), None),
