@@ -8359,3 +8359,129 @@ async fn test_records_own_write_read_in_the_feed_first_isnt_flagged() {
         "no flagged write names the app itself"
     );
 }
+
+/// Make the wallet's write of `ids` at `target` reach its feed before its answer: the answer
+/// is lost, the resend at the next read is held back by `429`, and that read reads the feed.
+/// A second read once the `retry_after` passed settles it from its original proof.
+async fn own_write_read_in_the_feed_first(
+    s: &Setup,
+    wallet: &mut App,
+    target: &RecordTarget,
+    ids: &[&str],
+) {
+    s.w.switch
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let error = wallet
+        .put_record(target, &value(ids), vec![])
+        .await
+        .unwrap_err();
+    assert!(error.kept_batch().is_some(), "{error:?}");
+    s.w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::RateLimited,
+        current: json!(null),
+    });
+    wallet.receive(None).await.unwrap();
+    s.w.clock
+        .advance_ms(crate::testing::SCRIPTED_RETRY_AFTER_S * 1000);
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.kept_batches().await.unwrap().is_empty());
+}
+
+/// An own write the feed showed before its answer marks what it wrote, as one taken from
+/// its answer does: an app added later that builds on it, keeping what it holds, isn't
+/// flagged at the wallet.
+#[tokio::test]
+async fn test_records_own_write_read_in_the_feed_first_marks_what_it_wrote() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a", "x"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+    own_write_read_in_the_feed_first(&s, &mut wallet, &target, &["b"]).await;
+    let held = wallet.record_seen(&key).await.unwrap().unwrap();
+    let mark = ids(Some(&held));
+    let mut till = s.join("till").await;
+    till.receive(None).await.unwrap();
+    till.put_record(&target, &value(&["b", "c"]), vec![])
+        .await
+        .unwrap();
+    let report = wallet.receive(None).await.unwrap();
+    assert!(
+        !flagged_by(&report.events, &key, till.app_id()),
+        "mark {mark:?}: {:?}",
+        report.events
+    );
+    assert_eq!(mark, ["b"]);
+}
+
+/// The same after an own delete: the write back the feed showed first marks what it wrote,
+/// not what the wallet saw before the delete.
+#[tokio::test]
+async fn test_records_own_write_back_read_in_the_feed_first_marks_what_it_wrote() {
+    let s = Setup::new();
+    let (mut wallet, _phone, target, key) = seen_then_deleted(&s).await;
+    own_write_read_in_the_feed_first(&s, &mut wallet, &target, &["b"]).await;
+    let held = wallet.record_seen(&key).await.unwrap().unwrap();
+    let mark = ids(Some(&held));
+    let mut till = s.join("till").await;
+    till.receive(None).await.unwrap();
+    till.put_record(&target, &value(&["b", "c"]), vec![])
+        .await
+        .unwrap();
+    let report = wallet.receive(None).await.unwrap();
+    assert!(
+        !flagged_by(&report.events, &key, till.app_id()),
+        "mark {mark:?}: {:?}",
+        report.events
+    );
+    assert_eq!(mark, ["b"]);
+}
+
+/// Two devices of one app share its keys (Switch spec 3.1 "Several devices"). Device B's
+/// write that drops what device A saw is the app's own: A takes it, flags nothing, and marks
+/// what B wrote.
+#[tokio::test]
+async fn test_records_second_device_write_is_the_apps_own() {
+    let s = Setup::new();
+    let mut a = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    a.set_multi_device(true).await.unwrap();
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a", "x"]), vec![])
+        .await
+        .unwrap();
+    a.receive(None).await.unwrap();
+    let key = a.record_key(&target).unwrap();
+    let backup = a.backup().await.unwrap();
+    let store_b = Arc::new(MemoryStore::new());
+    let mut b = App::restore(
+        s.env_on(Arc::clone(&store_b) as Arc<dyn StateStore>),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    b.receive(None).await.unwrap();
+    b.end_reconcile(crate::app::UserConfirmed::new())
+        .await
+        .unwrap();
+    assert_eq!(a.app_id(), b.app_id());
+    b.put_record(&target, &value(&["a"]), vec![]).await.unwrap();
+    let report = a.receive(None).await.unwrap();
+    assert!(
+        !flagged_by(&report.events, &key, a.app_id()),
+        "{:?}",
+        report.events
+    );
+    let held = a.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["a"]);
+    assert!(!held.flagged);
+    let mark = a.record_seen(&key).await.unwrap().unwrap();
+    assert_eq!(ids(Some(&mark)), ["a"]);
+}
