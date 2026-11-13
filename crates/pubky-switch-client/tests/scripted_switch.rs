@@ -434,6 +434,46 @@ async fn test_testing_holding_transport_holds_a_waiting_read_until_an_item_comes
 }
 
 #[tokio::test]
+async fn test_testing_held_read_doesnt_hold_up_other_requests() {
+    // The wallet's read is held. Meanwhile an entry for the phone is appended, the phone
+    // holds a read of its own, and the wallet writes a record through the same transport:
+    // each is answered while the first read is held (Switch wire 7.4.4).
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let transport = switch.holding_transport();
+    s.router.add(SWITCH_ORIGIN, Arc::clone(&transport));
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    phone.receive(None).await.unwrap();
+    let mut first = transport.send(waiting_read(&s, &wallet, "25"));
+    assert!(poll_once(&mut first).is_none());
+    let mut second = transport.send(waiting_read(&s, &phone, "25"));
+    assert!(poll_once(&mut second).is_none());
+    assert_eq!(switch.held_reads(), 2);
+    // The append wakes the phone's read only.
+    note(&s, &[phone.app_id()]);
+    let answer = poll_once(&mut second).expect("the phone's read is answered");
+    assert_eq!((answer.status, items_of(&answer)), (200, 1));
+    assert!(
+        poll_once(&mut first).is_none(),
+        "the wallet's read is still held"
+    );
+    // The wallet's write goes through while its read is held, and its record wakes it.
+    let target = RecordTarget::new(items(), b"n1");
+    let value = json!({ "items": ["a"] }).to_string().into_bytes();
+    let write = wallet.put_record(&target, &value, vec![]);
+    tokio::time::timeout(std::time::Duration::from_secs(10), write)
+        .await
+        .expect("the write isn't held up")
+        .unwrap();
+    let answer = poll_once(&mut first).expect("the wallet's read is answered");
+    assert_eq!(answer.status, 200);
+    assert!(items_of(&answer) > 0);
+    assert_eq!(switch.held_reads(), 0);
+}
+
+#[tokio::test]
 async fn test_testing_holding_transport_answers_a_waiting_read_once_its_wait_passed() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
