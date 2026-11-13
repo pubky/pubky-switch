@@ -22,7 +22,7 @@ use pubky_switch_core::{
     claims::{ClaimFields, ClaimType},
     enc::pubky_key,
     http::header,
-    ops::{Condition, OpKind, OpsRequest, SignedOp, sign_batch},
+    ops::{Condition, OpKind, OpsRequest, Position, SignedOp, sign_batch},
     sig::SignedDoc,
 };
 use serde_json::{Value, json};
@@ -111,7 +111,7 @@ async fn test_feed_vectors_page_after_the_registration() {
             "seq {seq}"
         );
     }
-    for member in ["next", "scanned_through", "more", "head"] {
+    for member in ["next", "scanned_through", "more", "cursor", "head"] {
         assert_eq!(page[member], expected_page[member], "{member}");
     }
     assert_eq!(
@@ -208,11 +208,21 @@ async fn test_feed_refusals() {
         (403, json!("permission_missing"))
     );
     assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    assert_eq!(
+        body(&answer).get("cursor"),
+        None,
+        "no cursor for the signer"
+    );
     // A revoked app is no longer current.
     let answer = read(&replay, "phone", "", &at).await;
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
         (403, json!("not_current"))
+    );
+    assert_eq!(
+        body(&answer).get("cursor"),
+        None,
+        "no cursor for a revoked app"
     );
     for query in [
         "?after=9",
@@ -224,6 +234,120 @@ async fn test_feed_refusals() {
         let answer = read(&replay, "wallet", query, &at).await;
         assert_eq!(answer.status, 400, "{query}");
     }
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// Move `app_name`'s cursor to `1:{seq}` with a batch of no operations, at `at`: the status.
+async fn move_cursor(replay: &Replay, app_name: &str, seq: u64, at: &str) -> u16 {
+    let keys = vectors("keys.json");
+    let position = Position { generation: 1, seq };
+    let body = OpsRequest::new(&[], Some(position)).to_json();
+    let path = format!("/v1/{}/ops", alice_id());
+    let request = app_request(app(&keys, app_name), "POST", &path, body, ms(at));
+    replay.service.handle(request).await.status
+}
+
+/// The `cursor` a page of `app_name`'s feed after `after` reports.
+async fn held_cursor(replay: &Replay, app_name: &str, after: &str, at: &str) -> Value {
+    let answer = read(replay, app_name, &format!("?after={after}"), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    body(&answer)["cursor"].clone()
+}
+
+#[tokio::test]
+async fn test_feed_cursor_is_the_one_held_for_the_caller() {
+    // Each page reports the `seq` of the cursor the service holds for its caller, 0 before
+    // the app's first move, and only the caller's own (Switch spec 8.3, wire 7.4.4).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let record: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "executor app record",
+        )["signed"]
+            .clone(),
+    )
+    .expect("record");
+    let registered = post(
+        &replay,
+        "executor",
+        &app_batch(
+            "executor",
+            80,
+            vec![(Vec::new(), OpKind::AppPut { record })],
+        ),
+        ms(&at),
+    )
+    .await;
+    assert_eq!(
+        registered.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&registered.body)
+    );
+    assert_eq!(held_cursor(&replay, "wallet", "1:10", &at).await, json!(0));
+    assert_eq!(
+        held_cursor(&replay, "executor", "1:10", &at).await,
+        json!(0)
+    );
+    assert_eq!(move_cursor(&replay, "wallet", 7, &at).await, 200);
+    assert_eq!(held_cursor(&replay, "wallet", "1:10", &at).await, json!(7));
+    // Another app's page shows its own cursor, never the wallet's.
+    assert_eq!(
+        held_cursor(&replay, "executor", "1:10", &at).await,
+        json!(0)
+    );
+    assert_eq!(move_cursor(&replay, "executor", 5, &at).await, 200);
+    assert_eq!(
+        held_cursor(&replay, "executor", "1:10", &at).await,
+        json!(5)
+    );
+    assert_eq!(held_cursor(&replay, "wallet", "1:10", &at).await, json!(7));
+    // A move behind it leaves it where it is, and the page says so.
+    assert_eq!(move_cursor(&replay, "wallet", 6, &at).await, 200);
+    assert_eq!(held_cursor(&replay, "wallet", "1:10", &at).await, json!(7));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_feed_cursor_is_the_apps_whatever_the_reads_position() {
+    // The cursor is the app's, shared by its devices: a device reading from behind it, as one
+    // restored from a backup at 1:4 would, sees the cursor another device moved, whatever
+    // position it reads from (Switch spec 8.3).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    assert_eq!(move_cursor(&replay, "wallet", 8, &at).await, 200);
+    let page = body(&read(&replay, "wallet", "?after=1:4", &at).await);
+    assert_eq!(
+        (seqs(&page), page["cursor"].clone()),
+        (vec![6, 7, 8, 9], json!(8))
+    );
+    let page = body(&read(&replay, "wallet", "", &at).await);
+    assert_eq!(page["cursor"], json!(8));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_feed_held_read_reports_the_cursor_as_it_answers() {
+    // A held read reports the cursor of the snapshot it answers from: a move made while it
+    // waits shows (Switch wire 7.4.4).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let (answer, moved) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        move_cursor(&replay, "wallet", 9, &at).await
+    });
+    assert_eq!(moved, 200);
+    let page = body(&answer);
+    assert_eq!((seqs(&page), page["cursor"].clone()), (vec![], json!(9)));
     replay.db.drop_database().await.expect("drop");
 }
 
