@@ -44,7 +44,10 @@ impl AccountTxn {
         self.documents_of_apps.insert(app);
     }
 
-    /// The chain items of the generation served among `seqs`, with their documents.
+    /// The chain items of the generation served among `seqs`, with their documents. An item
+    /// whose stored row doesn't read is left out, so it keeps its document: what supersedes
+    /// documents never fails the request it runs in over one it can't read (only a feed page
+    /// over that item fails, as before), and the log names its `seq` alone.
     async fn chain_rows(&mut self, seqs: &[i64]) -> Result<Vec<FeedRow>, StoreError> {
         let head = self.head().clone();
         let rows = sqlx::query(
@@ -58,7 +61,17 @@ impl AccountTxn {
         .fetch_all(self.conn())
         .await
         .map_err(StoreError::from_db)?;
-        rows.iter().map(super::feed::row_of).collect()
+        Ok(rows
+            .iter()
+            .filter_map(|row| match super::feed::row_of(row) {
+                Ok(row) => Some(row),
+                Err(_) => {
+                    let seq: Option<i64> = row.try_get("seq").ok();
+                    tracing::warn!(?seq, "a chain item doesn't read; it keeps its document");
+                    None
+                }
+            })
+            .collect())
     }
 
     /// Of the items at `seqs`, delete the documents no app may read in full any more, and
@@ -74,11 +87,28 @@ impl AccountTxn {
             .iter()
             .map(|row| to_db(row.seq, "seq"))
             .collect::<Result<_, _>>()?;
-        let current = super::feed::current_docs_at(self.conn(), &head.id, generation, &at).await?;
+        // What is current doesn't read: every item keeps its document. A database failure
+        // is still a temporary one.
+        let current =
+            match super::feed::current_docs_at(self.conn(), &head.id, generation, &at).await {
+                Ok(current) => current,
+                Err(StoreError::Corrupt(_) | StoreError::OutOfRange(_)) => {
+                    tracing::warn!("the current documents don't read; every item keeps its own");
+                    return Ok(rows);
+                }
+                Err(error) => return Err(error),
+            };
         let mut stale = Vec::new();
         for row in &rows {
-            if !current.shows_in_full_to_some_app(row)? {
-                stale.push(to_db(row.seq, "seq")?);
+            match current.shows_in_full_to_some_app(row) {
+                Ok(true) => {}
+                Ok(false) => stale.push(to_db(row.seq, "seq")?),
+                Err(_) => {
+                    tracing::warn!(
+                        seq = row.seq,
+                        "a chain item's document doesn't read; it keeps it"
+                    );
+                }
             }
         }
         if !stale.is_empty() {
