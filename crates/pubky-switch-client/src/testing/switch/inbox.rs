@@ -936,6 +936,16 @@ mod tests {
                 }),
                 (403, json!("not_current"), Value::Null),
             ),
+            (
+                "removed",
+                copy(&|b| {
+                    b.removed = vec![pubky_switch_core::records::RemovedApp {
+                        app_id: cert.app_id(),
+                        distrust_from: 1,
+                    }];
+                }),
+                (409, json!("identity_needed"), Value::Null),
+            ),
         ];
         let mut differences = Vec::new();
         for (what, doc, service) in cases {

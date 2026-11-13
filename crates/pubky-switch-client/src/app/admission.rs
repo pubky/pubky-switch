@@ -514,11 +514,15 @@ impl App {
         .await
     }
 
-    /// Withdraw an invite code (`invite_code.delete`, `conversation.add`).
+    /// Withdraw an invite code (`invite_code.delete`, `conversation.add`). A code that
+    /// expired or ran out is deleted by the switch's own sweep at a later request (Switch
+    /// wire 9.1): withdrawing it then is `404`, and the next refresh of the lists
+    /// ([`App::allow_list`]) drops it from what the app holds.
     ///
     /// # Errors
     ///
-    /// As [`App::register_invite_code`]; `404` for a code the switch doesn't hold.
+    /// As [`App::register_invite_code`]; `404` for a code the switch doesn't hold, a swept
+    /// one included.
     pub async fn withdraw_invite_code(&mut self, code_hash: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
             self.need(Permission::ConversationAdd)?;

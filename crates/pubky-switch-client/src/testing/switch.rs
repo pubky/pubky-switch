@@ -1195,6 +1195,7 @@ impl ScriptedSwitch {
         inner.seen_at_arrival = held;
         // A held read whose wait has passed is answered now at the latest.
         inner.wake_held();
+        inner.minute_sweep();
         let path = request.path_and_query.clone();
         let mut lose = false;
         let mut leave_out = None;

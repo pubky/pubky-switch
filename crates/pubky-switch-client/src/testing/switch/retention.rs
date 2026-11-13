@@ -125,6 +125,58 @@ impl Inner {
         let current = self.current_app_ids();
         self.convert_unreadable(&current);
         self.release_passed(&current, true);
+        self.forget_deleted_keys();
+    }
+
+    /// Forget the deleted keys nothing refers to (Switch spec 10.3, wire 9.1), as the
+    /// service does: the record's current write is its delete, written here, not taken
+    /// from a recovery upload; the cursor of every app the held `identity.json` lists that
+    /// isn't revoked or departed is at or past it, lagging or not, an app with no cursor
+    /// here holding every key; and no divergent upload names the key. With no document held,
+    /// nothing goes. The record goes, so its delete shows as its stub, its reads are `404`,
+    /// and a create at the key starts afresh.
+    fn forget_deleted_keys(&mut self) {
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let waited: Vec<u64> = doc
+            .body()
+            .apps
+            .iter()
+            .map(|listed| listed.app_id)
+            .filter(|app| {
+                !self.kept_app_ids.contains(app)
+                    && !self.apps.get(app).is_some_and(|held| held.departed)
+            })
+            .map(|app| self.cursor_of(&app))
+            .collect();
+        let shared = &mut self.shared;
+        let divergent = &shared.divergent;
+        shared.records.retain(|key, held| {
+            !held.state.deleted
+                || held.uploaded.is_some()
+                || divergent.contains_key(key)
+                || waited.iter().any(|cursor| *cursor < held.seq)
+        });
+    }
+
+    /// The sweep the service runs once a minute of service time (Switch wire 9.1), at the
+    /// first request a minute after the last: invite codes that expired or ran out go.
+    pub(super) fn minute_sweep(&mut self) {
+        let now = self.now();
+        let shared = &mut self.shared;
+        if shared
+            .swept_at
+            // A mark ahead of the clock, left before it stepped back, is due at once, as at
+            // the service.
+            .is_some_and(|at| at <= now && now < at.saturating_add(60_000))
+        {
+            return;
+        }
+        shared.swept_at = Some(now);
+        shared
+            .invites
+            .retain(|_, invite| invite.uses < invite.max_uses && now < invite.expires_at);
     }
 
     /// After the chain item of a delivery, a revocation or a leave, `was` holding the apps
