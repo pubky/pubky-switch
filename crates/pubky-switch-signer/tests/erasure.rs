@@ -1712,7 +1712,11 @@ async fn test_erasure_in_doubt_ending_erased_raises_no_account_not_hosted() {
 fn apps_answers(
     world: &World,
     store: Arc<MemoryStore>,
-) -> (SignerEnv, Arc<MockTransport>, Arc<std::sync::Mutex<Option<u16>>>) {
+) -> (
+    SignerEnv,
+    Arc<MockTransport>,
+    Arc<std::sync::Mutex<Option<u16>>>,
+) {
     let switch = Arc::clone(&world.switch);
     let unsigned = Arc::new(std::sync::Mutex::new(None));
     let status = Arc::clone(&unsigned);

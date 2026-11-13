@@ -1145,8 +1145,7 @@ impl Signer {
                 // and the first refusal is returned once the others are made.
                 Err(
                     error @ SignerError::Switch(ClientError::Switch {
-                        status: 400..=499,
-                        ..
+                        status: 400..=499, ..
                     }),
                 ) if self.flow.is_none() => {
                     refused_now.get_or_insert(error);

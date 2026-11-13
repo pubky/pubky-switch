@@ -134,7 +134,12 @@ async fn leaving_with_records(
         })
         .collect();
     let homeserver = Arc::clone(&world.homeserver);
-    move || paths.iter().filter(|p| homeserver.file(p).is_some()).count()
+    move || {
+        paths
+            .iter()
+            .filter(|p| homeserver.file(p).is_some())
+            .count()
+    }
 }
 
 #[tokio::test]
@@ -185,7 +190,10 @@ async fn test_run_due_past_its_time_takes_one_step_with_work() {
         .insert(record.clone());
     world.switch.leave(gone).unwrap();
     signer.run_due().await.unwrap();
-    assert!(world.homeserver.file(&record).is_some(), "its deletion failed");
+    assert!(
+        world.homeserver.file(&record).is_some(),
+        "its deletion failed"
+    );
     world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
     world.switch.leave(goes).unwrap();
     clock_moves_at_the_first_read(&world, 31_000);
@@ -565,7 +573,10 @@ async fn test_renew_expiring_renews_a_joined_app_behind_four_being_cut_off() {
     world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
     (0..4).for_each(|_| unreachable());
     let doc = signer.identity_doc().unwrap().unwrap();
-    assert!(apps.iter().all(|a| doc.listed_cert(&a.keys.app_id_bytes()).is_some()));
+    assert!(
+        apps.iter()
+            .all(|a| doc.listed_cert(&a.keys.app_id_bytes()).is_some())
+    );
     assert_eq!(signer.renew_expiring().await.unwrap(), [joined]);
 }
 

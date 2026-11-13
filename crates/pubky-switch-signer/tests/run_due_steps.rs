@@ -422,7 +422,10 @@ async fn test_run_due_dropped_run_leaves_each_later_call_its_own_budget() {
                 break;
             }
         }
-        assert!(*hanging.hung.lock().unwrap(), "the run reached the publication");
+        assert!(
+            *hanging.hung.lock().unwrap(),
+            "the run reached the publication"
+        );
     }
     *hanging.path.lock().unwrap() = None;
     signer.resume().await.unwrap();
