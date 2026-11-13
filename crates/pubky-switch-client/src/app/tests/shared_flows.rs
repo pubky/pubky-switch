@@ -5295,10 +5295,10 @@ async fn test_records_held_unreadable_opens_once_its_key_arrives() {
     );
 }
 
-/// A store whose commit that ends an owed reopening fails once, while armed.
+/// A store whose commits that end an owed reopening fail, as many times as `failing` says.
 struct FailingReopen {
     inner: MemoryStore,
-    armed: std::sync::atomic::AtomicBool,
+    failing: std::sync::Mutex<u32>,
 }
 
 impl StateStore for FailingReopen {
@@ -5320,7 +5320,13 @@ impl StateStore for FailingReopen {
         let ends_reopen = batch.writes.iter().any(|write| {
             matches!(write, crate::store::Write::Delete { key, .. } if key.as_slice() == b"reopen")
         });
-        if ends_reopen && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let fails = ends_reopen && {
+            let mut left = self.failing.lock().unwrap();
+            let fails = *left > 0;
+            *left = left.saturating_sub(1);
+            fails
+        };
+        if fails {
             return Err(crate::error::StoreError::Unavailable);
         }
         self.inner.commit(batch)
@@ -5328,14 +5334,14 @@ impl StateStore for FailingReopen {
 }
 
 /// The reopening a key owes is kept with the key: when its own commit fails after the key
-/// was taken, the next read reopens the record held `Unreadable`, though no fetch takes a
-/// key again.
+/// was taken, the read goes on and reports it, and the next read reopens the record held
+/// `Unreadable`, though no fetch takes a key again.
 #[tokio::test]
 async fn test_records_reopening_that_fails_is_made_at_the_next_read() {
     let s = Setup::new();
     let store = Arc::new(FailingReopen {
         inner: MemoryStore::new(),
-        armed: std::sync::atomic::AtomicBool::new(false),
+        failing: std::sync::Mutex::new(0),
     });
     let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
     let mut wallet = App::join(
@@ -5354,11 +5360,20 @@ async fn test_records_reopening_that_fails_is_made_at_the_next_read() {
         held.content,
         RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 }),
     );
-    // The key arrives, and the reopening's commit fails.
-    store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The key arrives, and the reopening's commit fails at each try of that read: after
+    // the page, and at the read's end.
+    *store.failing.lock().unwrap() = 2;
     store_parts_for(&s, &wallet.cert().clone());
-    wallet.receive(None).await.unwrap_err();
-    assert!(!store.armed.load(std::sync::atomic::Ordering::SeqCst));
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(*store.failing.lock().unwrap(), 0);
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ReopeningOwed { .. })),
+        "{:?}",
+        report.events
+    );
     assert!(
         wallet.scope_key(2, "scope-a").is_some(),
         "the key was taken"
@@ -6467,4 +6482,605 @@ async fn test_records_listing_at_a_missed_item_fetches_the_key_and_reads_on() {
     let report = app.receive(None).await.unwrap();
     assert_eq!(handed(&s, &note.msg_id), 1, "{:?}", report.events);
     assert!(!app.listing_owed().await.unwrap());
+}
+
+/// Records held `Unreadable` whose reopened writes together pass one commit's size: the
+/// reopening owed once their key arrives must not keep every later read from the feed.
+#[tokio::test]
+async fn test_records_reopening_too_large_for_one_commit_keeps_reads_going() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let pad = "x".repeat(200 * 1024);
+    let mut keys = Vec::new();
+    for n in 0..80 {
+        let target = s.target(&format!("big{n}"));
+        let big = json!({ "items": ["a"], "pad": pad })
+            .to_string()
+            .into_bytes();
+        phone.put_record(&target, &big, vec![]).await.unwrap();
+        keys.push(phone.record_key(&target).unwrap());
+    }
+    wallet.receive(None).await.unwrap();
+    for key in &keys {
+        let held = wallet.shared_record(key).await.unwrap().unwrap();
+        assert!(held.content.value().is_none(), "held unreadable for now");
+    }
+    store_parts_for(&s, &wallet.cert().clone());
+    let first = wallet.receive(None).await;
+    // A note sent after the key: a read that gets to the feed takes it.
+    let (seq, _) = s.w.note(wallet.app_id(), "after the key");
+    let mut results = Vec::new();
+    for _ in 0..3 {
+        results.push(wallet.receive(None).await.map(|_| ()));
+    }
+    assert!(
+        results.iter().all(Result::is_ok),
+        "the first read after the key: {first:?}; later reads: {results:?}"
+    );
+    assert!(wallet.cursor().seq >= seq, "the feed is read on");
+    for key in &keys {
+        let held = wallet.shared_record(key).await.unwrap().unwrap();
+        assert_eq!(ids(held.content.value()), vec!["a"]);
+    }
+}
+
+/// A store whose commits that put a held record fail once, after `pass` of them went
+/// through, while armed.
+struct FailingRecordCommit {
+    inner: MemoryStore,
+    armed: std::sync::Mutex<Option<u32>>,
+}
+
+impl StateStore for FailingRecordCommit {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, crate::error::StoreError> {
+        self.inner.get(ns, key)
+    }
+
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::KeyValue>, crate::error::StoreError> {
+        self.inner.scan(ns, prefix, after, limit)
+    }
+
+    fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), crate::error::StoreError> {
+        let puts_record = batch.writes.iter().any(|write| {
+            matches!(write, crate::store::Write::Put { key, .. } if key.starts_with(b"rec/"))
+        });
+        if puts_record {
+            let mut armed = self.armed.lock().unwrap();
+            match *armed {
+                Some(0) => {
+                    *armed = None;
+                    return Err(crate::error::StoreError::Unavailable);
+                }
+                Some(pass) => *armed = Some(pass - 1),
+                None => {}
+            }
+        }
+        self.inner.commit(batch)
+    }
+}
+
+/// A reopening of more records than one commit takes that fails after its first commit:
+/// the mark stays, since only the last commit clears it, and the rest open at the next
+/// try.
+#[tokio::test]
+async fn test_records_reopening_cut_short_keeps_the_rest_owed() {
+    let s = Setup::new();
+    let store = Arc::new(FailingRecordCommit {
+        inner: MemoryStore::new(),
+        armed: std::sync::Mutex::new(None),
+    });
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let mut wallet = App::join(
+        s.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        s.protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let pad = "x".repeat(200 * 1024);
+    let mut keys = Vec::new();
+    for n in 0..80 {
+        let target = s.target(&format!("big{n}"));
+        let big = json!({ "items": ["a"], "pad": pad })
+            .to_string()
+            .into_bytes();
+        phone.put_record(&target, &big, vec![]).await.unwrap();
+        keys.push(phone.record_key(&target).unwrap());
+    }
+    wallet.receive(None).await.unwrap();
+    // The key arrives; the reopening's first commit goes through and its second fails.
+    *store.armed.lock().unwrap() = Some(1);
+    store_parts_for(&s, &wallet.cert().clone());
+    let report = wallet.receive(None).await.unwrap();
+    assert!(
+        store.armed.lock().unwrap().is_none(),
+        "the second commit failed"
+    );
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ReopeningOwed { .. })),
+        "{:?}",
+        report.events
+    );
+    wallet.receive(None).await.unwrap();
+    for key in &keys {
+        let held = wallet.shared_record(key).await.unwrap().unwrap();
+        assert_eq!(ids(held.content.value()), vec!["a"]);
+    }
+    let ns = crate::store::client_namespace(&wallet.app_id());
+    assert!(store.get(&ns, b"reopen").unwrap().is_none());
+}
+
+/// [`ItemsProtocol`], whose receive step reads the record `shared`: held not open for want
+/// of a key, it waits for that key; open, it writes the note's own record.
+struct SharedReader {
+    items: ItemsProtocol,
+    runs: std::sync::Mutex<usize>,
+}
+
+impl Protocol for SharedReader {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.items.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.items.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.items.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.items.accepts(cert)
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.items.check_body(message)
+    }
+
+    fn receive_with(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
+        *self.runs.lock().unwrap() += 1;
+        let shared = RecordTarget::new(items(), b"shared");
+        match cx
+            .record(&shared)
+            .ok()
+            .flatten()
+            .map(|record| record.content)
+        {
+            Some(RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch })) => {
+                Outcome::AwaitKey { data_epoch }
+            }
+            _ => {
+                let own = RecordTarget::new(items(), message.message.msg_id.as_bytes());
+                let _ = cx.put_record(&own, &value(&["seen"]), vec![]);
+                Outcome::Apply(Effect::default())
+            }
+        }
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.items.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.items.missed(missed)
+    }
+
+    fn collections(&self) -> Vec<Collection> {
+        vec![items()]
+    }
+}
+
+/// alice's wallet on a store whose reopening commits fail, with [`SharedReader`], and a note
+/// waiting for the epoch-2 key that opens the record `shared`: the wallet, its store, the
+/// protocol and the note's `seq`.
+async fn waiting_on_shared(s: &Setup) -> (App, Arc<FailingReopen>, Arc<SharedReader>, u64) {
+    let store = Arc::new(FailingReopen {
+        inner: MemoryStore::new(),
+        failing: std::sync::Mutex::new(0),
+    });
+    let protocol = Arc::new(SharedReader {
+        items: ItemsProtocol::default(),
+        runs: std::sync::Mutex::new(0),
+    });
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let mut wallet = App::join(
+        s.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    let mut phone = s.join("phone").await;
+    record_at_a_new_epoch(s, &mut wallet, &mut phone).await;
+    phone
+        .put_record(
+            &RecordTarget::new(items(), b"shared"),
+            &value(&["a"]),
+            vec![],
+        )
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (seq, _) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "reads shared" }),
+            &[wallet.app_id()],
+        )
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*protocol.runs.lock().unwrap(), 1);
+    assert!(wallet.stored_at(seq).is_some(), "waits for the key");
+    (wallet, store, protocol, seq)
+}
+
+/// An entry waiting for a key reads a record the key opens. The key arrives in a read whose
+/// reopening fails at both its tries: the entry isn't run on the record still held not
+/// open. The next read reopens at its start and takes the entry there, before the feed.
+#[tokio::test]
+async fn test_records_waiting_entry_waits_for_an_owed_reopening() {
+    let s = Setup::new();
+    let (mut wallet, store, protocol, seq) = waiting_on_shared(&s).await;
+    // The key comes; both tries of that read's reopening fail.
+    *store.failing.lock().unwrap() = 2;
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*store.failing.lock().unwrap(), 0);
+    assert_eq!(
+        *protocol.runs.lock().unwrap(),
+        1,
+        "not run on a record still not open"
+    );
+    // The next read reopens, then takes the entry before it reads the feed.
+    let from = s.log().len();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*protocol.runs.lock().unwrap(), 2);
+    assert!(wallet.stored_at(seq).is_none());
+    let log = s.log();
+    let read = &log[from..];
+    let effect = read.iter().position(|line| line.contains("/ops")).unwrap();
+    // The one-item read that verifies a service time before the effect is sent isn't the
+    // feed's (Switch spec 10.1).
+    let feed = read
+        .iter()
+        .position(|line| line.contains("/feed") && !line.ends_with("limit=1"))
+        .unwrap();
+    assert!(effect < feed, "{read:?}");
+}
+
+/// The same, with the next read's reopening at its start failing too: the retries there
+/// pass the entry over, and it is taken at the read's end, once the reopening after the
+/// page went through.
+#[tokio::test]
+async fn test_records_waiting_entry_passed_over_while_the_start_reopening_fails() {
+    let s = Setup::new();
+    let (mut wallet, store, protocol, seq) = waiting_on_shared(&s).await;
+    *store.failing.lock().unwrap() = 3;
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*protocol.runs.lock().unwrap(), 1);
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*store.failing.lock().unwrap(), 0);
+    assert!(
+        wallet.stored_at(seq).is_none(),
+        "taken once the records opened"
+    );
+    assert_eq!(*protocol.runs.lock().unwrap(), 2);
+}
+
+/// A record write sealed at an epoch whose key a later item of the same page brings: the
+/// write is taken unreadable in the page's open writes, the key's fetch reopens what the
+/// store holds, and the record must still open once the key is held.
+#[tokio::test]
+async fn test_records_key_on_the_same_page_as_the_unreadable_write_opens_it() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&target).unwrap();
+    // The wallet's key comes after the write, and both are read in one page.
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap();
+    assert!(
+        wallet.scope_key(2, "scope-a").is_some(),
+        "the key was taken"
+    );
+    for _ in 0..2 {
+        wallet.receive(None).await.unwrap();
+    }
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        ids(held.content.value()),
+        vec!["a"],
+        "held {:?} with its key held",
+        held.content
+    );
+}
+
+/// A record change whose delivery failed goes to the switch at the next read, before the
+/// feed, also in a read whose owed listing waits for a scope key: senders reading the
+/// directory see the new record without waiting for the key.
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_still_delivers_a_kept_record() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    app.receive(None).await.unwrap();
+    assert!(app.listing_owed().await.unwrap());
+    s.w.clock.advance_ms(1_000);
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap_err();
+    let kept = app.record().clone();
+    assert_ne!(s.w.switch.app(&me).record.as_ref(), Some(&kept));
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ListingWaitsForKey)),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(s.w.switch.app(&me).record.as_ref(), Some(&kept));
+}
+
+/// An owed publication goes at the next read, also one whose owed listing waits for a scope
+/// key, for an app whose devices don't share its keys: nothing a feed shows bears on it.
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_still_publishes_what_is_owed() {
+    let s = Setup::new();
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let config = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let mut app = App::join(s.env(), s.protocol.clone(), config, request)
+        .await
+        .unwrap();
+    let me = app.app_id();
+    let path = pubky_switch_core::records::app_record_path(&me);
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    app.receive(None).await.unwrap();
+    assert!(app.listing_owed().await.unwrap());
+    s.w.clock.advance_ms(1_000);
+    s.w.homeserver.fail_writes(1, false);
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap();
+    let accepted = app.record().clone();
+    assert_eq!(s.w.switch.app(&me).record.as_ref(), Some(&accepted));
+    for _ in 0..2 {
+        app.receive(None).await.unwrap();
+        s.w.clock.advance_ms(crate::app::PUBLISHED_CHECK_MS);
+    }
+    assert!(
+        s.w.homeserver.file(s.w.alice.public(), &path)
+            == Some(serde_json::to_vec(&accepted).unwrap()),
+        "the switch holds the new record, the Homeserver still the old one"
+    );
+}
+
+/// A read that delivers a kept record publishes it too, also when its owed listing then
+/// waits for a scope key: the switch accepted the record in that read, so the app is
+/// current, and the Homeserver needn't keep the older record meanwhile.
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_publishes_the_record_it_delivers() {
+    let s = Setup::new();
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let config = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let mut app = App::join(s.env(), s.protocol.clone(), config, request)
+        .await
+        .unwrap();
+    let me = app.app_id();
+    let path = pubky_switch_core::records::app_record_path(&me);
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    app.receive(None).await.unwrap();
+    s.w.clock.advance_ms(1_000);
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap_err();
+    let kept = app.record().clone();
+    app.receive(None).await.unwrap();
+    assert_eq!(s.w.switch.app(&me).record.as_ref(), Some(&kept));
+    assert!(
+        s.w.homeserver.file(s.w.alice.public(), &path) == Some(serde_json::to_vec(&kept).unwrap()),
+        "delivered in the read, not published"
+    );
+}
+
+/// A read whose owed listing waits for a scope key reads no feed, so an app whose devices
+/// share its keys writes no missing Homeserver copy back in it: another device may have
+/// deleted the copy to leave, and only a feed would show the departure (Switch spec 4.2).
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_writes_no_missing_copy_back() {
+    let s = Setup::new();
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let config = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let mut app = App::join(s.env(), s.protocol.clone(), config, request)
+        .await
+        .unwrap();
+    let me = app.app_id();
+    let path = pubky_switch_core::records::app_record_path(&me);
+    app.set_multi_device(true).await.unwrap();
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    app.receive(None).await.unwrap();
+    assert!(app.listing_owed().await.unwrap());
+    s.w.homeserver.remove(s.w.alice.public(), &path);
+    s.w.clock.advance_ms(crate::app::PUBLISHED_CHECK_MS);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ListingWaitsForKey)),
+        "{:?}",
+        report.events
+    );
+    assert!(s.w.homeserver.file(s.w.alice.public(), &path).is_none());
+}
+
+/// A publishing app whose owed listing waits for a scope key: joined, its scope keys
+/// dropped, and a `missed` item read so that the listing is owed.
+async fn publishing_app_waiting_for_a_key(s: &Setup) -> App {
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let config = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let mut app = App::join(s.env(), s.protocol.clone(), config, request)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    app.receive(None).await.unwrap();
+    assert!(app.listing_owed().await.unwrap());
+    app
+}
+
+/// A single-device app revoked while offline, whose publication is owed and
+/// whose copy the signer's clean-up deleted, writes nothing back in a read that waits for
+/// a key: the key bundle read is refused first.
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_revoked_app_writes_nothing_back() {
+    let s = Setup::new();
+    let mut app = publishing_app_waiting_for_a_key(&s).await;
+    let me = app.app_id();
+    let path = pubky_switch_core::records::app_record_path(&me);
+    s.w.clock.advance_ms(1_000);
+    s.w.homeserver.fail_writes(1, false);
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap();
+    assert!(app.state.pending_publish.is_some());
+    s.w.switch.revoke(me).unwrap();
+    s.w.homeserver.remove(s.w.alice.public(), &path);
+    let outcome = app.receive(None).await;
+    assert!(
+        s.w.homeserver.file(s.w.alice.public(), &path).is_none(),
+        "{outcome:?}"
+    );
+}
+
+/// A read that delivers a kept record and then waits for a key, with the
+/// Homeserver down, reports the failed publication once.
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_reports_a_failed_publication_once() {
+    let s = Setup::new();
+    let mut app = publishing_app_waiting_for_a_key(&s).await;
+    s.w.clock.advance_ms(1_000);
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap_err();
+    app.take_events();
+    s.w.homeserver.set_down(true);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ListingWaitsForKey)),
+        "{:?}",
+        report.events
+    );
+    let failed = report
+        .events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::RecordPublishFailed { .. }))
+        .count();
+    assert_eq!(failed, 1, "{:?}", report.events);
 }

@@ -330,9 +330,13 @@ pub enum AppEvent {
         /// ([`ParkReason::AwaitingKey`]); `None` for an entry whose sender couldn't be
         /// checked.
         awaited_epoch: Option<u64>,
-        /// The message's `msg_id`, for an entry that waited for a scope key: it passed the
-        /// recipient checks before it was stored, so its sender signed it. `None` for an
-        /// entry whose sender couldn't be checked, whose `msg_id` no check stands behind.
+        /// The `msg_id` of the message given up: named only for an entry that waited for a
+        /// scope key, which passed the recipient checks before it was stored, so its sender
+        /// signed it, and only when nothing else may still apply the message: no other entry
+        /// stored locally holds it, no kept effect is its, and it isn't processed. A copy
+        /// dropped while another still waits names none; the last to go names it. `None` too
+        /// for an entry whose sender couldn't be checked, whose `msg_id` no check stands
+        /// behind.
         msg_id: Option<String>,
     },
     /// An entry stored locally was processed.
@@ -408,6 +412,14 @@ pub enum AppEvent {
         epochs: Vec<u64>,
         /// How many entries wait.
         entries: u64,
+    },
+    /// The records held `Unreadable` that a scope key taken opens couldn't be reopened now,
+    /// such as for a store that refused a commit (Switch spec 3.5): the reopening stays owed
+    /// and is made again at the next read, and the read went on. Informational: what is
+    /// owed is in the store, so the next read that fails again tells it again.
+    ReopeningOwed {
+        /// Why, without content.
+        error: String,
     },
     /// The app holds every scope key through this data epoch (Switch spec 3.5).
     KeysThrough {
@@ -1208,8 +1220,9 @@ pub enum ParkReason {
     /// effect with a write the context couldn't seal for want of the current data epoch's
     /// key, after the key bundle was fetched once. It is stored at once, with no bounded
     /// wait and no [`AppEvent::StoreFailing`]. It is tried again once the app holds every
-    /// key of `data_epoch` its certificate is given, and not before, so an entry whose key
-    /// never comes costs no request of its own. It is bounded together with the entries
+    /// key of `data_epoch` its certificate is given and a key came since its step last ran,
+    /// and not before, so an entry whose key never comes, or one its certificate is never
+    /// given, costs a read no request and no step. It is bounded together with the entries
     /// stored as [`ParkReason::Unverifiable`], and dropped past the bounds
     /// ([`AppEvent::StoredEntryDropped`]).
     AwaitingKey {

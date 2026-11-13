@@ -1056,15 +1056,14 @@ impl App {
     /// only at a fetch that takes a key, and when the write is read again, never at every
     /// read.
     ///
-    /// The commit that takes the key keeps the reopening owed ([`REOPEN_DUE`]), and the
-    /// reopening's own commit clears it, so a failure between them, or of the reopening,
-    /// leaves it owed: every read makes it first while it is ([`App::reopen_if_due`]).
+    /// The commit that takes the key keeps the reopening owed ([`REOPEN_DUE`]). The
+    /// reopened records are committed as `list_collection` commits a listing, a commit
+    /// whenever one more record might not fit, and only the last clears the mark: a failure
+    /// at any of them leaves it owed, the records committed before it opened, and the next
+    /// reading of the store goes on from there ([`App::reopen_if_due`]).
     pub(crate) async fn reopen_unreadable(&mut self) -> Result<(), AppError> {
         let held = self.reader().scan::<HeldRecord>(RECORD_PREFIX).await?;
         let mut tx = self.tx()?;
-        if self.reader().exists(REOPEN_DUE).await? {
-            tx.delete(REOPEN_DUE)?;
-        }
         for (_, record) in held {
             if !record.content.waits_for_key() {
                 continue;
@@ -1084,6 +1083,10 @@ impl App {
             {
                 continue;
             }
+            if tx.size().saturating_add(LISTED_RECORD_ROOM_BYTES) > crate::store::MAX_BATCH_BYTES {
+                let full = std::mem::replace(&mut tx, self.tx()?);
+                self.commit(full).await?;
+            }
             let collection = Collection::new(&record.collection, record.policy.clone());
             let evidence = Evidence {
                 op: &record.op,
@@ -1095,6 +1098,9 @@ impl App {
             self.read_write(&evidence, Some((&put.key, &collection)), put.key, &mut tx)
                 .await?;
         }
+        if self.reader().exists(REOPEN_DUE).await? {
+            tx.delete(REOPEN_DUE)?;
+        }
         if !tx.is_empty() {
             self.commit(tx).await?;
         }
@@ -1102,10 +1108,20 @@ impl App {
     }
 
     /// The reopening a commit that took a scope key left owed, made now
-    /// ([`App::reopen_unreadable`]).
+    /// ([`App::reopen_unreadable`]), never while a page's writes are open. It owes nothing
+    /// to the read: a reopening that fails keeps the mark, is reported
+    /// ([`AppEvent::ReopeningOwed`]) and is made again at the next read, and the read goes
+    /// on, from the store as committed when a commit failed. Only a store that can't be
+    /// read is this call's error.
     pub(crate) async fn reopen_if_due(&mut self) -> Result<(), AppError> {
-        if self.reader().exists(REOPEN_DUE).await? {
-            self.reopen_unreadable().await?;
+        if !self.reader().exists(REOPEN_DUE).await? {
+            return Ok(());
+        }
+        if let Err(error) = self.reopen_unreadable().await {
+            self.events.push(AppEvent::ReopeningOwed {
+                error: error.to_string(),
+            });
+            self.ready_local().await?;
         }
         Ok(())
     }

@@ -102,7 +102,17 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   senders, isn't shown. Marks are judged at every such request, the switch's clock being
   trusted. A scripted `missed` item (`push_missed`, or `push_missed_unparsable` for one whose times don't parse) is shown to every app and a scripted
   `unreadable` item (`push_unreadable`) has an `entry_id` of its own, and both stay
-  whatever the cursors. Checkpoints and dropped stubs exist only when a test scripts them;
+  whatever the cursors. Chain retention follows the service's rule by default (`Retention`,
+  Switch wire 7.4.4, 9.1): at each request of an own app or the signer, outside a freeze and
+  on a serving account, it signs a checkpoint once `checkpoint_behind` chain items may go and
+  drops the stubs behind it that every current app's cursor has passed or that are
+  `cursor_hold_ms` old, never inside a batch and at most `per_request` at a time. It differs
+  in one way: an app that hasn't moved its cursor yet holds the stubs from the time the switch
+  took its first record, not from its registration's `seq`; an app `identity.json` lists that
+  has no row here yet holds nothing, as for the service. Retention is on by default, for every
+  test: none reaches 1,000 chain items unless it means to. `set_retention(None)` keeps every
+  stub, and a test may still script a checkpoint and the stubs dropped by hand. Once the
+  service retains too, the harness comparison is what shows the two agree;
   claims are deleted only when `GET /claims` finds them deletable; batch records are never
   dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
@@ -193,9 +203,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   answer (Switch wire 7.3 steps 5 to 8), whatever the route: no `Switch-Head`,
   `Switch-Server-Time` the last time stamped, and the app not seen. A departed app that
   delivered its record keeps it, so it goes on to the route's checks, as at the service,
-  until the test call `purge` frees it, as a service may once the signer purges the app
-  from `removed` (Switch wire 9.1): then it meets the first call's refusal, without the
-  head. The service keeps a purged app's record, so it answers that app with the head.
+  until the test call `purge` frees it, as a service does once the signer purges the app
+  from `removed`, keeping only its App ID (Switch wire 9.1): then it meets the first call's
+  refusal, without the head. A known gap of the reference service: it doesn't free a
+  purged app's record yet, so it still answers that app with the head.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
   delivered its record: current, with an unexpired certificate, the stored renewed one once
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
@@ -328,7 +339,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
   leaves out a top-level member, such as a feed page's `items`; **`Fault::Replace`** one
   whose answer carries another value for it, such as `GET /apps`' `identity` replaced by a
-  copy that doesn't verify.
+  copy that doesn't verify; **`Fault::SignWith`** one that applies the request and signs
+  its answer with another key, such as a third key, or the key a recovery in place leaves,
+  signing the delivery that starts the new generation; **`Fault::ErrorSignedWith`** an
+  error answer under another key, applying nothing.
 - **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` checks the body names
   the account's service key (`409 conflict` for another) and, when it names one, the hash of
   the `identity.json` this switch holds (`409 conflict` for another, or for none held), and
@@ -338,10 +352,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   An app's call is `403 permission_missing`. Then every call, the retry included, gets the
   `404` signed with a fixed operator key. `erased` tells a test it happened; app tests set the
   flag directly. The service keeps no freeze or import state yet, so it refuses no erasure for
-  a move; and after an erasure it takes `POST /v1/enroll` again, creating a
-  new staged account, where this switch answers it with the operator's `404` too. That account
-  serves from its first `identity.json`, at the next generation with `recovery_from` (Switch
-  wire 7.4.16), which starts its recovery.
+  a move. After an erasure both take `POST /v1/enroll` again and make a new account under
+  another service key, which signs that answer and every answer after it; nothing of the
+  erased account stays, its kept App IDs included, which the new enrollment names again.
+  That account serves from its first `identity.json`, at the next generation with
+  `recovery_from` (Switch wire 7.4.16), which starts its recovery.
   This switch deletes everything at once and owes no key: its `404` comes right after the
   erasure. The service can owe the erased account's key when its key store fails, and until
   the key is gone it answers a request signed with the identity key, whatever its timestamp,
@@ -358,6 +373,8 @@ switch and the service shows there:
 - approval, renewals and reductions, a reduction's closing with its publication failing,
   rotations over several epochs, and an epoch completed after a rotation was given up at a
   batch (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
+- an approval with a protocol's grant paths declined, the paths allowed at a later
+  request, and a decline the protocol's rule refuses (`grant_paths.rs`);
 - revocations and departures, the time a removal counts from, full-bundle requests, the
   record's cleanup and the purge, a revocation past a read that failed and one asked for
   during a recovery (`revocation.rs`, `recovery.rs`);
@@ -368,10 +385,12 @@ switch and the service shows there:
   restored at once, the second delivery refused `409 stale_identity`, which the signer's
   own tests don't run;
 - the hand-over both ways, its abort, and the abort racing the take-over with either
-  arriving first (`handover.rs`), the account's erasure and its
-  lost answer (`erasure.rs`), and the provider loss: declared at a new service and in
-  place, declared again, refused, its staged admission ended, and restored mid-recovery
-  (`recovery.rs`).
+  arriving first (`handover.rs`), the account's erasure, its lost answer and an enrollment
+  at the same origin after it (`erasure.rs`), and the provider loss: declared at a new
+  service and in place, declared again, refused at a new service and at the origin the
+  identity was enrolled at, its staged admission ended, restored mid-recovery, and
+  restored on a new install from a backup a recovery in place wrote before its version
+  reached the service (`recovery.rs`).
 
 A grant path the user declines at an approval (Switch spec 3.4) needs nothing here: the
 declines change only the Pubky grant the host approves, never the certificate, the version
@@ -390,8 +409,8 @@ What stays only on the scripted switch, and why:
   what the signer does about them.
 - **A delivery refused for good,** other than a recovery's version over the service's app
   limit: a `400` to any other version (an ordinary or a renewing version, a restore's next
-  version), a take-over refused, or a `413 too_large`. No conforming signer meets these at
-  the service, so the tests script the refusal.
+  version), a take-over refused `400`, or a `413 too_large`. No conforming signer meets
+  these at the service, so the tests script the refusal.
 - **Exact timing.** A crash at each commit of a flow, a store that fails or can't tell
   whether it committed, and an answer lost at one chosen call among several alike: the
   tests place these by a commit's or a request's number.

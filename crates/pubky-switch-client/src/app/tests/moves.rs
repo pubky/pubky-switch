@@ -1437,6 +1437,7 @@ async fn store_entries(
                 reason: ParkReason::Refused,
                 round: 0,
                 released: false,
+                keys_at: None,
             };
             tx.put(&crate::app::state::key::parked(id), &stored)
                 .unwrap();
@@ -1523,6 +1524,7 @@ async fn test_new_feed_entry_at_a_stored_entrys_seq_meets_none_of_it() {
         reason: ParkReason::Refused,
         round: 0,
         released: false,
+        keys_at: None,
     };
     let id = app.state.next_stored_id;
     tx.put(&crate::app::state::key::parked(id), &stored)
@@ -3231,6 +3233,7 @@ async fn test_store_of_schema_two_with_entries_keyed_by_seq_fails_as_an_old_sche
         reason: ParkReason::Refused,
         round: 0,
         released: false,
+        keys_at: None,
     };
     let mut value = serde_json::to_value(&stored).unwrap();
     value.as_object_mut().unwrap().remove("seq");
@@ -4043,6 +4046,7 @@ async fn keep_an_effect(
             reason: ParkReason::Quota,
             round: 0,
             released: false,
+            keys_at: None,
         };
         tx.put(&crate::app::state::key::parked(seq), &stored)
             .unwrap();

@@ -677,6 +677,7 @@ fn uncertain_copy(
             reason: ParkReason::Uncertain,
             round: state.parked_round.number,
             released: false,
+            keys_at: None,
         },
     ))
 }
@@ -2387,7 +2388,6 @@ impl App {
         if self.state.leave.is_none() {
             let mut tx = self.tx()?;
             let leave = LeaveState {
-                two_step,
                 compromise,
                 ..LeaveState::default()
             };
@@ -2399,11 +2399,11 @@ impl App {
         // committed above stops every publication from here on. Only a two-step leave waits
         // for the delete: an immediate leave, and a compromise's, which leaves at once
         // (Switch spec 3.6), go on without it, the failure reported, and the signer's
-        // clean-up deletes the record (Switch spec 12.2 step 4).
-        let waits = self
-            .state
-            .leave
-            .is_some_and(|leave| leave.two_step && !leave.compromise);
+        // clean-up deletes the record (Switch spec 12.2 step 4). This call's mode decides,
+        // so an immediate leave asked for after a two-step one whose delete failed goes on
+        // too; and once a compromise started the leave, every later call is a leave after
+        // a compromise.
+        let waits = two_step && !self.state.leave.is_some_and(|leave| leave.compromise);
         match self.unpublish_to_leave().await {
             Ok(()) => {}
             Err(AppError::Transport(error)) if !waits => {

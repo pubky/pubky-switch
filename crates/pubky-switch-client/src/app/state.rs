@@ -487,6 +487,13 @@ pub(crate) struct ParkedEntry {
     /// has none; its reason [`ParkReason::Released`] says so ([`ParkedEntry::was_released`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) released: bool,
+    /// For an entry that waits for a scope key ([`ParkReason::AwaitingKey`]): how many
+    /// scope keys the app held when its step last ran. Keys are only ever added while the
+    /// app runs, so another count is a changed key set, and only that makes the entry due
+    /// again (`feed.rs`, `due_again`); `None` before its step ran so, or for an entry an
+    /// earlier build stored, which is due once its epoch's keys are held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) keys_at: Option<u64>,
 }
 
 impl ParkedEntry {
@@ -623,13 +630,13 @@ pub(crate) struct RestoreState {
     pub(crate) reconcile: bool,
 }
 
-/// `leave`: a leave in progress or done (Switch spec 12.3).
+/// `leave`: a leave in progress or done (Switch spec 12.3). Each call's mode decides how
+/// it goes, so the mode isn't kept; a `two_step` member that stores written before carry
+/// is ignored when read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LeaveState {
     /// When `leave` succeeded, app clock; `None` while it is owed.
     pub(crate) left_at_ms: Option<u64>,
-    /// The app deletes its keys only once its removal is published.
-    pub(crate) two_step: bool,
     /// When the app first saw its `identity.json` list it in `removed`.
     pub(crate) removed_seen_ms: Option<u64>,
     /// When it deleted its keys.
@@ -1198,6 +1205,7 @@ mod tests {
             reason: ParkReason::Quota,
             round: 0,
             released: false,
+            keys_at: None,
         };
         let text = format!("{parked:?}");
         assert!(!text.contains("secret"), "{text}");

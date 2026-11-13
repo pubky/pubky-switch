@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use super::enrollment::{enroll, status};
 use super::join::{app_status, events};
 use super::messaging::joined;
+use super::recovery::{expect_staged, expect_upload, follow_recovery};
 use super::{ORIGIN, STEP_MS};
 use crate::{FlowResult, World};
 
@@ -319,5 +320,101 @@ pub async fn erasure_answer_lost(world: &World) -> FlowResult {
     if world.faults_left() != 0 {
         return Err("a fault met no request".into());
     }
+    Ok(())
+}
+
+/// An erased account enrolled again at the same origin (Switch spec 12.7 step 4, Switch
+/// wire 7.4.16, 7.4.1). alice's signer closes her account, and the service deletes
+/// everything it held for her, its key for the account too. Her signer then declares the
+/// loss at the same origin. The service knows no account for her, so the enrollment makes
+/// a new one under a new key, which signs that answer and every answer after it. The
+/// account starts as after a provider loss: its first document is the next generation's,
+/// at a higher version, naming the erased one as lost. Her wallet follows the recovery
+/// there, and the signer signs on.
+///
+/// Calls: `POST /v1/enroll` and `PUT /v1/{id}/identity` at an origin whose account was
+/// erased, and what follows a recovery there.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, the new account answers
+/// under the erased account's key or the operator's, or doesn't start at the next
+/// generation.
+pub async fn erasure_enrolled_again(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    let before = signer
+        .identity_doc()?
+        .ok_or("the signer holds no document")?;
+    let first_key = world.last_answer("{alice} GET /v1/{alice}/apps");
+
+    let closed = signer
+        .close_account(UserConfirmed::shown_and_confirmed())
+        .await;
+    world.outcome("the account was closed", &ended(&closed));
+    if closed.is_err() || signer.status() != SignerStatus::Erased {
+        return Err(format!(
+            "the account wasn't erased: the signer is {:?}",
+            signer.status()
+        )
+        .into());
+    }
+    world.advance_ms(STEP_MS);
+
+    let doc = signer
+        .declare_provider_loss(ORIGIN, UserConfirmed::shown_and_confirmed())
+        .await?;
+    world.outcome(
+        "the signer enrolled again at the same origin",
+        &json!({
+            "generation": doc.generation(),
+            "recovery_from": doc.body().recovery_from,
+            "version_steps": doc.version() - before.version(),
+            "signer": status(&signer)?,
+        }),
+    );
+    // The new account's own key signs: the one its enrollment answer named, never the
+    // erased account's nor the operator's.
+    // An answer the trace names no key for counts as none.
+    let named =
+        |answer: Option<[String; 3]>| answer.map(|[_, _, key]| key).filter(|key| !key.is_empty());
+    let key_of = |label: &str| named(world.last_answer(label));
+    let enrolled_under = key_of("{alice} POST /v1/enroll");
+    let delivered_under = key_of("{alice} PUT /v1/{alice}/identity");
+    let erased_key = named(first_key);
+    if doc.generation() != before.generation() + 1
+        || doc.body().recovery_from != Some(before.generation())
+        || doc.version() <= before.version()
+        || delivered_under.as_deref() != Some("the account's service key of generation 2")
+        || enrolled_under.is_none()
+        || enrolled_under.as_deref() == Some("the operator key")
+        || enrolled_under == erased_key
+    {
+        return Err(format!(
+            "the new account starts at generation {} from {:?}, its enrollment answered \
+             under {enrolled_under:?} and its document under {delivered_under:?}; the erased \
+             account signed with {erased_key:?}",
+            doc.generation(),
+            doc.body().recovery_from
+        )
+        .into());
+    }
+    world.advance_ms(STEP_MS);
+
+    // The wallet follows the recovery there; its upload, with no contact to bring, ends
+    // the staged admission.
+    follow_recovery(world, &mut wallet, "wallet", 1).await?;
+    expect_upload(world, "wallet", false)?;
+    signer.run_due().await?;
+    world.outcome("the signer ran what is due", &status(&signer)?);
+    expect_staged(world, false)?;
+    world.advance_ms(STEP_MS);
+    let next = signer.set_record_max_age(Some(60)).await?;
+    world.outcome(
+        "the signer signed on",
+        &json!({ "version_steps": next.version() - doc.version(), "signer": status(&signer)? }),
+    );
     Ok(())
 }

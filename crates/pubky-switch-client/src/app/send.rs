@@ -1509,7 +1509,8 @@ impl App {
     /// new key a sender within its cache of the earlier document doesn't know (Switch spec
     /// 4.3: a copy is re-fetched after any failure; 12.6). At most one such read per
     /// identity per [`super::SENDER_REREAD_MS`], kept in memory, so a switch answering under
-    /// keys no document names makes the app read no more. Returns whether the newest copy
+    /// keys no document names makes the app read no more; a read whose copy failed to
+    /// commit doesn't count. Returns whether the newest copy
     /// names another switch or key, under which the delivery is tried again; a newer copy
     /// has the directory read again (Switch spec 8.1).
     async fn reread_after_unverified(
@@ -1522,9 +1523,15 @@ impl App {
         if self.peer_rereads.get(to).is_some_and(|at| lately(*at)) {
             return Ok(false);
         }
-        self.peer_rereads.retain(|_, at| lately(*at));
-        self.peer_rereads.insert(*to, now);
-        let newer = match self.peer_identity(to, true).await {
+        let read = self.peer_identity(to, true).await;
+        // The read counts once what it took is committed, an unreadable copy included. A
+        // newer copy whose commit failed leaves the held one, and the next try reads again
+        // rather than wait out the window under a key that no longer verifies.
+        if !matches!(read, Err(AppError::Store(_))) {
+            self.peer_rereads.retain(|_, at| lately(*at));
+            self.peer_rereads.insert(*to, now);
+        }
+        let newer = match read {
             Ok(doc) => doc,
             Err(AppError::Store(error)) => return Err(error.into()),
             Err(_) => return Ok(false),

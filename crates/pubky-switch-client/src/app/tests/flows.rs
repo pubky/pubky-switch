@@ -1954,7 +1954,7 @@ async fn test_receive_sends_no_batch_refused_for_good() {
 
 /// The signer renews the app's certificate and lists the renewal (Switch spec 3.2 steps 1
 /// and 2).
-fn renew_listed(w: &World, app: &App) {
+pub(super) fn renew_listed(w: &World, app: &App) -> pubky_switch_core::records::AppCert {
     let me = app.app_id();
     let old = app.cert().clone();
     let renewed = cert_for(
@@ -1990,6 +1990,7 @@ fn renew_listed(w: &World, app: &App) {
             until: None,
         });
     });
+    renewed
 }
 
 /// A write while the certificate is expired: the batch is signed and kept, then the

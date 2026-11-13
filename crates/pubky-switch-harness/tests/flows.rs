@@ -16,9 +16,7 @@ use pubky_switch_core::enc::{b64, unb64};
 use pubky_switch_harness::allowed::{ALLOWED, EVERY_FLOW};
 use pubky_switch_harness::compare::{Difference, differences, judge};
 use pubky_switch_harness::flows::{self, CALLS, FLOWS, ORIGIN, flow_of};
-use pubky_switch_harness::{
-    Backend, Comparison, FlowResult, Trace, World, compare_backends, on_flow_stack, run,
-};
+use pubky_switch_harness::{Backend, Comparison, FlowResult, Trace, World, compare_backends, run};
 use tokio::sync::OnceCell;
 
 /// Every flow's comparison, made once for the tests of this file; `None` when no test
@@ -392,19 +390,26 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
         let lines = comparison.service.lines.iter();
         lines.filter_map(|line| line.call).collect()
     };
-    // On a flow's own stack, as every flow runs.
-    let (failures, waiting) =
-        on_flow_stack(async || served_calls(&sent_by).await).expect("a thread for the flow");
+    // As a run of its own, like every flow: on a flow's stack, with the service's log kept.
+    // A `503 unavailable` reads as "not served" here, and a request the test database
+    // failed is answered the same: such a run fails as the database's, not as a listing's.
+    let found = std::sync::Mutex::new((Vec::new(), Vec::new()));
+    let ran = run(Backend::Service, async |world| {
+        let calls = served_calls(world, &sent_by).await?;
+        *found.lock().expect("no panic under the lock") = calls;
+        Ok(())
+    })
+    .await;
+    if let Err(error) = ran {
+        panic!("{error}");
+    }
+    let (failures, waiting) = found.into_inner().expect("no panic under the lock");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     // The served calls still waiting for a flow: this list shrinks to nothing as the flows
     // land, and a call that starts being served must be added to it or given a flow.
     assert_eq!(
         waiting,
-        [
-            "POST /v1/{id}/connect",
-            "GET /v1/{id}/connect",
-            "DELETE /v1/{id}/connect/{key}",
-        ],
+        Vec::<String>::new(),
         "the served calls no flow sends yet"
     );
 }
@@ -413,12 +418,10 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
 /// where alice is enrolled: the calls that fail their listing, and the served calls no flow
 /// sends yet. `sent_by` gives the calls a flow sent.
 async fn served_calls(
+    world: &World,
     sent_by: &(impl Fn(&str) -> BTreeSet<&'static str> + Sync),
-) -> (Vec<String>, Vec<String>) {
-    let world = World::start(Backend::Service)
-        .expect("a world")
-        .expect("a database");
-    flows::enrollment(&world).await.expect("enrolled");
+) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+    flows::enrollment(world).await?;
     let id = world.identity("alice").expect("alice").key().id();
     let mut failures = Vec::new();
     let mut waiting = Vec::new();
@@ -445,6 +448,5 @@ async fn served_calls(
             Some(_) => {}
         }
     }
-    world.close().await.expect("closed");
-    (failures, waiting)
+    Ok((failures, waiting))
 }

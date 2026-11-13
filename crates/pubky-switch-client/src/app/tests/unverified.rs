@@ -226,6 +226,7 @@ fn entry_of(
         reason,
         round: 0,
         released: false,
+        keys_at: None,
     }
 }
 
@@ -877,4 +878,27 @@ async fn test_unverified_bound_backup_copy_takes_an_id_the_live_store_reserves()
 #[tokio::test]
 async fn test_unverified_bound_halted_backup_copy_takes_an_id_the_live_store_reserves() {
     copy_and_next_entry_restored_in_place(true).await;
+}
+
+/// Two identities acting together can drop a third's entry (Switch spec 8.2): one holding
+/// 64 entries accepted before the third's 64, the other one entry. The total is one over,
+/// and the tie between the two holders of 64 goes against the third, whose newest entry is
+/// newest.
+#[test]
+fn test_unverified_bound_tie_lets_two_identities_drop_a_thirds_entry() {
+    use crate::app::unverified::{Counted, over_bounds};
+    let entry = |id: u64, sender: u8, accepted_at_ms: u64| Counted {
+        id,
+        sender: [sender; 32],
+        accepted_at_ms,
+    };
+    let mut entries: Vec<Counted> = (0..64).map(|n| entry(1 + n, 1, n)).collect();
+    entries.extend((0..64).map(|n| entry(100 + n, 2, 1_000 + n)));
+    entries.push(entry(300, 3, 5_000));
+    let drops = over_bounds(&entries, None);
+    assert_eq!(
+        drops,
+        vec![(100, DropReason::Total)],
+        "the third's earliest"
+    );
 }

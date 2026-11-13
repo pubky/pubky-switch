@@ -137,6 +137,10 @@ impl Protocol for Keyed {
     fn collections(&self) -> Vec<Collection> {
         vec![items()]
     }
+
+    fn backup_name(&self) -> Option<String> {
+        Some("keyed".into())
+    }
 }
 
 /// alice's wallet with `protocol`, talking through `transport`, read once so the join's
@@ -704,6 +708,586 @@ async fn test_awaiting_key_drop_names_the_msg_id_an_unverified_drop_none() {
     assert_eq!(
         dropped,
         vec![(waiting, Some(sent.msg_id)), (unverified, None)],
+        "{events:?}"
+    );
+}
+
+// -------------------------------------------------------------------------------------
+// Exits of the wait: a restore, a failed commit, a reload, a second copy of a message,
+// and a step that waits for a key its certificate isn't given.
+
+/// A store whose next commit that deletes a key under `prefix` fails, while armed.
+struct FailingDelete {
+    inner: MemoryStore,
+    prefix: &'static [u8],
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl StateStore for FailingDelete {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.get(ns, key)
+    }
+
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::KeyValue>, StoreError> {
+        self.inner.scan(ns, prefix, after, limit)
+    }
+
+    fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), StoreError> {
+        let deletes = batch.writes.iter().any(|write| {
+            matches!(write, crate::store::Write::Delete { key, .. } if key.starts_with(self.prefix))
+        });
+        if deletes && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.commit(batch)
+    }
+}
+
+/// alice's wallet with `protocol` on `store`, read once.
+async fn wallet_on(
+    w: &World,
+    protocol: &Arc<Keyed>,
+    transport: &Arc<MockTransport>,
+    store: Arc<dyn StateStore>,
+) -> App {
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let env = w.signer.env_with(
+        store,
+        Arc::clone(transport) as Arc<dyn crate::transport::Transport>,
+    );
+    let mut app = App::join(env, protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    app
+}
+
+/// A layered backup carries an entry waiting for a key; the app restored from it keeps it
+/// waiting, and takes it once when the key comes.
+#[tokio::test]
+async fn test_awaiting_key_layered_restore_keeps_the_entry_and_takes_it_once() {
+    let w = World::new();
+    let protocol = Keyed::new(Mode::Check);
+    let transport = w.switch.transport();
+    let mut app = wallet(&w, &protocol, &transport).await;
+    let cert = app.cert().clone();
+    w.next_doc(|body| body.data_epoch = 2);
+    let (seq, note) = w.note(app.app_id(), "hello");
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(2));
+    let backup = app.backup_layered().await.unwrap();
+    drop(app);
+    let env = w.signer.env_with(
+        Arc::new(MemoryStore::new()),
+        Arc::clone(&transport) as Arc<dyn crate::transport::Transport>,
+    );
+    let mut restored = App::restore(env, protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(restored.stored_at(seq).map(|s| s.reason), awaiting(2));
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.stored_at(seq).map(|s| s.reason), awaiting(2));
+    assert_eq!(protocol.runs_of(&note.msg_id), 1);
+    store_parts(&w, restored.app_id(), &cert, 1, 2);
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        w.clock.advance_ms(MAX_CURSOR_DEFER_MS + 1);
+        events.extend(restored.receive(None).await.unwrap().events);
+    }
+    assert!(restored.stored_at(seq).is_none(), "{events:?}");
+    assert_eq!(record_puts(&w), 1);
+    let received = events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::MessageReceived { msg_id, .. } if *msg_id == note.msg_id))
+        .count();
+    assert_eq!(received, 1, "{events:?}");
+}
+
+/// The commit that settles a waiting entry's effect fails after the switch applied it: the
+/// app loaded again settles it, and the record is written once, the entry gone.
+#[tokio::test]
+async fn test_awaiting_key_effect_commit_failure_applies_once_after_a_reload() {
+    let w = World::new();
+    let protocol = Keyed::new(Mode::Check);
+    let transport = w.switch.transport();
+    let store = Arc::new(FailingDelete {
+        inner: MemoryStore::new(),
+        prefix: b"parked/",
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut app = wallet_on(
+        &w,
+        &protocol,
+        &transport,
+        Arc::clone(&store) as Arc<dyn StateStore>,
+    )
+    .await;
+    let cert = app.cert().clone();
+    let app_id = app.app_id();
+    w.next_doc(|body| body.data_epoch = 2);
+    let (seq, note) = w.note(app_id, "hello");
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(2));
+    store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    store_parts(&w, app_id, &cert, 1, 2);
+    let failed = app.receive(None).await;
+    assert!(failed.is_err(), "{failed:?}");
+    assert!(!store.armed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(record_puts(&w), 1, "the switch applied it");
+    drop(app);
+    let env = w.signer.env_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&transport) as Arc<dyn crate::transport::Transport>,
+    );
+    let mut app = App::load(env, protocol.clone(), World::config(), app_id)
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        w.clock.advance_ms(MAX_CURSOR_DEFER_MS + 1);
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    assert!(app.stored_at(seq).is_none(), "{events:?}");
+    assert_eq!(record_puts(&w), 1, "{events:?}");
+    assert!(protocol.runs_of(&note.msg_id) <= 2);
+}
+
+/// A waiting entry dropped past the bounds is told as a duty event that a reload before the
+/// host acknowledges it delivers again.
+#[tokio::test]
+async fn test_awaiting_key_drop_is_delivered_again_after_a_reload() {
+    let w = World::new();
+    let protocol = Keyed::new(Mode::Check);
+    let transport = w.switch.transport();
+    let store = Arc::new(MemoryStore::new());
+    let mut app = wallet_on(
+        &w,
+        &protocol,
+        &transport,
+        Arc::clone(&store) as Arc<dyn StateStore>,
+    )
+    .await;
+    let app_id = app.app_id();
+    w.next_doc(|body| body.data_epoch = 2);
+    let (seq, note) = w.note(app_id, "hello");
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(2));
+    w.clock.advance_ms(MAX_UNVERIFIED_AGE_MS + 1);
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    let told = |events: &[AppEvent]| {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(e, AppEvent::StoredEntryDropped { seq: s, awaited_epoch: Some(2), msg_id: Some(m), .. }
+                    if *s == seq && *m == note.msg_id)
+            })
+            .count()
+    };
+    assert_eq!(told(&events), 1, "{events:?}");
+    drop(app);
+    let env = w.signer.env_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&transport) as Arc<dyn crate::transport::Transport>,
+    );
+    let mut app = App::load(env, protocol.clone(), World::config(), app_id)
+        .await
+        .unwrap();
+    let again = app.unacknowledged_events().await.unwrap();
+    assert_eq!(told(&again), 1, "{again:?}");
+    assert_eq!(protocol.runs_of(&note.msg_id), 1);
+}
+
+/// Two copies of one message wait for the key, accepted ten days apart. The earlier one
+/// ages out first: its drop names no `msg_id`, since the later copy still holds the
+/// message, which is taken once the key comes.
+#[tokio::test]
+async fn test_awaiting_key_drop_of_a_copy_names_no_msg_id_while_another_waits() {
+    use pubky_switch_core::message::{Message as Msg, Sender};
+    let w = World::new();
+    let protocol = Keyed::new(Mode::Check);
+    let transport = w.switch.transport();
+    let mut app = wallet(&w, &protocol, &transport).await;
+    let cert = app.cert().clone();
+    let app_id = app.app_id();
+    w.next_doc(|body| body.data_epoch = 2);
+    let mut body = serde_json::Map::new();
+    body.insert("text".into(), json!("twice"));
+    let message = Msg::new(
+        "sample.note",
+        Sender::of_app(w.bob.public(), &w.bob_keys),
+        w.alice.public(),
+        w.clock.now_ms(),
+        vec![],
+        body,
+    )
+    .unwrap();
+    let plaintext = message.sign(&w.bob_keys).unwrap();
+    let first = w
+        .switch
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[app_id])
+        .unwrap();
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(10 * pubky_switch_core::records::DAY_MS);
+    let second = w
+        .switch
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[app_id])
+        .unwrap();
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_at(first).map(|s| s.reason), awaiting(2));
+    assert_eq!(app.stored_at(second).map(|s| s.reason), awaiting(2));
+    w.clock.advance_ms(12 * pubky_switch_core::records::DAY_MS);
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    assert!(app.stored_at(first).is_none(), "{events:?}");
+    assert_eq!(app.stored_at(second).map(|s| s.reason), awaiting(2));
+    assert!(has(&events, |e| matches!(
+        e,
+        AppEvent::StoredEntryDropped { seq, msg_id: None, awaited_epoch: Some(2), .. } if *seq == first
+    )));
+    store_parts(&w, app_id, &cert, 1, 2);
+    for _ in 0..2 {
+        w.clock.advance_ms(MAX_CURSOR_DEFER_MS + 1);
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    assert!(app.stored_at(second).is_none());
+    assert_eq!(
+        record_puts(&w),
+        1,
+        "the message the other copy held is applied"
+    );
+}
+
+/// Two copies waiting when the key comes: the message is applied once and the other copy
+/// goes as a duplicate.
+#[tokio::test]
+async fn test_awaiting_key_two_copies_apply_once_when_the_key_comes() {
+    use pubky_switch_core::message::{Message as Msg, Sender};
+    let w = World::new();
+    let protocol = Keyed::new(Mode::Check);
+    let transport = w.switch.transport();
+    let mut app = wallet(&w, &protocol, &transport).await;
+    let cert = app.cert().clone();
+    let app_id = app.app_id();
+    w.next_doc(|body| body.data_epoch = 2);
+    let mut body = serde_json::Map::new();
+    body.insert("text".into(), json!("twice"));
+    let message = Msg::new(
+        "sample.note",
+        Sender::of_app(w.bob.public(), &w.bob_keys),
+        w.alice.public(),
+        w.clock.now_ms(),
+        vec![],
+        body,
+    )
+    .unwrap();
+    let plaintext = message.sign(&w.bob_keys).unwrap();
+    let first = w
+        .switch
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[app_id])
+        .unwrap();
+    let second = w
+        .switch
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[app_id])
+        .unwrap();
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_at(first).map(|s| s.reason), awaiting(2));
+    assert_eq!(app.stored_at(second).map(|s| s.reason), awaiting(2));
+    store_parts(&w, app_id, &cert, 1, 2);
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        w.clock.advance_ms(MAX_CURSOR_DEFER_MS + 1);
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    assert!(app.stored_seqs().is_empty(), "{events:?}");
+    assert_eq!(record_puts(&w), 1);
+    assert!(has(&events, |e| matches!(e, AppEvent::Duplicate { .. })));
+}
+
+/// A step that answers [`Outcome::AwaitKey`] for a scope its certificate isn't given, at
+/// the current data epoch or at `epoch`: no key bundle can bring that key.
+struct Unkeyed {
+    items: ItemsProtocol,
+    runs: Mutex<usize>,
+    epoch: Option<u64>,
+}
+
+impl Protocol for Unkeyed {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.items.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.items.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.items.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.items.accepts(cert)
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.items.check_body(message)
+    }
+
+    fn receive_with(&self, _: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+        *self.runs.lock().unwrap() += 1;
+        let data_epoch = self.epoch.unwrap_or(cx.data_epoch());
+        if !cx.holds_scope_key("scope-z", data_epoch) {
+            return Outcome::AwaitKey { data_epoch };
+        }
+        Outcome::Apply(Effect::default())
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.items.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.items.missed(missed)
+    }
+
+    fn collections(&self) -> Vec<Collection> {
+        vec![items()]
+    }
+}
+
+/// The step of a key the certificate is never given runs once, then not again while the
+/// keys the app holds stay as they are.
+#[tokio::test]
+async fn test_awaiting_key_for_a_scope_not_given_runs_the_step_only_once() {
+    let w = World::new();
+    let protocol = Arc::new(Unkeyed {
+        items: ItemsProtocol::default(),
+        runs: Mutex::new(0),
+        epoch: None,
+    });
+    let transport = w.switch.transport();
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let env = w.signer.env_with(
+        Arc::new(MemoryStore::new()),
+        Arc::clone(&transport) as Arc<dyn crate::transport::Transport>,
+    );
+    let mut app = App::join(env, protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    let (seq, _) = w.note(app.app_id(), "hello");
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(1));
+    let after_first = *protocol.runs.lock().unwrap();
+    for _ in 0..5 {
+        app.receive(None).await.unwrap();
+    }
+    let runs = *protocol.runs.lock().unwrap();
+    assert_eq!(
+        runs, after_first,
+        "later reads run the step: {after_first} then {runs}"
+    );
+}
+
+fn unkeyed_wallet_request(w: &World) -> JoinRequest {
+    w.approve(&app_keys("wallet"), &["scope-a"])
+}
+
+async fn unkeyed_wallet(w: &World, protocol: &Arc<Unkeyed>, transport: &Arc<MockTransport>) -> App {
+    let env = w.signer.env_with(
+        Arc::new(MemoryStore::new()),
+        Arc::clone(transport) as Arc<dyn crate::transport::Transport>,
+    );
+    let mut app = App::join(
+        env,
+        protocol.clone(),
+        World::config(),
+        unkeyed_wallet_request(w),
+    )
+    .await
+    .unwrap();
+    app.receive(None).await.unwrap();
+    app
+}
+
+fn parked_events(events: &[AppEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::Parked { .. }))
+        .count()
+}
+
+/// A waiting entry due again once a key comes, whose step waits for the same epoch again,
+/// stays stored as it was: it isn't stored again or told again, and isn't due again until
+/// the keys change once more.
+#[tokio::test]
+async fn test_awaiting_key_waiting_again_for_the_same_epoch_is_not_stored_again() {
+    let w = World::new();
+    let protocol = Arc::new(Unkeyed {
+        items: ItemsProtocol::default(),
+        runs: Mutex::new(0),
+        epoch: Some(1),
+    });
+    let transport = w.switch.transport();
+    let mut app = unkeyed_wallet(&w, &protocol, &transport).await;
+    let cert = app.cert().clone();
+    let (seq, _) = w.note(app.app_id(), "hello");
+    let mut events = app.receive(None).await.unwrap().events;
+    assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(1));
+    assert_eq!(*protocol.runs.lock().unwrap(), 1);
+    // A rotation brings the next epoch's keys: the entry is due and runs once.
+    w.next_doc(|body| body.data_epoch = 2);
+    store_parts(&w, app.app_id(), &cert, 1, 2);
+    for _ in 0..4 {
+        w.clock.advance_ms(MAX_CURSOR_DEFER_MS + 1);
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    assert!(app.scope_key(2, "scope-a").is_some());
+    assert_eq!(*protocol.runs.lock().unwrap(), 2);
+    assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(1));
+    assert_eq!(parked_events(&events), 1, "{events:?}");
+}
+
+/// A due entry whose retry at the start of a read is held, for a store unavailable for
+/// now, isn't run again at the end of the same read.
+#[tokio::test]
+async fn test_awaiting_key_held_at_the_start_runs_once_a_read() {
+    let w = World::new();
+    let protocol = Keyed::new(Mode::Check);
+    let transport = w.switch.transport();
+    let mut app = wallet(&w, &protocol, &transport).await;
+    let cert = app.cert().clone();
+    w.next_doc(|body| body.data_epoch = 2);
+    let (seq, note) = w.note(app.app_id(), "hello");
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(2));
+    // The key comes; the run at the end of that read is held.
+    store_parts(&w, app.app_id(), &cert, 1, 2);
+    *protocol.unavailable.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert_eq!(protocol.runs_of(&note.msg_id), 2);
+    assert!(app.stored_at(seq).is_some());
+    // Due at the next read's start, and held there again: once in that read.
+    *protocol.unavailable.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert_eq!(protocol.runs_of(&note.msg_id), 3, "once a read");
+    assert!(app.stored_at(seq).is_some());
+    app.receive(None).await.unwrap();
+    assert!(app.stored_at(seq).is_none());
+    assert_eq!(record_puts(&w), 1);
+}
+
+/// More waiting entries than one read retries whose key comes in one read: the end of that
+/// read takes `PARKED_RETRIES_PER_READ` of them, and the next read the rest.
+#[tokio::test]
+async fn test_awaiting_key_entries_a_key_brings_are_retried_within_the_per_read_bound() {
+    let w = World::new();
+    let protocol = Keyed::new(Mode::Check);
+    let transport = w.switch.transport();
+    let mut app = wallet(&w, &protocol, &transport).await;
+    let cert = app.cert().clone();
+    w.next_doc(|body| body.data_epoch = 2);
+    let many = crate::app::PARKED_RETRIES_PER_READ + 4;
+    for n in 0..many {
+        w.note(app.app_id(), &format!("note {n}"));
+    }
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_seqs().len(), many);
+    store_parts(&w, app.app_id(), &cert, 1, 2);
+    app.receive(None).await.unwrap();
+    assert_eq!(record_puts(&w), crate::app::PARKED_RETRIES_PER_READ);
+    app.receive(None).await.unwrap();
+    assert_eq!(record_puts(&w), many);
+    assert!(app.stored_seqs().is_empty());
+}
+
+/// A wait for an epoch past the current one isn't due when keys of earlier epochs come:
+/// its epoch's keys are still missing, so its step doesn't run.
+#[tokio::test]
+async fn test_awaiting_key_of_a_later_epoch_isnt_due_for_an_earlier_epochs_keys() {
+    let w = World::new();
+    let protocol = Keyed::new(Mode::Await(3));
+    let transport = w.switch.transport();
+    let mut app = wallet(&w, &protocol, &transport).await;
+    let cert = app.cert().clone();
+    let (seq, note) = w.note(app.app_id(), "hello");
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(3));
+    w.next_doc(|body| body.data_epoch = 2);
+    store_parts(&w, app.app_id(), &cert, 1, 2);
+    for _ in 0..3 {
+        w.clock.advance_ms(MAX_CURSOR_DEFER_MS + 1);
+        app.receive(None).await.unwrap();
+    }
+    assert!(app.scope_key(2, "scope-a").is_some());
+    assert_eq!(protocol.runs_of(&note.msg_id), 1);
+    assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(3));
+}
+
+/// A waiting entry dropped after another copy of its message was processed names no
+/// `msg_id`: the message wasn't given up.
+#[tokio::test]
+async fn test_awaiting_key_drop_of_a_processed_message_names_no_msg_id() {
+    use pubky_switch_core::message::{Message as Msg, Sender};
+    let w = World::new();
+    let protocol = Keyed::new(Mode::Await(3));
+    let transport = w.switch.transport();
+    let mut app = wallet(&w, &protocol, &transport).await;
+    let app_id = app.app_id();
+    let mut body = serde_json::Map::new();
+    body.insert("text".into(), json!("twice"));
+    let message = Msg::new(
+        "sample.note",
+        Sender::of_app(w.bob.public(), &w.bob_keys),
+        w.alice.public(),
+        w.clock.now_ms(),
+        vec![],
+        body,
+    )
+    .unwrap();
+    let plaintext = message.sign(&w.bob_keys).unwrap();
+    let waiting = w
+        .switch
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[app_id])
+        .unwrap();
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_at(waiting).map(|s| s.reason), awaiting(3));
+    // A second copy is processed while the first still waits.
+    *protocol.mode.lock().unwrap() = Mode::Write;
+    w.switch
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[app_id])
+        .unwrap();
+    app.receive(None).await.unwrap();
+    assert!(app.stored_at(waiting).is_some());
+    w.clock.advance_ms(MAX_UNVERIFIED_AGE_MS + 1);
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    assert!(app.stored_at(waiting).is_none());
+    assert!(
+        has(&events, |e| matches!(
+            e,
+            AppEvent::StoredEntryDropped { seq, msg_id: None, awaited_epoch: Some(3), .. } if *seq == waiting
+        )),
         "{events:?}"
     );
 }
