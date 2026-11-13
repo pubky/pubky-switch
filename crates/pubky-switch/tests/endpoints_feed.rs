@@ -984,6 +984,8 @@ async fn stamped_time(replay: &Replay) -> i64 {
 struct MarkStuck {
     inner: std::sync::Arc<pubky_switch::keys::FixedKeys>,
     armed: std::sync::atomic::AtomicBool,
+    /// The marks moved while it wasn't armed.
+    moved: std::sync::atomic::AtomicUsize,
 }
 
 impl KeyStore for MarkStuck {
@@ -1021,7 +1023,12 @@ impl KeyStore for MarkStuck {
                 Err(pubky_switch::keys::KeyStoreError::Corrupt("stuck".into()))
             });
         }
-        self.inner.advance_mark(id, head)
+        let moving = self.inner.advance_mark(id, head);
+        Box::pin(async move {
+            let moved = moving.await;
+            self.moved.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            moved
+        })
     }
     fn delete<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, ()> {
         self.inner.delete(id)
@@ -1043,6 +1050,9 @@ async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
     // As in the expiry test, a held read is refused from a later snapshot; but the key's
     // mark can't move to that snapshot's head, so the refusal carries the head the request
     // committed, which the mark covers, never the snapshot's (Switch wire 7.3 step 10).
+    // The key store sticks only once the read's own commit has moved the mark: stuck
+    // between the commit and that move, the read would answer the temporary `503`, which
+    // is right for a key store that fails there, and not what this test is about.
     let Some(mut replay) = replay().await else {
         return;
     };
@@ -1051,6 +1061,7 @@ async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
     let stuck = std::sync::Arc::new(MarkStuck {
         inner: replay.keys.clone(),
         armed: std::sync::atomic::AtomicBool::new(false),
+        moved: std::sync::atomic::AtomicUsize::new(0),
     });
     replay.service = pubky_switch::service::Service::new(
         ORIGIN.into(),
@@ -1063,12 +1074,17 @@ async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
     set_time(&replay.clock, &at);
     let read_ms = i64::try_from(ms(&at)).expect("time");
     let expired = ms("2026-12-01T00:00:01.000Z");
-    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+    // The later snapshot wakes the held read, as a commit does: the read never ends by
+    // its own clock.
+    let (stop, task) = listen(&replay).await;
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=25", &at), async {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while stamped_time(&replay).await != read_ms {
+        while stamped_time(&replay).await != read_ms
+            || stuck.moved.load(std::sync::atomic::Ordering::SeqCst) == 0
+        {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the read never committed its stamp"
+                "the read never committed its stamp and moved the mark"
             );
             tokio::task::yield_now().await;
         }
@@ -1082,7 +1098,14 @@ async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
             ),
         )
         .await;
+        sql(
+            &replay,
+            &format!("SELECT pg_notify('{}', $1)", pubky_switch::changes::CHANNEL),
+        )
+        .await;
     });
+    let _ = stop.send(());
+    task.await.expect("listener");
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
         (403, json!("cert_expired"))
