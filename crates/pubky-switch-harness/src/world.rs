@@ -251,6 +251,20 @@ impl World {
         self.router.remove(origin);
     }
 
+    /// Close the connections of the service at `origin` to its database, as a server that
+    /// takes no more: every later request to it fails in the service's storage. Nothing
+    /// happens at a scripted switch. For a test of how such a run ends.
+    pub async fn close_database_connections(&self, origin: &str) {
+        let stores: Vec<_> = lock(&self.services)
+            .iter()
+            .filter(|switch| switch.origin() == origin)
+            .filter_map(RealSwitch::store)
+            .collect();
+        for store in stores {
+            store.close().await;
+        }
+    }
+
     /// The transport every party of this world sends through: to the switch of the
     /// request's origin, recorded.
     pub fn transport(&self) -> Arc<dyn Transport> {

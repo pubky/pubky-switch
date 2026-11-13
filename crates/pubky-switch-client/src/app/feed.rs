@@ -435,9 +435,14 @@ impl App {
         if let Some(waiting) = waiting {
             self.events.push(waiting);
         }
-        // The record's delivery goes before the feed; its publication comes after it, once the
-        // feed shows the app still current (`own_record.rs`).
-        self.deliver_pending_record().await?;
+        // The record's delivery goes before the feed. A record the switch accepts here is
+        // published here too: accepting the `app.put` shows the app current, as the feed
+        // would (Switch spec 4.2, `own_record.rs`). That is the read's one publication: a
+        // write that failed here isn't tried again after the feed.
+        let published = self.deliver_pending_record().await?;
+        if published {
+            self.publish_owed(false, true).await?;
+        }
         self.ensure_scope_keys().await?;
         self.prune_processed().await?;
         self.retell_restored().await?;
@@ -552,12 +557,21 @@ impl App {
         if self.state.alarm.is_none() {
             // A stopped read leaves the claims and records it marked for the next one, and so
             // do one that waits for a key and one whose listing goes on at the next read. A
-            // publication goes only once the feed shows the app current (Switch spec 4.2).
-            if !report.stopped && !waits_for_key && !unfinished {
+            // read that read its feed publishes once the feed shows the app current. One that
+            // waits for a key, or whose listing goes on, read no feed, so it publishes as a
+            // call outside a read does: what is owed goes, and an app whose devices share its
+            // keys writes no missing copy back (Switch spec 4.2).
+            if waits_for_key || unfinished {
+                if !published {
+                    self.publish_owed(false, false).await?;
+                }
+            } else if !report.stopped {
                 self.reread_claims().await?;
                 self.reread_records().await?;
                 self.fetch_entry_writers().await?;
-                self.publish_owed(false, true).await?;
+                if !published {
+                    self.publish_owed(false, true).await?;
+                }
             }
             self.delete_retired_keys().await?;
             self.forget_chain_behind_cursor().await?;

@@ -10,7 +10,7 @@
 
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, OpKind};
-use pubky_switch_core::records::{AppCert, AppRecord, is_renewal};
+use pubky_switch_core::records::{AppCert, AppRecord, IdentityDoc, is_renewal};
 use pubky_switch_core::sig::SignedDoc;
 
 use super::events::AppEvent;
@@ -127,12 +127,19 @@ impl App {
     /// Send the kept `app.put` until answered; returns whether the switch accepted a record
     /// in this call. A `409 conflict` naming a record of this app with an `updated_at` at or
     /// after this one's (another device's) is written again once, later than the held one
-    /// (Switch spec 4.2). One naming no record that verifies is taken as delivered only when
-    /// the switch's directory shows it holds this very record, as for a re-send of a batch
-    /// the switch applied and holds without its proofs (Switch wire 6.4 step 5); otherwise
-    /// it is refused, and nothing is noted or published. Once the switch holds the record,
-    /// an app that publishes owes it to the Homeserver, in the commit that records the
-    /// answer.
+    /// (Switch spec 4.2). One naming no record that verifies answers a re-send of a batch
+    /// the switch applied and holds without its proofs (Switch wire 6.4 step 5), so the
+    /// switch's directory decides it: a directory that shows this very record makes it
+    /// delivered; one that shows a later record of the app, which another device put after
+    /// it, makes it superseded (Switch spec 4.2 "The later `updated_at` wins"). The kept
+    /// record is then dropped, and the later record taken in the same commit as the newest
+    /// the switch accepted, and as the record the app presents when it carries the
+    /// certificate the app presents: the app's next record builds on it, so this older body
+    /// is never signed again over it. A later record carrying a renewal another device
+    /// took is presented with that renewal when the newest `identity.json` lists it, and
+    /// one under any other certificate is never taken ([`App::take_superseding`]).
+    /// Otherwise it is refused, and nothing is noted or published. Once the switch holds the record, an app that publishes owes it to the
+    /// Homeserver, in the commit that records the answer.
     pub(crate) async fn deliver_pending_record(&mut self) -> Result<bool, AppError> {
         let Some(pending) = self.state.pending_record.clone() else {
             return Ok(false);
@@ -151,8 +158,16 @@ impl App {
                 };
                 // Boxed: the directory read is rare, and would otherwise widen every future
                 // that delivers a record.
-                if named.is_none() && !Box::pin(self.switch_holds(&batch)).await? {
-                    return Err(error);
+                if named.is_none() {
+                    match Box::pin(self.switch_holds(&batch)).await? {
+                        Held::This => {}
+                        Held::Later(later) => {
+                            let (later, identity) = *later;
+                            Box::pin(self.take_superseding(later, identity)).await?;
+                            return Ok(false);
+                        }
+                        Held::Other => return Err(error),
+                    }
                 }
                 named
             }
@@ -194,17 +209,87 @@ impl App {
         Ok(true)
     }
 
-    /// Whether the switch's directory shows it holds, for this app, the record `batch`
-    /// delivers, byte for byte.
-    async fn switch_holds(&mut self, batch: &Batch) -> Result<bool, AppError> {
+    /// Drop the kept record that `later`, a record of the app the switch holds, superseded,
+    /// and take `later` in the same commit, as the newest record the switch accepted and
+    /// as the record the app presents, when it carries the certificate the app presents.
+    /// Nothing is owed to the Homeserver for it: the device that put it publishes it, and
+    /// the next check compares the copy with it.
+    ///
+    /// A `later` carrying a renewal another device took, whose `cert.put` the feed shows
+    /// only as a stub once the record carries it, is taken with that certificate first, as
+    /// after a restore (Switch spec 3.2 step 3): when `identity`, the own `identity.json`
+    /// the same directory answer carried, or the newer one held, lists it, and it renews
+    /// the certificate held under the app's own keys. It is presented as it is, so nothing
+    /// is signed over it, also when the app already holds that renewal's `cert.put`.
+    ///
+    /// A `later` under any other certificate, which only a faulty switch shows, is never
+    /// taken: the kept record is dropped alone, nothing is noted as accepted, and nothing
+    /// of it is published.
+    async fn take_superseding(
+        &mut self,
+        later: AppRecord,
+        identity: IdentityDoc,
+    ) -> Result<(), AppError> {
+        let me = self.state.meta.app_id;
+        let newer = identity.version() > self.state.own_doc.version();
+        let listed = if newer {
+            identity.listed_cert(&me)
+        } else {
+            self.state.own_doc.listed_cert(&me)
+        };
+        let cert = later.cert();
+        if cert.hash() != self.state.cert.hash()
+            && listed == Some(cert.hash())
+            && cert.signing_key() == self.state.keys.signing_public()
+            && cert.bundle_key() == self.state.keys.bundle_public()
+            && is_renewal(&self.state.cert, cert)
+        {
+            // Before the newer document is taken, which would sign a renewal the app holds
+            // into the dropped body; and before the drop, so a crash between the two leaves
+            // the kept record, whose re-send then finds the later record under the
+            // certificate presented.
+            self.take_cert(cert.clone(), later.signed().clone(), false)
+                .await?;
+        }
+        if newer {
+            self.take_own_copy(identity).await?;
+        }
+        let taken = later.cert().hash() == self.state.cert.hash();
+        let signed = later.signed().clone();
+        let mut tx = self.tx()?;
+        tx.delete(key::PENDING_RECORD)?;
+        if taken {
+            tx.put(key::ACCEPTED_RECORD, &signed)?;
+            tx.put(key::RECORD, &signed)?;
+        }
+        self.commit(tx).await?;
+        self.state.pending_record = None;
+        if taken {
+            self.state.record = signed.clone();
+            self.state.accepted = Some(signed);
+            self.published_checked_ms = None;
+        }
+        Ok(())
+    }
+
+    /// What the switch's directory shows it holds for this app, beside the record `batch`
+    /// delivers.
+    async fn switch_holds(&mut self, batch: &Batch) -> Result<Held, AppError> {
         let record = delivered_record(batch)?;
+        let mine = AppRecord::verify(&record, &self.state.meta.identity)?;
         let me = self.state.meta.app_id;
         let result = self.client.directory(None).await;
         let directory = self.take(result).await?;
-        Ok(directory
-            .apps
-            .iter()
-            .any(|app| app.app_id == me && app.record.signed() == &record))
+        let Some(entry) = directory.apps.iter().find(|app| app.app_id == me) else {
+            return Ok(Held::Other);
+        };
+        Ok(if entry.record.signed() == &record {
+            Held::This
+        } else if entry.record.updated_at() > mine.updated_at() {
+            Held::Later(Box::new((entry.record.clone(), directory.identity.clone())))
+        } else {
+            Held::Other
+        })
     }
 
     /// The listed certificate from the own record in the directory, when the own
@@ -262,6 +347,18 @@ impl App {
         }
         Ok(Listed::Key(key))
     }
+}
+
+/// What the switch's directory shows for the app, beside a kept `app.put`'s record.
+enum Held {
+    /// That very record, byte for byte.
+    This,
+    /// A record of the app with a later `updated_at`, verified for the identity and the
+    /// App ID as every directory entry is, with the own `identity.json` the same answer
+    /// carried.
+    Later(Box<(AppRecord, IdentityDoc)>),
+    /// Another record, or none.
+    Other,
 }
 
 /// What [`App::take_listed_cert`] found.

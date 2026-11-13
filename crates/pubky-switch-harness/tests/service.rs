@@ -15,6 +15,7 @@ use pubky_switch_client::transport::{Request, Response, Transport};
 use pubky_switch_core::http::header;
 use pubky_switch_harness::service::RealSwitch;
 use pubky_switch_harness::service_log::ServiceLog;
+use pubky_switch_harness::{Backend, HarnessError, run};
 
 const ORIGIN: &str = "https://switch.example";
 
@@ -130,7 +131,7 @@ async fn test_service_storage_failure_is_a_503_whose_cause_the_log_names() {
         (503, "unavailable")
     );
     assert!(answer.header(header::SERVICE_SIGNATURE).is_some());
-    let failures = log.storage_failures();
+    let failures = log.database_failures();
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
         failures[0].starts_with("WARN pubky_switch::service: storage error=database: "),
@@ -138,6 +139,55 @@ async fn test_service_storage_failure_is_a_503_whose_cause_the_log_names() {
     );
 
     switch.close().await.expect("closed");
+}
+
+/// A run against the service whose database takes no connection ends as the database's
+/// failure, with the service's line for it, whether the flow fails on the `503` or passes
+/// it by.
+#[tokio::test]
+async fn test_run_at_the_service_fails_as_the_database_when_it_takes_no_connection() {
+    for flow_fails in [true, false] {
+        let ended = run(Backend::Service, async |world| {
+            let alice = world.identity("alice")?;
+            world.add_switch(ORIGIN, &[&alice]).await?;
+            let read = format!("/v1/{}/identity", alice.key().id());
+            let answer = world.request("GET", ORIGIN, &read).await?;
+            if answer.status != 404 {
+                return Err(
+                    format!("with its database the read was answered {}", answer.status).into(),
+                );
+            }
+            world.close_database_connections(ORIGIN).await;
+            let answer = world.request("GET", ORIGIN, &read).await?;
+            if flow_fails {
+                return Err(format!("the read was answered {}", answer.status).into());
+            }
+            Ok(())
+        })
+        .await;
+        let (logged, flow) = match ended {
+            // No test database: skipped.
+            Ok(None) => return,
+            Err(HarnessError::Database {
+                backend: Backend::Service,
+                logged,
+                ended,
+                ..
+            }) => (logged, ended),
+            other => panic!("the run ended {other:?}"),
+        };
+        assert_eq!(
+            logged,
+            "  WARN pubky_switch::service: storage error=database: attempted to acquire a \
+             connection on a closed pool"
+        );
+        let expected = if flow_fails {
+            "the read was answered 503"
+        } else {
+            "with no error"
+        };
+        assert_eq!(flow, expected);
+    }
 }
 
 /// Whether the test server holds a database named `name`.

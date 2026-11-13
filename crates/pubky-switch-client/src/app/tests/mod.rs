@@ -14,6 +14,7 @@ mod passed;
 mod protocol_api;
 mod protocol_reads;
 mod push;
+mod retention;
 mod send_futures;
 mod sender_document;
 mod sender_key;
