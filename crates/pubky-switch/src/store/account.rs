@@ -185,6 +185,7 @@ impl std::fmt::Debug for Creation {
 pub(super) async fn begin_create(
     pool: &PgPool,
     account: &NewAccount,
+    lock_timeout_ms: u64,
 ) -> Result<Option<Creation>, StoreError> {
     let identity_doc = account
         .identity_doc
@@ -192,6 +193,19 @@ pub(super) async fn begin_create(
         .map(super::identity::encode_doc)
         .transpose()?;
     let mut tx = pool.begin().await.map_err(StoreError::from_db)?;
+    // READ COMMITTED whatever the pool's default: the read after the insert takes a snapshot
+    // of its own, so it sees an erasure the insert waited for. The numbers are formatted, as
+    // `SET` takes no bind parameters.
+    sqlx::Executor::execute(
+        &mut *tx,
+        format!(
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
+             SET LOCAL lock_timeout = {lock_timeout_ms}"
+        )
+        .as_str(),
+    )
+    .await
+    .map_err(StoreError::from_db)?;
     let created = sqlx::query(
         "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms, \
          stamped_time_ms, announced_limits, identity_doc) VALUES ($1, $2, $3, $4, $5, $5, $6, $7) \
