@@ -612,8 +612,10 @@ impl App {
     ///
     /// Set it on every device of the app. [`App::take_device_keys`] sets it on the device
     /// that takes the keys; the device that gave them ([`App::device_keys`]) stays
-    /// single-device until its host sets it, and raises the rollback alarm if it falls
-    /// behind its app's cursor across a checkpoint.
+    /// single-device until its host sets it. Until then, if it falls behind its app's cursor
+    /// across a checkpoint without the stubs, it raises the rollback alarm while its verified
+    /// item is under 30 days old, or while it holds a head or own write between its position
+    /// and the checkpoint from an answer that recent; otherwise it reconciles.
     ///
     /// # Errors
     ///

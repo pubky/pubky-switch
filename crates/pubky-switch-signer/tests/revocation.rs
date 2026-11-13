@@ -1823,6 +1823,8 @@ async fn test_revocation_goes_on_when_the_first_read_fails() {
         Some(ErrorCode::Unavailable),
         Some(ErrorCode::RateLimited),
         Some(ErrorCode::StaleTimestamp),
+        Some(ErrorCode::NotFound),
+        Some(ErrorCode::PermissionMissing),
         None,
     ];
     for code in faults {

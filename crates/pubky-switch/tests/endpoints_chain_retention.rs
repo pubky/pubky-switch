@@ -976,3 +976,48 @@ async fn test_retention_a_batch_ending_before_its_missed_item_still_goes() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_retention_signs_and_drops_nothing_at_a_staged_account() {
+    // The held `identity.json` names another service, as a staged account's would: the
+    // account doesn't serve the chain, so a request, whose step 4 runs before the staged
+    // gate, signs no checkpoint and drops no stub, however the cursors stand (wire 9.1).
+    use pubky_switch_core::{
+        keys::IdentityKey,
+        records::{IdentityBody, IdentityDoc},
+    };
+    let Some(replay) = registered(small(), false).await else {
+        return;
+    };
+    chain(&replay, 10, 6, AT).await;
+    let before = kept(&replay).await;
+    cursors(&replay, ALL, head_seq(&replay).await).await;
+    let held: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .expect("document");
+    let mut body: IdentityBody =
+        serde_json::from_slice(&held.body_bytes().expect("body")).expect("identity body");
+    body.inbox.url = "https://elsewhere.example".into();
+    let key = IdentityKey::from_secret(hex32(&alice(&vectors("keys.json"))["secret_hex"]));
+    let elsewhere = IdentityDoc::sign(&key, body)
+        .expect("sign")
+        .signed()
+        .clone();
+    let mut db = conn(&replay).await;
+    sqlx::query("UPDATE accounts SET identity_doc = $2 WHERE id = $1")
+        .bind(alice_id())
+        .bind(serde_json::to_vec(&elsewhere).expect("json"))
+        .execute(&mut db)
+        .await
+        .expect("held");
+    db.close().await.expect("close");
+    request(&replay, AT).await;
+    assert_eq!(retained(&replay).await, (None, None));
+    assert_eq!(kept(&replay).await, before);
+    replay.db.drop_database().await.expect("drop");
+}
