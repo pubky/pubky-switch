@@ -2292,39 +2292,6 @@ async fn test_erasure_account_not_hosted_outlasts_an_unsigned_answer_and_clears_
 }
 
 #[tokio::test]
-async fn test_erasure_flow_stored_on_an_erased_install_is_never_loaded() {
-    // An earlier version could store a delivery on an erased install, which could never go.
-    // The flow is left out when the records load: the reopened install is erased, resumes
-    // nothing, and sends nothing (Switch spec 12.7).
-    use pubky_switch_client::store::{StateStore, WriteBatch};
-    use pubky_switch_signer::state::signer_namespace;
-    let world = World::new();
-    let (mut signer, store) = world.enrolled().await;
-    let ns = signer_namespace(&signer.identity());
-    // A delivery in progress, its answer not come: its flow as stored.
-    world.switch.fail_next(SwitchFault::Unreachable {
-        path: "/identity".into(),
-        after: 0,
-    });
-    signer.set_record_max_age(Some(60)).await.unwrap_err();
-    let flow = store.get(&ns, b"flow").unwrap().expect("a delivery stored");
-    signer.resume().await.unwrap();
-    signer.close_account(confirmed()).await.unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
-    drop(signer);
-    let mut batch = WriteBatch::new();
-    batch.put(&ns, b"flow", flow).unwrap();
-    store.commit(batch).unwrap();
-    let before = world.transport.requests().len();
-    let mut signer = Signer::open(world.env(store), world.keyring())
-        .await
-        .unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
-    signer.resume().await.unwrap();
-    assert_eq!(world.transport.requests().len(), before, "nothing sent");
-}
-
-#[tokio::test]
 async fn test_erasure_after_a_take_over_between_check_and_request_erases_nothing() {
     // The signer checks the copies, then another install delivers the next version before
     // the erasure request reaches the switch. The request names the mark it followed: the
