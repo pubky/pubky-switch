@@ -4413,8 +4413,10 @@ async fn test_provider_loss_in_place_taken_then_elsewhere_then_back_after_a_fail
 
 #[tokio::test]
 async fn test_provider_loss_in_place_taken_then_back_reads_a_refusal_under_the_remembered_key() {
-    // The service that took the first version refuses the new one with `400`, under the
-    // key the first declaration's enrollment answered, which signs its answers now.
+    // The service that took the first version refuses the new one under the key the first
+    // declaration's enrollment answered, which signs its answers now. The service answers
+    // `409`, `stale_identity` or `conflict`, as the scripted switch does; a `400` there is
+    // read under that key the same, whatever the refusal.
     let mut pending = SERVICE_SECRET;
     pending[0] ^= 0xa5;
     pending[31] = pending[31].wrapping_add(1);
@@ -4424,4 +4426,84 @@ async fn test_provider_loss_in_place_taken_then_back_reads_a_refusal_under_the_r
         secret: pending,
     }))
     .await;
+}
+
+#[tokio::test]
+async fn test_provider_loss_failed_delivery_reads_once_under_each_key() {
+    // Taken in place with its answer lost, declared elsewhere, declared back: the first read
+    // and then the read under the remembered key fail too. That run sends the version once
+    // and reads three times (the first read, the version's key, the remembered key), and
+    // stays recovering; the next healthy run finds the version taken, with as many requests.
+    let world = World::new();
+    let (signer, store) = world.enrolled().await;
+    let lost = signer.identity_doc().unwrap().unwrap();
+    drop(signer);
+    let other =
+        ScriptedSwitch::unenrolled_at(&world.key, [0x5f; 32], Arc::clone(&world.clock), NEW_ORIGIN);
+    let router = Arc::new(Router::new());
+    router.add_switch(SWITCH_ORIGIN, &world.switch);
+    router.add_switch(NEW_ORIGIN, &other);
+    let mut env = world.env(store);
+    env.transport = router.clone();
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    world.switch.fail_next(Fault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    signer
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    other.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    // The first read, then (after the version's key's read, which doesn't verify) the read
+    // under the remembered key.
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/apps".into(),
+        after: 0,
+    });
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/apps".into(),
+        after: 1,
+    });
+    let count = |method: &str, suffix: &str| {
+        router
+            .log()
+            .iter()
+            .filter(|line| line.starts_with(method) && line.ends_with(suffix))
+            .count()
+    };
+    let (reads, sends) = (count("GET", "/apps"), count("PUT", "/identity"));
+    let error = signer
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let failed = (
+        count("PUT", "/identity") - sends,
+        count("GET", "/apps") - reads,
+    );
+    assert_eq!(
+        signer.status(),
+        SignerStatus::Recovering {
+            origin: SWITCH_ORIGIN.into()
+        },
+        "{error:?}"
+    );
+    let (reads, sends) = (count("GET", "/apps"), count("PUT", "/identity"));
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Signing);
+    assert_eq!(world.switch.generation(), lost.generation() + 1);
+    let healthy = (
+        count("PUT", "/identity") - sends,
+        count("GET", "/apps") - reads,
+    );
+    // Each run: one send, then the reads. The failed run's are the first read, the
+    // version's key's and the remembered key's; the healthy run's the version's key's, the
+    // remembered key's and the publication's own.
+    assert_eq!((failed, healthy), ((1, 3), (1, 3)));
 }

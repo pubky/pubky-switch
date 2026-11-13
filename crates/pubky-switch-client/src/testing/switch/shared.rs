@@ -111,6 +111,8 @@ pub(crate) struct Shared {
     pub(crate) alternate_next: Option<([u8; 32], [u8; 32])>,
     /// Listing pages answered.
     pub(crate) listings: u64,
+    /// The service time of the last minute's sweep (Switch wire 9.1); none yet.
+    pub(crate) swept_at: Option<u64>,
 }
 
 #[cfg(test)]
@@ -171,6 +173,13 @@ impl ConditionState for Before<'_> {
             .records
             .get(key)
             .map_or(RecordVersion::NONE, |held| held.state.version)
+    }
+
+    fn record_deleted(&self, key: &[u8; 32]) -> bool {
+        self.shared
+            .records
+            .get(key)
+            .is_some_and(|held| held.state.deleted)
     }
 
     fn may_read_record(&self, key: &[u8; 32]) -> bool {
@@ -681,8 +690,6 @@ impl Inner {
         Some(match (request.method.as_str(), route) {
             // A scripted answer, for a faulty service, takes precedence.
             ("GET", "allow") if self.allow.is_none() => self.allow_list(),
-            // Own apps only, each with its permission, as at the service
-            // (`crates/pubky-switch/src/service/connect.rs`).
             // Apps of another identity ask to connect (`inbox.rs`); the account's own apps
             // and its signer don't.
             ("POST", "connect") => bad(
@@ -690,6 +697,8 @@ impl Inner {
                 "7.4.7: apps of another identity ask to connect",
                 json!(null),
             ),
+            // Own apps only, each with its permission, as at the service
+            // (`crates/pubky-switch/src/service/connect.rs`).
             ("GET", "connect") => {
                 if !self.caller_holds(caller, Permission::ListsRead) {
                     return Some(bad(

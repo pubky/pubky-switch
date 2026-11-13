@@ -95,6 +95,13 @@ const _: () = assert!(LISTED_RECORD_ROOM_BYTES < crate::store::MAX_BATCH_BYTES);
 /// How many times a write is built again after a conflict before the call gives up.
 const UPDATE_TRIES: usize = 4;
 
+/// Whether the signed operation `op` is a `record.put` that deletes its record.
+fn writes_a_delete(op: &SignedDoc) -> bool {
+    SignedOp::peek(op).is_ok_and(|op| {
+        matches!(&op.body().kind, OpKind::RecordPut(put) if put.value_sealed.looks_like_delete())
+    })
+}
+
 /// What became of an owed listing of the collections at a read
 /// ([`App::list_collections_if_due`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -573,6 +580,10 @@ pub(crate) struct HeldRecord {
     /// The switch's current write, which the app refused: its version.
     #[serde(with = "opt_version_serde")]
     follow: Option<RecordVersion>,
+    /// Whether that refused write is a delete: the next write then builds on `{0, 0}`, as
+    /// on a delete the app holds (Switch wire 6.2), since the service may forget the key.
+    #[serde(default)]
+    follow_deleted: bool,
 }
 
 impl std::fmt::Debug for HeldRecord {
@@ -586,6 +597,20 @@ impl HeldRecord {
     /// app refused it.
     pub(crate) fn base_version(&self) -> RecordVersion {
         self.follow.unwrap_or(self.version)
+    }
+
+    /// The version the next write names, and a condition on the record: the base
+    /// ([`HeldRecord::base_version`]), or `{0, 0}` when that base is a delete, held or
+    /// followed. `{0, 0}` matches a record that is absent, forgotten or deleted (Switch wire
+    /// 6.2, 6.3), so it stays right once the service forgets the key (Switch spec 10.3); the
+    /// delete's own version would be `409 conflict` for good then.
+    pub(crate) fn write_base(&self) -> RecordVersion {
+        match self.follow {
+            Some(_) if self.follow_deleted => RecordVersion::NONE,
+            Some(version) => version,
+            None if self.content == RecordContent::Deleted => RecordVersion::NONE,
+            None => self.version,
+        }
     }
 
     fn write_version(&self) -> WriteVersion {
@@ -1416,7 +1441,8 @@ impl App {
                 return Err(self.raise(Alarm::Rollback { reason }).await);
             }
             Err(Refused::Invalid { writer, reason }) => {
-                self.flag_write(&shown_key, version, writer, reason, tx)
+                let deleted = writes_a_delete(evidence.op);
+                self.flag_write(&shown_key, version, writer, reason, deleted, tx)
                     .await?;
             }
             Err(Refused::DoesNotOpen { writer, reason }) => {
@@ -1429,7 +1455,8 @@ impl App {
                     held.content = RecordContent::Unreadable(Unopened::DoesNotOpen);
                     tx.put(&record_key_of(&shown_key), &held)?;
                 }
-                self.flag_write(&shown_key, version, writer, reason, tx)
+                let deleted = writes_a_delete(evidence.op);
+                self.flag_write(&shown_key, version, writer, reason, deleted, tx)
                     .await?;
             }
             Err(Refused::Ignored | Refused::Unheld(_)) => {}
@@ -1445,6 +1472,7 @@ impl App {
         version: RecordVersion,
         writer: [u8; 16],
         reason: String,
+        deleted: bool,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let reason = cut_reason(reason);
@@ -1459,6 +1487,7 @@ impl App {
             && version > held.base_version()
         {
             held.follow = Some(version);
+            held.follow_deleted = deleted;
             tx.put(&record_key_of(key), &held)?;
         }
         self.events.push(AppEvent::WriteFlagged {
@@ -1968,7 +1997,8 @@ impl App {
             )
         {
             let version = accepted.version.version;
-            self.flag_write(&key, version, accepted.writer, reason, tx)
+            let deleted = accepted.content == RecordContent::Deleted;
+            self.flag_write(&key, version, accepted.writer, reason, deleted, tx)
                 .await?;
             return Ok(Taken::Flagged);
         }
@@ -2019,7 +2049,11 @@ impl App {
             item_hash: accepted.item_hash,
             content: accepted.content,
             doubtful: accepted.doubtful,
-            follow: held.and_then(|held| held.follow).filter(|_| reopened),
+            follow: held
+                .as_ref()
+                .and_then(|held| held.follow)
+                .filter(|_| reopened),
+            follow_deleted: held.as_ref().is_some_and(|held| held.follow_deleted) && reopened,
         };
         tx.put(&record_key_of(&key), &record)?;
         self.events.push(AppEvent::RecordChanged { key });
@@ -2373,12 +2407,7 @@ pub(crate) fn record_put(
         &key,
         value.unwrap_or_default(),
     )?;
-    let base = match held {
-        Some(held) if held.follow.is_some() || held.content != RecordContent::Deleted => {
-            held.base_version()
-        }
-        _ => RecordVersion::NONE,
-    };
+    let base = held.map_or(RecordVersion::NONE, HeldRecord::write_base);
     let id_inputs = base.is_none().then(|| IdInputs {
         collection: target.collection.name.clone(),
         blinded_key: state.naming.blind(&target.natural_key),

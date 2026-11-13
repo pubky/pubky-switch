@@ -1351,6 +1351,63 @@ async fn test_store_upgrade_keeps_owed_keys_as_erasures() {
     db.drop_database().await.expect("drop");
 }
 
+#[tokio::test]
+async fn test_store_upgrade_applies_0021_after_later_migrations() {
+    // A database made by a service that already ran 0022 and 0025, but not 0021: the
+    // upgrade applies 0021 then, with its column and both indexes.
+    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
+    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
+        Ok(db) => db,
+        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
+        Err(error) => panic!("test database: {error}"),
+    };
+    let mut conn = PgConnection::connect_with(db.options())
+        .await
+        .expect("conn");
+    let without_0021 = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATIONS
+                .iter()
+                .filter(|m| m.version != 21)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    without_0021
+        .run(&mut conn)
+        .await
+        .expect("every migration but 0021");
+    let applied = |version: i64| {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = $1 AND success)",
+        )
+        .bind(version)
+    };
+    assert!(applied(25).fetch_one(&mut conn).await.expect("0025"));
+    assert!(!applied(21).fetch_one(&mut conn).await.expect("0021"));
+    let announced =
+        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
+    db.store().migrate(&announced).await.expect("upgrade");
+    assert!(applied(21).fetch_one(&mut conn).await.expect("0021"));
+    let indexes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes \
+         WHERE indexname IN ('shared_records_deleted', 'batches_with_proofs')",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("indexes");
+    assert_eq!(indexes, 2);
+    sqlx::query("SELECT swept_at_ms FROM accounts LIMIT 0")
+        .execute(&mut conn)
+        .await
+        .expect("the column");
+    conn.close().await.expect("close");
+    db.drop_database().await.expect("drop");
+}
+
 /// A record taken from a recovery upload after a provider loss, at `version` of generation 1,
 /// listed by the `upload` transition at `seq`.
 fn uploaded_record(key: [u8; 32], version: u64, seq: u64) -> pubky_switch::store::StoredRecord {
@@ -1605,4 +1662,176 @@ async fn test_store_kept_proof_generations_leave_out_uploaded_records() {
         vec![1]
     );
     drop(txn);
+}
+
+#[tokio::test]
+async fn test_store_sweeps_take_at_most_their_bound_and_the_rest_later() {
+    // Each sweep takes at most the bound it is given, the oldest first, and leaves the rest
+    // for a later run: a run stopped after any of them leaves only rows a later one takes
+    // (Switch wire 9.1).
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let mut conn = PgConnection::connect_with(fx.db.options())
+        .await
+        .expect("conn");
+    for i in 1u8..=3 {
+        sqlx::query(
+            "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
+             generation, version, deleted, value_bytes, writer, cert, op, proof) \
+             VALUES ($1, $2, $3, 'pay', '{pay}', 1, $4, true, 0, $5, '\\x', '\\x', '\\x')",
+        )
+        .bind(ID_A)
+        .bind([i; 32].as_slice())
+        .bind([9u8; 32].as_slice())
+        .bind(i64::from(10 - i))
+        .bind([5u8; 16].as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("record");
+        sqlx::query(
+            "INSERT INTO batches (account_id, batch_id, ops_hash, proofs, at_ms, generation, \
+             first_seq, last_seq) VALUES ($1, $2, $3, '\\x5b5d', $4, 1, $5, $5)",
+        )
+        .bind(ID_A)
+        .bind([i; 16].as_slice())
+        .bind([i; 32].as_slice())
+        .bind(i64::try_from(T0).expect("t0") + i64::from(i))
+        .bind(i64::from(i))
+        .execute(&mut conn)
+        .await
+        .expect("batch");
+        sqlx::query(
+            "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
+             expires_at_ms, context) VALUES ($1, $2, 1, 0, $3, $4, 'null')",
+        )
+        .bind(ID_A)
+        .bind([i; 32].as_slice())
+        .bind([5u8; 16].as_slice())
+        .bind(i64::try_from(T0).expect("t0") + i64::from(i))
+        .execute(&mut conn)
+        .await
+        .expect("invite");
+    }
+    let later = T0 + 1_000;
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    // No cursor waited for: every delete may go.
+    assert_eq!(txn.forget_deleted_keys(None, 2).await.expect("forget"), 2);
+    assert_eq!(
+        txn.drop_expired_batch_proofs(later, 0, 2)
+            .await
+            .expect("proofs"),
+        2
+    );
+    assert_eq!(
+        txn.drop_spent_invite_codes(later, 2).await.expect("codes"),
+        2
+    );
+    txn.commit().await.expect("commit");
+    // The oldest went: the delete at the lowest version, the earliest batch and code.
+    let mut left: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT key FROM shared_records WHERE account_id = $1 \
+         UNION ALL SELECT batch_id FROM batches WHERE account_id = $1 AND proofs IS NOT NULL \
+         UNION ALL SELECT code_hash FROM invite_codes WHERE account_id = $1",
+    )
+    .bind(ID_A)
+    .fetch_all(&mut conn)
+    .await
+    .expect("left");
+    left.sort();
+    assert_eq!(
+        left,
+        vec![vec![1u8; 32], vec![3u8; 16], vec![3u8; 32]],
+        "the newest of each"
+    );
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    // Only up to the lowest cursor waited for: the last delete is past it.
+    let through = pubky_switch_core::ops::Position {
+        generation: 1,
+        seq: 8,
+    };
+    assert_eq!(
+        txn.forget_deleted_keys(Some(through), 2)
+            .await
+            .expect("forget"),
+        0
+    );
+    assert_eq!(txn.forget_deleted_keys(None, 2).await.expect("forget"), 1);
+    assert_eq!(
+        txn.drop_expired_batch_proofs(later, 0, 2)
+            .await
+            .expect("proofs"),
+        1
+    );
+    assert_eq!(
+        txn.drop_spent_invite_codes(later, 2).await.expect("codes"),
+        1
+    );
+    assert_eq!(txn.forget_deleted_keys(None, 2).await.expect("forget"), 0);
+    txn.commit().await.expect("commit");
+    conn.close().await.expect("close");
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn test_store_forget_compares_whole_positions() {
+    // The lowest cursor waited for is a position, generation first: a delete of an earlier
+    // generation is before it whatever its seq, one later in the same generation isn't
+    // (Switch spec 10.3).
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let mut conn = PgConnection::connect_with(fx.db.options())
+        .await
+        .expect("conn");
+    for (key, generation, version) in [(1u8, 0i64, 100i64), (2, 1, 11)] {
+        sqlx::query(
+            "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
+             generation, version, deleted, value_bytes, writer, cert, op, proof) \
+             VALUES ($1, $2, $3, 'pay', '{pay}', $4, $5, true, 0, $6, '\\x', '\\x', '\\x')",
+        )
+        .bind(ID_A)
+        .bind([key; 32].as_slice())
+        .bind([9u8; 32].as_slice())
+        .bind(generation)
+        .bind(version)
+        .bind([5u8; 16].as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("record");
+    }
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    let through = pubky_switch_core::ops::Position {
+        generation: 1,
+        seq: 10,
+    };
+    assert_eq!(
+        txn.forget_deleted_keys(Some(through), 8)
+            .await
+            .expect("forget"),
+        1
+    );
+    txn.commit().await.expect("commit");
+    let left: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT key FROM shared_records WHERE account_id = $1")
+            .bind(ID_A)
+            .fetch_all(&mut conn)
+            .await
+            .expect("left");
+    assert_eq!(left, vec![vec![2u8; 32]]);
+    conn.close().await.expect("close");
+    fx.finish().await;
 }

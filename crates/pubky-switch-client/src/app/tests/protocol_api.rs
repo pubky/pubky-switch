@@ -67,6 +67,8 @@ struct Seen {
     context: Option<Value>,
     /// What the context knew of the sender's standing in the lists.
     disposition: Option<SenderDisposition>,
+    /// The condition the context named on `inbox`, in the record modes.
+    condition: Option<Condition>,
 }
 
 /// [`ItemsProtocol`], with a receive step that uses the [`ReceiveContext`].
@@ -149,6 +151,7 @@ impl Protocol for ApiProtocol {
             writes: Vec::new(),
             context: message.context.clone(),
             disposition: cx.sender_disposition(&message.sender).ok(),
+            condition: None,
         };
         {
             let mut reject = self.reject.lock().unwrap();
@@ -165,6 +168,8 @@ impl Protocol for ApiProtocol {
             Mode::Record | Mode::RecordTwice | Mode::DropAfterWrite => {
                 let held = cx.record(&inbox()).unwrap();
                 seen.held = held.as_ref().map(|r| r.version);
+                let key = cx.record_key(&inbox()).unwrap();
+                seen.condition = Some(cx.record_condition(&key).unwrap());
                 let mut all = ids(held.as_ref().and_then(|r| r.content.value()));
                 if !all.contains(&msg_id) {
                     // A record that reflects the message already needs no write (Switch
@@ -325,6 +330,38 @@ async fn test_receive_context_writes_the_record_with_the_cursor_move() {
     assert!(app.protocol_get(local.as_bytes()).await.unwrap().is_some());
     // The message seen again writes nothing more.
     assert!(protocol.seen()[0].held.is_none());
+}
+
+#[tokio::test]
+async fn test_receive_context_condition_names_zero_for_a_held_delete() {
+    // The receive step's condition on a record: `{0, 0}` for one the app holds nothing of
+    // and for one it holds as deleted, which `{0, 0}` matches as it matches a forgotten key
+    // (Switch wire 6.3, spec 10.3); the held version for a live one.
+    let w = World::new();
+    let protocol = ApiProtocol::new(Mode::Record);
+    let mut app = join(&w, &protocol, "wallet").await;
+    let key = app.record_key(&inbox()).unwrap();
+    let zero = Condition::RecordVersion {
+        key,
+        version: RecordVersion::NONE,
+    };
+    w.note(app.app_id(), "one");
+    app.receive(None).await.unwrap();
+    let live = app.shared_record(&key).await.unwrap().unwrap().version;
+    w.note(app.app_id(), "two");
+    app.receive(None).await.unwrap();
+    app.delete_record(&inbox(), vec![]).await.unwrap();
+    w.note(app.app_id(), "three");
+    app.receive(None).await.unwrap();
+    let seen = protocol.seen();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert_eq!(seen[0].condition, Some(zero), "absent");
+    assert_eq!(
+        seen[1].condition,
+        Some(Condition::RecordVersion { key, version: live }),
+        "live"
+    );
+    assert_eq!(seen[2].condition, Some(zero), "held as deleted");
 }
 
 #[tokio::test]
@@ -3378,4 +3415,65 @@ async fn test_backup_outbox_deadline_starts_at_the_verified_service_time() {
         .replay_until_ms()
         .unwrap();
     assert_eq!(deadline, START + SENT_RETENTION_MS - CLOCK_TOLERANCE_MS);
+}
+
+#[tokio::test]
+async fn test_scripted_invite_codes_spent_or_expired_go_at_the_minutes_sweep() {
+    // As at the service (Switch wire 9.1): once a minute of the switch's clock, at a
+    // request, the codes that expired or ran out go; a live one stays, and a spent one
+    // stays until the next sweep.
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let spent = shop
+        .register_invite_code(START + DAY_MS, 1, json!({ "order": "o-1" }))
+        .await
+        .unwrap();
+    let expiring = shop
+        .register_invite_code(START + 10 * MINUTE, 1, Value::Null)
+        .await
+        .unwrap();
+    let live = shop
+        .register_invite_code(START + DAY_MS, 2, Value::Null)
+        .await
+        .unwrap();
+    let mut first = Pair::note(&p.bob, "order");
+    first.invite_code = Some(spent.code.clone());
+    let (_, delivery) = wallet.send(first).await.unwrap();
+    assert!(
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    shop.receive(None).await.unwrap();
+    assert_eq!(p.bob.switch().invite_uses_left(&spent.code), Some(0));
+    // A code expiring at the very time of the sweep is expired then, as at the service.
+    let at_the_sweep = shop
+        .register_invite_code(p.clock.now_ms() + 11 * MINUTE, 1, Value::Null)
+        .await
+        .unwrap();
+    p.clock.advance_ms(11 * MINUTE);
+    shop.receive(None).await.unwrap();
+    let left = |code: &str| p.bob.switch().invite_uses_left(code);
+    assert_eq!(left(&spent.code), None);
+    assert_eq!(left(&expiring.code), None);
+    assert_eq!(left(&at_the_sweep.code), None);
+    assert_eq!(left(&live.code), Some(2));
+}
+
+#[tokio::test]
+async fn test_scripted_invite_codes_sweep_with_the_clock_behind_its_mark() {
+    // A minute's mark ahead of the switch's clock, left before the clock stepped back, is
+    // due at once, as at the service: an expired code goes at the next request.
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let code = shop
+        .register_invite_code(START + MINUTE, 1, Value::Null)
+        .await
+        .unwrap();
+    p.bob.switch().lock().shared.swept_at = Some(START + DAY_MS);
+    p.clock.advance_ms(2 * MINUTE);
+    shop.receive(None).await.unwrap();
+    assert_eq!(p.bob.switch().invite_uses_left(&code.code), None);
 }
