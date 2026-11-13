@@ -477,3 +477,65 @@ async fn test_retention_a_single_device_app_behind_dropped_stubs_still_raises_a_
         b.alarm()
     );
 }
+
+/// As [`device_left_behind`], with `b` more than 30 days behind but holding a mark: its
+/// own write 31 days on, whose stub `a`'s cursor then passes and the switch drops behind a
+/// checkpoint. The seq of that write.
+async fn device_with_a_held_mark(multi_device: bool) -> (World, App, App, u64) {
+    let w = World::new();
+    w.switch.set_retention(retention(3));
+    let mut a = writer(&w, "wallet").await;
+    a.set_multi_device(true).await.unwrap();
+    read_a_note(&w, &mut [&mut a]).await;
+    let backup = a.backup().await.unwrap();
+    let mut b = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    b.end_reconcile(crate::app::UserConfirmed::new())
+        .await
+        .unwrap();
+    b.set_multi_device(multi_device).await.unwrap();
+    read_a_note(&w, &mut [&mut b]).await;
+    b.receive(None).await.unwrap();
+    w.clock.advance_ms(31 * DAY);
+    write(&mut b, 1).await;
+    let held = w.switch.lock().tip.seq;
+    write(&mut a, 5).await;
+    read_a_note(&w, &mut [&mut a]).await;
+    write(&mut a, 1).await;
+    let (checkpoint, dropped) = w.switch.retained();
+    assert!(
+        checkpoint.is_some() && dropped >= held,
+        "the held mark's stub dropped"
+    );
+    (w, a, b, held)
+}
+
+#[tokio::test]
+async fn test_retention_a_device_holding_a_mark_behind_its_shared_cursor_reconciles() {
+    // Its own write's stub is gone, but another device moved the shared cursor past it:
+    // no evidence, so the device continues from the checkpoint in reconcile mode (Switch
+    // wire 7.4.4).
+    let (_w, _a, mut b, _) = device_with_a_held_mark(true).await;
+    b.receive(None).await.unwrap();
+    assert_eq!(b.alarm(), None);
+    assert!(b.reconcile_mode());
+}
+
+#[tokio::test]
+async fn test_retention_a_single_device_app_holding_a_mark_raises_a_rollback() {
+    // On one device the cursor is its own, so the stub of its recent write stays behind
+    // the cursor: its absence is a rollback (Switch wire 7.4.4).
+    let (_w, _a, mut b, _) = device_with_a_held_mark(false).await;
+    assert!(b.receive(None).await.is_err());
+    assert!(
+        matches!(b.alarm(), Some(crate::app::Alarm::Rollback { .. })),
+        "{:?}",
+        b.alarm()
+    );
+}

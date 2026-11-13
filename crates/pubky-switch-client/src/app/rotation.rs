@@ -604,6 +604,17 @@ impl App {
     /// and then calls [`App::end_reconcile`], and until then the app makes no new attempt,
     /// a payment's included ([`App::may_attempt`]).
     ///
+    /// What that gives up: a dishonest switch can drop or hide the recent chain between a
+    /// device's position and a checkpoint it signs, and the device only reconciles. What is
+    /// left is a rollback all the same: a page's head behind the newest head seen, a
+    /// checkpoint behind one accepted, a checkpoint that doesn't match the chain hash the
+    /// device verified there, and stubs after the checkpoint that don't extend it.
+    ///
+    /// Set it on every device of the app. [`App::take_device_keys`] sets it on the device
+    /// that takes the keys; the device that gave them ([`App::device_keys`]) stays
+    /// single-device until its host sets it, and raises the rollback alarm if it falls
+    /// behind its app's cursor across a checkpoint.
+    ///
     /// # Errors
     ///
     /// A store failure.

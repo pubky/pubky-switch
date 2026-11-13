@@ -18,9 +18,10 @@
 //!
 //! Nothing is signed or dropped with `chain_retention` off, for a staged account, which
 //! doesn't serve the chain, or one whose state is behind its key's mark, which signs no
-//! checkpoint (spec 6.5), or when the mark can't be read: keeping a stub is always safe. Freezes aren't served, so there is no
-//! frozen account to stop at; the check comes with the cooperative move (spec 12.5). Each
-//! write is in the request's transaction, so a failure rolls the whole step back.
+//! checkpoint (spec 6.5), or when the mark can't be read: keeping a stub is always safe.
+//! Freezes aren't served, so there is no frozen account to stop at; the check comes with
+//! the cooperative move (spec 12.5). Each write is in the request's transaction, so a
+//! failure rolls the whole step back.
 //!
 //! Each run reads the oldest kept stub first and stops there when it can't go, so a request
 //! with nothing to drop reads one stub, not `retention_per_request`; it still reads the held
