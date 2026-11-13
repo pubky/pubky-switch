@@ -870,7 +870,8 @@ mod tests {
             "/pub/",
             "/pub/pubky-switch/",
             "/pub/pubky-switch/v1/identity.json",
-            "/pub/pubky-switch/v1/signer-backup.json",
+            "/priv/pubky-switch/v1/signer-backup.json",
+            "/priv/pubky-switch/",
             "/pub/pubky-switch/v1/apps/x.json",
             "/priv/pubky-switch/v1/apps/x/",
         ] {
