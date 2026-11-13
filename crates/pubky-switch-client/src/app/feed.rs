@@ -382,9 +382,13 @@ impl App {
     /// two items, never inside a batch's items; the next read goes on from where it got
     /// (`feed_at`). The time budget ([`super::AppConfig::call_budget_ms`], 20 s by default)
     /// bounds the steps that loop: the kept batches, the listing, the stored entries, the
-    /// feed and the rereads. Once it is spent each of them starts no further request after
-    /// its first, which it makes whatever the time, so no step waits for ever behind a slow
-    /// one. It doesn't bound the whole read:
+    /// feed and the rereads. Once it is spent each of them starts no further unit after its
+    /// first, a kept batch, a listing page, a stored entry, a page or a reread, which it
+    /// makes whatever the time with the requests that unit needs (a kept batch's time
+    /// sample, its send again after `409 stale_generation`, and its attempts' checks, the
+    /// claim reads and, for a proof of another state, the `failed` write; a stored entry's
+    /// own requests, as a feed item's), so no step waits for ever behind a slow one. It doesn't
+    /// bound the whole read:
     /// - an item processed after it still makes its own requests, its sender's
     ///   `identity.json` and its effect's batch;
     /// - the read's other steps take no budget and make their requests whatever the time,
@@ -395,13 +399,14 @@ impl App {
     /// - a move or provider change met during the read is followed, which the budget doesn't
     ///   bound either, and the read then goes on once more under the same budget.
     ///
-    /// So a read ends after its budget, one request of each looping step and the requests
-    /// of the item it stopped on and of those other steps, each request within its timeout.
-    /// Once the budget is spent, the rest of a page already downloaded is dropped, past the
-    /// one item or batch processed, and the next read downloads that page again.
+    /// So a read ends after its budget, the first unit of each looping step and the
+    /// requests of the item it stopped on and of those other steps, each request within its
+    /// timeout. Once the budget is spent, the rest of a page already downloaded is dropped,
+    /// past the items processed, and the next read downloads that page again.
     ///
-    /// **Order.** The kept batches go before the feed, oldest first, and no later write of
-    /// the host overtakes them ([`App::submit_batch`]). The read's own writes aren't kept
+    /// **Order.** The kept batches go before the feed, oldest first, and no later write
+    /// through [`App::submit_batch`], [`App::write_claim`], the record writes or the
+    /// admission writes overtakes them. The read's own writes aren't kept
     /// batches: the effects of the messages it processes, its cursor moves and a rotation
     /// go as the read makes them, also when it left kept batches unsent, on its budget or
     /// because their resend failed. So a read's own write may reach the switch before a
@@ -468,7 +473,18 @@ impl App {
         result
     }
 
-    async fn receive_inner(
+    fn receive_inner<'a>(
+        &'a mut self,
+        wait: Option<u32>,
+        budget: &'a super::CallBudget,
+    ) -> crate::transport::BoxFuture<'a, Result<ReceiveReport, AppError>> {
+        // A read's large steps are boxed one by one, so that no poll frame holds the state
+        // of the step under it. In a debug build, the paths
+        // `test_receive_runs_on_a_one_mebibyte_stack` runs fit in a 1 MiB thread.
+        Box::pin(self.receive_inner_body(wait, budget))
+    }
+
+    async fn receive_inner_body(
         &mut self,
         wait: Option<u32>,
         budget: &super::CallBudget,
@@ -800,7 +816,18 @@ impl App {
 
     /// One page, read after `after`, with the lowest `seq` held so far in this read: how it
     /// ended, or `None` when the read stops on it.
-    async fn process_page(
+    fn process_page<'a>(
+        &'a mut self,
+        page: FeedPage,
+        after: u64,
+        blocked: &'a mut Option<u64>,
+        budget: Option<&'a super::CallBudget>,
+    ) -> crate::transport::BoxFuture<'a, Result<Option<PageEnd>, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.process_page_body(page, after, blocked, budget))
+    }
+
+    async fn process_page_body(
         &mut self,
         page: FeedPage,
         after: u64,
@@ -1032,7 +1059,20 @@ impl App {
     // ---------------------------------------------------------------------------------
     // Entries
 
-    async fn handle_entry(&mut self, item: &EntryItem, read: &mut Read) -> Result<Step, AppError> {
+    fn handle_entry<'a>(
+        &'a mut self,
+        item: &'a EntryItem,
+        read: &'a mut Read,
+    ) -> crate::transport::BoxFuture<'a, Result<Step, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.handle_entry_body(item, read))
+    }
+
+    async fn handle_entry_body(
+        &mut self,
+        item: &EntryItem,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
         let entry = Entry {
             seq: item.seq,
             generation: self.state.cursor.generation,
@@ -1070,7 +1110,18 @@ impl App {
     }
 
     /// Checks 2 to 9, then the protocol's check 10 and effect.
-    async fn check_and_apply(
+    fn check_and_apply<'a>(
+        &'a mut self,
+        entry: &'a Entry,
+        plaintext: MessagePlaintext,
+        parked: bool,
+        read: &'a mut Read,
+    ) -> crate::transport::BoxFuture<'a, Result<Step, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.check_and_apply_body(entry, plaintext, parked, read))
+    }
+
+    async fn check_and_apply_body(
         &mut self,
         entry: &Entry,
         plaintext: MessagePlaintext,
@@ -1243,7 +1294,18 @@ impl App {
     /// The protocol's check 10, then its effect, at most twice after a conflict: the records
     /// and claims the effect wrote are read again before the second try (Switch spec 8.2,
     /// 10.3).
-    async fn apply(
+    fn apply<'a>(
+        &'a mut self,
+        entry: &'a Entry,
+        received: Received,
+        parked: bool,
+        read: &'a mut Read,
+    ) -> crate::transport::BoxFuture<'a, Result<Step, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.apply_body(entry, received, parked, read))
+    }
+
+    async fn apply_body(
         &mut self,
         entry: &Entry,
         received: Received,
@@ -1600,7 +1662,20 @@ impl App {
 
     /// Sign the effect's batch with the cursor move, keep it with what the answer commits,
     /// then send it (Switch spec 8.2: the effect and the cursor in one batch).
-    async fn send_effect(
+    fn send_effect<'a>(
+        &'a mut self,
+        entry: &'a Entry,
+        received: &'a Received,
+        effect: Effect,
+        written: Written<'a>,
+        parked: bool,
+        read: &'a mut Read,
+    ) -> crate::transport::BoxFuture<'a, Result<Sent, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.send_effect_body(entry, received, effect, written, parked, read))
+    }
+
+    async fn send_effect_body(
         &mut self,
         entry: &Entry,
         received: &Received,
@@ -1688,7 +1763,17 @@ impl App {
     /// the same answer to any request; past the window in which a resend tells, its entry is
     /// stored as uncertain instead. One about these bytes will come again: the entry is
     /// stored as uncertain at once ([`App::effect_uncertain`]), and the read goes on.
-    async fn run_effect(
+    fn run_effect<'a>(
+        &'a mut self,
+        pending: PendingEffect,
+        batch: &'a Batch,
+        resent: bool,
+    ) -> crate::transport::BoxFuture<'a, Result<Sent, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.run_effect_body(pending, batch, resent))
+    }
+
+    async fn run_effect_body(
         &mut self,
         pending: PendingEffect,
         batch: &Batch,

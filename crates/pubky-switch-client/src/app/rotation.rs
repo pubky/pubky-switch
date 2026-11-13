@@ -595,6 +595,28 @@ impl App {
 
     /// Whether the app runs on several devices sharing its keys (Switch spec 3.1).
     ///
+    /// Its devices share its cursor at the switch, so another device may move it past stubs
+    /// that the switch then drops honestly behind a checkpoint. A multi-device app therefore
+    /// takes no rollback evidence from stubs missing between its position and a checkpoint:
+    /// not from a verified item under 30 days old, nor from a held head or own write
+    /// (Switch wire 7.4.4). A device behind such a checkpoint continues from it in reconcile
+    /// mode ([`App::reconcile_mode`]); its host reconciles its state with the other devices'
+    /// and then calls [`App::end_reconcile`], and until then the app makes no new attempt,
+    /// a payment's included ([`App::may_attempt`]).
+    ///
+    /// What that gives up: a dishonest switch can drop or hide the recent chain between a
+    /// device's position and a checkpoint it signs, and the device only reconciles. What is
+    /// left is a rollback all the same: a page's head behind the newest head seen, a
+    /// checkpoint behind one accepted, a checkpoint that doesn't match the chain hash the
+    /// device verified there, and stubs after the checkpoint that don't extend it.
+    ///
+    /// Set it on every device of the app. [`App::take_device_keys`] sets it on the device
+    /// that takes the keys; the device that gave them ([`App::device_keys`]) stays
+    /// single-device until its host sets it. Until then, if it falls behind its app's cursor
+    /// across a checkpoint without the stubs, it raises the rollback alarm while its verified
+    /// item is under 30 days old, or while it holds a head or own write between its position
+    /// and the checkpoint from an answer that recent; otherwise it reconciles.
+    ///
     /// # Errors
     ///
     /// A store failure.

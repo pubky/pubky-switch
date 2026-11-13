@@ -418,9 +418,14 @@ impl App {
     // Hooks of the read
 
     /// Run before a read: `Some` stops the read with that report.
-    pub(crate) async fn follow_provider_change(
+    pub(crate) fn follow_provider_change(
         &mut self,
-    ) -> Result<Option<ReceiveReport>, AppError> {
+    ) -> crate::transport::BoxFuture<'_, Result<Option<ReceiveReport>, AppError>> {
+        // Boxed, as `App::receive_inner` says.
+        Box::pin(self.follow_provider_change_body())
+    }
+
+    async fn follow_provider_change_body(&mut self) -> Result<Option<ReceiveReport>, AppError> {
         match self.provider_step().await? {
             ProviderStatus::AwaitingMove { .. } | ProviderStatus::Gone => Ok(Some(ReceiveReport {
                 stopped: true,
@@ -737,7 +742,18 @@ impl App {
     /// service than the freeze names, declared a loss, or moved on to a later generation:
     /// the move is given up at whichever step it stands, a stuck one included, and that
     /// change is followed instead (Switch spec 12.5 "Abort").
-    async fn run_move(&mut self, mut mv: MoveRecord) -> Result<Option<ProviderStatus>, AppError> {
+    fn run_move(
+        &mut self,
+        mv: MoveRecord,
+    ) -> crate::transport::BoxFuture<'_, Result<Option<ProviderStatus>, AppError>> {
+        // Boxed, as `App::receive_inner` says.
+        Box::pin(self.run_move_body(mv))
+    }
+
+    async fn run_move_body(
+        &mut self,
+        mut mv: MoveRecord,
+    ) -> Result<Option<ProviderStatus>, AppError> {
         let freeze = match &mv.freeze {
             None => None,
             Some(signed) => {
@@ -1416,7 +1432,15 @@ impl App {
     /// The checks once the app follows the next service (Switch spec 12.5 step 4): the old
     /// service's proofs again, the admission lists, and the push setting, which the next
     /// service doesn't hold.
-    async fn after_switch(&mut self, from_generation: u64) -> Result<(), AppError> {
+    fn after_switch(
+        &mut self,
+        from_generation: u64,
+    ) -> crate::transport::BoxFuture<'_, Result<(), AppError>> {
+        // Boxed, as `App::receive_inner` says.
+        Box::pin(self.after_switch_body(from_generation))
+    }
+
+    async fn after_switch_body(&mut self, from_generation: u64) -> Result<(), AppError> {
         let old_key = self
             .reader()
             .get::<GenerationRecord>(&keys::generation(from_generation))

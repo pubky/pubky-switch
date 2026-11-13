@@ -733,7 +733,8 @@ pub enum AppEvent {
         app_id: [u8; 16],
     },
     /// After a provider loss of a counterparty, the messages its old switch accepted since
-    /// the previous check were queued again for its new one (Switch spec 8.1).
+    /// the previous check were queued again for its new one (Switch spec 8.1), but none
+    /// whose delivery the app gave up ([`AppEvent::MessageUndelivered`]).
     ResendAfterLoss {
         /// The counterparty.
         identity: [u8; 32],

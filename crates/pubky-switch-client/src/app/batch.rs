@@ -323,8 +323,12 @@ impl App {
     /// builds the batch again ([`App::record_op`] seals at the epoch the app holds then).
     ///
     /// **Kept batches ahead, and the worst case.** A batch kept from an earlier call goes
-    /// before any later write, in the order the calls kept them, and no later write of the
-    /// host overtakes it; this is the client's rule, the switch orders only what reaches it.
+    /// before any later write, in the order the calls kept them, and no later write through
+    /// this call, [`App::write_claim`], the record writes or the admission writes overtakes
+    /// it; this is the client's rule, the switch orders only what reaches it. The one
+    /// exception is the best-effort `failed` write of an own attempt whose proof shows
+    /// another state ([`App::check_attempt`]): it goes at once, and its claim entry carries
+    /// a step condition, so it can't land on a state it doesn't fit.
     /// A write sends at most one of them again ([`KEPT_RESENDS_PER_WRITE`]) before its own.
     /// With more kept, its own batch is kept unsent behind them and the call fails with
     /// [`AppError::Kept`] around [`Refusal::KeptBatchesAhead`], which names the oldest and
@@ -916,7 +920,15 @@ impl App {
     ///
     /// At most [`KEPT_RESENDS_PER_READ`] kept batches go in one read, oldest first; the
     /// second value says more are kept, for the next read.
-    pub(crate) async fn resume_batches_before_feed(
+    pub(crate) fn resume_batches_before_feed<'a>(
+        &'a mut self,
+        budget: Option<&'a super::CallBudget>,
+    ) -> crate::transport::BoxFuture<'a, Result<(Option<AppEvent>, bool), AppError>> {
+        // Boxed, as `App::receive_inner` says.
+        Box::pin(self.resume_batches_before_feed_body(budget))
+    }
+
+    async fn resume_batches_before_feed_body(
         &mut self,
         budget: Option<&super::CallBudget>,
     ) -> Result<(Option<AppEvent>, bool), AppError> {
@@ -964,7 +976,17 @@ impl App {
     /// an answer, still kept under `id`. A refusal for good, other than one about the caller, which keeps it, drops
     /// it with what it carried and tells the protocol in that commit ([`AppEvent::BatchRefused`]);
     /// it was never applied.
-    async fn send_unsent(
+    fn send_unsent<'a>(
+        &'a mut self,
+        id: &'a [u8; 16],
+        pending: &'a PendingBatch,
+        batch: &'a Batch,
+    ) -> crate::transport::BoxFuture<'a, Result<(), AppError>> {
+        // Boxed, as `App::receive_inner` says.
+        Box::pin(self.send_unsent_body(id, pending, batch))
+    }
+
+    async fn send_unsent_body(
         &mut self,
         id: &[u8; 16],
         pending: &PendingBatch,
@@ -1071,7 +1093,18 @@ impl App {
     /// lookup stays kept ([`RefusalPlace`]). A batch's first send is stamped first, at a
     /// service time verified in this call, committed before the request leaves; a call
     /// that can't verify one leaves it kept and unsent.
-    async fn run_pending(
+    fn run_pending<'a>(
+        &'a mut self,
+        id: &'a [u8; 16],
+        pending: &'a PendingBatch,
+        batch: &'a Batch,
+        resent: bool,
+    ) -> crate::transport::BoxFuture<'a, Result<Submitted, AppError>> {
+        // Boxed, as `App::receive_inner` says.
+        Box::pin(self.run_pending_body(id, pending, batch, resent))
+    }
+
+    async fn run_pending_body(
         &mut self,
         id: &[u8; 16],
         pending: &PendingBatch,
@@ -1264,7 +1297,17 @@ impl App {
     /// tell: one kept longer than the service holds batch IDs is dropped instead, and
     /// reported with each `attempt` in it. Another refusal for good drops it; any other
     /// failure keeps it, and is the caller's error.
-    pub(crate) async fn resend_earlier(
+    pub(crate) fn resend_earlier<'a>(
+        &'a mut self,
+        id: &'a [u8; 16],
+        pending: &'a PendingBatch,
+        batch: &'a Batch,
+    ) -> crate::transport::BoxFuture<'a, Result<(), AppError>> {
+        // Boxed, as `App::receive_inner` says.
+        Box::pin(self.resend_earlier_body(id, pending, batch))
+    }
+
+    async fn resend_earlier_body(
         &mut self,
         id: &[u8; 16],
         pending: &PendingBatch,

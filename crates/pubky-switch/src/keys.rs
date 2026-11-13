@@ -309,6 +309,28 @@ pub fn sign_head(
     Ok(SignedHead::sign(signer, identity, tip))
 }
 
+/// Sign a checkpoint at `at`, a chain item at or before `head` in its generation, for
+/// `identity` (Switch spec 6.5, 8.3; wire 7.4.4): a head at an earlier `seq` of the chain the
+/// key serves, not a state behind its mark, so it is signed only while `head`, the account's
+/// state, is at or past `mark`. Like [`sign_head`], it doesn't move the mark. The caller
+/// gives `at`'s chain hash as it read it from the chain.
+pub fn sign_checkpoint(
+    signer: &ServiceSigner,
+    mark: Option<&Mark>,
+    identity: &[u8; 32],
+    head: &ChainTip,
+    at: &ChainTip,
+) -> Result<SignedHead, KeyStoreError> {
+    let check = check_mark(mark, &Mark::from(*head));
+    if !check.allows_signing() {
+        return Err(KeyStoreError::Refused(check));
+    }
+    if at.generation != head.generation || at.seq > head.seq {
+        return Err(KeyStoreError::Refused(MarkCheck::OtherGeneration));
+    }
+    Ok(SignedHead::sign(signer, identity, at))
+}
+
 /// A key store in files under one directory:
 ///
 /// - `keys/<id>`: the key's 32-byte secret seed, readable by the owner only;
@@ -980,6 +1002,54 @@ mod tests {
             Err(KeyStoreError::Refused(MarkCheck::OtherGeneration))
         ));
         assert_eq!(store.mark(&key.id).await.expect("mark"), Some(mark(5, 1)));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_sign_checkpoint_only_while_the_head_is_at_the_mark() {
+        // A checkpoint at an earlier `seq` of the chain the key serves is signed while the
+        // account's head is at or past the mark, and refused once the head is behind it, on
+        // a fork, or for a point past the head or of another generation (Switch spec 6.5).
+        let (_dir, store) = open();
+        let key = store.generate().await.expect("generate");
+        let signer = store.signer(&key.id).await.expect("signer");
+        let identity = [3u8; 32];
+        let tip = |seq: u64, hash: u8| ChainTip {
+            generation: 1,
+            seq,
+            chain_hash: [hash; 32],
+        };
+        let marked = mark(5, 1);
+        let checkpoint = sign_checkpoint(&signer, Some(&marked), &identity, &tip(5, 1), &tip(2, 7))
+            .expect("at the mark");
+        assert_eq!(
+            (checkpoint.generation, checkpoint.seq, checkpoint.chain_hash),
+            (1, 2, [7; 32])
+        );
+        checkpoint
+            .verify(&signer.public_key(), &identity)
+            .expect("signed");
+        sign_checkpoint(&signer, Some(&marked), &identity, &tip(6, 9), &tip(6, 9))
+            .expect("ahead, at the head");
+        sign_checkpoint(&signer, None, &identity, &tip(3, 1), &tip(2, 7)).expect("unmarked");
+        for (head, at, refused) in [
+            (tip(4, 1), tip(2, 7), MarkCheck::Behind),
+            (tip(5, 2), tip(2, 7), MarkCheck::Fork),
+        ] {
+            assert!(matches!(
+                sign_checkpoint(&signer, Some(&marked), &identity, &head, &at),
+                Err(KeyStoreError::Refused(check)) if check == refused
+            ));
+        }
+        let other = ChainTip {
+            generation: 2,
+            ..tip(2, 7)
+        };
+        for at in [tip(6, 7), other] {
+            assert!(matches!(
+                sign_checkpoint(&signer, Some(&marked), &identity, &tip(5, 1), &at),
+                Err(KeyStoreError::Refused(MarkCheck::OtherGeneration))
+            ));
+        }
     }
 
     #[tokio::test]

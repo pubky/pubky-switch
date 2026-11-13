@@ -23,6 +23,7 @@ const ACCOUNT_TABLES: &[(&str, &str)] = &[
     ("accounts", "id"),
     ("kept_app_ids", "account_id"),
     ("chain_items", "account_id"),
+    ("chain_retention", "account_id"),
     ("enrollment_answers", "account_id"),
     ("apps", "account_id"),
     ("receive_keys", "account_id"),

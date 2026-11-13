@@ -334,10 +334,10 @@ impl Service {
         .map_err(|e| store_error(&e))?;
         // A `notify` entry owes each handle of each target's registration a webhook, queued
         // with the entry and sent by the background worker, never during the append (Switch
-        // spec 9 step 4, Switch wire 8.2). Not without trusted time: a webhook needs it, and
-        // a row queued meanwhile would only go unsent once its minute had passed.
-        if header.notify && self.push_enabled && trusted {
-            txn.queue_pushes(&targets, time_ms)
+        // spec 9 step 4, Switch wire 8.2). Queued without trusted time too: it is sent once
+        // trusted time is back within the entry's minute, and goes unsent past it.
+        if header.notify && self.push_enabled {
+            txn.queue_pushes(&targets)
                 .await
                 .map_err(|e| store_error(&e))?;
         }

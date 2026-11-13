@@ -38,6 +38,7 @@ mod purge;
 mod push;
 mod records;
 mod recovery;
+mod retention;
 pub mod rules;
 mod sweeps;
 mod upload;
@@ -128,8 +129,11 @@ pub struct Service {
     push_enabled: bool,
     /// Resolves relay hosts for the address check (Switch wire 8.1, 8.2).
     resolver: Resolver,
-    /// How many webhooks one round of delivery sends at once (`push.concurrency`).
+    /// How many webhooks delivery sends at once (`push.concurrency`).
     push_concurrency: usize,
+    /// Turns to hold a registration while its webhook is signed, each on a connection of the
+    /// request pool: a quarter of the pool, at least one, so requests keep the rest.
+    push_holds: tokio::sync::Semaphore,
     /// Where webhooks connect in tests.
     #[cfg(any(test, feature = "test-util"))]
     relay_route: Option<webhooks::RelayRoute>,
@@ -283,6 +287,11 @@ impl Service {
     }
 
     /// A service at `origin`, the switch origin `identity.json` names.
+    ///
+    /// Push is on, as `push.enabled` defaults: a service that takes registrations must also
+    /// run [`Service::deliver_pushes_until`], as the binary does, or the webhooks its
+    /// `notify` entries queue are neither sent nor dropped. [`Service::with_push`] turns it
+    /// off.
     pub fn new(
         origin: String,
         store: Store,
@@ -291,6 +300,11 @@ impl Service {
         limits: Limits,
     ) -> Self {
         let failed_auth = FailedAuthentications::new(limits.auth_failures_per_source_per_min);
+        let push_holds = tokio::sync::Semaphore::new(
+            usize::try_from(store.max_connections() / 4)
+                .unwrap_or(1)
+                .max(1),
+        );
         Self {
             origin,
             store,
@@ -315,9 +329,10 @@ impl Service {
             erasure_sweeps: KeyedWindows::default(),
             changes: ChangeHub::new(),
             entry_ids: Arc::new(random_entry_id),
-            push_enabled: false,
+            push_enabled: crate::config::PushConfig::default().enabled,
             resolver: push::system_resolver(),
             push_concurrency: crate::config::PushConfig::default().concurrency,
+            push_holds,
             #[cfg(any(test, feature = "test-util"))]
             relay_route: None,
         }
@@ -899,9 +914,13 @@ impl Service {
         // is checked (Switch wire 7.5), and the sweeps of 9.1 run (`sweeps.rs`). It comes
         // before the endpoint, so a refusal doesn't undo it; an unauthenticated request, or
         // the public read, pays for none of it. A claim a request reads or writes goes when
-        // it is due, whatever the batch reached.
+        // it is due, whatever the batch reached. Chain stub retention comes last
+        // (`retention.rs`).
         if let (Some(base), Some(_)) = (due, caller)
-            && let Err(error) = self.step_four(&mut txn, base).await
+            && let Err(error) = match self.step_four(&mut txn, base).await {
+                Ok(()) => self.retain_chain(&mut txn, &signer, base).await,
+                failed => failed,
+            }
         {
             let _ = store_error(&error);
             let error = ApiError::unavailable("7.6: a temporary failure");

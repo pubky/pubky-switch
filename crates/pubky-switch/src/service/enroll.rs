@@ -26,7 +26,7 @@ use crate::{
     },
     keys::{KeyId, KeyStore, ServiceKey},
     limits::{Limits, fixed},
-    store::NewAccount,
+    store::{NewAccount, StoreError},
 };
 
 /// The limits an enrollment answer announces (Switch wire 3.7).
@@ -188,9 +188,10 @@ impl Service {
             let identity_doc = enrollment.identity_doc().map(|doc| doc.signed().clone());
             let revoked_apps = enrollment.revoked_apps().to_vec();
             // The key is made and the account created with it, or the key deleted when
-            // another enrollment made the account first, in a task of its own: a signer that
-            // hangs up between them leaves no key no account names. A creation whose result
-            // is lost may have committed, so its key stays.
+            // another enrollment made the account first or the database refused the
+            // creation, in a task of its own: a signer that hangs up between them leaves no
+            // key no account names. A creation whose result is lost may have committed, so
+            // its key stays.
             let made = to_the_end(async move {
                 let key = keys.generate().await.ok()?;
                 let account = NewAccount {
@@ -205,9 +206,11 @@ impl Service {
                     enrollment_hash,
                 };
                 let created = store.create_account(&account).await;
-                if matches!(created, Ok(false))
-                    && let Err(failure) = keys.delete(&key.id).await
-                {
+                let unnamed = match &created {
+                    Ok(created) => !created,
+                    Err(error) => error.is_refused(),
+                };
+                if unnamed && let Err(failure) = keys.delete(&key.id).await {
                     tracing::warn!(%failure, "dropping an unused service key");
                 }
                 Some((key, created))
@@ -331,10 +334,13 @@ impl Service {
         .await
         .map_err(|e| store_error(&e))?;
         // The commit runs to its end in a task of its own, and the pending key made here is
-        // kept once it is under way: a commit whose result is lost may have landed.
+        // kept once it is under way, unless the database refused the commit: one whose result
+        // is lost may have landed.
         to_the_end(async move {
             let committed = txn.commit().await;
-            if let Some(made) = made {
+            if let Some(made) = made
+                && !committed.as_ref().is_err_and(StoreError::is_refused)
+            {
                 made.keep();
             }
             committed

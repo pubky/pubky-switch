@@ -1878,9 +1878,9 @@ impl Inner {
     /// The retention sweep (Switch wire 7.4.4, 9.1): a checkpoint signed once enough chain
     /// items may go, and the stubs behind it dropped, oldest first. A stub may go once it is
     /// `cursor_hold_ms` old, or every current app (`current_app_ids`) has moved its cursor
-    /// past it; an app that hasn't moved its cursor yet holds the stubs from its
-    /// registration, here from the time the switch took its first record. It never cuts
-    /// inside a batch. Nothing goes while the account is frozen, staged or erased.
+    /// past it; a registered app that hasn't moved its cursor yet holds every stub, as at
+    /// the service, which keeps no registration `seq`, and one not registered holds none.
+    /// It never cuts inside a batch. Nothing goes while the account is frozen, staged or erased.
     fn sweep_chain(&mut self) {
         let Some(retention) = self.retention else {
             return;
@@ -1901,14 +1901,16 @@ impl Inner {
             .collect();
         let holds = |seq: u64, at: u64| {
             at.saturating_add(retention.cursor_hold_ms) > now
-                && holders.iter().any(|(cursor, joined)| {
-                    *cursor < seq && (*cursor > 0 || joined.is_some_and(|joined| at >= joined))
-                })
+                && holders
+                    .iter()
+                    .any(|(cursor, joined)| *cursor < seq && (*cursor > 0 || joined.is_some()))
         };
-        // The newest chain item that may go and ends a batch, or is of none.
+        // The newest chain item that may go and ends a batch, or is of none; the head never
+        // goes. The items that may go past the latest checkpoint are counted whether or not
+        // their batch ends in the look, as at the service.
+        let checkpointed = self.checkpoint.as_ref().map_or(0, |c| c.seq);
         let mut cut: Option<ChainTip> = None;
-        let mut may_go = 0;
-        let mut since_cut = 0;
+        let mut may_go = 0u64;
         let mut left_in_batch = 0;
         let mut looked = 0;
         for item in &self.items {
@@ -1919,7 +1921,7 @@ impl Inner {
                 continue;
             }
             looked += 1;
-            if looked > retention.per_request {
+            if looked > retention.per_request || *seq >= self.tip.seq {
                 break;
             }
             let Ok(envelope) = ChainEnvelope::parse(&stub.envelope) else {
@@ -1928,7 +1930,9 @@ impl Inner {
             if holds(*seq, envelope.server_time) {
                 break;
             }
-            since_cut += 1;
+            if *seq > checkpointed {
+                may_go += 1;
+            }
             let ends = match envelope.batch {
                 Some(batch) => {
                     if left_in_batch == 0 {
@@ -1940,8 +1944,6 @@ impl Inner {
                 None => true,
             };
             if ends {
-                may_go += since_cut;
-                since_cut = 0;
                 cut = Some(ChainTip {
                     generation: envelope.generation,
                     seq: *seq,
@@ -1949,7 +1951,6 @@ impl Inner {
                 });
             }
         }
-        let checkpointed = self.checkpoint.as_ref().map_or(0, |c| c.seq);
         if retention.at_head {
             let added = self
                 .items
@@ -1963,7 +1964,9 @@ impl Inner {
                     &self.tip,
                 ));
             }
-        } else if let Some(cut) = cut.filter(|_| may_go >= retention.checkpoint_behind) {
+        } else if let Some(cut) =
+            cut.filter(|cut| may_go >= retention.checkpoint_behind && cut.seq > checkpointed)
+        {
             self.checkpoint = Some(SignedHead::sign(
                 &self.service,
                 &self.identity.public(),
@@ -2817,6 +2820,28 @@ impl Inner {
                 json!({ "push_key": current.map(|k| b64(&k)) }),
             )
         };
+        // An entry sends at most 8 webhooks toward one relay host (8.2): the handles the
+        // other apps hold at this one count against them.
+        let host = |url: &str| {
+            pubky_switch_core::net::check_url(url, &pubky_switch_core::net::UrlUse::Relay)
+                .ok()
+                .map(|checked| checked.host)
+        };
+        let at_host = host(&body.relay_url);
+        let held_there: usize = self
+            .push
+            .iter()
+            .filter(|(id, other)| {
+                **id != app && at_host.is_some() && host(&other.relay_url) == at_host
+            })
+            .map(|(_, other)| {
+                other
+                    .handles
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+            })
+            .sum();
         let answer = |reg: &PushReg| {
             (
                 200,
@@ -2835,6 +2860,17 @@ impl Inner {
             },
             Some(named) => match self.push.get_mut(&app) {
                 Some(reg) if Some(named) == current && reg.relay_url == body.relay_url => {
+                    let listed = body
+                        .handles
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>();
+                    if held_there + listed.len() > 8 {
+                        return bad(
+                            ErrorCode::BadRequest,
+                            "more than 8 handles at one relay host across the account's apps",
+                            json!(null),
+                        );
+                    }
                     reg.handles = body.handles;
                     let reg = reg.clone();
                     answer(&reg)

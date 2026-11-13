@@ -105,19 +105,29 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   trusted. A scripted `missed` item (`push_missed`, or `push_missed_unparsable` for one whose times don't parse) is shown to every app and a scripted
   `unreadable` item (`push_unreadable`) has an `entry_id` of its own, and both stay
   whatever the cursors. Chain retention follows the service's rule by default (`Retention`,
-  Switch wire 7.4.4, 9.1): at each request of an own app or the signer, outside a freeze and
-  on a serving account, it signs a checkpoint once `checkpoint_behind` chain items may go and
-  drops the stubs behind it that every current app's cursor has passed or that are
-  `cursor_hold_ms` old, never inside a batch and at most `per_request` at a time. It differs
-  in one way: an app that hasn't moved its cursor yet holds the stubs from the time the switch
-  took its first record, not from its registration's `seq`; an app `identity.json` lists that
-  has no row here yet holds nothing, as for the service. Retention is on by default, for every
-  test: none reaches 1,000 chain items unless it means to. `set_retention(None)` keeps every
-  stub, and a test may still script a checkpoint and the stubs dropped by hand. Once the
-  service retains too, the harness comparison is what shows the two agree;
+  Switch wire 7.4.4, 9.1): outside a freeze and on a serving account, it signs a checkpoint
+  once `checkpoint_behind` chain items may go and drops the stubs behind it that every
+  current app's cursor has passed or that are `cursor_hold_ms` old, never inside a batch
+  (ended by its envelopes' `count`), never the head, and at most `per_request` at a time,
+  counting the stubs that may go before the batch edge, from the latest checkpoint. As at
+  the service, an app `identity.json` lists that isn't registered here yet holds nothing, a
+  registered one that hasn't moved its cursor yet holds every stub, and feed pages carry
+  the latest checkpoint. It differs in three ways:
+  - it sweeps at each request of an own app or the signer, where the service sweeps at
+    every verified caller's, an app of another identity's included;
+  - its current apps (`current_app_ids`) are those whose held certificate, or a renewal of
+    it still open, is the one listed, where the service counts every listed App ID that
+    isn't revoked or departed; so after a renewal an app hasn't taken and that has closed,
+    it drops stubs the service keeps for that app;
+  - it has no trusted-time gate and no key mark, so nothing holds its sweep back for them.
+  Retention is on by default, for every test: none reaches 1,000 chain items unless it
+  means to. `set_retention(None)` keeps every stub, and a test may still script a
+  checkpoint and the stubs dropped by hand. The harness comparison is what shows the two
+  agree;
   claims are deleted only when `GET /claims` finds them deletable; batch records are never
-  dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`, which
-  answers it `409 conflict` as the service's sweep does.
+  dropped, where the service drops one once its proofs and its stubs are gone, and their
+  proofs go only when a retry finds them past `batch_proofs_ms`, which answers it `409
+  conflict` as the service's sweep does.
 - **Purge of removed apps** (Switch wire 9.1), in `switch/retention.rs` `purge_removed`, by
   the service's rule and at the service's requests: a revoked or departed app, or an App ID
   an enrollment named, that the newest `identity.json` lists in neither `apps` nor
@@ -415,7 +425,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   client flow sees it, and an app learns of the entry by reading its feed at either switch.
   The same as the service: the body goes through
   the core's checks (`parse_push_body`, `400`), the signer is `403 permission_missing`, an
-  app that isn't current `403 not_current`, a staged account `503 staged`, 8.1's start and handle cases and their `409 conflict`s, one registration per
+  app that isn't current `403 not_current`, a staged account `503 staged`, 8.1's start and handle cases and their `409 conflict`s, the `400` for more than 8 handles at one relay host across the account's apps, one registration per
   app, and the registration dropped when its app stops being current (a revocation, a
   departure, a delivery that no longer lists it) and with the generation at a recovery. What
   differs: the relay's host isn't resolved, so a name that resolves to a private address is

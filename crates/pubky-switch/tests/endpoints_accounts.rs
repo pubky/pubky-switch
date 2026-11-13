@@ -1308,6 +1308,78 @@ async fn test_enroll_dropped_while_its_key_is_made_leaves_no_key_unnamed() {
     replay.db.drop_database().await.expect("drop");
 }
 
+/// Run `sql` on the replay's database.
+async fn run_sql(replay: &Replay, sql: &str) {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::raw_sql(sql).execute(&mut conn).await.expect("sql");
+    conn.close().await.expect("close");
+}
+
+/// The database refuses every write of `when` on `accounts`.
+async fn refuse(replay: &Replay, when: &str) {
+    run_sql(
+        replay,
+        &format!(
+            "CREATE FUNCTION refuse_write() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'refused'; END $$; \
+             CREATE CONSTRAINT TRIGGER refuse AFTER {when} ON accounts \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse_write()"
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_enroll_key_of_a_commit_the_database_refused_is_deleted() {
+    // The database refuses the commit that would name a key an enrollment made: a serving
+    // account's pending key, then a new account's service key. Neither landed, so neither key
+    // stays.
+    use pubky_switch::keys::KeyStore as _;
+    let Some((replay, keys)) = pausing().await else {
+        return;
+    };
+    serving(&replay).await;
+    refuse(&replay, "UPDATE OF pending_key").await;
+    let request = signer_request("POST", "/v1/enroll", enrollment_body(3, ORIGIN), ms(T));
+    assert_eq!(replay.service.handle(request).await.status, 503);
+    let pending = keys
+        .made
+        .lock()
+        .expect("lock")
+        .last()
+        .cloned()
+        .expect("made");
+    // Deleted by a task of its own once the request lets the key go.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while keys.public_key(&pending).await.is_ok() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(keys.public_key(&pending).await.is_err(), "the pending key");
+    replay.db.drop_database().await.expect("drop");
+
+    let Some((replay, keys)) = pausing().await else {
+        return;
+    };
+    refuse(&replay, "INSERT").await;
+    set_time(&replay.clock, T);
+    let request = signer_request("POST", "/v1/enroll", enrollment_body(1, ORIGIN), ms(T));
+    assert_eq!(replay.service.handle(request).await.status, 503);
+    let made = keys
+        .made
+        .lock()
+        .expect("lock")
+        .last()
+        .cloned()
+        .expect("made");
+    assert!(
+        keys.public_key(&made).await.is_err(),
+        "the new account's key"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
 #[tokio::test]
 async fn test_enroll_pending_key_of_a_dropped_enrollment_is_deleted() {
     // A serving account's enrollment whose signer hangs up once its pending key is made:
