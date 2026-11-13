@@ -1160,6 +1160,35 @@ async fn test_inbox_a_page_with_no_items_doesnt_end_a_lagging_mark() {
 }
 
 #[tokio::test]
+async fn test_inbox_a_page_with_no_items_and_a_wait_is_refused_and_keeps_the_mark() {
+    // `limit=0` with `wait` is refused at its query, before the read is admitted: the
+    // lagging app stays marked, and nothing it waited for went (Switch wire 7.4.4).
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    for byte in 1..=3 {
+        append_to(&replay, &["executor"], byte).await;
+    }
+    assert!(lagging(&replay, "executor").await);
+    let entries = count(&replay, "entry").await;
+    let path = format!("/v1/{}/feed?limit=0&wait=1", alice_id());
+    let answer = replay
+        .service
+        .handle(app_request(
+            app(&vectors("keys.json"), "executor"),
+            "GET",
+            &path,
+            Vec::new(),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(answer.status, 400);
+    assert!(lagging(&replay, "executor").await, "still marked");
+    assert_eq!(count(&replay, "entry").await, entries);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_inbox_a13_a_lagging_app_is_told_what_it_missed() {
     let Some(replay) = lagging_replay().await else {
         return;

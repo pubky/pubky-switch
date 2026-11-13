@@ -1099,6 +1099,14 @@ impl ScriptedSwitch {
             Some(value) => Position::parse(value).ok()?.seq,
             None => 0,
         };
+        // As the feed reads `limit` (`Inner::feed`): one it refuses, `limit=0` with `wait`
+        // among them, is answered at once.
+        let limit = params
+            .get("limit")
+            .map_or(Some(100), |value| decimal(value));
+        if !limit.is_some_and(|limit| (1..=500).contains(&limit)) {
+            return None;
+        }
         let wait_s = feed_wait(params.get("wait")?).filter(|seconds| *seconds > 0)?;
         // The read is admitted as it arrives, as the service admits it under its lock: an
         // account that doesn't serve it (gone, staged, or frozen for a write) or an app that

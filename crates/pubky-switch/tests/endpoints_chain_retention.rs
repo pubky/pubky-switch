@@ -1021,3 +1021,60 @@ async fn test_retention_signs_and_drops_nothing_at_a_staged_account() {
     assert_eq!(kept(&replay).await, before);
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_retention_a_page_with_no_items_carries_the_checkpoint() {
+    // A page with no items carries the checkpoint as any page does, also from behind the
+    // oldest kept stub, where it covers no position (Switch wire 7.4.4).
+    let Some(replay) = registered(small(), false).await else {
+        return;
+    };
+    chain(&replay, 10, 10, AT).await;
+    let head = head_seq(&replay).await;
+    cursors(&replay, ALL, head).await;
+    assert_eq!(request(&replay, AT).await, 404);
+    let keys = vectors("keys.json");
+    let path = format!("/v1/{}/feed?after=1:0&limit=0", alice_id());
+    let request = app_request(app(&keys, "wallet"), "GET", &path, Vec::new(), ms(AT));
+    let answer = replay.service.handle(request).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let page: Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(page["items"], serde_json::json!([]));
+    assert_eq!(
+        (
+            page["next"].clone(),
+            page["scanned_through"].clone(),
+            page["more"].clone(),
+            page["cursor"].clone()
+        ),
+        (
+            serde_json::json!("1:0"),
+            serde_json::json!(0),
+            serde_json::json!(true),
+            serde_json::json!(head)
+        )
+    );
+    let (Some(checkpoint), _) = retained(&replay).await else {
+        panic!("a checkpoint");
+    };
+    let signed = SignedHead::from_value(&page["checkpoint"]).expect("checkpoint");
+    assert_eq!((signed.generation, signed.seq), (1, checkpoint));
+    let key = replay
+        .keys
+        .public_key(&service_key(&replay).await)
+        .await
+        .expect("public");
+    signed
+        .verify(&key, &alice_key())
+        .expect("signed by the account's key");
+    assert_eq!(
+        SignedHead::from_value(&page["head"]).expect("head").seq,
+        head
+    );
+    replay.db.drop_database().await.expect("drop");
+}
