@@ -73,7 +73,7 @@ impl Signer {
             flow: None,
             unsure: false,
             left: super::RunDue::default(),
-            run: None,
+            run: std::sync::Arc::default(),
         };
         signer.restore_records(false, confirmed).await?;
         Ok(signer)

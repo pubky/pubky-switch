@@ -68,6 +68,8 @@ pub struct TestHomeserver {
     pub failing_deletes: Mutex<BTreeSet<String>>,
     /// Every path a deletion was asked for, in order, failed or not.
     pub deletes: Mutex<Vec<String>>,
+    /// Every path a read was asked for, in order, failed or not.
+    pub gets: Mutex<Vec<String>>,
     /// Run once, right after this path is deleted: something that happens between two
     /// deletions, such as another install delivering.
     #[allow(clippy::type_complexity)]
@@ -101,6 +103,7 @@ impl TestHomeserver {
 
 impl Homeserver for TestHomeserver {
     fn get(&self, path: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, TransportError>> {
+        self.gets.lock().unwrap().push(path.to_owned());
         let failing = self.failing_read_path.lock().unwrap().as_deref() == Some(path);
         let answer = if *self.down.lock().unwrap() || failing {
             Err(TransportError::Connect("down".into()))

@@ -1,6 +1,6 @@
 //! How much one routine run does (design note, section 4.5): each of its steps a bounded
-//! amount, and none of its later steps started past the run's time, the rest left for the
-//! next run.
+//! amount, and past the run's time no later step started once one has had work, the rest
+//! left for the next run.
 
 // Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -12,10 +12,10 @@ use std::sync::Arc;
 use common::*;
 use pubky_switch_client::clock::Clock;
 use pubky_switch_client::store::MemoryStore;
-use pubky_switch_client::testing::SWITCH_ORIGIN;
+use pubky_switch_client::testing::{Fault as SwitchFault, SWITCH_ORIGIN};
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::records::{IDENTITY_PATH, Limits, app_record_path};
-use pubky_switch_signer::Signer;
+use pubky_switch_signer::{Signer, UserConfirmed};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const LIFETIME_MS: u64 = 365 * DAY_MS;
@@ -113,31 +113,37 @@ async fn test_run_due_answers_four_full_bundle_requests_a_run_the_oldest_first()
     assert!(!report.more_due());
 }
 
+/// `n` apps whose records are on the Homeserver leave at once: their removal owes `n` record
+/// deletions. Returns how many of those records are still held.
+async fn leaving_with_records(
+    world: &World,
+    signer: &mut Signer,
+    n: u8,
+) -> impl Fn() -> usize + use<> {
+    let apps = apps(n);
+    for app in &apps {
+        world.approve(signer, app).await;
+    }
+    let paths: Vec<String> = apps
+        .iter()
+        .map(|app| {
+            let id = app.keys.app_id_bytes();
+            world.homeserver.set(&app_record_path(&id), b"{}".to_vec());
+            world.switch.leave(id).unwrap();
+            app_record_path(&id)
+        })
+        .collect();
+    let homeserver = Arc::clone(&world.homeserver);
+    move || paths.iter().filter(|p| homeserver.file(p).is_some()).count()
+}
+
 #[tokio::test]
 async fn test_run_due_deletes_32_records_a_run() {
-    // Thirty-three apps leave at once: their removal owes 33 record deletions, of which a
-    // run makes 32, and the next the last.
+    // Thirty-three apps leave at once: of the 33 record deletions owed, a run makes 32, and
+    // the next the last.
     let world = World::new();
     let mut signer = enrolled_for_many(&world).await;
-    let apps = apps(33);
-    for app in &apps {
-        world.approve(&mut signer, app).await;
-    }
-    for app in &apps {
-        let id = app.keys.app_id_bytes();
-        world.homeserver.set(&app_record_path(&id), b"{}".to_vec());
-        world.switch.leave(id).unwrap();
-    }
-    let held = || {
-        apps.iter()
-            .filter(|a| {
-                world
-                    .homeserver
-                    .file(&app_record_path(&a.keys.app_id_bytes()))
-                    .is_some()
-            })
-            .count()
-    };
+    let held = leaving_with_records(&world, &mut signer, 33).await;
     let report = signer.run_due().await.unwrap();
     assert_eq!(held(), 1);
     assert!(report.deletions_left && report.more_due());
@@ -147,56 +153,68 @@ async fn test_run_due_deletes_32_records_a_run() {
 }
 
 #[tokio::test]
-async fn test_run_due_starts_no_later_step_past_its_time() {
-    // The run's first steps take more than its time: the removal still runs, the renewal due
-    // waits for the next run.
+async fn test_run_due_deleting_exactly_32_records_says_nothing_more_is_due() {
     let world = World::new();
     let mut signer = enrolled_for_many(&world).await;
-    let apps = apps(2);
-    for app in &apps {
-        world.approve(&mut signer, app).await;
-    }
-    let (stays, goes) = (apps[0].keys.app_id_bytes(), apps[1].keys.app_id_bytes());
-    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
-    world.switch.leave(goes).unwrap();
-    // The run's first read of the Homeserver's copy takes 31 seconds.
-    let clock = Arc::clone(&world.clock);
-    *world.homeserver.after_get.lock().unwrap() = Some((
-        IDENTITY_PATH.to_owned(),
-        1,
-        Box::new(move || clock.advance_ms(31_000)),
-    ));
-    let since = world.clock.now_ms();
+    let held = leaving_with_records(&world, &mut signer, 32).await;
     let report = signer.run_due().await.unwrap();
-    let doc = signer.identity_doc().unwrap().unwrap();
-    assert!(doc.listed_cert(&goes).is_none(), "removed in this run");
-    assert!(renewed_since(&signer, &[stays], since).is_empty());
-    assert!(report.steps_left && report.more_due());
-    let report = signer.run_due().await.unwrap();
-    assert_eq!(renewed_since(&signer, &[stays], since), [stays]);
-    assert!(!report.more_due());
+    assert_eq!(held(), 0);
+    assert!(!report.deletions_left && !report.more_due());
 }
 
 #[tokio::test]
-async fn test_run_due_past_its_time_answers_no_full_bundle_request() {
-    // Nothing to remove, and the run's first read of the Homeserver's copy takes 31 seconds:
-    // the full-bundle request waits for the next run.
+async fn test_run_due_past_its_time_takes_one_step_with_work() {
+    // An earlier removal owes a record deletion that keeps failing, and its check of the
+    // Homeserver's copy, before the run's removals, takes 31 seconds. The removal due still
+    // runs, and so does the first later step with work, the renewal due. The step after it
+    // waits for the next run.
+    let world = World::new();
+    let mut signer = enrolled_for_many(&world).await;
+    let apps = apps(3);
+    for app in &apps {
+        world.approve(&mut signer, app).await;
+    }
+    let [stays, gone, goes] = [0, 1, 2].map(|i| apps[i].keys.app_id_bytes());
+    let record = app_record_path(&gone);
+    world.homeserver.set(&record, b"{}".to_vec());
+    world
+        .homeserver
+        .failing_deletes
+        .lock()
+        .unwrap()
+        .insert(record.clone());
+    world.switch.leave(gone).unwrap();
+    signer.run_due().await.unwrap();
+    assert!(world.homeserver.file(&record).is_some(), "its deletion failed");
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    world.switch.leave(goes).unwrap();
+    clock_moves_at_the_first_read(&world, 31_000);
+    let since = world.clock.now_ms();
+    let report = signer.run_due().await.unwrap();
+    assert!(world.clock.now_ms() >= since + 31_000);
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&goes).is_none(), "removed in this run");
+    assert_eq!(renewed_since(&signer, &[stays], since), [stays]);
+    assert!(report.steps_left && report.more_due());
+}
+
+#[tokio::test]
+async fn test_run_due_past_its_time_passes_the_turn_to_a_step_with_work() {
+    // Nothing to remove or close, and the run's first read of the Homeserver's copy takes 31
+    // seconds: the closings have nothing to do, so the full-bundle request is still answered
+    // in this run.
     let world = World::new();
     let mut signer = enrolled_for_many(&world).await;
     let app = &apps(1)[0];
     world.approve(&mut signer, app).await;
     let id = app.keys.app_id_bytes();
     world.switch.request_full_bundle(id);
-    let clock = Arc::clone(&world.clock);
-    *world.homeserver.after_get.lock().unwrap() = Some((
-        IDENTITY_PATH.to_owned(),
-        1,
-        Box::new(move || clock.advance_ms(31_000)),
-    ));
-    signer.run_due().await.unwrap();
-    assert!(world.switch.app(&id).full_requested.is_some());
-    signer.run_due().await.unwrap();
+    clock_moves_at_the_first_read(&world, 31_000);
+    let report = signer.run_due().await.unwrap();
     assert!(world.switch.app(&id).full_requested.is_none());
+    assert!(report.steps_left);
+    let report = signer.run_due().await.unwrap();
+    assert!(!report.more_due());
 }
 
 #[tokio::test]
@@ -240,9 +258,9 @@ fn clock_moves_at_the_first_read(world: &World, ms: i64) {
 
 #[tokio::test]
 async fn test_run_due_with_a_clock_that_jumps_every_run_takes_its_steps_in_turn() {
-    // The device clock jumps an hour ahead in every run: each run starts one later step, the
-    // next run the step after it, so the full-bundle request is answered at the second run
-    // and the renewal made at the third.
+    // The device clock jumps an hour ahead in every run: each run takes one later step with
+    // work, and the next run goes on from the step after it, so the full-bundle request is
+    // answered at the first run and the renewal made at the second.
     let world = World::new();
     let mut signer = enrolled_for_many(&world).await;
     let app = &apps(1)[0];
@@ -254,69 +272,98 @@ async fn test_run_due_with_a_clock_that_jumps_every_run_takes_its_steps_in_turn(
     let hour = 60 * 60 * 1000;
     clock_moves_at_the_first_read(&world, hour);
     assert!(signer.run_due().await.unwrap().steps_left);
-    assert!(world.switch.app(&id).full_requested.is_some());
-    clock_moves_at_the_first_read(&world, hour);
-    signer.run_due().await.unwrap();
     assert!(world.switch.app(&id).full_requested.is_none());
     assert!(renewed_since(&signer, &[id], since).is_empty());
     clock_moves_at_the_first_read(&world, hour);
-    signer.run_due().await.unwrap();
+    assert!(signer.run_due().await.unwrap().steps_left);
     assert_eq!(renewed_since(&signer, &[id], since), [id]);
 }
 
 #[tokio::test]
 async fn test_run_due_with_a_clock_that_goes_back_counts_its_time_passed() {
     // The device clock goes back an hour during the run: that can't be read as time spent,
-    // so the run starts one later step only, and the next run goes on from the step after.
+    // so the run takes one later step with work only, the full-bundle request, and the next
+    // run makes the renewal.
     let world = World::new();
     let mut signer = enrolled_for_many(&world).await;
     let app = &apps(1)[0];
     world.approve(&mut signer, app).await;
     let id = app.keys.app_id_bytes();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
     world.switch.request_full_bundle(id);
-    clock_moves_at_the_first_read(&world, -(60 * 60 * 1000));
+    let hour = 60 * 60 * 1000;
+    let since = world.clock.now_ms() - hour;
+    clock_moves_at_the_first_read(&world, -i64::try_from(hour).unwrap());
     let report = signer.run_due().await.unwrap();
     assert!(report.steps_left);
-    assert!(world.switch.app(&id).full_requested.is_some());
-    let report = signer.run_due().await.unwrap();
     assert!(world.switch.app(&id).full_requested.is_none());
+    assert!(renewed_since(&signer, &[id], since).is_empty());
+    let report = signer.run_due().await.unwrap();
+    assert_eq!(renewed_since(&signer, &[id], since), [id]);
     assert!(!report.more_due());
 }
 
-#[tokio::test]
-async fn test_run_due_checks_32_owed_deletions_a_run() {
-    // A new install restored after 33 apps left: their records are owed checks, of which a
-    // run makes 32, and says more is due.
-    let world = World::new();
-    let mut signer = enrolled_for_many(&world).await;
-    let apps = apps(33);
-    for app in &apps {
+/// A new install restored after `n` apps left, and `stays` others didn't: the records of the
+/// `n` are owed checks. The restore's own run reads no record, its first check failing, so the
+/// checks, in App ID order, wait for the next run. Returns the restored signer and the apps
+/// that stay, then the apps that left.
+async fn restored_owing_checks(world: &World, n: u8, stays: u8) -> (Signer, Vec<App>) {
+    let mut signer = enrolled_for_many(world).await;
+    let all = apps(stays + n);
+    for app in &all {
         world.approve(&mut signer, app).await;
     }
-    for app in &apps {
+    let apps = &all[usize::from(stays)..];
+    for app in apps {
         world.switch.leave(app.keys.app_id_bytes()).unwrap();
     }
     signer.run_due().await.unwrap();
     signer.run_due().await.unwrap();
     drop(signer);
-    // The restore's own run reads no record, its first check failing: the checks, in App ID
-    // order, wait for the next run.
     let smallest = apps.iter().map(|a| a.keys.app_id_bytes()).min().unwrap();
-    let first = app_record_path(&smallest);
-    *world.homeserver.failing_read_path.lock().unwrap() = Some(first);
+    *world.homeserver.failing_read_path.lock().unwrap() = Some(app_record_path(&smallest));
     let env = world.env(Arc::new(MemoryStore::new()));
-    let mut restored = Signer::restore_new(
-        env,
-        world.keyring(),
-        pubky_switch_signer::UserConfirmed::shown_and_confirmed(),
-    )
-    .await
-    .unwrap();
+    let restored = Signer::restore_new(env, world.keyring(), UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
     *world.homeserver.failing_read_path.lock().unwrap() = None;
+    (restored, all)
+}
+
+#[tokio::test]
+async fn test_run_due_checks_32_owed_deletions_a_run() {
+    // Of 33 owed checks, a run makes 32, and says more is due.
+    let world = World::new();
+    let (mut restored, _) = restored_owing_checks(&world, 33, 0).await;
     let report = restored.run_due().await.unwrap();
     assert!(report.deletions_left && report.more_due());
     let report = restored.run_due().await.unwrap();
     assert!(!report.more_due());
+}
+
+#[tokio::test]
+async fn test_run_due_checking_exactly_32_owed_deletions_says_nothing_more_is_due() {
+    let world = World::new();
+    let (mut restored, _) = restored_owing_checks(&world, 32, 0).await;
+    let report = restored.run_due().await.unwrap();
+    assert!(!report.deletions_left && !report.more_due());
+}
+
+#[tokio::test]
+async fn test_run_due_owed_checks_share_the_runs_budget() {
+    // Thirty-three owed checks and a renewal due in the same run: however many times the run
+    // checks, it reads no more than 32 of the records.
+    let world = World::new();
+    let (mut restored, all) = restored_owing_checks(&world, 33, 1).await;
+    let stays = all[0].keys.app_id_bytes();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    let since = world.clock.now_ms();
+    world.homeserver.gets.lock().unwrap().clear();
+    let report = restored.run_due().await.unwrap();
+    assert_eq!(renewed_since(&restored, &[stays], since), [stays]);
+    let checked = checked(&world, &all[1..]);
+    assert!(checked <= 32, "{checked} records read");
+    assert!(report.deletions_left);
 }
 
 /// An app approved and never joined: it delivered no record.
@@ -483,4 +530,101 @@ async fn test_run_due_a_check_that_keeps_failing_holds_back_no_other() {
         .filter(|p| world.homeserver.file(p).is_some())
         .collect();
     assert_eq!(held, [&failing]);
+}
+
+#[tokio::test]
+async fn test_renew_expiring_renews_a_joined_app_behind_four_being_cut_off() {
+    // Four apps whose revocation hasn't reached the switch expire first: none can be renewed,
+    // so none takes a place, and the fifth is renewed at the first call.
+    let world = World::new();
+    let mut signer = enrolled_for_many(&world).await;
+    let apps = apps(5);
+    for app in &apps {
+        world.approve(&mut signer, app).await;
+        world.clock.advance_ms(DAY_MS);
+    }
+    // Every revocation sent fails to reach the switch, the ones still pending included.
+    let unreachable = || {
+        world.switch.fail_next(SwitchFault::Unreachable {
+            path: "/revoke".into(),
+            after: 0,
+        });
+    };
+    for (n, app) in apps[..4].iter().enumerate() {
+        (0..=n).for_each(|_| unreachable());
+        signer
+            .revoke(
+                app.keys.app_id_bytes(),
+                None,
+                UserConfirmed::shown_and_confirmed(),
+            )
+            .await
+            .unwrap_err();
+    }
+    let joined = apps[4].keys.app_id_bytes();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    (0..4).for_each(|_| unreachable());
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(apps.iter().all(|a| doc.listed_cert(&a.keys.app_id_bytes()).is_some()));
+    assert_eq!(signer.renew_expiring().await.unwrap(), [joined]);
+}
+
+#[tokio::test]
+async fn test_renew_expiring_after_a_run_has_a_budget_of_its_own() {
+    // Nine apps due: the run renews four, and a call of its own after it renews four more.
+    let world = World::new();
+    let mut signer = enrolled_for_many(&world).await;
+    let apps = apps(9);
+    for app in &apps {
+        world.approve(&mut signer, app).await;
+        world.clock.advance_ms(DAY_MS);
+    }
+    let ids: Vec<[u8; 16]> = apps.iter().map(|a| a.keys.app_id_bytes()).collect();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    let since = world.clock.now_ms();
+    assert!(signer.run_due().await.unwrap().renewals_left);
+    assert_eq!(renewed_since(&signer, &ids, since), ids[..4]);
+    assert_eq!(signer.renew_expiring().await.unwrap(), ids[4..8]);
+}
+
+/// The records of the apps in `left` read since the Homeserver's read log was last cleared.
+fn checked(world: &World, left: &[App]) -> usize {
+    let left: Vec<String> = left
+        .iter()
+        .map(|app| app_record_path(&app.keys.app_id_bytes()))
+        .collect();
+    let reads = world.homeserver.gets.lock().unwrap();
+    reads.iter().filter(|path| left.contains(path)).count()
+}
+
+#[tokio::test]
+async fn test_renew_expiring_outside_a_run_has_one_budget() {
+    // Thirty-three owed checks and two renewals due, made by a call of its own: each renewal
+    // runs the owed steps again, and the call reads no more than 32 of the records.
+    let world = World::new();
+    let (mut restored, all) = restored_owing_checks(&world, 33, 2).await;
+    let stay: Vec<[u8; 16]> = all[..2].iter().map(|a| a.keys.app_id_bytes()).collect();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    world.homeserver.gets.lock().unwrap().clear();
+    let mut renewed = restored.renew_expiring().await.unwrap();
+    renewed.sort_unstable();
+    let mut expected = stay.clone();
+    expected.sort_unstable();
+    assert_eq!(renewed, expected);
+    let checked = checked(&world, &all[2..]);
+    assert!(checked <= 32, "{checked} records read");
+}
+
+#[tokio::test]
+async fn test_serve_full_bundles_outside_a_run_has_one_budget() {
+    // The same with two full-bundle requests, answered by a call of their own.
+    let world = World::new();
+    let (mut restored, all) = restored_owing_checks(&world, 33, 2).await;
+    for app in &all[..2] {
+        world.switch.request_full_bundle(app.keys.app_id_bytes());
+    }
+    world.homeserver.gets.lock().unwrap().clear();
+    assert_eq!(restored.serve_full_bundles().await.unwrap().len(), 2);
+    let checked = checked(&world, &all[2..]);
+    assert!(checked <= 32, "{checked} records read");
 }

@@ -647,12 +647,15 @@ impl Signer {
     ///
     /// An app whose certificate holds a scope no registered protocol owns gets nothing, with
     /// [`Alert::RotationSkipped`] (design note, decision 2). At most four requests are
-    /// answered in one call, the oldest first; the others at the next run.
+    /// answered in one call, the oldest first; the others at the next run. Outside a run the
+    /// call has a budget of its own, which the steps each answer runs again share
+    /// ([`Signer::run_due`]).
     ///
     /// # Errors
     ///
     /// As [`Signer::resume`].
     pub async fn serve_full_bundles(&mut self) -> Result<Vec<[u8; 16]>> {
+        let _budget = self.budget();
         // Served is judged on the switch's signed time, not the device clock.
         let read = self.ready_at_switch().await?;
         let (statuses, now) = (read.answer.apps, read.answer.server_time);
