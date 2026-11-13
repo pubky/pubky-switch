@@ -44,6 +44,9 @@ pub(crate) struct ItemsProtocol {
     pub(crate) bases: std::sync::Mutex<Vec<WriteBase>>,
     /// The collections in place of `sample.items` alone, when set.
     pub(crate) collections: std::sync::Mutex<Option<Vec<Collection>>>,
+    /// Whether a delete goes back on what was seen, as for a protocol whose seen records
+    /// are never let go.
+    pub(crate) deletes_regress: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) fn items() -> Collection {
@@ -148,7 +151,12 @@ impl Protocol for ItemsProtocol {
     }
 
     fn record_regression(&self, _: &str, seen: &[u8], value: Option<&[u8]>) -> Option<String> {
-        let value = value?;
+        let Some(value) = value else {
+            return self
+                .deletes_regress
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then(|| "sample: a record seen was deleted".to_owned());
+        };
         let held = ids(Some(value));
         let pad = "é".repeat(*self.pad.lock().unwrap());
         ids(Some(seen))
@@ -6637,6 +6645,35 @@ async fn test_scripted_records_refused_delete_is_written_over_after_a_forget() {
     let forgotten = !held_at_switch(&s, &key);
     let written = phone.put_record(&target, &value(&["a"]), vec![]).await;
     assert!(written.is_ok(), "forgotten: {forgotten}; {written:?}");
+}
+
+#[tokio::test]
+async fn test_scripted_records_delete_flagged_as_a_regression_is_written_over_after_a_forget() {
+    // A delete the protocol finds goes back on what the phone has seen: the phone keeps the
+    // record and follows the delete's version, so its next write names `{0, 0}`, which still
+    // holds once both readers have passed the delete and the switch forgets the key.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+    read_on(&mut phone).await;
+    s.protocol
+        .deletes_regress
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    wallet.delete_record(&target, vec![]).await.unwrap();
+    read_on(&mut phone).await;
+    let held = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+    assert!(held.flagged);
+    read_on(&mut wallet).await;
+    assert!(!held_at_switch(&s, &key), "both readers passed the delete");
+    let written = phone.put_record(&target, &value(&["a"]), vec![]).await;
+    assert!(written.is_ok(), "{written:?}");
 }
 
 #[tokio::test]
