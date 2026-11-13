@@ -142,7 +142,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   answered `pending` with nothing kept, as at the service. Neither switch sends the push
   `policy.connect_requests.push` asks for yet: push isn't served.
 - **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
-  by a write here, as at the service (Recovery uploads, below).
+  by a write here, as at the service (Recovery uploads, below). `make_divergent`, public,
+  sets it for one record without a loss or an upload: the upload's `doc_hash` is kept among
+  the record's divergent uploads, and an `upload` transition listing the key as divergent,
+  merging nothing, is chained, so an app reading its feed reads the record again; for a
+  protocol's tests of a divergent record.
 - **Directory** (Switch wire 7.4.10): an app is reachable from its first receive key until
   it is revoked or leaves; one that stops being current otherwise, with an expired or
   closed certificate, stays reachable, and `apps_version` doesn't move for it.
