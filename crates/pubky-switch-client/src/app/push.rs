@@ -113,7 +113,6 @@ pub(crate) struct PushRecord {
     /// The handles are set at the service.
     pub(crate) set: bool,
     /// The handles the service keeps, once set.
-    #[serde(default)]
     pub(crate) handles: u64,
     /// A start in flight that names this push key in `replaces`.
     pub(crate) replacing: Option<[u8; 32]>,
