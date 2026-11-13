@@ -1690,13 +1690,13 @@ impl App {
                 authenticated: false,
                 expected_version: put.expected_version,
             },
-            (None, None) => return invalid("Switch wire 6.2 step 6: nothing gives the version"),
+            // The version is the service's word, not the writer's: a write whose version is
+            // missing or not plausible is ignored, naming no app. A client loses nothing by it
+            // that a service withholding the write couldn't take.
+            (None, None) => return Ok(Err(Refused::Ignored)),
         };
         if !version.plausible(body.generation) {
-            return invalid(
-                "Switch wire 6.2 step 6: the version isn't of the operation's generation, after \
-                 its expected_version",
-            );
+            return Ok(Err(Refused::Ignored));
         }
         // Step 7: the content.
         let content = match put

@@ -5109,6 +5109,31 @@ async fn test_records_unverified_write_names_no_app() {
     assert!(wallet.flagged_writes().await.unwrap().is_empty());
 }
 
+/// A record's view whose version isn't of the write's generation, and nothing else gives one:
+/// the version is the service's word, so nothing names the writer.
+#[tokio::test]
+async fn test_records_implausible_version_names_no_app() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&target).unwrap();
+    {
+        let mut switch = s.w.switch.lock();
+        let held = switch.shared.records.get_mut(&key).unwrap();
+        held.proof = None;
+        held.state.version = RecordVersion::new(99, held.state.version.version);
+    }
+    wallet.read_record(&target).await.unwrap();
+    let events = wallet.take_events();
+    assert!(flagged_rules(&events).is_empty(), "{events:?}");
+    assert!(wallet.flagged_writes().await.unwrap().is_empty());
+}
+
 /// A record's view that carries the genuine write of another record: its writer wrote it
 /// for that record, so the service, not the writer, is at fault, and nothing names the
 /// writer.
