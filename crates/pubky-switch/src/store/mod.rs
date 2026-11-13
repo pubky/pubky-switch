@@ -37,6 +37,7 @@ mod push;
 mod push_queue;
 mod records;
 mod recovery;
+mod retention;
 mod snapshot;
 mod sweeps;
 #[cfg(any(test, feature = "test-util"))]
@@ -71,6 +72,7 @@ pub use push_queue::{
     PUSH_RETRY_MS, PUSH_WINDOW_MS, QueuedPush,
 };
 pub use recovery::{RECOVERY_KEEPS, Recovery, recovery_clears};
+pub use retention::{ChainRetention, KeptStub};
 pub use snapshot::SnapshotRead;
 
 use crate::admin::{CheckFuture, ReadinessCheck};

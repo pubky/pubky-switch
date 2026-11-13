@@ -137,6 +137,12 @@ pub struct Limits {
     pub checkpoint_behind: u64,
     /// Sign each checkpoint at the newest chain item.
     pub checkpoint_at_head: bool,
+    /// Chain stubs one request reads and drops for chain stub retention, oldest first; at
+    /// least `checkpoint_behind`, which a request's read must reach for a checkpoint, and a
+    /// batch's 8 items, so a batch at the start of the read is always whole in it.
+    pub retention_per_request: u64,
+    /// Sign checkpoints and drop chain stubs behind them; off keeps every stub.
+    pub chain_retention: bool,
     /// Mark lagging apps.
     pub mark_lagging: bool,
     /// Appends with `notify` per sender identity per minute.
@@ -192,6 +198,8 @@ impl Default for Limits {
             list_page: 1_000,
             checkpoint_behind: 1_000,
             checkpoint_at_head: false,
+            retention_per_request: 1_000,
+            chain_retention: true,
             mark_lagging: true,
             notify_per_min: 20,
             connect_per_min: 5,
@@ -260,7 +268,7 @@ impl Limits {
                 return fail(name, "must be between 1 and 100");
             }
         }
-        let nonzero: [(&'static str, u64); 36] = [
+        let nonzero: [(&'static str, u64); 37] = [
             ("quota_bytes", self.quota_bytes),
             ("record_quota_bytes", self.record_quota_bytes),
             ("max_record_keys", self.max_record_keys),
@@ -305,6 +313,7 @@ impl Limits {
             ),
             ("list_page", self.list_page),
             ("checkpoint_behind", self.checkpoint_behind),
+            ("retention_per_request", self.retention_per_request),
             ("notify_per_min", u64::from(self.notify_per_min)),
             ("connect_per_min", u64::from(self.connect_per_min)),
             ("flag_after", u64::from(self.flag_after)),
@@ -312,6 +321,12 @@ impl Limits {
         ];
         if let Some((name, _)) = nonzero.into_iter().find(|(_, value)| *value == 0) {
             return fail(name, "must be at least 1");
+        }
+        if self.retention_per_request < self.checkpoint_behind.max(fixed::MAX_BATCH) {
+            return fail(
+                "retention_per_request",
+                "must be at least checkpoint_behind and a batch's 8 items, or no checkpoint is signed",
+            );
         }
         Ok(())
     }
@@ -381,6 +396,8 @@ mod tests {
         assert_eq!(limits.list_page, 1_000);
         assert_eq!(limits.checkpoint_behind, 1_000);
         assert!(!limits.checkpoint_at_head);
+        assert_eq!(limits.retention_per_request, 1_000);
+        assert!(limits.chain_retention);
         assert!(limits.mark_lagging);
         assert_eq!(limits.notify_per_min, 20);
         assert_eq!(limits.connect_per_min, 5);
@@ -489,6 +506,21 @@ mod tests {
                     ..Limits::default()
                 },
                 "checkpoint_behind",
+            ),
+            (
+                Limits {
+                    retention_per_request: 999,
+                    ..Limits::default()
+                },
+                "retention_per_request",
+            ),
+            (
+                Limits {
+                    retention_per_request: 7,
+                    checkpoint_behind: 7,
+                    ..Limits::default()
+                },
+                "retention_per_request",
             ),
             (
                 Limits {
