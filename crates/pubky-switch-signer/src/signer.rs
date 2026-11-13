@@ -996,11 +996,9 @@ impl Signer {
 
     /// While recovering, whether the service the signer goes to took a version of this
     /// recovery under a key an earlier declaration's enrollment answered there, read under
-    /// each such key ([`Signer::taken_under_an_earlier_key`]): that version is then delivered.
+    /// each such key but the one pinned ([`Signer::taken_under_an_earlier_key`], which reads
+    /// nothing unless recovering): that version is then delivered.
     async fn taken_under_a_remembered_key(&mut self) -> Result<bool> {
-        if !self.state.recovering {
-            return Ok(false);
-        }
         let origin = self.service()?.origin;
         self.taken_under_an_earlier_key(&origin, true).await
     }
@@ -1479,7 +1477,12 @@ impl Signer {
                     return self.commit(state, self.flow.clone()).await;
                 }
                 // Not the version's key either: it may still be the key an earlier
-                // declaration's enrollment answered here, whatever the refusal, as below.
+                // declaration's enrollment answered here, as below. The service refuses a
+                // version of this recovery sent after it took an earlier one with `409`,
+                // `stale_identity` or `conflict`, and the read is made whatever the refusal.
+                // So one failed delivery reads `GET /apps` at most 1 + R times after its send:
+                // once under the version's key, once under each of the R keys earlier
+                // declarations' enrollments answered at this service.
                 if self.taken_under_a_remembered_key().await? {
                     return Ok(());
                 }

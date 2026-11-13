@@ -636,6 +636,13 @@ impl ConditionState for Before<'_> {
             .map_or(RecordVersion::NONE, |held| held.state.version)
     }
 
+    fn record_deleted(&self, key: &[u8; 32]) -> bool {
+        self.state
+            .records
+            .get(key)
+            .is_some_and(|held| held.state.deleted)
+    }
+
     fn may_read_record(&self, key: &[u8; 32]) -> bool {
         self.state.records.get(key).is_none_or(|held| {
             self.writer

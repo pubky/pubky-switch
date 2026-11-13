@@ -476,3 +476,60 @@ async fn test_run_due_refused_renewal_goes_behind_the_others() {
     assert_eq!(renewed_since(&signer, &ids, since), ids[1..8]);
     assert!(report.renewals_left);
 }
+
+#[tokio::test]
+async fn test_run_due_users_refused_renewals_hold_back_no_other_app() {
+    // Four apps expire first; for each the switch refuses every renewal for good, and the
+    // user, told so, asked for a renewal of their own, refused too. A fifth app is due after
+    // them: it is still renewed.
+    let world = World::new();
+    let mut signer = enrolled_for_many(&world).await;
+    let all = apps(5);
+    for app in &all {
+        world.approve(&mut signer, app).await;
+        world.clock.advance_ms(DAY_MS);
+    }
+    let ids: Vec<[u8; 16]> = all.iter().map(|a| a.keys.app_id_bytes()).collect();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    for id in &ids[..4] {
+        plant_later_renewal(&world, &signer, *id, 300 * DAY_MS);
+        signer.renew(*id, CertChange::default()).await.unwrap_err();
+        assert!(signer.alerts().iter().any(|a| matches!(
+            a,
+            Alert::RenewalRefused { app_id, by_user: true, .. } if app_id == id
+        )));
+    }
+    let since = world.clock.now_ms();
+    for _ in 0..3 {
+        let _ = signer.run_due().await;
+    }
+    assert_eq!(renewed_since(&signer, &ids[4..], since), ids[4..]);
+}
+
+#[tokio::test]
+async fn test_run_due_renews_nothing_while_a_removal_is_half_done() {
+    // An app leaves, and the delivery of the version removing it fails: the run's renewals,
+    // which come after, sign nothing while that version is in progress. The next run
+    // delivers it, then renews the app due.
+    let world = World::new();
+    let mut signer = enrolled_for_many(&world).await;
+    let all = apps(2);
+    for app in &all {
+        world.approve(&mut signer, app).await;
+    }
+    let (stays, goes) = (all[0].keys.app_id_bytes(), all[1].keys.app_id_bytes());
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    world.switch.leave(goes).unwrap();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    let since = world.clock.now_ms();
+    signer.run_due().await.unwrap_err();
+    assert!(renewed_since(&signer, &[stays], since).is_empty());
+    assert!(world.switch.app(&stays).renewed.is_none(), "nothing sent");
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&goes).is_none());
+    assert_eq!(renewed_since(&signer, &[stays], since), [stays]);
+}
