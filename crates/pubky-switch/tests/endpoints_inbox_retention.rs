@@ -1168,6 +1168,32 @@ async fn test_inbox_a13_a_lagging_app_is_told_what_it_missed() {
     replay.db.drop_database().await.expect("drop");
 }
 
+#[tokio::test]
+async fn test_inbox_a_lagging_apps_held_cursor_stays_while_its_entries_go() {
+    // The entries a lagging app hasn't read go without its cursor moving (Switch spec 6.3):
+    // its page reports the same `cursor` as before they came, equal to its position, and
+    // only the `missed` item shows that they are gone (Switch spec 8.2, 8.3).
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    let position = chain_seq(&replay).await;
+    move_cursor(&replay, "executor", position).await;
+    let before = feed_of(&replay, "executor", position).await;
+    assert_eq!(before["cursor"], position);
+    for byte in 1..=3 {
+        append_to(&replay, &["executor"], byte).await;
+    }
+    assert!(lagging(&replay, "executor").await);
+    assert_eq!(count(&replay, "entry").await, 0);
+    let after = feed_of(&replay, "executor", position).await;
+    assert_eq!(after["cursor"], position, "the held cursor didn't move");
+    assert!(items_of(&after, "entry").is_empty(), "{after}");
+    let missed = items_of(&after, "missed");
+    assert_eq!(missed.len(), 1, "{after}");
+    assert_eq!(missed[0]["entries"], 3);
+    replay.db.drop_database().await.expect("drop");
+}
+
 /// The newest seq the inbox holds, or `or` when it holds nothing.
 async fn entry_seq_or(replay: &Replay, or: u64) -> u64 {
     let seq = sql_value(
