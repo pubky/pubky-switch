@@ -400,8 +400,12 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
         Ok(())
     })
     .await;
-    if let Err(error) = ran {
-        panic!("{error}");
+    match ran {
+        Ok(Some(_)) => {}
+        // The flows above ran against the service, so a test database is configured: a
+        // run that didn't happen asked nothing, and must not pass as "nothing to report".
+        Ok(None) => panic!("the calls weren't asked: no world against the service"),
+        Err(error) => panic!("{error}"),
     }
     let (failures, waiting) = found.into_inner().expect("no panic under the lock");
     assert!(failures.is_empty(), "{}", failures.join("\n"));

@@ -121,7 +121,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   item's document and proof once no app may read it in full, the switch keeps every
   document and decides at each read which show (`Readers`). Every answer is the same, since
   a superseded document shows as its stub to every app; only a test that looks inside the
-  switch's items could tell.
+  switch's items could tell. The harness flow `records, superseded writes read late` reads
+  replaced writes at both switches from cursors that stand before them.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires.
 - **Lists**: `flagged` is always empty.

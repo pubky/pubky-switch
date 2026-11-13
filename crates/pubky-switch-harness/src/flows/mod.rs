@@ -32,6 +32,7 @@ mod renewal;
 mod restore;
 mod retries;
 mod revocations;
+mod superseded;
 mod upload;
 mod waiting;
 mod watching;
@@ -79,6 +80,7 @@ pub use retries::{
     signer_retries,
 };
 pub use revocations::{departure_time, revocation_cleanup, revocation_times, revocation_unread};
+pub use superseded::superseded_writes_read_late;
 pub use upload::{
     recovery_upload_claim, recovery_upload_deny_only, recovery_upload_records,
     recovery_upload_refused, recovery_upload_slots_before_the_loss,
@@ -139,6 +141,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
         Box::pin(signer_two_installs_race(world))
     }),
     ("records", |world| Box::pin(records(world))),
+    ("records, superseded writes read late", |world| {
+        Box::pin(superseded_writes_read_late(world))
+    }),
     ("erasure", |world| Box::pin(erasure(world))),
     ("erasure, answer lost", |world| {
         Box::pin(erasure_answer_lost(world))

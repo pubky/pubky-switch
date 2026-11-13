@@ -166,8 +166,10 @@ async fn test_run_at_the_service_fails_as_the_database_when_it_takes_no_connecti
         })
         .await;
         let (logged, flow) = match ended {
-            // No test database: skipped.
-            Ok(None) => return,
+            Ok(None) => {
+                eprintln!("skipped: no test database to run against the service");
+                return;
+            }
             Err(HarnessError::Database {
                 backend: Backend::Service,
                 logged,
