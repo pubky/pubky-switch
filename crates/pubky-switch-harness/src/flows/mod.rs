@@ -31,6 +31,7 @@ mod reduction;
 mod removal;
 mod renewal;
 mod restore;
+mod retention;
 mod retries;
 mod revocations;
 mod superseded;
@@ -78,6 +79,7 @@ pub use reduction::{reduction_unpublished, renewal_drops_scope};
 pub use removal::{departure, revocation};
 pub use renewal::{renewal, renewed_twice};
 pub use restore::restore;
+pub use retention::behind_a_checkpoint;
 pub use retries::{
     app_retries, append_retry, claim_and_read_retries, claim_retries, removal_retries,
     signer_retries,
@@ -186,6 +188,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("two collections", |world| Box::pin(two_collections(world))),
     ("waiting read", |world| Box::pin(waiting_read(world))),
     ("lagging app", |world| Box::pin(lagging_app(world))),
+    ("behind a checkpoint", |world| {
+        Box::pin(behind_a_checkpoint(world))
+    }),
     ("missed item", |world| Box::pin(missed_item(world))),
     ("unreadable after a revoke", |world| {
         Box::pin(unreadable_after_revoke(world))

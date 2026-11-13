@@ -232,26 +232,26 @@ async fn test_retention_turned_off_keeps_every_stub() {
 }
 
 #[tokio::test]
-async fn test_retention_an_app_yet_to_move_its_cursor_holds_from_its_registration() {
-    // The phone joins after the wallet's first items and never moves its cursor: what came
-    // before its registration may go, nothing after it, inside 30 days.
+async fn test_retention_an_app_yet_to_move_its_cursor_holds_every_stub() {
+    // The phone joins after the wallet's first items and never moves its cursor: what went
+    // before it joined stays gone, and nothing more goes inside 30 days, as at the service,
+    // which keeps no registration `seq`; once 30 days old, the rest go.
     let w = World::new();
     w.switch.set_retention(retention(2));
     let mut wallet = writer(&w, "wallet").await;
     write(&mut wallet, 3).await;
     read_a_note(&w, &mut [&mut wallet]).await;
+    write(&mut wallet, 1).await;
+    let before = w.switch.retained().1;
     w.clock.advance_ms(1_000);
     let phone = writer(&w, "phone").await;
-    let joined = w.switch.lock().seq;
     write(&mut wallet, 3).await;
     read_a_note(&w, &mut [&mut wallet]).await;
     write(&mut wallet, 1).await;
-    let (checkpoint, dropped) = w.switch.retained();
-    assert!(checkpoint.is_some(), "what came before it went");
-    assert!(
-        dropped < joined,
-        "dropped through {dropped}, joined at {joined}"
-    );
+    assert_eq!(w.switch.retained().1, before, "held by the phone");
+    w.clock.advance_ms(31 * DAY);
+    write(&mut wallet, 1).await;
+    assert!(w.switch.retained().1 > before, "30 days old");
     drop(phone);
 }
 
