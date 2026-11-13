@@ -1,9 +1,0 @@
-{
-  "description": "The protocol names and scope roots that belong to one protocol (wire 3.1, \"Scope roots\"), in machine-readable form. It lists the same names and roots as that section, which is normative with it. A signer refuses to take a protocol whose name is one of these roots, or whose name followed by `_` or `-` and more characters is one, and a protocol named here claims only the roots listed with it.",
-  "reserved": [
-    {
-      "name": "paykit",
-      "roots": ["pay", "request", "allowance", "allowance_execute", "contacts", "manage_contacts", "ext"]
-    }
-  ]
-}

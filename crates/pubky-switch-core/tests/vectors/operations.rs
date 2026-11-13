@@ -323,13 +323,13 @@ fn check_invite_context(keys: &Keys, v: &Value, identity: &[u8; 32]) {
         .find(|o| st(o, "name") == "invite_code.put")
         .unwrap();
     let text = st(based_on, "body");
-    let context = r#""context":{"order":"order-1042"}"#;
+    let context = r#""context":{"board":"home"}"#;
     assert!(text.contains(context));
-    let compact = format!(r#"{{"order":"{}"}}"#, "x".repeat(988));
+    let compact = format!(r#"{{"board":"{}"}}"#, "x".repeat(988));
     assert_eq!(compact.len(), 1000);
     let case = |name: &str, written: usize, expect: Value| {
         let padded = format!(
-            r#"{{{}"order":"{}"}}"#,
+            r#"{{{}"board":"{}"}}"#,
             " ".repeat(written - 1000),
             "x".repeat(988)
         );
@@ -629,41 +629,20 @@ fn check_attempt_deadlines(v: &Value, ops: &HashMap<String, SignedOp>) {
         };
         let Some(text) = c["deadline"].as_str() else {
             assert!(c["deadline"].is_null(), "{name}");
+            assert!(c["d"].is_null(), "{name}: no deadline only without a d");
             assert_eq!(entry(None).fields().deadline, None);
             continue;
         };
         let deadline = parse_rfc3339(text).unwrap();
         assert_eq!(rfc3339(deadline), text, "{name}: three fraction digits");
         assert_eq!(entry(Some(deadline)).fields().deadline, Some(deadline));
-        // Every instant the case names, at millisecond precision.
-        let mut instants = Vec::new();
-        collect_times(&c["fields"], &mut instants);
-        if let Some(start) = c["billing_period_start"].as_str() {
-            assert!(parse_rfc3339(start).unwrap() < deadline, "{name}");
-        }
-        if !instants.is_empty() {
-            assert!(
-                instants.iter().any(|d| attempt_deadline(*d) == deadline),
-                "{name}: d + 1 ms for an instant the case names"
-            );
-        }
+        // d is read at millisecond precision, and the attempt carries d + 1 ms.
+        let d = parse_rfc3339(st(c, "d")).unwrap();
+        assert_eq!(attempt_deadline(d), deadline, "{name}: d + 1 ms");
     }
     let first = parse_rfc3339(st(&cases[0], "deadline")).unwrap();
     let OpKind::Claim(attempt) = &ops["claim attempt"].body().kind else {
         panic!("the claim attempt is a claim");
     };
     assert_eq!(attempt.deadline, Some(first));
-}
-
-fn collect_times(value: &Value, out: &mut Vec<u64>) {
-    match value {
-        Value::String(s) => {
-            if let Ok(ms) = parse_rfc3339(s) {
-                out.push(ms);
-            }
-        }
-        Value::Object(m) => m.values().for_each(|x| collect_times(x, out)),
-        Value::Array(a) => a.iter().for_each(|x| collect_times(x, out)),
-        _ => {}
-    }
 }
