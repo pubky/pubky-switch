@@ -777,6 +777,13 @@ impl App {
     /// sending nothing. Returns its `msg_id`. A message already in the outbox, or sent, is
     /// left as it is.
     ///
+    /// It is for a message just signed. It checks neither a give-up nor the message's age,
+    /// so a host doesn't queue a kept [`SignedMessage`] again once its delivery was given up
+    /// ([`AppEvent::MessageUndelivered`]), or 30 days after it was signed: past that a
+    /// recipient that processed it may have forgotten the pair, and would process it as new
+    /// (Switch spec 11). A message signed before is queued again with [`App::queue_stored`],
+    /// which refuses those.
+    ///
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`]; [`Refusal::Usage`] for a message another
@@ -834,7 +841,9 @@ impl App {
     /// [`AppEvent::MessageUndelivered`], nor to one with `resend: false` once this app had a
     /// copy of it accepted. A backup carries neither the sent messages nor the give-up
     /// marks, so a restored app may queue again a message given up or accepted before the
-    /// backup: within its window it goes again, and the recipient drops it as a duplicate.
+    /// backup: within its window it goes again. A recipient that processed a copy accepted
+    /// before the backup drops it as a duplicate; a message given up before the backup goes
+    /// as a first delivery.
     ///
     /// # Errors
     ///
