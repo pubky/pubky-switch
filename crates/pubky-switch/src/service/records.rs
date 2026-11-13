@@ -159,8 +159,8 @@ impl Service {
     /// `GET /v1/{id}/records/{key}` (Switch wire 7.4.9) under the lock, for the own app
     /// `reader`: the record view of the key's current write, deleted or not. `404` for a key
     /// the service doesn't hold, never written or forgotten (6.2), and `403
-    /// permission_missing` for a record whose `read_scope` the reader doesn't hold (3.1:
-    /// plain `request` holds every `request:<label>`). A record is under 1 MiB, so it is
+    /// permission_missing` for a record whose `read_scope` the reader doesn't hold (3.1: a
+    /// scope's name holds every sub-scope `<name>:<sub>`). A record is under 1 MiB, so it is
     /// read under the lock.
     pub(super) async fn get_record(
         &self,

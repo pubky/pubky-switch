@@ -296,8 +296,8 @@ impl PeerIdentity {
             .saturating_add(DOC_CACHE_MS)
     }
 
-    /// Whether an action on the counterparty's public app records, such as paying one of
-    /// its public endpoints, may go ahead on this copy now (Switch spec 4.3, "The switch's
+    /// Whether an action on the counterparty's public app records, such as acting on data
+    /// one of them publishes, may go ahead on this copy now (Switch spec 4.3, "The switch's
     /// copy"): only once the switch confirmed it, unless the switch's lookup failed or
     /// hasn't answered within `grace_ms` after the Homeserver's read, when a user's action
     /// goes ahead on the user's explicit confirmation and an automatic one waits or isn't
