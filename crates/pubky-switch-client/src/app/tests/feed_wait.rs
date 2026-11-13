@@ -1962,8 +1962,9 @@ impl Setup {
 #[tokio::test]
 async fn test_flush_outbox_tries_at_most_its_budget_and_goes_round() {
     // Six messages to bob, whose switch answers `503 staged`: a flush tries four and says
-    // more, and the next starts after the last one tried, so the two left go first. Once
-    // bob's switch serves, flushes until none says more deliver each once.
+    // more, and the next tries the two left and ends the pass. A new pass starts after the
+    // last one tried. Once bob's switch serves, flushes until none says more deliver each
+    // once.
     let s = Setup::new(false);
     let mut app = s.join("wallet").await;
     s.peer.set_staged(true);
@@ -1976,11 +1977,19 @@ async fn test_flush_outbox_tries_at_most_its_budget_and_goes_round() {
     assert!(report.more, "{report:?}");
     assert_eq!(report.queued.len(), 6, "{report:?}");
     assert_eq!(tries(&app, &ids).await, [1, 1, 1, 1, 0, 0]);
+    // The pass goes on with the two left, and ends.
+    let report = app.flush_outbox().await.unwrap();
+    assert!(!report.more, "{report:?}");
+    assert_eq!(tries(&app, &ids).await, [1, 1, 1, 1, 1, 1]);
+    // The next flush starts a new pass, after the last one tried.
     let report = app.flush_outbox().await.unwrap();
     assert!(report.more, "{report:?}");
-    assert_eq!(tries(&app, &ids).await, [2, 2, 1, 1, 1, 1]);
+    assert_eq!(tries(&app, &ids).await, [2, 2, 2, 2, 1, 1]);
     s.peer.set_staged(false);
+    // The pass under way ends with the two it hadn't tried; the next trigger's pass takes
+    // the rest.
     let mut done = s.flush_all(&mut app, 3).await;
+    done.extend(s.flush_all(&mut app, 3).await);
     done.sort();
     let mut all = ids.clone();
     all.sort();
@@ -2090,4 +2099,31 @@ async fn test_peek_reads_at_most_its_page_budget() {
     let report = app.peek().await.unwrap();
     assert!(!report.more, "{report:?}");
     assert_eq!(report.items.len(), 3);
+}
+
+#[tokio::test]
+async fn test_flush_outbox_while_more_stops_after_one_pass() {
+    // Six messages to bob, whose switch answers `503 staged`, as in an outage: a host that
+    // flushes while a flush says more stops after one pass, each message tried once. Only a
+    // later flush, on the host's own triggers, tries them again.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    s.peer.set_staged(true);
+    let mut ids = Vec::new();
+    for n in 0..6 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    let mut flushes = 0;
+    loop {
+        flushes += 1;
+        let report = app.flush_outbox().await.unwrap();
+        if !report.more {
+            assert_eq!(report.queued.len(), ids.len(), "{report:?}");
+            break;
+        }
+        assert!(flushes < 10, "the loop settles");
+    }
+    assert_eq!(flushes, 2);
+    assert_eq!(tries(&app, &ids).await, [1; 6]);
 }

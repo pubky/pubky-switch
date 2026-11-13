@@ -4823,6 +4823,98 @@ async fn test_send_unreachable_peer_doesnt_hold_up_the_others() {
     assert!(s.peer.routes().is_empty(), "{:?}", s.peer.routes());
 }
 
+/// A switch that takes `ms` of the app's clock for each request and then fails to connect,
+/// as a slow switch that is down.
+struct SlowDown {
+    clock: Arc<crate::clock::TestClock>,
+    ms: u64,
+}
+
+impl Transport for SlowDown {
+    fn send(
+        &self,
+        _: crate::transport::Request,
+    ) -> crate::transport::BoxFuture<
+        '_,
+        Result<crate::transport::Response, crate::error::TransportError>,
+    > {
+        Box::pin(async move {
+            self.clock.advance_ms(self.ms);
+            Err(crate::error::TransportError::Connect("down".into()))
+        })
+    }
+}
+
+/// A slow switch that keeps failing, met first among those owed an app's removal, uses each
+/// flush's budget: the healthy switch behind it still gets the removal within two flushes.
+#[tokio::test]
+async fn test_send_slow_failing_peer_doesnt_starve_the_others() {
+    const SLOW: &str = "https://slow.example";
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.send(s.note("hello")).await.unwrap();
+    let bob = pubky_switch_core::enc::pubky_id(&s.w.bob.public());
+    let slow_key = (0..100)
+        .map(|n| identity(&format!("peer{n}")))
+        .find(|key| pubky_switch_core::enc::pubky_id(&key.public()) < bob)
+        .unwrap();
+    let slow = slow_key.public();
+    // Its identity.json is published, naming the slow switch.
+    let published = PeerSwitch::new(
+        slow_key,
+        SLOW,
+        Arc::clone(&s.w.clock),
+        Arc::clone(&s.w.homeserver),
+    );
+    published
+        .add_app("shop", &AppSpec::new(&["scope-a"]), &["sample.note"], false)
+        .unwrap();
+    s.router.add(
+        SLOW,
+        Arc::new(SlowDown {
+            clock: Arc::clone(&s.w.clock),
+            ms: 25_000,
+        }) as Arc<dyn Transport>,
+    );
+    let ns = crate::store::client_namespace(&app.app_id());
+    let mut tx = crate::app::state::Tx::new(&ns);
+    crate::app::directory::put_peer(
+        &mut tx,
+        &slow,
+        &crate::app::directory::PeerSwitch {
+            known_version: Some(1),
+            last_sent_ms: Some(s.w.clock.now_ms()),
+        },
+    )
+    .unwrap();
+    tx.commit(&StoreHandle::inline(
+        Arc::clone(&s.w.store) as Arc<dyn StateStore>
+    ))
+    .await
+    .unwrap();
+    let doc = s.w.next_doc(|body| {
+        body.removed.push(RemovedApp {
+            app_id: [9; 16],
+            distrust_from: START,
+        })
+    });
+    app.refresh_identity().await.unwrap();
+    let bob_has_it = || {
+        s.peer
+            .lock()
+            .peers
+            .get(&s.w.alice.public())
+            .is_some_and(|held| held.version() == doc.version())
+    };
+    for _ in 0..2 {
+        app.flush_outbox().await.unwrap();
+        if bob_has_it() {
+            break;
+        }
+    }
+    assert!(bob_has_it(), "the healthy switch has the removal");
+}
+
 #[tokio::test]
 async fn test_directory_floor_only_rises_within_one_answer() {
     let s = Setup::new();
