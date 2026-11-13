@@ -138,20 +138,9 @@ pub enum ProtocolError {
     /// (Switch wire 3.1 "Scope roots").
     #[error("protocols: a protocol name that isn't 1 to 32 of a-z and 0-9, starting with a letter")]
     BadName,
-    /// A protocol name that is a reserved root, or the beginning of one followed by `_` or `-`
-    /// (Switch wire 3.1 "Scope roots", `spec/reserved-roots.json`).
-    #[error("protocols: protocol name {name} is reserved")]
-    ReservedName {
-        /// The name.
-        name: String,
-    },
-    /// The reserved list didn't read, so no protocol is taken.
-    #[error("protocols: the reserved roots don't read: {0}")]
-    ReservedList(String),
     /// A scope name that isn't the protocol's own root: its name, or its name followed by `_`
-    /// or `-` and more characters, or for a reserved name the roots listed with it (Switch
-    /// wire 3.1 "Scope roots"). A protocol claims no other root, even where it is the only one
-    /// installed.
+    /// or `-` and more characters (Switch wire 3.1 "Scope roots"). A protocol claims no other
+    /// root, even where it is the only one installed.
     #[error("protocols: protocol {protocol} declares the scope {scope}, a root that isn't its own")]
     ForeignRoot {
         /// The protocol.
@@ -247,14 +236,13 @@ impl Protocols {
     /// # Errors
     ///
     /// [`ProtocolError`] for an empty set, a malformed or repeated protocol name, a protocol
-    /// owning no scope, a scope name that breaks the scope rule or has a sub-scope, and a scope
-    /// name declared twice.
+    /// owning no scope, a scope name that breaks the scope rule or has a sub-scope, a scope
+    /// whose root isn't the protocol's own (Switch wire 3.1 "Scope roots"), and a scope name
+    /// declared twice.
     pub fn new(protocols: Vec<Arc<dyn Protocol>>) -> std::result::Result<Self, ProtocolError> {
         if protocols.is_empty() {
             return Err(ProtocolError::NoProtocols);
         }
-        let reserved =
-            scopes::reserved().map_err(|error| ProtocolError::ReservedList(error.to_string()))?;
         let mut owners: BTreeMap<String, Owner> = BTreeMap::new();
         for (index, protocol) in protocols.iter().enumerate() {
             let name = protocol.name();
@@ -263,18 +251,6 @@ impl Protocols {
             }
             if protocols[..index].iter().any(|p| p.name() == name) {
                 return Err(ProtocolError::DuplicateProtocol {
-                    name: name.to_owned(),
-                });
-            }
-            // A reserved name claims only its own roots; any other name is none of them and the
-            // beginning of none (Switch wire 3.1 "Scope roots").
-            let own = reserved.iter().find(|r| r.name == name);
-            let takes_reserved = reserved
-                .iter()
-                .flat_map(|r| &r.roots)
-                .any(|root| owns_root(name, root));
-            if own.is_none() && takes_reserved {
-                return Err(ProtocolError::ReservedName {
                     name: name.to_owned(),
                 });
             }
@@ -290,11 +266,7 @@ impl Protocols {
                         protocol: name.to_owned(),
                     });
                 }
-                let allowed = match own {
-                    Some(own) => own.roots.contains(&def.name),
-                    None => owns_root(name, &def.name),
-                };
-                if !allowed {
+                if !owns_root(name, &def.name) {
                     return Err(ProtocolError::ForeignRoot {
                         protocol: name.to_owned(),
                         scope: def.name,
@@ -1088,111 +1060,27 @@ mod roots {
             );
         }
     }
-}
-
-#[cfg(test)]
-mod reserved_roots {
-    //! The reserved list's rules, with the names and roots read from the spec's file, so the
-    //! tests name no protocol of their own beyond neutral ones.
-
-    use super::*;
-
-    struct Owned(String, Vec<String>);
-
-    impl Protocol for Owned {
-        fn name(&self) -> &str {
-            &self.0
-        }
-        fn scopes(&self) -> Vec<ScopeDef> {
-            self.1.iter().map(|s| ScopeDef::keyed(s)).collect()
-        }
-        fn check_scopes(&self, _: &[&str]) -> std::result::Result<(), String> {
-            Ok(())
-        }
-        fn permissions(&self, _: &[&str]) -> Vec<Permission> {
-            Vec::new()
-        }
-    }
-
-    fn one(name: &str, scopes: &[&str]) -> std::result::Result<Protocols, ProtocolError> {
-        let scopes = scopes.iter().map(|s| (*s).to_owned()).collect();
-        Protocols::new(vec![Arc::new(Owned(name.to_owned(), scopes))])
-    }
-
-    fn list() -> &'static scopes::ReservedProtocol {
-        scopes::reserved().unwrap().first().unwrap()
-    }
 
     #[test]
-    fn test_protocols_a_reserved_name_takes_its_roots() {
-        let own = list();
-        let roots: Vec<&str> = own.roots.iter().map(String::as_str).collect();
-        let protocols = one(&own.name, &roots).unwrap();
-        for root in &roots {
-            assert!(protocols.knows_scope(root));
+    fn test_protocols_every_name_of_the_rule_takes_its_roots() {
+        // One rule for every protocol: no name is set aside for one protocol, and none is
+        // refused for being, or beginning, another protocol's root (Switch wire 3.1 "Scope roots").
+        for (name, root) in [
+            ("notes", "notes"),
+            ("photos", "photos_share"),
+            ("files", "files-sync"),
+            ("a1", "a1_b"),
+        ] {
+            Protocols::new(vec![Arc::new(Claims(name, root))])
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
-    }
-
-    #[test]
-    fn test_protocols_a_reserved_name_claims_no_other_root() {
-        let own = list();
-        for other in [own.name.as_str(), "chat"] {
-            assert_eq!(
-                one(&own.name, &[other]).unwrap_err(),
-                ProtocolError::ForeignRoot {
-                    protocol: own.name.clone(),
-                    scope: other.into()
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn test_protocols_no_other_protocol_claims_a_reserved_root() {
-        // The reviewer's case: `chat` claiming a reserved root, with only `chat` installed.
-        for root in &list().roots {
-            assert_eq!(
-                one("chat", &[root.as_str()]).unwrap_err(),
-                ProtocolError::ForeignRoot {
-                    protocol: "chat".into(),
-                    scope: root.clone()
-                },
-                "{root}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_protocols_a_name_that_is_a_reserved_root_is_refused() {
-        for root in list().roots.iter().filter(|r| !r.contains(['_', '-'])) {
-            assert_eq!(
-                one(root, &[root]).unwrap_err(),
-                ProtocolError::ReservedName {
-                    name: root.to_string()
-                },
-                "{root}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_protocols_a_name_that_begins_a_reserved_root_is_refused() {
-        // A name whose own roots would take a reserved one, such as the part before the `_` of
-        // a reserved root, when that part isn't itself reserved.
-        let own = list();
-        let prefixes: Vec<&str> = own
-            .roots
-            .iter()
-            .filter_map(|root| root.split_once(['_', '-']).map(|(head, _)| head))
-            .filter(|head| !own.roots.iter().any(|r| r == head))
-            .collect();
-        assert!(!prefixes.is_empty(), "the list has such a root");
-        for name in prefixes {
-            assert_eq!(
-                one(name, &[name]).unwrap_err(),
-                ProtocolError::ReservedName { name: name.into() },
-                "{name}"
-            );
-        }
+        let error = Protocols::new(vec![Arc::new(Claims("tasks", "notes"))]).unwrap_err();
+        assert_eq!(
+            error,
+            ProtocolError::ForeignRoot {
+                protocol: "tasks".into(),
+                scope: "notes".into()
+            }
+        );
     }
 }

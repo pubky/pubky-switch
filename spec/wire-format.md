@@ -2,11 +2,11 @@
 
 **Status.** Complete; a review candidate, with the Pubky Switch spec. The wire format of `spec/spec.md` ("the spec"). The spec decides behaviour; this document decides bytes. It settles every wire detail the spec leaves open, taking the reference prototype as the source of truth, so that a second team can build an interoperable switch, signer or app without reading the prototype. Where this document had to choose something the prototype doesn't fix, Appendix A says so.
 
-**Test vectors.** `spec/vectors/` holds the Switch's test vectors for every encoding, signature, derivation, envelope and state transition below; its `README.md` lists the files. Every example in this document comes from those files and uses the fixed keys of `keys.json` (identities alice and bob, alice's apps `wallet`, `phone` and `executor`, bob's apps `shop` and `cap`), except the `429 quota_exceeded` body of 9.3, which is the reference prototype's answer and says so. The JSON samples in this document, like the test vectors, use the scopes, message kinds, collections and app record member of an existing protocol as opaque sample data. The prose uses the spec's sample protocol, `tasks` (spec 1). The switch treats every protocol's names as opaque. The reference prototype, shared separately, computes every vector from its code, but for the cases the vectors README lists as `pubky-switch-core`'s, which that crate's tests compute.
+**Test vectors.** `spec/vectors/` holds the Switch's test vectors for every encoding, signature, derivation, envelope and state transition below; its `README.md` lists the files. Every example in this document comes from those files and uses the fixed keys of `keys.json` (identities alice and bob, alice's apps `wallet`, `phone` and `executor`, bob's apps `shop` and `cap`), except the `429 quota_exceeded` body of 9.3, which is the reference prototype's answer and says so. The JSON samples in this document, like the test vectors and the prose, use the scopes, message kinds, collections and app record member of the spec's sample protocol, `tasks` (spec 1). The switch treats every protocol's names as opaque. The reference prototype, shared separately, computes every vector from its code, but for the cases the vectors README lists as `pubky-switch-core`'s, which that crate's tests compute.
 
 **Conventions.**
 
-- "Section N" means this document; "spec N" means the Pubky Switch spec; "Paykit spec N" and "Paykit wire N" mean Paykit's documents.
+- "Section N" means this document; "spec N" means the Pubky Switch spec.
 - Field tables have the columns Field, Type, Req (required), Constraints and Notes.
 - Types:
 
@@ -116,7 +116,7 @@ Vectors: `encoding.json` `lp` and `u64_be`.
 
 - **Whose naming key.** Record keys, and a protocol's claim keys, are blinded with the naming key of the identity whose Pubky Switch holds them. Equal inputs give equal outputs within one identity, so all its apps find the same record and claim, and the stored keys name neither the counterparty nor the other inputs. That protects stored state and exports, not against a live operator, which links records and claims to senders through batches and timing (spec 15).
 
-Vectors: `encoding.json` `derive`; `keys.json` the Switch root, naming key and backup key of each identity, `scope_keys` and `sub_scope_keys`; `identifiers.json` `blinded_inputs` and every value of the table, with the blinded inputs of each record key; the record keys use Paykit's collections and natural keys (Paykit wire 1.5).
+Vectors: `encoding.json` `derive`; `keys.json` the Switch root, naming key and backup key of each identity, `scope_keys` and `sub_scope_keys`; `identifiers.json` `blinded_inputs` and every value of the table, with the blinded inputs of each record key; the record keys use the collections and natural keys of `tasks`.
 
 ### 1.6 Times
 
@@ -242,13 +242,12 @@ A list with a name not among them, one repeated or out of order is malformed, an
 
 **Scope roots** (spec 3.3). A scope's root is its `name`, the part before any `:`. Each protocol has a name, the one it uses under `protocols` in app records (3.2) and as the prefix of its kinds (5.1), and each root belongs to one protocol, so a reader never takes one protocol's scope for another's:
 
-- Paykit's roots are reserved for Paykit: `pay`, `request`, `allowance`, `allowance_execute`, `contacts`, `manage_contacts` and `ext` (Paykit spec 3.1). Its name is `paykit`. `spec/reserved-roots.json` holds this list in machine-readable form, with the same name and roots.
-- Every other protocol's roots are its name, or its name followed by `_` or `-` and more characters, such as `chat` and `chat_read` for a protocol named `chat`.
-- A protocol's name other than Paykit's is 1 to 32 characters of `a-z` and `0-9`, starting with a letter, without `_` or `-`, so no protocol's root is another's; it isn't `paykit` or a reserved root, and no reserved root is it followed by `_` or `-` and more characters (so `manage` isn't one, since `manage_contacts` is reserved).
+- A protocol's name is 1 to 32 characters of `a-z` and `0-9`, starting with a letter, without `_` or `-`. The rule is the same for every protocol: no name or root is set aside for one.
+- Its roots are its name, or its name followed by `_` or `-` and more characters, such as `chat` and `chat_read` for a protocol named `chat`. A root's protocol is therefore the part before its first `_` or `-`, so no protocol's root is another's.
 - A signer refuses to take a protocol whose name breaks these rules, or that claims a root other than its own, so two independent signers can't give one root to two protocols, even where only one of them is installed.
-- A reader takes a root that is neither reserved nor one of its own protocols' as another protocol's.
+- A reader takes a root that isn't one of its own protocols' as another protocol's.
 
-Kind prefixes follow the same rule: a kind's prefix, the part before its first `.`, is its protocol's name, or, for Paykit's extension kinds, an extension prefix, which always holds a `-` (Paykit wire 4.3), so it is never another protocol's name.
+Kind prefixes follow the same rule: a kind's prefix, the part before its first `.`, is its protocol's name, or its name followed by `-` and more characters, such as `tasks-cap` for a protocol named `tasks`. A kind's protocol is therefore the part of its prefix before any `-`, so no protocol's kind is another's. The `kind` of the switch's own signed documents, such as `pubky-switch.app`, isn't a message kind, and this rule doesn't apply to it: signature labels keep documents and messages apart (2.3).
 
 
 Example (`wallet`):
@@ -257,14 +256,14 @@ Example (`wallet`):
 {
   "v": 1,
   "kind": "pubky-switch.app_cert",
-  "identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
-  "app_id": "wejf37ngr7qizej3eoijn3hq4c",
-  "signing_key": "34ZGVmVZLEaW9LV-fvdhq5LWstPhljHGbJgcQVSR9Ek",
-  "bundle_key": "iSFVOWWeuN4EuNB7jx0IcOChXdjFaFF0P9YZGeYLsmE",
+  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+  "signing_key": "zBRPZWGzwLZBL6JkbhAtcqenmOAvuaEARhizaATmEOY",
+  "bundle_key": "vX0u3QBiY5h9MwfEYToLHubYCoCUxY3XAnbnl5vrFQA",
   "scopes": [
-    "pay",
-    "contacts",
-    "manage_contacts"
+    "tasks",
+    "tasks_people",
+    "tasks_people_admin"
   ],
   "permissions": [
     "claims.read",
@@ -298,45 +297,45 @@ Signed by the app's signing key (label `pubky-switch/v1/app-record`). Delivered 
 
 A verifier reads `signing_key` from the body, verifies the signature with it, then checks `v`, `kind` and `identity`, verifies `cert` for that identity, checks that the certificate names the same `app_id` and `signing_key`, and checks the form of `protocols` (below). A record that fails any of these is invalid at every reader, the switch included.
 
-- **Protocols' members** (spec 4.2). `protocols` holds what the app's protocols add to its record: one member per protocol, under the protocol's name, such as `tasks`. A protocol's name has the syntax of a scope `name` (3.1): 1 to 32 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit; which names a protocol may take is the Scope roots rule (3.1), which signers apply. The switch checks only the form: `protocols` is an object, each name has that syntax, and each value is an object, or `null`, which is no member (Absent and null). Every reader refuses a record that breaks this, the switch included. Inside a member the rules of 1.1 hold as in the rest of the record: duplicate names, the integer rule, and unknown members, which readers ignore. The operation cap bounds the record with its members (6.1). The switch never reads inside a member, and a reader ignores the member of a protocol it doesn't know. A protocol's rules on its member, and on `expires_at`, are its own: a record that breaks them is invalid at that protocol's readers, though the switch takes it. Vectors: the app records of `documents.json` carry Paykit's member; the apps of `claims.json` belong to no protocol, and their records carry an empty `protocols`; `documents.json` `app_record_protocols` holds records that only the form check refuses, and two that every reader takes.
+- **Protocols' members** (spec 4.2). `protocols` holds what the app's protocols add to its record: one member per protocol, under the protocol's name, such as `tasks`. A member's name has the syntax of a scope `name` (3.1): 1 to 32 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit. A protocol's own name is narrower, without `_` or `-` and starting with a letter, by the Scope roots rule (3.1), which signers apply. The switch checks only the form: `protocols` is an object, each name has that syntax, and each value is an object, or `null`, which is no member (Absent and null). Every reader refuses a record that breaks this, the switch included. Inside a member the rules of 1.1 hold as in the rest of the record: duplicate names, the integer rule, and unknown members, which readers ignore. The operation cap bounds the record with its members (6.1). The switch never reads inside a member, and a reader ignores the member of a protocol it doesn't know. A protocol's rules on its member, and on `expires_at`, are its own: a record that breaks them is invalid at that protocol's readers, though the switch takes it. Vectors: the app records of `documents.json` carry the member of `tasks`, `protocols.tasks`; the apps of `claims.json` belong to no protocol, and their records carry an empty `protocols`; `documents.json` `app_record_protocols` holds records that only the form check refuses, and two that every reader takes.
 - **Equal times** (spec 4.2): each new record of an app has an `updated_at` later than every record of it the app delivered or published, on any of its devices. Two records of one app with the same `updated_at` and different body bytes are a conflict for every reader, wherever it read them. A reader uses neither record and tells the user; it goes on using an earlier record of that app it holds, if any, and can still use the identity's other apps. A record with a strictly later `updated_at` ends the conflict. The same body twice is one record. The switch refuses the second record of such a pair (6.2 `app.put`). A record whose `updated_at` is more than the clock tolerance, 5 minutes (spec 11), ahead of the reader's clock isn't used at all, so it takes part in no comparison. Vectors: `documents.json` `app_record_conflict`.
 - **Deliver, then publish** (spec 4.2). The app delivers each new record to the service first (`app.put`) and publishes it on the Homeserver only after the service accepts it. If a publication fails, or the Homeserver copy differs from the newest record the service accepted from the app, the app publishes that newest record again, never an older one and never over a Homeserver copy with a later `updated_at`, until it deletes that record to leave, or leaves (spec 12.3).
 
-Example (`shop`, with a public endpoint and its 30-day `expires_at`):
+Example (`shop`, with a public board and its 30-day `expires_at`):
 
 ```json
 {
   "v": 1,
   "kind": "pubky-switch.app",
-  "identity": "7p4fn44qoshcwgfndz5grt7fyyz1eycqyduxdqe8o58of1byzodo",
-  "app_id": "brrz3m6g5rci6iqnzke44q4djc",
-  "signing_key": "D9vXhyOi76BsSuPscqj3tU8t_i5rcRkdOkqPyMy1WWM",
+  "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+  "app_id": "ye9a6d8e43cq3f69kto91csqqe",
+  "signing_key": "gmF0xGQzye0xpTkrPbj7ioEf0rf9CaPpEBCasQzNRPA",
   "cert": {
     "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "DcZij9RBJFkc9zKg4JRc9zdz2sgDvUR0ZAWP2_VBgKqCUIJFKQSy2x2uKApzYCfiFD6DFvKL161n6kj-J_FGBw"
+    "sig": "ohhwX8z64fjy4uk6QOqgDKOElHAm8HVBJgrAZzCJrydTkvwG6wWNMA2r5suhSQz4NpA3xcm47H73sCUPUC1uAQ"
   },
   "accepts": [
-    "paykit.payment_request_acceptance",
-    "paykit.payment_request_rejection",
-    "paykit.payment_request_cancellation",
-    "paykit.payment_proof",
-    "paykit.private_payment_list_request",
-    "paykit.resend_request",
-    "paykit.allowance_proposal",
-    "paykit.allowance_acceptance",
-    "paykit.allowance_rejection",
-    "paykit.allowance_end"
+    "tasks.acceptance",
+    "tasks.rejection",
+    "tasks.cancellation",
+    "tasks.done",
+    "tasks.list_request",
+    "tasks.resend_request",
+    "tasks.share_proposal",
+    "tasks.share_acceptance",
+    "tasks.share_rejection",
+    "tasks.share_end"
   ],
   "protocols": {
-    "paykit": {
-      "capabilities": {
-        "endpoint_identifiers": [
-          "btc-lightning-bolt11",
-          "btc-bitcoin-p2wpkh"
+    "tasks": {
+      "features": {
+        "board_kinds": [
+          "kanban",
+          "checklist"
         ]
       },
-      "public_endpoints": {
-        "btc-lightning-bolt12": "lno1qgsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzr"
+      "public_boards": {
+        "home": "board-7f3a"
       }
     }
   },
@@ -395,7 +394,7 @@ Rules the service enforces at `PUT /identity` (7.4.2):
 
 - **Deliver, then publish.** The signer delivers each new version to the service first and publishes it on the Homeserver only after the service accepts. If the Homeserver copy differs from the service's, the signer republishes the service's copy (the one `409 stale_identity` carries).
 - **Never back** (spec 4.3). The signer keeps the generation, version and document hash of the newest version a service accepted from it, or that it adopted, a version it restored from its backup (3.13) included. It never adopts or republishes a copy with a lower version or generation, or another body at that version, whichever service or answer shows it: that is a rollback or an equivocation, which it shows the user as an alarm instead of building on it. A copy with a higher version, another signer's, it may adopt.
-- **Equivocation.** Two documents with the same `version` and different body bytes are equivocation: an app that sees both, from any source, stops paying and alerts the user. Apps keep `hash(body bytes)` of each `(identity, version)` they have seen. The same body under another signature isn't equivocation: it shows a signer that signed one version twice, against 2.1, and the service still treats it as another document (7.4.2). A switch that holds one body refuses a peer delivery of another at that version and answers with its copy (7.4.5), so the sender holds both.
+- **Equivocation.** Two documents with the same `version` and different body bytes are equivocation: an app that sees both, from any source, stops acting on that identity, sending to it included, and alerts the user. Apps keep `hash(body bytes)` of each `(identity, version)` they have seen. The same body under another signature isn't equivocation: it shows a signer that signed one version twice, against 2.1, and the service still treats it as another document (7.4.2). A switch that holds one body refuses a peer delivery of another at that version and answers with its copy (7.4.5), so the sender holds both.
 - **Two copies.** A reader that holds both the Homeserver copy and the copy in the identity's directory (7.4.10) uses the one with the higher `version`.
 - **The switch's copy** (spec 4.3). A reader about to act on an identity's public app records that holds no copy of the identity's document fresher than 10 minutes reads the Homeserver copy, then, in parallel with the app record reads that need only that document, the copy the identity's switch holds (7.4.15, at the `inbox.url` the Homeserver copy names). It waits for that answer at most until its record reads finish plus a short grace (the reference prototype: 500 ms), and uses the higher `version`: the same body at an equal version, and another body there is equivocation (above). A lower copy changes nothing, and still counts as an answer. The switch's copy is fetched now, so it counts as a fresh copy (spec 4.3), for 10 minutes like any other, whether it came from the service or from a cache (7.4.15). An app that only the newer copy lists has its record read then, one more read in that case only.
   - **A freeze in the answer** (7.4.15): the reader checks it as a freeze (3.6) with the identity's key, then reads the public read once more, at the freeze's `inbox.url`, and uses the higher of all the copies it holds. That answer without a freeze completes the lookup; `503 staged` there means the move isn't published, and the first answer's copy stands; a second freeze isn't followed, and the lookup has failed. A freeze that doesn't verify fails the lookup.
@@ -418,14 +417,14 @@ Rules the service enforces at `PUT /identity` (7.4.2):
 
 Example of the record age limit: `documents.json` "alice identity.json, record age limit (version 6)" is alice's version 3 document at version 6 with `"record_max_age": 2592000` (30 days) after `recovery_from`.
 
-Example: alice's version 4 during a renewal of `wallet` (`documents.json` "alice identity.json, wallet renewal in progress"). The renewal drops `manage_contacts` and expires earlier, so it is a reduction, and since `manage_contacts` has keys it rotates the data epoch (3.8 Reductions). Its members are those of the version 3 example below, except `version`, which is 4, `data_epoch`, which is 3, and the hash `apps` lists for `wallet`, which is now the renewed certificate's (`mU1AzNkfFrYnccIEHI8YZXvca9LHByLn7HvBSA4kpZA`). After `recovery_from` comes the `renewed` member below. Version 5 ("... renewal closed") is the same with `until` set to `2026-01-01T00:08:00.000Z`: the service took version 4 at `00:03:00`, and the signer closed the reduction at once, adding the 5-minute tolerance (3.8 Reductions).
+Example: alice's version 4 during a renewal of `wallet` (`documents.json` "alice identity.json, wallet renewal in progress"). The renewal drops `tasks_people_admin` and expires earlier, so it is a reduction, and since `tasks_people_admin` has keys it rotates the data epoch (3.8 Reductions). Its members are those of the version 3 example below, except `version`, which is 4, `data_epoch`, which is 3, and the hash `apps` lists for `wallet`, which is now the renewed certificate's (`m9qO1CMcSOGDUYWn26M2RJ4vNRJcXJdM6bhBatyn_08`). After `recovery_from` comes the `renewed` member below. Version 5 ("... renewal closed") is the same with `until` set to `2026-01-01T00:08:00.000Z`: the service took version 4 at `00:03:00`, and the signer closed the reduction at once, adding the 5-minute tolerance (3.8 Reductions).
 
 ```json
 {
   "renewed": [
     {
-      "app_id": "wejf37ngr7qizej3eoijn3hq4c",
-      "cert": "vNz9pCLTlE0FhqJO-LyVrvp2R9fLPaJEJE-PaXG9RH4",
+      "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+      "cert": "D7UeJkS3FxHaOrpvgTVoD7ft790HEp2wiEceSAogOhE",
       "until": null
     }
   ]
@@ -438,13 +437,13 @@ Example (alice, version 3, with a removed app):
 {
   "v": 1,
   "kind": "pubky-switch.identity",
-  "identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
+  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
   "version": 3,
   "generation": 1,
-  "signer": "R3a8ZlRoUWZNc5lozgdUMw",
+  "signer": "zxbf_4P_t4vlYbtZ2ZuLNQ",
   "inbox": {
     "url": "https://inbox.example",
-    "service_key": "L3ykcjHUhsMki_ANP51ny-bBnRwgQbpdDKNAs1BotNI"
+    "service_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI"
   },
   "policy": {
     "admission": "contacts_and_conversations",
@@ -456,21 +455,21 @@ Example (alice, version 3, with a removed app):
   },
   "apps": [
     {
-      "app_id": "wejf37ngr7qizej3eoijn3hq4c",
-      "cert": "vNz9pCLTlE0FhqJO-LyVrvp2R9fLPaJEJE-PaXG9RH4"
+      "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+      "cert": "D7UeJkS3FxHaOrpvgTVoD7ft790HEp2wiEceSAogOhE"
     },
     {
-      "app_id": "g7teif9k1ur75jrmidqk7z7u6w",
-      "cert": "zZHXctuRACD9IMovASws1wl93gxjHQClw0iGrcUr80o"
+      "app_id": "c1utah9jitjs43etzdkj6cqdwr",
+      "cert": "wxm2nzYAOo4eQH7VN1N9aNQlf3cDLAoLU9y6rBbsp0A"
     },
     {
-      "app_id": "cw5ahtdkixcafna9zh1y5y5o1w",
-      "cert": "mHF_23P3wo5d0XIIu4uUfd28tdePYkzFgnokrJ2mr4U"
+      "app_id": "f4dtxinwdkb55gdwksph85m18w",
+      "cert": "fy6JFZbVm8eQkZLbGn_6diR4CqWG_k-n-dhhJ2j5Bwk"
     }
   ],
   "removed": [
     {
-      "app_id": "dw883cp3afxuwbgqsnpdbns7ry",
+      "app_id": "jiksqs9ixqfbgtingdjqh3sosc",
       "distrust_from": "2025-12-15T00:00:00.000Z"
     }
   ],
@@ -506,11 +505,11 @@ Example (`wallet`, its first key):
 {
   "v": 1,
   "kind": "pubky-switch.receive_key",
-  "identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
-  "app_id": "wejf37ngr7qizej3eoijn3hq4c",
+  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
   "n": 0,
-  "kid": "BCnGGmq8mrg",
-  "x25519": "hd7UWzOh1c6wf8IlsOPeUbRdpHO3-ldT01QdGK1MUCg"
+  "kid": "U0tWwIxdGyk",
+  "x25519": "s5JU_dJRw_bydtQ51Glju9Fd6kTGSLGR0j2tHpDca3Q"
 }
 ```
 
@@ -540,7 +539,7 @@ A key bundle is a JSON object, not a signed document:
 - **At approval** (spec 3.2, 3.5) the app gets its scope keys for every data epoch so far and the naming key as a full bundle of this format, sealed to its certified bundle key, inside the approval (3.10). No Pubky grant carries them, and the companion claim's plaintext holds none either (the reference prototype: it hands the approval over in process).
 - **Incremental bundles** (spec 3.5). A bundle holds only the epochs the app lacks: those after the newest epoch through which the app holds every key (`keys_through` in `GET /apps`, 7.4.12), up to the current one. The signer reads `keys_through`; when the service shows none (a new app before any bundle, or after a provider loss), it stores a full bundle. A bundle that replaces one the app never fetched starts where the app's holdings end, so nothing is skipped.
 - **Full bundles on request.** An app that, after fetching its bundle, still lacks a scope key for some data epoch up to the current one (after a restore from an old backup) asks once with `POST /v1/{id}/apps/{app_id}/keys` (7.4.11); the signer, when next online, stores a full bundle for each app with a pending request, a bounded number each run, the oldest requests first, made for the app's current certificate, in parts when it is large: every epoch from 1 to the current one, whatever the parts it stored for that certificate already cover. The app that asks may have lost what those parts gave it, and the request is answered only by a put that completes the range, so storing only the ranges not yet covered would leave a request made while every epoch is covered pending for good. The service shows only the ranges of the stored parts (`bundle_ranges`, 7.4.12), so the signer keeps which certificate each part it stored names, and passes that on in a hand-over or a backup (`bundle_parts`, 3.12); a range whose part names another certificate, or one it can't tell, counts as missing. The new parts replace every part made for another certificate, which the app skipped. When the app's record at the service carries a certificate other than the current one (`record_cert`, 7.4.12), the signer also stores the current certificate with `cert.put`, in the batch of the first part, as at a renewal (3.8 step 1): an app restored from a backup older than its renewal, or one at a new service after a provider loss, may never have seen that `cert.put`, and takes the parts once it holds the certificate. The request stays pending until the stored parts together cover every epoch from 1 to the current one.
-- **Size:** each scope key takes 81 to 160 bytes of compact JSON, by the length of its `scope` and its `data_epoch`, so one 64 KiB envelope holds about 400 to 800 of them. A Paykit app's keys take about 90 bytes each, about 700 to an envelope (714 with three scopes). Incremental bundles stay small while the app keeps up.
+- **Size:** each scope key takes 81 to 160 bytes of compact JSON, by the length of its `scope` and its `data_epoch`, so one 64 KiB envelope holds about 400 to 800 of them. The keys of the vectors' apps take about 90 bytes each, about 700 to an envelope (708 with the executor's three scopes). Incremental bundles stay small while the app keeps up.
 - **Parts** (spec 3.5). A bundle whose envelope would exceed 64 KiB, such as a full bundle of three scopes over 300 data epochs, or the delta of an app offline through many rotations, is stored as several bundles, each a `key_bundle.put` (6.2) covering a contiguous range `[first_epoch, last_epoch]` and each within 64 KiB. Each part is signed and sealed on its own, with the naming key and the scope keys of its range only, so an app opens it without the others. (The reference prototype: it seals the whole range, and halves a range whose envelope doesn't fit until each half does.) The parts stored for an app never overlap; the app fetches them all (7.4.11) and merges their keys. A delivery cut short leaves whole parts stored, and the signer resumes it from where it stopped, with the rest of the parts it signed, which it keeps until they are sent. Every renewal stores, with its `cert.put`, a full bundle made for the new certificate (spec 3.2 step 1): its range, from epoch 1 to the current one, or to the next one for a renewal that rotates the data epoch (3.8 Reductions), covers every part stored for the app, so its parts replace them all, and every part stored for an app names its newest certificate. A renewal cut short between two parts leaves parts made for the earlier certificate; the app skips them and asks for a full bundle. No part holds `switch_root` or a key for an epoch after the one it was made for: the current one, or during a rotation the next one, whose parts the signer stores before it publishes the document that raises the epoch (spec 3.2 and 12.2 step 2).
 - **Reading** (7.4.11): for each part the app verifies `sig` with the identity key, opens the envelope with its bundle secret, checks `v`, `kind` and the epoch range and that the naming key is the one it holds, and merges the keys into its state. The naming key never changes (spec 3.5): the app keeps the one it was approved with. `key_bundle.put` names `first_epoch` and `last_epoch` in the clear (6.2), since data epochs are public in `identity.json`. For the parts of a `GET /keys` answer:
   - The app refuses the whole answer when its parts, by the ranges they name in the clear, are out of `first_epoch` order or overlap, since merging them would pick between two keys. It takes no part from it. An empty `bundles` is none.
@@ -562,25 +561,25 @@ Example plaintext JSON (the `executor` app's incremental bundle at data epoch 2,
 {
   "v": 1,
   "kind": "pubky-switch.key_bundle",
-  "naming_key": "5AO6w5gGCLH-8mq7M11VAHUtatZT5a708KzmlEUdApY",
-  "cert": "mHF_23P3wo5d0XIIu4uUfd28tdePYkzFgnokrJ2mr4U",
+  "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M",
+  "cert": "fy6JFZbVm8eQkZLbGn_6diR4CqWG_k-n-dhhJ2j5Bwk",
   "first_epoch": 2,
   "last_epoch": 2,
   "keys": [
     {
       "data_epoch": 2,
-      "scope": "pay",
-      "key": "yG_XliYxOR8tWgKowDdeqZ9oQpuA7QESajDOHRPe3lE"
+      "scope": "tasks",
+      "key": "-wIBL-ZWhO2cPb_611j056TqFoL4vfgIc7F-X6ndyUI"
     },
     {
       "data_epoch": 2,
-      "scope": "allowance",
-      "key": "GEIyEAug6I4vVoFU05tve2rYsTGKSXra4buQRLpprgQ"
+      "scope": "tasks_share",
+      "key": "BfCsE-uaNYgXje2vqrt2SlBP3BQ9A8uPOWMYOcNqBcY"
     },
     {
       "data_epoch": 2,
-      "scope": "allowance_execute",
-      "key": "XUEBd9f8DaREq-cxRpzdPawZHFklFBoOg9afhkpMIPU"
+      "scope": "tasks_share_run",
+      "key": "Nzu-x2K_G6GApK4vSpDhytDCfuupJScBmg012fqLCqs"
     }
   ]
 }
@@ -629,14 +628,14 @@ Example freeze:
 {
   "v": 1,
   "kind": "pubky-switch.freeze",
-  "identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
+  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
   "inbox": {
     "url": "https://inbox.next.example",
-    "service_key": "AxJWQ859k9ruLxc2bKi32fEnDTjAaaD0wgWazuFYJ4w"
+    "service_key": "6FWRmADt_5se6vWPbPzsmizJDM9aLablPEpo5K-drd8"
   },
   "next_generation": 2,
   "issued_at": "2026-04-11T00:00:00.000Z",
-  "nonce": "jfL4l5QlRZJmCREH9UTEsg"
+  "nonce": "LXeO2-_LVf4L1TLryxRHWA"
 }
 ```
 
@@ -644,8 +643,8 @@ Example unfreeze (as sent to N; `documents.json` `discarded` has N's answer, sig
 
 ```json
 {
-  "freeze_hash": "eOGVDf-J3YOJBPhaH5n8L6Kbwo1Rba_PMiyeq9-bbU8",
-  "sig": "85XwIkh7-m47Uq1oL-DT4rTMJKnnfH-3bb92QVVAaDP3OKpYb08yxiuksfFVJhUbAjIy9GJJ6XdKiyENjQIeBw"
+  "freeze_hash": "k38YxzhWMzgCiPkN4jU2cXzCIAA4IRK8zYvrFH6kLQA",
+  "sig": "IqdY0k5nHtitP6FH6YKzd9z8Q5L1h0IcF2qu3fMHDaDaD81zsD3NmvqxGwMNBCOsTkAwLobit4w3k-4ujr9zCg"
 }
 ```
 
@@ -705,9 +704,9 @@ Example enrollment:
 {
   "v": 1,
   "kind": "pubky-switch.enroll",
-  "identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
+  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
   "origin": "https://inbox.example",
-  "nonce": "cyMjqSLMjQL1PfIN117ZVQ",
+  "nonce": "y6aw9gQLsoxRMM6deQh0gA",
   "policy": {
     "admission": "contacts_and_conversations",
     "connect_requests": {
@@ -723,7 +722,7 @@ Example answer:
 
 ```json
 {
-  "service_key": "L3ykcjHUhsMki_ANP51ny-bBnRwgQbpdDKNAs1BotNI",
+  "service_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
   "limits": {
     "app_limit": 32,
     "max_envelope": 65536,
@@ -733,10 +732,10 @@ Example answer:
     "record_quota_bytes": 67108864,
     "max_import_bytes": 4294967296
   },
-  "identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
+  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
   "origin": "https://inbox.example",
-  "nonce": "cyMjqSLMjQL1PfIN117ZVQ",
-  "enrollment": "CWMGAfj9JxdUPKaDWSFs1GDk2EloinoxVBaUbzhCAnw"
+  "nonce": "y6aw9gQLsoxRMM6deQh0gA",
+  "enrollment": "lC6Xmj6jfvx2H_zixYqVwcHKlpdT6Mn87HJLx8TmrEY"
 }
 ```
 
@@ -780,11 +779,11 @@ Then come scopes and switch permissions (`403 permission_missing`; recipients dr
 4. `GET /apps` (7.4.12) shows, for each app, `record_cert`, the certificate hash of the record the service holds, and `record_at`, when the service took it. Once `record_cert` is the new hash, the signer sets the entry's `until` to `record_at` plus the clock tolerance, 5 minutes (spec 3.2 step 4), in its next `identity.json` and delivers it. A renewal isn't a distrust event, so the tolerance goes on the side that keeps the app's last messages: recipients count the earlier certificate for a message accepted more than 5 minutes before `until` (5.1 check 7), that is, before `record_at`, when the app stopped presenting it.
 
 - **Reductions** (spec 3.2). A renewal is a reduction when the new certificate lacks a scope or a switch permission of the earlier one, or expires earlier. Its cutoff doesn't wait for the app: right after the delivery of step 2, the signer delivers a further `identity.json` that sets `until` of every renewed entry of the app still `null` to the service time at which the service took that delivery, plus the 5-minute tolerance, and then publishes it. The time is the `server_time` of the chain envelope in the delivery's transition proof (6.5). A retry of a delivery whose answer was lost gets that proof again (7.4.2), so the time is always the service's, never the signer's clock. Step 4 doesn't apply. Recipients count the earlier certificate for a message accepted more than the tolerance before `until`, so before that delivery (5.1 check 7). Renewals that only add scopes or extend the expiry follow steps 3 and 4.
-- **A removed scope's keys rotate** (spec 3.2, 12.2). A reduction whose new certificate lacks a scope with keys of the earlier one rotates the data epoch from e to e+1: a keyed scope (3.5), such as a sub-scope with keys of its own, or a name replaced by some of its sub-scopes, whose key derives every sub-scope's (in the `tasks` protocol: `tasks`, `tasks_assign:team1`, or `tasks_assign` replaced by `tasks_assign:team1`). One that removes only scopes without keys, a switch permission or expiry doesn't, and neither does dropping a sub-scope that its name in the new certificate covers (such as `tasks_assign:team1` when the new certificate holds `tasks_assign`). The full bundle of step 1 runs from epoch 1 to e+1 and is made for the new certificate, so it holds no key of the removed scope; then the signer stores each other current app's bundle for e+1, with its own scopes' keys, as at a revocation (spec 12.2 step 2); then step 2's delivery lists the new certificate and raises `data_epoch` to e+1, in one `identity.json`, as a revocation's delivery moves the app and raises it. The closing delivery follows as above. From that delivery the service takes sealed fields only at e+1 (`409 stale_epoch`), so the reduced app holds no key for anything written under the removed scope after it, whoever hands it the ciphertext. Vectors: the wallet renewal of `documents.json`, which removes `manage_contacts`, raises `data_epoch` from 2 to 3 in version 4, and `envelopes.json` `reduction_key_bundle` is the wallet's full bundle for it.
+- **A removed scope's keys rotate** (spec 3.2, 12.2). A reduction whose new certificate lacks a scope with keys of the earlier one rotates the data epoch from e to e+1: a keyed scope (3.5), such as a sub-scope with keys of its own, or a name replaced by some of its sub-scopes, whose key derives every sub-scope's (in the `tasks` protocol: `tasks`, `tasks_assign:team1`, or `tasks_assign` replaced by `tasks_assign:team1`). One that removes only scopes without keys, a switch permission or expiry doesn't, and neither does dropping a sub-scope that its name in the new certificate covers (such as `tasks_assign:team1` when the new certificate holds `tasks_assign`). The full bundle of step 1 runs from epoch 1 to e+1 and is made for the new certificate, so it holds no key of the removed scope; then the signer stores each other current app's bundle for e+1, with its own scopes' keys, as at a revocation (spec 12.2 step 2); then step 2's delivery lists the new certificate and raises `data_epoch` to e+1, in one `identity.json`, as a revocation's delivery moves the app and raises it. The closing delivery follows as above. From that delivery the service takes sealed fields only at e+1 (`409 stale_epoch`), so the reduced app holds no key for anything written under the removed scope after it, whoever hands it the ciphertext. Vectors: the wallet renewal of `documents.json`, which removes `tasks_people_admin`, raises `data_epoch` from 2 to 3 in version 4, and `envelopes.json` `reduction_key_bundle` is the wallet's full bundle for it.
 - **A closing delivery owed.** A signer stopped between the renewing delivery and the closing one leaves the earlier certificate open until it returns. At its next run, before any other delivery and before a provider change, it finds the closing delivery it owes from the newest `identity.json` the service holds (`GET /apps`, 7.4.12): every `renewed` entry still `null` whose renewal was a reduction, which it judges from the certificates it issued. It delivers that version again, a retry: it is still the renewing delivery, so the answer carries that delivery's proof, and the signer closes from its time as above. After a provider loss the lost service can't answer, so the document that starts the recovery closes it instead (spec 12.6 step 1).
 - **In between.** While `until` is `null` the earlier certificate counts wherever the app presents it: other inboxes accept appends carrying it, recipients accept its messages, and senders and other readers use the record that carries it. Once `until` is set, a switch refuses a request presenting it (`403 not_current`), and recipients accept a message carrying it only if its inbox accepted it more than the 5-minute tolerance before `until` (5.1 check 7), so before `record_at`, or for a reduction before the renewing delivery. A sender skips an app whose record carries a certificate whose renewal has closed (check 5, "current now"), until the app delivers its record with the new certificate.
 - **Directory caches** (spec 8.1): a sender's cached directory belongs to the `identity.json` version it was read under; once the sender holds a newer version, it reads the directory again before its next send, so an app given a scope receives its kinds as soon as its new record is delivered. An app that lost a receiving scope receives its kinds no longer from each sender's next send after that sender sees the closing version: through the Homeserver event stream, an append answer whose `directory_version` is newer (7.4.3), or its re-fetch of a copy more than 10 minutes old (spec 8.1). Until then the sender's appends may still wrap those kinds to the app, and the inbox can't refuse them, since kinds are sealed and `apps_version` doesn't change on a renewal. So a removed receiving scope stops at most the sender's directory cache lifetime after the cutoff. A removed sending scope has no such delay: recipients reject a message carrying the earlier certificate that their inbox accepted after the cutoff (5.1 check 7).
-- **Earlier messages** keep the authority they were sent with: a request stored in a record still verifies and can be paid (spec 11).
+- **Earlier messages** keep the authority they were sent with: a message stored in a record still verifies and can be acted on (spec 11).
 - **Removing a scope** applies at once at the service and, since the reduction closes the earlier certificate in the same signer step, at recipients: a switch holding the closing `identity.json` refuses the earlier certificate (`403 not_current`), recipient apps checking against it reject messages accepted after the cutoff (5.1 check 7), and senders stop wrapping to the app from their next send after they see the closing document (Directory caches, above). Own apps deliver the closing document to the switches they wrote to in the last 30 days, as after a revocation (3.3). The app keeps that scope's keys for every data epoch so far, so the removal of a scope with keys also rotates the data epoch (A removed scope's keys rotate, above).
 - **An expired certificate** fails check 3, so the service refuses every request of that app, its feed read included. A renewal the signer stores and lists brings it back without anything from the app: the service takes the signer's `cert.put` and key bundle for it although its certificate has expired (step 1, 6.2), and from the delivery of step 2 it checks the app against the renewed certificate, so the app's next request, its feed read included, passes check 3. The app then reads the `cert.put` in its feed and takes the certificate (step 3).
 - **At the service** a stored renewed certificate is dropped once the app's record carries it (its `cert.put` item keeps only its stub, 7.5), or replaced by a newer `cert.put`. At most one is kept per app (Section 9).
@@ -825,18 +824,18 @@ Example (`wallet`, `documents.json` "wallet app request"; `documents.json` `auth
 {
   "v": 1,
   "kind": "pubky-switch.app_request",
-  "app_id": "wejf37ngr7qizej3eoijn3hq4c",
-  "signing_key": "34ZGVmVZLEaW9LV-fvdhq5LWstPhljHGbJgcQVSR9Ek",
-  "bundle_key": "iSFVOWWeuN4EuNB7jx0IcOChXdjFaFF0P9YZGeYLsmE",
+  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+  "signing_key": "zBRPZWGzwLZBL6JkbhAtcqenmOAvuaEARhizaATmEOY",
+  "bundle_key": "vX0u3QBiY5h9MwfEYToLHubYCoCUxY3XAnbnl5vrFQA",
   "scopes": [
-    "pay",
-    "contacts",
-    "manage_contacts"
+    "tasks",
+    "tasks_people",
+    "tasks_people_admin"
   ],
   "client_id": "wallet.example",
-  "client_key": "4KsMX-bMv84j6kdgukbEEWdG0g3PGHhqPG6BljlANeg",
-  "caps": "/pub/pubky-switch/v1/apps/wejf37ngr7qizej3eoijn3hq4c.json:rw",
-  "secret_hash": "U_Gr-hJ54h-OApK5mB3NTs4kjZ1sQlb9adQuvQSjPHk"
+  "client_key": "ZdRdUHBwBGPRoRiu68ae07U7yZsZQA9R8hYN7csdtvw",
+  "caps": "/pub/pubky-switch/v1/apps/w8amtmn13m6p5bwnmj9wejbq4c.json:rw",
+  "secret_hash": "E25R1Ja9oaRFvsz-oM635SOXcvEuxtuJ0tTDWq3zg4k"
 }
 ```
 
@@ -874,12 +873,12 @@ Example (`documents.json` `approval`, the wallet's at data epoch 2, its signed m
 {
   "v": 1,
   "kind": "pubky-switch.approval",
-  "request": "G8U_OzD_C_gTrHArWT3ok_XIGH272mV_RwIG_0SlJUE",
-  "cert": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...", "sig": "7HEQItMv..." },
-  "identity": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...", "sig": "REeYn51S..." },
+  "request": "9koaj3xs6EwmTHvNRYdqIrfV90Zlf_f54RcF2WCgwfs",
+  "cert": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...", "sig": "3SnTaXtQ..." },
+  "identity": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...", "sig": "ysIV9UOQ..." },
   "bundles": [
     {
-      "bundle": { "envelope": "UFNXMQEBAAEAb3Vx...", "sig": "CNDY5SQi..." },
+      "bundle": { "envelope": "UFNXMQEBAAEISgTv...", "sig": "btIAmTAm..." },
       "first_epoch": 1,
       "last_epoch": 2
     }
@@ -1049,7 +1048,7 @@ The inbox reads only the header: it checks steps 1 and the size (4.4), and that 
 - **Key bundle:** `u32_be(len(JSON)) || JSON || zero padding` (3.5).
 - A reader rejects a length that runs past the plaintext and any non-zero padding byte.
 
-Vectors: `envelopes.json` seals messages from bob's `shop` to alice's apps, to one and to three recipients in every bucket (a `payment_request_cancellation` in the 1 KiB bucket, a `resend_request` padded with `msg_ids` in the others), with every input and intermediate value: content key, key commitment, nonce, each recipient's `ikmE`, `skE`, `info`, `enc` and wrapped key, the header, and the envelope. It also has the bucket boundaries, the key bundle, and three envelopes that must be rejected: a flipped `notify` bit, the wrong recipient identity, and a forged second content key that fails the key commitment.
+Vectors: `envelopes.json` seals messages from bob's `shop` to alice's apps, to one and to three recipients in every bucket (a `tasks.cancellation` in the 1 KiB bucket, a `tasks.resend_request` padded with `msg_ids` in the others), with every input and intermediate value: content key, key commitment, nonce, each recipient's `ikmE`, `skE`, `info`, `enc` and wrapped key, the header, and the envelope. It also has the bucket boundaries, the key bundle, and three envelopes that must be rejected: a flipped `notify` bit, the wrong recipient identity, and a forged second content key that fails the key commitment.
 
 ## 5. Messages
 
@@ -1060,7 +1059,7 @@ Every message is one JSON object (spec 5.3):
 | Field | Type | Req | Constraints | Notes |
 |---|---|---|---|---|
 | `v` | int | yes | 1 | |
-| `kind` | string | yes | a kind of the sender's protocol, `<protocol>.<name>`, such as `tasks.assignment` | recipients drop kinds they don't know |
+| `kind` | string | yes | a kind of the sender's protocol, `<prefix>.<name>`, whose prefix is the protocol's name or an extension of it (3.1 Kind prefixes), such as `tasks.assignment` | recipients drop kinds they don't know |
 | `msg_id` | uuid | yes | fresh per message | deduplication key with the sender identity (spec 11); a re-send keeps it |
 | `created_at` | time | yes | | informational (spec 5.3), except for provider-loss recovery (spec 12.6) |
 | `from` | object | yes | `{ "identity": pubky, "app_id": app-id }` | must match the certificate of the inbox entry and the plaintext's App ID |
@@ -1091,23 +1090,25 @@ Every message is one JSON object (spec 5.3):
 - **The standing is checked once** (spec 8.2): when the message is recorded, against the sender identity's `identity.json` current then. A stored message isn't checked again against later versions, so a signer that purges `removed` or `renewed` entries doesn't invalidate stored evidence; a protocol may have its apps check that app against the current document before acting (spec 8.2).
 - **A write the service refuses** for a per-kind limit or the storage quota (`429 quota_exceeded`), or because it would take the record over the 256 KiB value limit (`413 too_large`, 9.2), MUST NOT stall the feed (spec 8.2): the app stores the entry locally, moves its cursor past it, and writes the record once room frees. A write refused for good, or one that doesn't fit one batch, is stored and passed the same way, and the app tells its protocol instead of sending it again (spec 8.2).
 
-Example (an acceptance, from the test vectors of the protocol whose values the JSON samples use):
+Example (`envelopes.json`'s message in the 1 KiB bucket, a `tasks.cancellation` from bob's `shop` to alice):
 
 ```json
 {
   "v": 1,
-  "kind": "paykit.payment_request_acceptance",
-  "msg_id": "dd9fb672-ca40-418c-ac4d-a73a010186d5",
-  "created_at": "2026-01-01T00:03:00.000Z",
+  "kind": "tasks.cancellation",
+  "msg_id": "4cc9d48b-b1d1-4e90-8b51-16e9ad89cc56",
+  "created_at": "2026-02-10T00:00:00.000Z",
   "from": {
-    "identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
-    "app_id": "wejf37ngr7qizej3eoijn3hq4c"
+    "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+    "app_id": "ye9a6d8e43cq3f69kto91csqqe"
   },
-  "to": "7p4fn44qoshcwgfndz5grt7fyyz1eycqyduxdqe8o58of1byzodo",
+  "to": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
   "refs": [
-    "pukrdI5C7SfN7mlLheLGWRk2qzt8RTKXlXv4E1rRGKg"
+    "KUXRO3VXukWmEtyK77jTHohDxrD75xJjsVq9P3DxXnk"
   ],
-  "body": {}
+  "body": {
+    "reason": "no_longer_needed"
+  }
 }
 ```
 
@@ -1133,27 +1134,27 @@ Example (`operations.json` `claim attempt`: an `attempt` with a deadline, condit
 
 ```json
 {
-  "identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
-  "app_id": "wejf37ngr7qizej3eoijn3hq4c",
+  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
   "generation": 1,
   "batch": {
-    "id": "X8mxmFl3oL9HfIUnsds0GQ",
+    "id": "ytmXw2Y65nm811vKBpkAQQ",
     "count": 2
   },
   "conditions": [
     {
       "record_version": {
-        "key": "pj5Kzy_tpIntcicQT2-nlIrRDN6x9qRm3ODJrs9nUpY",
+        "key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM",
         "generation": 1,
         "version": 6
       }
     }
   ],
   "op": "claim",
-  "claim_key": "sTqkmOg6G5PIHULuqwOHIuIiZBdkPJL2uxE_kuo8K5Y",
+  "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
   "type": "attempt",
   "expected_step": 0,
-  "attempt_id": "DgCVYQKL1eyDacZvG6YhZg",
+  "attempt_id": "P37OWgXQlGXLccI0TFBpwg",
   "orphan_after": 86400,
   "deadline": "2026-01-02T00:00:00.001Z"
 }
@@ -1220,23 +1221,23 @@ A `done` names at most one piece of evidence, by `evidence_ref` (spec 10.2). A t
 
   Signed evidence of misbehaviour (an item that doesn't match its stub, a proof that names another operation or object, or contradicts the verified chain) is a rollback (spec 10.1). Some failures are only the service's word, not the writer's: a write whose signature doesn't verify with a certificate of its writer the app finds, or that is of another `key` than the one read, or of a collection of another protocol (steps 1 and 3), the certificate the service shows with it or a missing date (steps 1 and 4), and a version that fails step 6. Each leaves the write ignored, naming no app, which loses nothing a service withholding the write couldn't take. A write signed with the reading app's own key is that app's own (spec 3.1): steps 4 and 5 don't apply to it, but for a removed app's `distrust_from`, since a lost device holds the key too (spec 12.2 step 3), and a failure of steps 3 to 6 leaves it ignored, naming no app. A value that doesn't open (step 7) names the app that signed it, the reading app included, since the signature covers `value_sealed`. Any other failure leaves the write ignored and shown with the app it names (spec 8.2). The app shows each such write once, by its item hash (6.6), at the version it was last shown at, and keeps at most eight for a record, the one shown at the lowest version dropped first. A write ignored only for the certificate the service shows or a missing date, whose version passes step 6, is followed, naming nobody: the app builds its next write on it, as on a flagged write, and the record doesn't read as flagged. Any other write ignored without naming an app isn't followed: the app builds its next write on the version it holds (spec 8.2). A write at the key read that its writer signed for another collection or policy fails step 3 and names its writer; from the feed, which reads no key, a write whose collection and policy name no collection of the app's protocol is ignored, naming no app. The app takes an accepted write in place of the one it holds only if it is newer: with both versions authenticated, the higher one; with the new version unauthenticated, only if its `expected_version` is the held version or later; with the held version unauthenticated, the held write counts as just after its own `expected_version`. The same write again, with an authenticated version, makes the held one authenticated. The AAD stays `lp("pubky-switch/v1/sealed", identity, scope, record key)`: the operation's signature binds the writer.
 
-Example (`operations.json` `record.put create`, which `chain.json` applies at `seq` 6, giving the record version (1, 6); `ct`, cut short, seals a sample record holding bob's request):
+Example (`operations.json` `record.put create`, which `chain.json` applies at `seq` 6, giving the record version (1, 6); `ct`, cut short, seals a `task_items` record holding bob's assignment):
 
 ```json
 {
-  "identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
-  "app_id": "wejf37ngr7qizej3eoijn3hq4c",
+  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
   "generation": 1,
   "batch": {
-    "id": "RlS8dXaU6JBOESpdL12e5A",
+    "id": "XjPa0rAnB2ReUhZEv0mVSg",
     "count": 1
   },
   "op": "record.put",
-  "key": "pj5Kzy_tpIntcicQT2-nlIrRDN6x9qRm3ODJrs9nUpY",
-  "collection": "t-YfESPIL9L9uVE2Y6IfOrHnGY3eEg74o6zouKupqdI",
-  "read_scope": "pay",
+  "key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM",
+  "collection": "rThZDAv1FHRMIiUn6S8h7HBHF_-gTlmA13cC8V-Prug",
+  "read_scope": "tasks",
   "write_scopes": [
-    "pay"
+    "tasks"
   ],
   "expected_version": {
     "generation": 0,
@@ -1244,13 +1245,13 @@ Example (`operations.json` `record.put create`, which `chain.json` applies at `s
   },
   "value_sealed": {
     "data_epoch": 2,
-    "scope": "pay",
-    "nonce": "WDEyIeaJ1mScEvDVOP66KIv2LyuUnfy2",
-    "ct": "e49GTPFcdocXPyB1rLAX5I2xtqeUpyYHRcJV4Q0rqwdsomL9vt-tHQD..."
+    "scope": "tasks",
+    "nonce": "a6aRD9-0Omz67vnFzFd06S8lEny5XdcL",
+    "ct": "-aKYccxUt-Wo9TE4LEE1W9_bYgftquiAzTBtdv0oe_Ht-h242sDhGtQ..."
   },
   "id_inputs": {
-    "collection": "payer_activity",
-    "blinded_key": "eovKe6MqrisjKMSB9Iq0r7Z3wtPNBQqeCb5kP0MlX8M"
+    "collection": "task_items",
+    "blinded_key": "oZHk8WYT151d-gC9U5twKugX1w360FV7vxhdXIVVeTQ"
   }
 }
 ```
@@ -1294,18 +1295,18 @@ Example (`operations.json` `cert.put`; certificate cut short):
 
 ```json
 {
-  "identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
+  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
   "app_id": null,
   "generation": 1,
   "batch": {
-    "id": "9G8n3RwiijmAxZku6M5rDA",
+    "id": "qgStjlRCdUE1jWm6iZ4hSg",
     "count": 1
   },
   "op": "cert.put",
-  "target_app_id": "wejf37ngr7qizej3eoijn3hq4c",
+  "target_app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
   "cert": {
     "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "SwxhvJhpa654MZNcBV8NyEAZH2eRlyahFFb5KM7VrSXR-3_pOoj8-T4IUwO_RpyBCi25GI6NIfGjUK4Yy6SpAA"
+    "sig": "pJsCU4UIXeHk1QS_UqlP76nqXpyny7dRJCU8w55_8JB8FfZXgKzfQt3TedrTbeg7-RcxzzhKP9B0PgKep_SjDA"
   }
 }
 ```
@@ -1344,19 +1345,19 @@ A failed condition is `409 conflict`, with the current value the caller may read
   "proofs": [
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "CEsyOBevIdX7OGtYEHr_nITIARcwoKIl_SOyRVskyzNJaYIVV29L7Pkl0d-PGwa3zZTj75wCHQ-DB9YwKlmLCw"
+      "sig": "Z3_U3AsxoDiMQTgRCZ8fF9E_P0Ex2tL8skLWlSRytVy7NoyzEuWBFXlvnWZ8pOe_v4IOVclvBlEPZkT_Q61jBw"
     },
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "EKxwnREEqEIFUTxlrhjF7Qnsn-ub22nFWseqqqityQgInMnmqwIIsYby7X76XFhQKQIsD2UclxgXsG44Bq99DA"
+      "sig": "svZhsiF2IRrW30xJK0hM9m3784FyWv9LoTeA8gBblYIH6CHdzoHoWgVJU99bdzE62W6eBccnxjyQCnlZMWmACg"
     }
   ],
   "head": {
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "7cnQjhJhU6AcoBWbYkGqHkYpCA-dn_qkjLalmGaky9g",
-    "sig": "yZx9ezPGRFJ4xaokjpOrhPntr7_82PJpHurtW2cBi6ttl8EMu6Lcqi3emnON4A53tySDxjp6JUBdZAnXRC1wAA"
+    "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
+    "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
   }
 }
 ```
@@ -1372,12 +1373,12 @@ Example (the registration batch of spec 12.1 step 2: `app.put`, the first `recei
 {
   "ops": [
     {
-      "body": "eyJpZGVudGl0eSI6IjZmcmFvOHc5c3M1Y241NDRx...",
-      "sig": "fX8mPu_Gx7BeDzLiOmQ59dPCu2Ry1tDQTATqEnRyJSv9PAMoh6kKnXOSZ4lLhSL3Rh0kRA7wQSthcLMuM3bmDA"
+      "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
+      "sig": "_yTDzcX99n7F-4c5R39619aNnDuSEZMTMCYtQ_RdfbUPBfE04MGc9FIiHqYGd5kPDUnJWpn4-nKgGEnPElmsDw"
     },
     {
-      "body": "eyJpZGVudGl0eSI6IjZmcmFvOHc5c3M1Y241NDRx...",
-      "sig": "jSZmeO0fzDCn1uC_exX_u7iSJ1HxiIf9hob7-hCbSCL5cawoBk1SDLzfe0YPP9cqTJfgVIKS1KydZe4TTkPvAA"
+      "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
+      "sig": "NQubEwL3PW59A3Yq2M44KzHI1Kjp809ENWYyUgrQMwUrHtMHHdBjD3xQLjTkwPaWp9H-dCKjjHx8WUkWkaTQDw"
     },
     {
       "op": "cursor.set",
@@ -1445,29 +1446,29 @@ Example proof (`chain.json` "claim attempt (seq 7)", the `attempt` of 6.1; the c
 {
   "chain": {
     "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-    "chain_hash": "5pd27ePol1fBJcRvuJhfSLI0kXfMiYT4EiXf8htSkOY"
+    "chain_hash": "39Z4TXAiQunrwwnx_BUO46H96vxegqPZNl261qJJ8Qo"
   },
-  "object": "sTqkmOg6G5PIHULuqwOHIuIiZBdkPJL2uxE_kuo8K5Y",
+  "object": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
   "step": 1,
   "state": {
-    "attempt_id": "DgCVYQKL1eyDacZvG6YhZg",
+    "attempt_id": "P37OWgXQlGXLccI0TFBpwg",
     "attempts": [
       {
-        "attempt_id": "DgCVYQKL1eyDacZvG6YhZg",
+        "attempt_id": "P37OWgXQlGXLccI0TFBpwg",
         "duplicate": false,
         "opened_at": "2026-01-01T00:00:03.000Z",
         "orphan_after": 86400,
         "orphaned": false,
         "outcome": "open",
-        "owner": "wejf37ngr7qizej3eoijn3hq4c",
+        "owner": "w8amtmn13m6p5bwnmj9wejbq4c",
         "possibly_duplicate": false
       }
     ],
-    "claim_key": "sTqkmOg6G5PIHULuqwOHIuIiZBdkPJL2uxE_kuo8K5Y",
+    "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
     "deadline": "2026-01-02T00:00:00.001Z",
     "divergent": false,
     "next_possibly_duplicate": false,
-    "owner": "wejf37ngr7qizej3eoijn3hq4c",
+    "owner": "w8amtmn13m6p5bwnmj9wejbq4c",
     "state": "ATTEMPTING",
     "step": 1,
     "tombstone": false
@@ -1505,11 +1506,11 @@ Example envelope (the `attempt` of 6.1, at `seq` 7: an inbox entry at `seq` 5, t
   "chain_version": 1,
   "generation": 1,
   "seq": 7,
-  "prev_chain_hash": "PEG3PKwsceFwKTZKjaBRzGEYRurhBQ7cn8jNiBRNtgs",
+  "prev_chain_hash": "jjMkxY3N9g4KTZ5l0nIgjk9pCBnf0fLun1aMA8OWYPw",
   "server_time": "2026-01-01T00:00:03.000Z",
   "item_type": "op",
-  "item_hash": "nLYzEGm46RkXyS60TK0uwblTbRrIgJEtMk0m-2a9KUU",
-  "batch_id": "X8mxmFl3oL9HfIUnsds0GQ",
+  "item_hash": "bMl6YsCP6NVSV_gLdAJvf38hivvMXRL9dhQFc6pG8X4",
+  "batch_id": "ytmXw2Y65nm811vKBpkAQQ",
   "batch_count": 2
 }
 ```
@@ -1531,11 +1532,11 @@ A signed head is a JSON object (not a signed document):
 
 ```json
 {
-  "chain_hash": "7cnQjhJhU6AcoBWbYkGqHkYpCA-dn_qkjLalmGaky9g",
+  "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
   "chain_version": 1,
   "generation": 1,
   "seq": 9,
-  "sig": "yZx9ezPGRFJ4xaokjpOrhPntr7_82PJpHurtW2cBi6ttl8EMu6Lcqi3emnON4A53tySDxjp6JUBdZAnXRC1wAA"
+  "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
 }
 ```
 
@@ -1687,13 +1688,13 @@ Vectors: `http.json` has signed requests from an own app, an app of another iden
 Example request headers (an append from bob's `shop` to alice's inbox):
 
 ```
-POST /v1/6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy/inbox?apps_version=4
-Switch-Identity: 7p4fn44qoshcwgfndz5grt7fyyz1eycqyduxdqe8o58of1byzodo
-Switch-App: brrz3m6g5rci6iqnzke44q4djc
+POST /v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/inbox?apps_version=4
+Switch-Identity: 43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o
+Switch-App: ye9a6d8e43cq3f69kto91csqqe
 Switch-Cert: eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...
-Switch-Invite-Code: IRrC78oNIjZ4hcet2fYnJQ
+Switch-Invite-Code: YMXqc5UxVVGogjCsEo424Q
 Switch-Timestamp: 2026-01-01T00:05:01Z
-Switch-Signature: XlOZJ7scT4uKhfLOBNQ_3ioVtmgrsksLBcyNdU45Mr8zr-3bfEaQnU05sXaVfgBBhT71lojb2KC1DsXZobzlCg
+Switch-Signature: A_wDd8-ZdLJEFUjHwmTDsr1ILsvXaW1uZGn-9FzrGIx53zp_UV4qbcCtmBDrNy53CQKxi2ZXMIzgV0V0E8piCg
 ```
 
 ### 7.2 Callers and authentication
@@ -1870,7 +1871,7 @@ For every request the service:
 - **`missed` items:** when the service deletes an entry a lagging target hasn't read, it records the miss in a `missed` item for that app, which takes a new `seq` like an unreadable entry, so the app's cursor reaches it whatever its position. A later miss replaces an item the app hasn't passed with one covering both. On a `missed` item the app asks the counterparties of its unfinished records to re-send what their inboxes accepted from the later of the item's `accepted_from` and its cursor's time, less the clock tolerance, by its protocol's re-send, and lists its collections again (7.4.9), to check what it holds after the gap; no key it hasn't read past the delete of is forgotten meanwhile (9.1). It owes that listing from the commit that passes the item and makes it before it hands any entry to its protocol, a stored one included, so no entry is judged on records the listing would change. An item whose times don't parse asks for no re-send, but still owes the listing.
 - **Errors:** `403 permission_missing` for callers that aren't own apps; `400` for a malformed `after`.
 
-Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four chain items: the record's create, the attempt batch and a service transition; long values cut short):
+Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's create at `seq` 6 as its stub, since the attempt batch's write at `seq` 8 supersedes it (7.5); the attempt batch's two operations; and a service transition; long values cut short):
 
 ```json
 {
@@ -1878,30 +1879,21 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
     {
       "type": "entry",
       "seq": 5,
-      "entry_id": "FN-CtHkJNr1sjf6lqfIzqg",
-      "sender": "7p4fn44qoshcwgfndz5grt7fyyz1eycqyduxdqe8o58of1byzodo",
+      "entry_id": "YfEG-ssKoaUNx40eATBsyg",
+      "sender": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
       "cert": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "DcZij9RBJFkc9zKg4JRc9zdz2sgDvUR0ZAWP2_VBgKqCUIJFKQSy2x2uKApzYCfiFD6DFvKL161n6kj-J_FGBw"
+        "sig": "ohhwX8z64fjy4uk6QOqgDKOElHAm8HVBJgrAZzCJrydTkvwG6wWNMA2r5suhSQz4NpA3xcm47H73sCUPUC1uAQ"
       },
       "accepted_at": "2026-01-01T00:00:02.000Z",
-      "envelope": "UFNXMQEBAQF5KmCReWHDPm1RMUmA1drKn-JKw5Ff..."
+      "envelope": "UFNXMQEBAQFDyTFC9V6clYCvyk8-AtxlrRQYynxH..."
     },
     {
-      "type": "chain",
+      "type": "stub",
       "seq": 6,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "PEG3PKwsceFwKTZKjaBRzGEYRurhBQ7cn8jNiBRNtgs"
-      },
-      "item_type": "op",
-      "item": {
-        "body": "eyJpZGVudGl0eSI6IjZmcmFvOHc5c3M1Y241NDRx...",
-        "sig": "ZVja1mNnd8J7C4up7ZNCwnRx-ZyLwfMaXTOOSDvGNaKSVDiLsR5K_5CgnzeppHbzmC5G22aBcHdE_znoU8ntDg"
-      },
-      "proof": {
-        "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "aHA6fvZEMbToN3t16uPsDAHQBm81_4pnvimBkgNJfA_POUxKH9S8kNgL8zKGgWYz-deUa91AdL6KaCcxs001DQ"
+        "chain_hash": "jjMkxY3N9g4KTZ5l0nIgjk9pCBnf0fLun1aMA8OWYPw"
       }
     },
     {
@@ -1909,16 +1901,16 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
       "seq": 7,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "5pd27ePol1fBJcRvuJhfSLI0kXfMiYT4EiXf8htSkOY"
+        "chain_hash": "39Z4TXAiQunrwwnx_BUO46H96vxegqPZNl261qJJ8Qo"
       },
       "item_type": "op",
       "item": {
-        "body": "eyJpZGVudGl0eSI6IjZmcmFvOHc5c3M1Y241NDRx...",
-        "sig": "XZhGShG5jhjbLykQrpPVyyEP14wtEX2CU82HkqVGmxHPBybCA6EzMK649wrgu9nErE1trmYuNQWjNpy-Iz7MDg"
+        "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
+        "sig": "uyEJk2QGiGpoJ9FO8iyrmaJoPu175snD9GvnGQf4nPP5NvbpN5_FLYq7tG_-fxJghSV_1qpB9ISWSTk6yklqCA"
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "CEsyOBevIdX7OGtYEHr_nITIARcwoKIl_SOyRVskyzNJaYIVV29L7Pkl0d-PGwa3zZTj75wCHQ-DB9YwKlmLCw"
+        "sig": "Z3_U3AsxoDiMQTgRCZ8fF9E_P0Ex2tL8skLWlSRytVy7NoyzEuWBFXlvnWZ8pOe_v4IOVclvBlEPZkT_Q61jBw"
       }
     },
     {
@@ -1926,16 +1918,16 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
       "seq": 8,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "yTESsVT4FMSMWpLke97CDhoQg1OVGe3_ZigpgZZhwWc"
+        "chain_hash": "L0v5_hmltlaZgDMwk4pDQeO0KqqDwXeRvtBGVY5z0Q4"
       },
       "item_type": "op",
       "item": {
-        "body": "eyJpZGVudGl0eSI6IjZmcmFvOHc5c3M1Y241NDRx...",
-        "sig": "6avozn7zJM2YHHFmMvHtLXBSmb6G6BrbZM61YApA19g1F6qOvP_IElHfXp_LOyHTljc5LyXra2rFovr_i8R_CQ"
+        "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
+        "sig": "MJnPcjmxKygWKsQud4bULoc8pwfT6ISIr1kM6O_O4H_PnGkhcvoR5Wl2_sEB20B3-XEkueQS-p-ZKqi58HHRBg"
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "EKxwnREEqEIFUTxlrhjF7Qnsn-ub22nFWseqqqityQgInMnmqwIIsYby7X76XFhQKQIsD2UclxgXsG44Bq99DA"
+        "sig": "svZhsiF2IRrW30xJK0hM9m3784FyWv9LoTeA8gBblYIH6CHdzoHoWgVJU99bdzE62W6eBccnxjyQCnlZMWmACg"
       }
     },
     {
@@ -1943,12 +1935,12 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
       "seq": 9,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "7cnQjhJhU6AcoBWbYkGqHkYpCA-dn_qkjLalmGaky9g"
+        "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA"
       },
       "item_type": "service",
       "item": {
-        "body": "eyJhcHBfaWQiOiJnN3RlaWY5azF1cjc1anJtaWRx...",
-        "sig": "9yBz6rIezY4sPZAwVqgF4Sj1KByCH00upMpf3nmL5dZSnSOZIOWp0hvu7HdgU57HQKXdbMdm6yw9_aC59aLOAQ"
+        "body": "eyJhcHBfaWQiOiJjMXV0YWg5aml0anM0M2V0emRr...",
+        "sig": "vxSfwR3sT3q2yyGXVYV8AEEhDSbC84WzTRlTTBQc81vai8jiEOTcDyxc0SrQ3dPNbMuHSVAAIow1BC_FJQ7BBw"
       }
     }
   ],
@@ -1960,8 +1952,8 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "7cnQjhJhU6AcoBWbYkGqHkYpCA-dn_qkjLalmGaky9g",
-    "sig": "yZx9ezPGRFJ4xaokjpOrhPntr7_82PJpHurtW2cBi6ttl8EMu6Lcqi3emnON4A53tySDxjp6JUBdZAnXRC1wAA"
+    "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
+    "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
   }
 }
 ```
@@ -1971,9 +1963,9 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
 - **Body:** a `signed<IdentityDoc>` of another identity.
 - **Answer:** `{ "version": int }`, the version the service now holds, and `known_version` for apps of other identities.
 - **Rules:** an app of another identity delivers only its own identity's document (`403 not_admitted` otherwise), and must be admitted, or asking to connect where the policy allows it (`403 not_admitted`; `503 staged` during a recovery's staged admission). An own app delivers counterparties' documents, never its own identity's (`400`). The service keeps one copy per identity per account, the highest version: a delivery at the version it holds is judged first, by the next bullet, whatever its generation; otherwise a lower version or generation is `409 stale_identity` with `current: { "version" }`.
-- **The held version again** (3.3): a delivery at the version the service holds is a no-op only with the held copy's body bytes, whatever the signature: the service keeps its copy and answers its version. Another body at that version is equivocation. The service keeps its copy and answers `409 stale_identity` with `current: { "version", "identity" }`, the held signed document. The sender then holds both documents and acts as 3.3 says: it stops paying that identity, or pays nothing at all when the document is its own identity's, and alerts the user. This holds for an app of another identity delivering its own identity's document and for an own app delivering a counterparty's.
+- **The held version again** (3.3): a delivery at the version the service holds is a no-op only with the held copy's body bytes, whatever the signature: the service keeps its copy and answers its version. Another body at that version is equivocation. The service keeps its copy and answers `409 stale_identity` with `current: { "version", "identity" }`, the held signed document. The sender then holds both documents and acts as 3.3 says: it stops acting on that identity, sending to it included, or on anything at all when the document is its own identity's, and alerts the user. This holds for an app of another identity delivering its own identity's document and for an own app delivering a counterparty's.
 - **Limits** (9.4): a delivery admitted by an invite code counts against that code's rate, shared with directory reads admitted by it (`invite_reads_per_min`); one admitted only because connect requests are on counts against the account's stranger rate (`stranger_per_min`), shared with connect requests. Beyond either, `429 rate_limited`.
-- **Floors** (9.1): when the service drops the copy of an admitted identity (a contact or conversation) beyond `max_peers`, it keeps that copy's version, generation and body hash. Until a copy of that identity is held again, a delivery below that version or generation, or another body at that version, is `409 stale_identity` naming the floor's version, `current: { "version" }`: the service keeps the floor's hash, not the document. That answer carries no document, so it shows the sender nothing to compare and proves nothing: the sender doesn't treat it as equivocation, and keeps paying on the documents it holds.
+- **Floors** (9.1): when the service drops the copy of an admitted identity (a contact or conversation) beyond `max_peers`, it keeps that copy's version, generation and body hash. Until a copy of that identity is held again, a delivery below that version or generation, or another body at that version, is `409 stale_identity` naming the floor's version, `current: { "version" }`: the service keeps the floor's hash, not the document. That answer carries no document, so it shows the sender nothing to compare and proves nothing: the sender doesn't treat it as equivocation, and keeps acting on the documents it holds.
 - **Denied senders** (spec 7): where connect requests are on, a denied sender's delivery is answered and kept exactly like a stranger's (a peer copy admits nothing), so its connect request is answered alike too (7.4.7); where they are off, both get `403 not_admitted`.
 - **From a removed app** (7.2): an app that the held copy or the delivered document lists in `removed` is answered like a stranger. Admitted only by an invite code or where the policy allows connect requests (`403 not_admitted` otherwise), it gets `{ "version": v, "known_version": v }` with v the version it delivered, whatever the service holds. The service still keeps a delivered document that is newer than the copy it holds, or, holding none, one it would keep from a stranger; it never goes back. This answer compares no bodies: another body at the version held gets it too, and isn't kept.
 - Vectors: `http.json` "app of another identity: identity.json at the version the switch holds, the same body" is alice's wallet delivering her version 3 (`documents.json` "alice identity.json") to bob's switch, which holds it, signed for bob's origin; its answer, "app of another identity: the version held again with the same body, a no-op", is `{"known_version":3,"version":3}`, signed with bob's service key. "..., another body" delivers her version 3 with connect requests on, signed with her key; its answer, "app of another identity: 409 stale_identity, another body at the version held, current the held copy", carries `current: { "version": 3, "identity" }` with the version 3 held, and no `known_version` (7.1).
@@ -2062,36 +2054,36 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
 {
   "apps": [
     {
-      "app_id": "wejf37ngr7qizej3eoijn3hq4c",
+      "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
       "receive_key": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-        "sig": "IcKyKdRWh8hqCC1er2YK8NztNLXO8XyoAIFtUqRs2Zr44JyeMiDyYbUF358ec7IdOHn3USOxW2RBlLUX8ccaCA"
+        "sig": "2v-AMIqAxitgORsPtoQGTK8uaVwNV_F0zs6A-5a3Ad787xX2Lpghv9ICS39ofJT5_q5ticrDWj0mKXn7vkl2Bw"
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "0KQI1CIMiMApXmQkYbSgsd9xttJaW-iGFfasDbQlmCwDXzfM1qj1hydqFFRL8NJVrMH_LWxuE0Q2A1E_k1yFCQ"
+        "sig": "soHnAkpU7U2ovHwh3rpcP-UlAgRUZFE0SOWUwzbrcoWMIYkueFEF0uL1L2P7uViYpyru26Lkipx-i1t02MneCQ"
       }
     },
     {
-      "app_id": "g7teif9k1ur75jrmidqk7z7u6w",
+      "app_id": "c1utah9jitjs43etzdkj6cqdwr",
       "receive_key": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-        "sig": "RNWoFs1Z1PxFDCDOjynAZtpIoIMnqy9zvVXkUJSISW0idCGFOhFGP0EBFpsrA8xApBDyE6a57P7pRpIgqOHBCQ"
+        "sig": "EPbFVAY6CLyzPBnizLl9BzSadKS-N5yCwxRlWdov679J_-DMa6uls-bRqhFf95p-k0ML8hIhocoqK_7rAlbcCg"
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "I1VnSi0CjO7W45Z9gpn90mxAxq4DV5m9IwX72O07hHHfI2xpevmxW8x8OP2rfAJiQXnfK67MATaTYgcUTZEvCg"
+        "sig": "M-2HJw3X_8STEphe67IcgEjAcSQCDo6xzoZn-4heZF2NWsRkpRTxgNZ1hINObcUFo39gZ6bFX4ZkGTxr1BDxCA"
       }
     },
     {
-      "app_id": "cw5ahtdkixcafna9zh1y5y5o1w",
+      "app_id": "f4dtxinwdkb55gdwksph85m18w",
       "receive_key": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-        "sig": "21Sjkpcnz1SWB6v9y6nvGSfo4Qrccz-mWjJndN75ZfHF_PX3KAaLyKpEgsOvMte4Sg-9n9E_k5sQvIvSVxZyAA"
+        "sig": "mu0brcgLPTdH7gwX7gmGugeUJU8ioD4wQNZ-TOWbBa35HwRVuI8hk2ZP39GH3JxAXJmreIFkGCKq-b3J0szpBA"
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "Gf11MF1EMN3ipYAsh7_vv6JFL2J0MdOzjcNMHXpkqdZDRAALwMB18BmrBW_X7ZRsj8WmE3Q-Rr7ihaxRkLxBDA"
+        "sig": "cZqYi_BOCmqHIY80XwzbE2L5DPdsie1e5Zv6Il2EvKhavdUXmup0lG01pmVdc4Tap7I-WaNL_DXmLDbQQbRbAg"
       }
     }
   ],
@@ -2099,7 +2091,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
   "directory_version": 7,
   "identity": {
     "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...",
-    "sig": "REeYn51SNF2tMOsR8f64ENQ3hLYPPQsiEDWm07pKr-SENlAk5zakdZAoSdfXE0JXdJIHfGjM1QCSjmMYYiBEAQ"
+    "sig": "ysIV9UOQnZRttQbBzDKXLUVCRTBLWEE4V7un_LPwFGkK9M4awl2lNkZPt4Wl5t9mCCYhZczlBxFCAmgovYX2Aw"
   },
   "known_version": 1
 }
@@ -2231,7 +2223,7 @@ The newest `identity.json` the service holds for the account's own identity, as 
 - **Limits** (9.4): per network source, an IPv4 address or an IPv6 /64, `identity_reads_per_source_per_min` reads a minute per account; and per account, from all sources together, `identity_reads_per_min`, a higher backstop. Reads that a source's limit refuses don't count against the account's. A service that can't tell the source (the reference prototype: its in-process transport) applies only the account's limit; behind a reverse proxy the source is the address the proxy reports.
 - **Errors:** `404` for an unknown account (operator key) or one holding no document; `503 staged` for an account the newest document doesn't name yet (7.3 step 7); `429 rate_limited` past either limit (9.4).
 - **A frozen account** answers with its last document and the freeze. After a move the old service keeps both, and answers so, for at least the identity's record age limit (`record_max_age`, 90 days when absent) after the move, after which no reader that applies it uses an app record from before the move. It doesn't see the move published, so it counts from the last export call it answered, plus a day. (The reference prototype: it deletes a frozen account only when the signer erases it, 7.4.16.) After an unfreeze (10.6) the answer carries no freeze.
-- It reveals nothing the Homeserver doesn't publish. The service sees the reader's network address and when it looked the identity up, so it learns that someone is about to pay it (spec 15).
+- It reveals nothing the Homeserver doesn't publish. The service sees the reader's network address and when it looked the identity up, so it learns that someone is about to act on its public app records (spec 15).
 - Vectors: `http.json` "anyone: the public identity.json read" and "anyone: a frozen service's public identity.json read, with the freeze".
 
 #### 7.4.16 `POST /v1/{id}/erase`
@@ -2339,14 +2331,14 @@ Example (`409 stale_key`, records cut short):
   "current": {
     "added_apps": [
       {
-        "app_id": "g7teif9k1ur75jrmidqk7z7u6w",
+        "app_id": "c1utah9jitjs43etzdkj6cqdwr",
         "app_record": {
           "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-          "sig": "I1VnSi0CjO7W45Z9gpn90mxAxq4DV5m9IwX72O07hHHfI2xpevmxW8x8OP2rfAJiQXnfK67MATaTYgcUTZEvCg"
+          "sig": "M-2HJw3X_8STEphe67IcgEjAcSQCDo6xzoZn-4heZF2NWsRkpRTxgNZ1hINObcUFo39gZ6bFX4ZkGTxr1BDxCA"
         },
         "record": {
           "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-          "sig": "RNWoFs1Z1PxFDCDOjynAZtpIoIMnqy9zvVXkUJSISW0idCGFOhFGP0EBFpsrA8xApBDyE6a57P7pRpIgqOHBCQ"
+          "sig": "EPbFVAY6CLyzPBnizLl9BzSadKS-N5yCwxRlWdov679J_-DMa6uls-bRqhFf95p-k0ML8hIhocoqK_7rAlbcCg"
         }
       }
     ],
@@ -2354,10 +2346,10 @@ Example (`409 stale_key`, records cut short):
     "not_current": [],
     "receive_keys": [
       {
-        "app_id": "wejf37ngr7qizej3eoijn3hq4c",
+        "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
         "record": {
           "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-          "sig": "IcKyKdRWh8hqCC1er2YK8NztNLXO8XyoAIFtUqRs2Zr44JyeMiDyYbUF358ec7IdOHn3USOxW2RBlLUX8ccaCA"
+          "sig": "2v-AMIqAxitgORsPtoQGTK8uaVwNV_F0zs6A-5a3Ad787xX2Lpghv9ICS39ofJT5_q5ticrDWj0mKXn7vkl2Bw"
         }
       }
     ],
@@ -2424,9 +2416,9 @@ Example (vectors `http.json` `webhook`, signed there with the fixed service key 
 ```
 POST https://push.example/v1/hook
 Content-Type: application/json
-Switch-Signature: 3RJb7xbz0O1JO05SZIRoW0UnCEM6LY6mTC1Sp4fUUYgb-zPA2IepsiFCwOkNjZQmCSgIbMJLK0GWl0DmtszPAA
+Switch-Signature: yf38KwoGUEG-DWIt_eTjVx_E7dca-MzSOGhiQV-yoO4xITjyfNErlKcU2xJyoZo4lRy-K3i_dijEWpU76EBdCQ
 
-{"v":1,"handle":"Kt8fSp-tnjGPMhobvyuT-Q","ts":"2026-01-01T00:06:00.000Z","nonce":"93mQsFU50c1_PkEDllOYNA"}
+{"v":1,"handle":"iUsOsTv5mB7OMLMdQZi8QA","ts":"2026-01-01T00:06:00.000Z","nonce":"vX9AwGixjY0MiVA86rs3Gw"}
 ```
 
 ### 8.3 Relay rules
@@ -2453,7 +2445,7 @@ Spec 6.3. For every kind of state the service keeps, how long it keeps it, which
 | Inbox entry | until every current target's cursor has passed it, not waiting for targets marked lagging (7.4.4); no expiry | inbox quota: its envelope bytes plus `entry_overhead_bytes` (256) | `quota_bytes` 64 MiB; 64 KiB per envelope (4.4) | the append is `429 quota_exceeded` (`inbox`) |
 | `missed` item (7.5) | until its app's cursor has passed it | nothing; never refused | one per lagging app; a later miss replaces it | - |
 | Unreadable entry (7.5) | until every current app's cursor has passed it | inbox quota: `entry_overhead_bytes` only | - | never refused: the service creates it |
-| Shared record value | while current, with the operation, certificate and transition proof of its current write (7.4.9); a superseded value is deleted at once | storage quota: its sealed `ct` bytes, ciphertext and tag as decoded from base64url (not the text), 0 for a delete; the certificate and proof are bounded by `max_record_keys`, not counted: at most 33,950 bytes, the largest certificate of 10.3 and a proof of 1,078, and about 1.6 KB for a Paykit app's | `record_quota_bytes` 64 MiB; 256 KiB per value (6.2) | a `record.put` that grows the stored bytes is `429` (`storage`) |
+| Shared record value | while current, with the operation, certificate and transition proof of its current write (7.4.9); a superseded value is deleted at once | storage quota: its sealed `ct` bytes, ciphertext and tag as decoded from base64url (not the text), 0 for a delete; the certificate and proof are bounded by `max_record_keys`, not counted: at most 33,950 bytes, the largest certificate of 10.3 and a proof of 1,078, and about 1.6 KB for the vectors' apps | `record_quota_bytes` 64 MiB; 256 KiB per value (6.2) | a `record.put` that grows the stored bytes is `429` (`storage`) |
 | Shared record key | while live; once deleted, until the service forgets it (below) | record key limit: live keys only | `max_record_keys` 100,000 live keys | a `record.put` creating a key, or writing a deleted one again, is `429` (`record_keys`) |
 | Live claim | until finished, then compacted to a tombstone at once (6.8) | claim limit, with tombstones; its creator's share of it (6.8) | `max_claims` 1,000,000; `max_attempts_per_claim` 64; `claim_share_percent` 25; `open_attempts_per_app` 1,000 | only `attempt` is refused: on a new claim key (`claims`, or `claim_share` beyond its app's share), beyond 64 on one (`attempts`), or beyond its app's open attempts (`open_attempts`) |
 | Tombstone | until the time base, with trusted time, reaches its pinned deadline plus the 30-day reconciliation window (6.8), then deleted at a request to the account (7.3 step 4); when pinned to "none", until it reaches its last entry plus `max_claim_age_ms` (400 days), then deleted the same way | claim limit, its creator's share | as above | - |
@@ -2823,8 +2815,8 @@ The manifest body:
 {
   "v": 1,
   "kind": "pubky-switch.export_manifest",
-  "identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
-  "freeze_hash": "eOGVDf-J3YOJBPhaH5n8L6Kbwo1Rba_PMiyeq9-bbU8",
+  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "freeze_hash": "k38YxzhWMzgCiPkN4jU2cXzCIAA4IRK8zYvrFH6kLQA",
   "generation": 1,
   "next_generation": 2,
   "last_time": "2026-04-11T00:00:01.000Z",
@@ -2832,17 +2824,17 @@ The manifest body:
     "chain_version": 1,
     "generation": 1,
     "seq": 10,
-    "chain_hash": "jsOhKDUaJnG60SNNklE2uLefYLF58_yV9LWArp-9nPQ",
-    "sig": "5ZDjNf53Pt7aR-UvC3QsihF3JPmFyMfdBYIYAEQs..."
+    "chain_hash": "HDiFHOlPNQId9KGGr1CcEfpCfks1oxSkDba9uRxfO58",
+    "sig": "AxFJFQnl71N8EFGYMpWPkFBwQdAJOK_IJz2nWZsS..."
   },
   "checkpoint": null,
   "parts": 19,
-  "bytes": 29266,
+  "bytes": 28982,
   "chunks": [
     {
       "id": "00000",
-      "len": 29266,
-      "hash": "uoPKdyr2jxgYR2FhZsMVOokEBxFD6JnO-AOs2TE1NgI",
+      "len": 28982,
+      "hash": "dG2Xe-sx30GQlHT3YT6ennfz_Q5-2pL7199woRB_vbo",
       "first": 0,
       "last": 18
     }
@@ -2863,14 +2855,14 @@ The chunk, with its first two parts, the `meta` part and the `chain` part at `se
       "part": "meta",
       "identity": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...",
-        "sig": "REeYn51SNF2tMOsR8f64ENQ3hLYPPQsiEDWm07pK..."
+        "sig": "ysIV9UOQnZRttQbBzDKXLUVCRTBLWEE4V7un_LPw..."
       },
       "generation": 1,
       "seq": 10,
       "directory_version": 7,
       "apps_version": 4,
       "app_added_at": {
-        "wejf37ngr7qizej3eoijn3hq4c": 1
+        "w8amtmn13m6p5bwnmj9wejbq4c": 1
       }
     },
     {
@@ -2878,12 +2870,12 @@ The chunk, with its first two parts, the `meta` part and the `chain` part at `se
       "seq": 1,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "wPRtb6jESXjyXA2GguOB-fN_S-eUoQFy2ftFWwPWR1o"
+        "chain_hash": "0joOBYIoI36HB5DGDTSm8KaMaGxa9oOfhGW6X2PnqVE"
       },
       "item_type": "identity",
       "doc": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...",
-        "sig": "LuC0Kuz7qzVy1n_NjUs7uZdPeUSXuTkpDJ1Vl1_x..."
+        "sig": "BlYsoTmSrf4pCW8U_2TOJRew9L2ISRaSRHjpZ3-O..."
       },
       "context": null
     }
@@ -2896,23 +2888,23 @@ The `claim` part, the live claim of `seq` 7, and its one `claim_entry` part, the
 ```json
 {
   "part": "claim",
-  "claim_key": "sTqkmOg6G5PIHULuqwOHIuIiZBdkPJL2uxE_kuo8K5Y",
+  "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
   "claim": {
     "attempts": [
       {
-        "attempt_id": "DgCVYQKL1eyDacZvG6YhZg",
+        "attempt_id": "P37OWgXQlGXLccI0TFBpwg",
         "deadline_ms": 1767312000001,
         "duplicate": false,
         "from_upload": false,
         "opened_at_ms": 1767225603000,
         "orphan_after_s": 86400,
         "outcome": "open",
-        "owner": "wejf37ngr7qizej3eoijn3hq4c",
+        "owner": "w8amtmn13m6p5bwnmj9wejbq4c",
         "possibly_duplicate": false
       }
     ],
-    "creator": "wejf37ngr7qizej3eoijn3hq4c",
-    "current": "DgCVYQKL1eyDacZvG6YhZg",
+    "creator": "w8amtmn13m6p5bwnmj9wejbq4c",
+    "current": "P37OWgXQlGXLccI0TFBpwg",
     "divergent": false,
     "last_entry_ms": 1767225603000,
     "pinned_deadline": 1767312000001,
@@ -2926,16 +2918,16 @@ The `claim` part, the live claim of `seq` 7, and its one `claim_entry` part, the
 ```json
 {
   "part": "claim_entry",
-  "claim_key": "sTqkmOg6G5PIHULuqwOHIuIiZBdkPJL2uxE_kuo8K5Y",
+  "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
   "step": 0,
   "seq": 7,
   "op": {
-    "body": "eyJpZGVudGl0eSI6IjZmcmFvOHc5c3M1Y241NDRx...",
-    "sig": "XZhGShG5jhjbLykQrpPVyyEP14wtEX2CU82HkqVG..."
+    "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
+    "sig": "uyEJk2QGiGpoJ9FO8iyrmaJoPu175snD9GvnGQf4..."
   },
   "proof": {
     "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-    "sig": "CEsyOBevIdX7OGtYEHr_nITIARcwoKIl_SOyRVsk..."
+    "sig": "Z3_U3AsxoDiMQTgRCZ8fF9E_P0Ex2tL8skLWlSRy..."
   },
   "cert": null
 }
@@ -2948,25 +2940,25 @@ The `record` part, with the proof of its current write (`chain.json` `seq` 8); `
   "part": "record",
   "record": {
     "cert": null,
-    "collection": "t-YfESPIL9L9uVE2Y6IfOrHnGY3eEg74o6zouKupqdI",
+    "collection": "rThZDAv1FHRMIiUn6S8h7HBHF_-gTlmA13cC8V-Prug",
     "deleted": false,
     "from_upload": false,
     "generation": 1,
-    "key": "pj5Kzy_tpIntcicQT2-nlIrRDN6x9qRm3ODJrs9nUpY",
+    "key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM",
     "op": null,
     "proof": {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "EKxwnREEqEIFUTxlrhjF7Qnsn-ub22nFWseqqqit..."
+      "sig": "svZhsiF2IRrW30xJK0hM9m3784FyWv9LoTeA8gBb..."
     },
-    "read_scope": "pay",
+    "read_scope": "tasks",
     "seq": 8,
     "size": 4112,
     "upload_base": null,
     "version": 8,
     "write_scopes": [
-      "pay"
+      "tasks"
     ],
-    "writer": "wejf37ngr7qizej3eoijn3hq4c"
+    "writer": "w8amtmn13m6p5bwnmj9wejbq4c"
   }
 }
 ```
@@ -2976,10 +2968,10 @@ The wallet's `app` part:
 ```json
 {
   "part": "app",
-  "app_id": "wejf37ngr7qizej3eoijn3hq4c",
+  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
   "record": {
     "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "0KQI1CIMiMApXmQkYbSgsd9xttJaW-iGFfasDbQl..."
+    "sig": "soHnAkpU7U2ovHwh3rpcP-UlAgRUZFE0SOWUwzbr..."
   },
   "record_seq": 3,
   "record_at_ms": 1767225601000,
@@ -2987,7 +2979,7 @@ The wallet's `app` part:
     [
       {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-        "sig": "IcKyKdRWh8hqCC1er2YK8NztNLXO8XyoAIFtUqRs..."
+        "sig": "2v-AMIqAxitgORsPtoQGTK8uaVwNV_F0zs6A-5a3..."
       },
       4
     ]
@@ -3010,10 +3002,10 @@ The first `batch` part:
 ```json
 {
   "part": "batch",
-  "id": "RlS8dXaU6JBOESpdL12e5A",
+  "id": "43lMSHQ8vKwdwxES7T9SUw",
   "record": {
-    "at_ms": 1767225602500,
-    "ops_hash": "y9_AiGbiGVk_pHYYtjaXP50RLr4HloB-AB_5oATTbcE",
+    "at_ms": 1767225601000,
+    "ops_hash": "piV-jr-g2YX_JlSqnH26awNUBwM1TpMuhq6DnsJ1gPE",
     "proofs": []
   }
 }
@@ -3058,12 +3050,12 @@ The prototype fixes every other detail above. These it leaves open, so this docu
 | A31 | The reserved `suite_keys` member | 1 to 4 entries `{ suite, key }`, suites 2 to 255 strictly ascending, keys 1 to 4096 bytes; in a receive key record no entry's kid equals the record's; readers ignore unsupported suites (3.1, 3.4) | `records::SuiteKey`, `check_suite_keys` |
 | A32 | The kid of a later suite's key | first 8 bytes of `derive("pubky-switch/v1/kid", u64(suite), key)`; suite 1 keeps `derive("pubky-switch/v1/kid", key)`, so no existing kid changes (1.5) | `wire::suite_kid` |
 | A33 | Ed25519 verification and low-order X25519 keys | the four steps of 2.1; a key is of low order when X25519 with a clamped secret gives all zeros (4.2) | `wire::verify`, `wire::x25519_low_order` |
-| A34 | The import limit | 4 GiB. Part sizes measured on the vectors' Paykit apps, each operation once and no batch proofs (10.3 gives the largest): a shared record about 1.2 KB with the transition proof of its current write (0.9 KB), plus its chain item with its operation about 2.5 KB (at the smallest sealed value), a tombstone with one attempt 0.4 KB, a live claim 2.5 KB, a chain stub alone about 0.5 KB, a batch part 0.15 KB. An account at every default limit (100,000 records within the 64 MiB record quota, 1,000,000 claims and tombstones, a full 64 MiB inbox, 100,000 entries in each list, 10,000 peer copies) exports under 1 GiB; the other 3 GiB hold about 5 million kept chain stubs with their batch parts. A service whose rates and stub retention keep more raises it, and a signer moves an identity only to a service whose limit is at least its current one's (7.4.13) | `retention::KindLimits::max_import_bytes`, `lifecycle::Limits` |
+| A34 | The import limit | 4 GiB. Part sizes measured on the vectors' apps, each operation once and no batch proofs (10.3 gives the largest): a shared record about 1.2 KB with the transition proof of its current write (0.9 KB), plus its chain item with its operation about 2.5 KB (at the smallest sealed value), a tombstone with one attempt 0.4 KB, a live claim 2.5 KB, a chain stub alone about 0.5 KB, a batch part 0.15 KB. An account at every default limit (100,000 records within the 64 MiB record quota, 1,000,000 claims and tombstones, a full 64 MiB inbox, 100,000 entries in each list, 10,000 peer copies) exports under 1 GiB; the other 3 GiB hold about 5 million kept chain stubs with their batch parts. A service whose rates and stub retention keep more raises it, and a signer moves an identity only to a service whose limit is at least its current one's (7.4.13) | `retention::KindLimits::max_import_bytes`, `lifecycle::Limits` |
 | A35 | The clock bound for automatic attempts (spec 10.1) | 5 minutes, the clock tolerance, either way: the offset between the service's signed time and the device clock at the latest verified answer, or the highest verified service time ahead of the device clock now | `App::clock_skew_ms`, `check_clock`: an automatic attempt is refused, a manual one goes on with the event `clock_skew_warning` |
 | A36 | How the next service fetches the export | during `POST /import`, before it answers, one chunk at a time, stopping at the first failure; the status counts `pulled` and names `pull_error`; the signer moves what is missing | `InboxService::serve`, `set_peer_transport`; `Signer::transfer` (direct, with the fallback) and `transfer_relayed` |
 | A37 | The sender's share of the inbox quota | `sender_share_percent` 25 | the same |
-| A38 | The switch's copy of `identity.json` | the grace after the Homeserver reads: 500 ms, after which the lookup keeps running and a manual attempt it hasn't answered for needs the user's confirmation before the attempt; an automatic attempt's lookup: 5 s per try and one retry; `identity_reads_per_source_per_min` 60 per IPv4 address or IPv6 /64, `identity_reads_per_min` 6,000 per account; `Cache-Control: public, max-age=60`; a failed lookup counts until the reader's copy is 10 minutes old | `pay::INBOX_IDENTITY_GRACE_MS`, `INBOX_LOOKUP_TIMEOUT_MS`, `with_grace`, `lookup_with_retry`, `App::settle_lookup`; `execute::check_unconfirmed` (event `identity_unconfirmed`); `directory::source_key`, `IDENTITY_CACHE_CONTROL` |
-| A39 | How long a frozen service answers the public read with its freeze | while frozen, and after a move at least `record_max_age` counted from the last export call it answered, plus a day; the reader follows a freeze once | the prototype deletes a frozen account only when the signer erases it (7.4.16, `directory::public_identity`); `pay::inbox_identity` |
+| A38 | The switch's copy of `identity.json` | the grace after the Homeserver reads: 500 ms, after which the lookup keeps running and a manual attempt it hasn't answered for needs the user's confirmation before the attempt; an automatic attempt's lookup: 5 s per try and one retry; `identity_reads_per_source_per_min` 60 per IPv4 address or IPv6 /64, `identity_reads_per_min` 6,000 per account; `Cache-Control: public, max-age=60`; a failed lookup counts until the reader's copy is 10 minutes old | `INBOX_IDENTITY_GRACE_MS`, `INBOX_LOOKUP_TIMEOUT_MS`, `with_grace`, `lookup_with_retry`, `App::settle_lookup`; `check_unconfirmed` (event `identity_unconfirmed`); `directory::source_key`, `IDENTITY_CACHE_CONTROL` |
+| A39 | How long a frozen service answers the public read with its freeze | while frozen, and after a move at least `record_max_age` counted from the last export call it answered, plus a day; the reader follows a freeze once | the prototype deletes a frozen account only when the signer erases it (7.4.16, `directory::public_identity`); `inbox_identity` |
 | A40 | A full connect request list | refused with `429 quota_exceeded` `connect_requests`, checked before the deny list; `GET /connect` reports `max_pending` and `full` | `connect::post_connect`, `get_connect`, `ConnectList` |
 | A41 | The cap on an invite code's uses | `max_invite_uses` 100 | the same |
 

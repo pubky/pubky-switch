@@ -1438,7 +1438,7 @@ mod tests {
 
     #[test]
     fn test_feed_reader_takes_a_reducing_renewal_in_the_snapshot() {
-        // The wallet's renewal, which drops manage_contacts, lands during a wait: the next
+        // The wallet's renewal, which drops tasks_people_admin, lands during a wait: the next
         // page reads with the renewed certificate, the one the wallet is checked against now.
         let alice = alice_key();
         let op = SignedOp::peek(row(3).item.as_ref().expect("item")).expect("op");
