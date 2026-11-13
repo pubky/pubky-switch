@@ -751,3 +751,64 @@ async fn test_purge_envelope_to_a_purged_apps_kid_is_not_current() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_purge_between_the_check_before_the_lock_and_the_lock_is_not_current() {
+    // The wallet's batch verifies with the record read before the account's lock; the
+    // wallet is purged while the batch waits for the lock. Under it no record is held: the
+    // batch gets the headless `403 not_current` a purged app gets (Switch wire 7.2), not
+    // `401 bad_signature`.
+    let Some(replay) = replay().await else { return };
+    let at = revoke_wallet(&replay).await;
+    let wallet = app_id_of("wallet");
+    let mut txn = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    let (answer, ()) = tokio::join!(
+        app_batch(
+            &replay,
+            "wallet",
+            92,
+            vec![on_wallet_attempt(ClaimType::Failed, 1, None)],
+            at,
+        ),
+        async {
+            let mut watcher = sqlx::PgConnection::connect_with(replay.db.options())
+                .await
+                .expect("conn");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+                     AND datname = current_database()",
+                )
+                .fetch_one(&mut watcher)
+                .await
+                .expect("count");
+                if waiting > 0 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the batch never waited"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(txn.purge_apps(&[wallet]).await.expect("purge"), [wallet]);
+            txn.commit().await.expect("commit");
+        }
+    );
+    assert_eq!(holdings(&replay, &wallet).await, [0, 0, 0, 0]);
+    assert_eq!(
+        (answer.status, json_of(&answer)["code"].clone()),
+        (403, json!("not_current")),
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(header_text(&answer, header::HEAD).is_none());
+    replay.db.drop_database().await.expect("drop");
+}

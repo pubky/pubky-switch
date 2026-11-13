@@ -854,6 +854,27 @@ pub fn alice_version_3() -> SignedDoc {
 /// from it (Switch wire 9.1): the newest document, which lists it in neither list, and the
 /// time of it all.
 pub async fn purge_wallet(replay: &Replay) -> (SignedDoc, u64) {
+    let at = revoke_wallet(replay).await;
+    let wallet = app_id_of("wallet");
+    let removing = deliver_next(replay, &alice_version_3(), at, |body| {
+        body.apps.retain(|listed| listed.app_id != wallet);
+        body.removed.push(pubky_switch_core::records::RemovedApp {
+            app_id: wallet,
+            distrust_from: at,
+        });
+        body.data_epoch += 1;
+    })
+    .await;
+    let purging = deliver_next(replay, &removing, at, |body| {
+        body.removed.retain(|removed| removed.app_id != wallet);
+    })
+    .await;
+    (purging, at)
+}
+
+/// The vectors' chain through the phone's revocation, then the wallet's attempt failed by
+/// the wallet and the wallet revoked, still listed in `apps`: the time of it all.
+pub async fn revoke_wallet(replay: &Replay) -> u64 {
     use pubky_switch_core::claims::ClaimType;
     replay_chain_through_revoke(replay).await;
     let at = ms(&item_time(chain_item(&vectors("chain.json"), 9)));
@@ -887,21 +908,7 @@ pub async fn purge_wallet(replay: &Replay) -> (SignedDoc, u64) {
         "{}",
         String::from_utf8_lossy(&revoked.body)
     );
-    let wallet = app_id_of("wallet");
-    let removing = deliver_next(replay, &alice_version_3(), at, |body| {
-        body.apps.retain(|listed| listed.app_id != wallet);
-        body.removed.push(pubky_switch_core::records::RemovedApp {
-            app_id: wallet,
-            distrust_from: at,
-        });
-        body.data_epoch += 1;
-    })
-    .await;
-    let purging = deliver_next(replay, &removing, at, |body| {
-        body.removed.retain(|removed| removed.app_id != wallet);
-    })
-    .await;
-    (purging, at)
+    at
 }
 
 /// How many rows `table` holds for alice's account whose `column` is `app`.
