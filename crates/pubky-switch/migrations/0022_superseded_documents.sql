@@ -6,12 +6,11 @@
 -- record or renewed certificate changes are found without reading every item; null for
 -- every other item, and once the document is deleted.
 -- The check is NOT VALID, so adding it reads no existing row (every one is null): new and
--- updated rows are checked.
+-- updated rows are checked. Its index is built by 0025, in a transaction of its own, so the
+-- exclusive lock these take on `chain_items` lasts only as long as this migration.
 ALTER TABLE chain_items ADD COLUMN doc_app BYTEA;
 ALTER TABLE chain_items ADD CONSTRAINT chain_items_doc_app_length
     CHECK (doc_app IS NULL OR octet_length(doc_app) = 16) NOT VALID;
-CREATE INDEX chain_items_by_doc_app ON chain_items (account_id, doc_app)
-    WHERE doc_app IS NOT NULL;
 -- The documents chained before this rule are checked at the account's requests, a bounded
 -- number at a time, oldest first: those through `documents_checked_seq` are, up to
 -- `documents_check_end`, the account's last seq now. An account created later has none.
