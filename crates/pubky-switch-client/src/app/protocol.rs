@@ -758,7 +758,9 @@ pub trait Protocol: Send + Sync {
 
     /// What the app has seen of a record, its high water (Switch spec 8.2): the protocol's
     /// mark after `value`, from the mark held (`None` for a write of the app's own, built on
-    /// what it trusts), or `None` to keep no mark. None by default.
+    /// what it trusts), or `None` to keep no mark. None by default. It isn't called for the
+    /// app's own delete, which leaves the mark held as it is: what the app saw stays seen,
+    /// and a later write by another app is checked against it.
     ///
     /// A mark is at most [`MAX_SEEN_MARK_BYTES`], 64 KiB. Past it, nothing is silent:
     ///

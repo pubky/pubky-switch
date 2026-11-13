@@ -8042,3 +8042,50 @@ async fn test_records_renewal_another_device_took_that_narrows_owes_no_listing()
     );
     wallet.receive(None).await.unwrap();
 }
+
+/// The wallet saw a record, then deleted it itself. What it saw stays seen: the phone's
+/// write that brings the record back without it is flagged, and one that holds it is taken
+/// (Switch spec 8.2).
+#[tokio::test]
+async fn test_records_own_delete_keeps_what_was_seen() {
+    for (back, taken) in [(&["b"][..], false), (&["a", "c"][..], true)] {
+        let s = Setup::new();
+        let mut wallet = s.join("wallet").await;
+        let mut phone = s.join("phone").await;
+        let target = s.target("n1");
+        phone
+            .put_record(&target, &value(&["a"]), vec![])
+            .await
+            .unwrap();
+        wallet.receive(None).await.unwrap();
+        let key = wallet.record_key(&target).unwrap();
+        assert!(wallet.record_seen(&key).await.unwrap().is_some());
+        wallet.delete_record(&target, vec![]).await.unwrap();
+        assert!(
+            wallet.record_seen(&key).await.unwrap().is_some(),
+            "the mark stays after the own delete"
+        );
+        phone.receive(None).await.unwrap();
+        phone
+            .put_record(&target, &value(back), vec![])
+            .await
+            .unwrap();
+        let report = wallet.receive(None).await.unwrap();
+        let flagged = report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::WriteFlagged { .. }));
+        let held = wallet.shared_record(&key).await.unwrap().unwrap();
+        if taken {
+            assert!(!flagged, "{:?}", report.events);
+            assert_eq!(ids(held.content.value()), back.to_vec());
+        } else {
+            assert!(
+                flagged,
+                "a write that drops what was seen: {:?}",
+                report.events
+            );
+            assert_eq!(held.content, RecordContent::Deleted, "not taken");
+        }
+    }
+}

@@ -2092,15 +2092,23 @@ impl App {
                 .await?;
             return Ok(Taken::Flagged);
         }
-        let marked = self.protocol.record_seen(
-            &accepted.collection.name,
-            if own {
-                None
-            } else {
-                seen.as_ref().map(|m| m.mark.as_slice())
-            },
-            new_value,
-        );
+        // What the app saw of a record stays seen after its own delete (Switch spec 8.2):
+        // the mark it holds stays, so a write that brings the record back without it is
+        // checked against it. Any other own write marks from the value it wrote.
+        let own_delete = own && accepted.content == RecordContent::Deleted;
+        let marked = if own_delete {
+            None
+        } else {
+            self.protocol.record_seen(
+                &accepted.collection.name,
+                if own {
+                    None
+                } else {
+                    seen.as_ref().map(|m| m.mark.as_slice())
+                },
+                new_value,
+            )
+        };
         match marked {
             // A mark over its bound isn't kept, and nothing of it is silent: another app's
             // write leaves the mark held, so what was seen before is still checked; an own
@@ -2122,7 +2130,7 @@ impl App {
                 )?;
             }
             Some(mark) => tx.put(&seen_key(&key), &SeenMark { mark })?,
-            None if own => tx.delete(&seen_key(&key))?,
+            None if own && !own_delete => tx.delete(&seen_key(&key))?,
             None => {}
         }
         let record = HeldRecord {
@@ -2463,13 +2471,17 @@ pub(crate) fn refuse_non_json(value: Option<&[u8]>) -> Result<(), AppError> {
 
 /// Refuse an own write whose mark ([`super::Protocol::record_seen`] after `value`, from
 /// nothing, as for every own write) would be over [`MAX_SEEN_MARK_BYTES`]: the app couldn't
-/// keep it, and the record couldn't be checked from that write on.
+/// keep it, and the record couldn't be checked from that write on. An own delete keeps the
+/// mark held and makes none, so it is never refused here.
 pub(crate) fn refuse_unmarkable(
     protocol: &dyn super::Protocol,
     target: &RecordTarget,
     value: Option<&[u8]>,
 ) -> Result<(), AppError> {
-    match protocol.record_seen(&target.collection.name, None, value) {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    match protocol.record_seen(&target.collection.name, None, Some(value)) {
         Some(mark) if mark.len() > MAX_SEEN_MARK_BYTES => Err(Refusal::Usage(format!(
             "the protocol's mark of this write takes {} bytes, over {MAX_SEEN_MARK_BYTES}",
             mark.len()
