@@ -956,6 +956,18 @@ mod tests {
     }
 
     #[test]
+    fn test_push_body_debug_shows_no_relay_or_handle() {
+        let key = crate::enc::b64(&[7u8; 32]);
+        let body = format!(
+            r#"{{"relay_url":"https://push.example/v1/hook","handles":["handle-Kt8fSp"],"push_key":"{key}"}}"#
+        );
+        let shown = format!("{:?}", parse_push_body(body.as_bytes()).expect("set"));
+        for hidden in ["push.example", "/v1/hook", "handle-Kt8fSp", key.as_str()] {
+            assert!(!shown.contains(hidden), "{shown}");
+        }
+    }
+
+    #[test]
     fn test_erase_body_refuses_other_members() {
         let key = [3; 32];
         assert_eq!(

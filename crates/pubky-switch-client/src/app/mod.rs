@@ -644,6 +644,10 @@ pub struct App {
     /// When this app last asked for its full key bundle, device clock (`keys.rs`,
     /// [`keys::KEY_REQUEST_RETRY_MS`]). In memory only.
     bundle_asked_ms: Option<u64>,
+    /// When a read last looked in the directory for a renewal the own `identity.json` lists
+    /// and the app holds no `cert.put` for, without finding it, device clock
+    /// ([`App::take_renewal_listed_elsewhere`]). In memory only.
+    renewal_looked_ms: Option<u64>,
     /// Where a wait for the feed starts, as the last read left it ([`App::feed_wait`]). In
     /// memory only: a restart waits from the cursor.
     next_wait: wait::NextWait,
@@ -881,6 +885,7 @@ impl App {
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
                 bundle_asked_ms: None,
+                renewal_looked_ms: None,
                 next_wait: wait::NextWait::Cursor,
                 read_done_ms: None,
                 peer_rereads: HashMap::new(),
@@ -1019,6 +1024,7 @@ impl App {
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
                 bundle_asked_ms: None,
+                renewal_looked_ms: None,
                 next_wait: wait::NextWait::Cursor,
                 read_done_ms: None,
                 peer_rereads: HashMap::new(),
@@ -1750,6 +1756,7 @@ impl App {
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
                 bundle_asked_ms: None,
+                renewal_looked_ms: None,
                 next_wait: wait::NextWait::Cursor,
                 read_done_ms: None,
                 peer_rereads: HashMap::new(),

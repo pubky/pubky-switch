@@ -128,6 +128,7 @@ connect_retry_ms = 30000               # keep trying to reach the database at st
 [keys]
 # path = "/var/lib/pubky-switch/keys"
 
-# Push (Switch wire 8). Registrations are kept; no webhook is sent to a relay yet.
+# Push (Switch wire 8): registrations, and the webhooks a notify entry sends to each handle.
 [push]
-enabled = false                        # off (the default while no push is sent): every PUT /push is 400
+enabled = false                        # off (the default): every PUT /push is 400, nothing queued or sent
+concurrency = 16                       # the most webhooks this instance sends at once

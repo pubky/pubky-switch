@@ -510,6 +510,10 @@ impl App {
                         .listed_cert(&me)
                         .is_some_and(|listed| listed != self.state.cert.hash())
                 {
+                    // The refusal says the switch holds a record under the listed
+                    // certificate now: the next read looks for it in the directory, whenever
+                    // it last looked.
+                    self.renewal_looked_ms = None;
                     return Ok(TakeOver::Done(Err(error)));
                 }
                 if unverified

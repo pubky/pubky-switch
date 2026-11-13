@@ -5,8 +5,11 @@
 //! from `cert.put` and takes it once its own `identity.json` lists it: it presents it from
 //! then on, and delivers its record carrying it (`app.put`), signed once and kept before it
 //! is sent. An app without the `cert.put`, such as one restored from a backup older than
-//! the renewal, takes the listed certificate from its own record in its directory, under
-//! the checks of Switch spec 3.2 step 3.
+//! the renewal, or one that was offline while another device of the app took the renewal
+//! and put its record (the feed then shows the `cert.put` only as a stub), takes the
+//! listed certificate from its own record in its directory, under the checks of Switch
+//! spec 3.2 step 3: after a restore, and at a read's start while its own `identity.json`
+//! lists another certificate (Switch wire 7.2 "How an own app reads it").
 
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, OpKind};
@@ -55,7 +58,7 @@ impl App {
         body.accepts = self.protocol.accepts(&renewal);
         body.updated_at = self.now().max(old.updated_at().saturating_add(1));
         let record = AppRecord::sign(&self.state.keys, body)?;
-        self.take_cert(renewal, record.signed().clone(), true)
+        self.take_cert(renewal, record.signed().clone(), true, None)
             .await?;
         self.deliver_record().await?;
         Ok(true)
@@ -65,13 +68,25 @@ impl App {
     /// before it is sent. A certificate that reads a member of a collection of the protocol
     /// the one before didn't owes a listing, in the same commit, so the next read lists it (Switch
     /// spec 8.3, Switch wire 7.4.9): the writes made there before it were stubs in the feed.
+    ///
+    /// With `accepted`, a record the switch holds that carries `cert`, that record is noted
+    /// as the newest the switch accepted, in the same commit, and the published copy is
+    /// checked against it at the next publication check.
     async fn take_cert(
         &mut self,
         cert: AppCert,
         record: SignedDoc,
         deliver: bool,
+        accepted: Option<SignedDoc>,
     ) -> Result<(), AppError> {
         let issued_at = cert.issued_at();
+        // A later renewal the app holds, of the certificate taken, stays held: it is taken
+        // in turn once its listing comes (`adopt_renewal`).
+        let keep_renewal = self
+            .state
+            .renewal
+            .as_ref()
+            .is_some_and(|held| is_renewal(&cert, held));
         // Member by member: a scope of the new certificate that reads a collection's member,
         // its fixed read scope or a sub-scope of its family, and that the one before doesn't
         // hold (Switch spec 3.3).
@@ -88,7 +103,12 @@ impl App {
         }
         tx.put(key::CERT, self.state.cert.signed())?;
         tx.put(key::RECORD, &record)?;
-        tx.delete(key::CERT_RENEWAL)?;
+        if !keep_renewal {
+            tx.delete(key::CERT_RENEWAL)?;
+        }
+        if let Some(accepted) = &accepted {
+            tx.put(key::ACCEPTED_RECORD, accepted)?;
+        }
         if deliver {
             let pending = PendingRecord {
                 body: self.record_batch(&record)?.body().to_vec(),
@@ -97,8 +117,14 @@ impl App {
             self.state.pending_record = Some(pending);
         }
         self.state.record = record;
-        self.state.renewal = None;
+        if !keep_renewal {
+            self.state.renewal = None;
+        }
         self.commit(tx).await?;
+        if let Some(accepted) = accepted {
+            self.state.accepted = Some(accepted);
+            self.published_checked_ms = None;
+        }
         self.events.push(AppEvent::CertificateTaken { issued_at });
         Ok(())
     }
@@ -248,7 +274,7 @@ impl App {
             // into the dropped body; and before the drop, so a crash between the two leaves
             // the kept record, whose re-send then finds the later record under the
             // certificate presented.
-            self.take_cert(cert.clone(), later.signed().clone(), false)
+            self.take_cert(cert.clone(), later.signed().clone(), false, None)
                 .await?;
         }
         if newer {
@@ -270,6 +296,56 @@ impl App {
             self.published_checked_ms = None;
         }
         Ok(())
+    }
+
+    /// Take a renewal another device of the app took (Switch wire 7.2 "How an own app reads
+    /// it", spec 3.2 step 3): the own `identity.json` lists another certificate than the
+    /// one the app presents, and the app holds no `cert.put` for it, which the feed showed
+    /// only as a stub once that device's record carried it. Without it every write is
+    /// refused `403 not_current`. Taken from the own record in the directory, as after a
+    /// restore ([`App::take_listed_cert`]). Only a directory read tells whether that record
+    /// carries it yet, so a look that doesn't find it, or fails, is made again at most every
+    /// [`super::DOC_CACHE_MS`] while the listing lasts, and the read goes on; a refusal of
+    /// the app's record write under the earlier certificate makes the next read look at
+    /// once. `None` when no look was due or it failed.
+    pub(crate) async fn take_renewal_listed_elsewhere(
+        &mut self,
+    ) -> Result<Option<Listed>, AppError> {
+        let me = self.state.meta.app_id;
+        let doc = &self.state.own_doc;
+        let Some(listed) = doc.listed_cert(&me) else {
+            return Ok(None);
+        };
+        let held = self
+            .state
+            .renewal
+            .as_ref()
+            .is_some_and(|r| r.hash() == listed);
+        if listed == self.state.cert.hash() || held || doc.lists_removed(&me) {
+            return Ok(None);
+        }
+        let now = self.now();
+        if self
+            .renewal_looked_ms
+            .is_some_and(|at| now >= at && now - at < super::DOC_CACHE_MS)
+        {
+            return Ok(None);
+        }
+        // A look that fails, on the network or with an answer the app won't read, is paced
+        // as one that found nothing, and the read goes on: only a record write is refused
+        // under the earlier certificate, and the next look may find it.
+        let found = match Box::pin(self.take_listed_cert()).await {
+            Ok(found) => found,
+            Err(AppError::Transport(_) | AppError::Switch(_) | AppError::InvalidData(_)) => {
+                self.renewal_looked_ms = Some(now);
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let listed_now = self.state.own_doc.listed_cert(&me);
+        self.renewal_looked_ms =
+            (listed_now.is_some_and(|l| l != self.state.cert.hash())).then_some(now);
+        Ok(Some(found))
     }
 
     /// What the switch's directory shows it holds for this app, beside the record `batch`
@@ -342,8 +418,27 @@ impl App {
             && is_renewal(&self.state.cert, &cert)
             && cert.hash() == listed
         {
-            self.take_cert(cert, entry.record.signed().clone(), false)
-                .await?;
+            // The switch holds that record: it is the newest it accepted, and the published
+            // copy is checked against it. A record change kept under the earlier certificate
+            // is signed anew under this one, later than both records, and delivered by the
+            // read, as `adopt_renewal` builds on a kept one: sent as it is, it would be
+            // refused for its certificate, and read as the app not current.
+            let taken = entry.record.signed().clone();
+            let kept = self.state.pending_record.is_some();
+            let record = if kept {
+                let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
+                let mut body = old.body().clone();
+                body.cert = cert.signed().clone();
+                body.accepts = self.protocol.accepts(&cert);
+                body.updated_at = self
+                    .now()
+                    .max(old.updated_at().saturating_add(1))
+                    .max(entry.record.updated_at().saturating_add(1));
+                AppRecord::sign(&self.state.keys, body)?.signed().clone()
+            } else {
+                taken.clone()
+            };
+            self.take_cert(cert, record, kept, Some(taken)).await?;
         }
         Ok(Listed::Key(key))
     }

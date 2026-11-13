@@ -1658,6 +1658,7 @@ dependencies = [
  "parking_lot",
  "pubky-switch",
  "pubky-switch-core",
+ "reqwest",
  "roughenough-protocol",
  "serde",
  "serde_json",

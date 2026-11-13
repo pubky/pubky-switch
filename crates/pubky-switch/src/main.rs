@@ -151,8 +151,17 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     config.limits.clone(),
                 )
                 .await
-                .with_push(config.push.enabled),
+                .with_push(config.push.enabled)
+                .with_push_concurrency(config.push.concurrency),
             );
+            // Webhooks queued by any instance are sent by one of them (Switch wire 8.2).
+            if config.push.enabled {
+                tokio::spawn(
+                    service
+                        .clone()
+                        .deliver_pushes_until(until_stopped(stopped.clone())),
+                );
+            }
             // Changes made by any instance wake the feed reads waiting here.
             let changes = ChangeListener::connect(&store).await?;
             tokio::spawn(changes.run(service.changes(), until_stopped(stopped.clone())));

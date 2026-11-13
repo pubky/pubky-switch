@@ -10,7 +10,8 @@ use pubky_switch_core::ident::{Policy, invite_code_hash};
 use pubky_switch_core::message::MessagePlaintext;
 use pubky_switch_core::ops::{AllowKind, Condition, KeyBundlePut, OpKind, RecordVersion, SignedOp};
 use pubky_switch_core::records::{
-    CLOCK_TOLERANCE_MS, DAY_MS, RemovedApp, RenewedCert, seal_bundle_parts,
+    AppRecord, AppRecordBody, CLOCK_TOLERANCE_MS, DAY_MS, RemovedApp, RenewedCert,
+    seal_bundle_parts,
 };
 use pubky_switch_core::scopes::Permission;
 use serde_json::{Map, json};
@@ -7904,4 +7905,87 @@ async fn test_records_listing_that_goes_on_still_publishes_what_is_owed_once_a_r
     let report = app.receive(None).await.unwrap();
     assert!(!report.more, "{:?}", report.events);
     assert_eq!(handed(&s, &note.msg_id), 1);
+}
+
+/// Another device of the wallet took `renewed` and put its record carrying it, so the
+/// wallet's feed shows the renewal's `cert.put` only as a stub: the wallet takes it from its
+/// record in the directory at a read's start.
+fn renewal_another_device_took(s: &Setup, earlier: &AppCert, renewed: &AppCert) {
+    s.w.next_doc(|body| list_renewal(body, earlier, renewed, None));
+    let accepts = s.protocol.accepts(renewed);
+    let record = AppRecordBody::new(renewed, accepts, s.w.clock.now_ms());
+    let record = AppRecord::sign(&app_keys("wallet"), record).unwrap();
+    s.w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_records_renewal_another_device_took_that_widens_lists_the_family() {
+    let s = Setup::new();
+    let family = Collection::with_sub_scopes("sample.items", Policy::new("scope-a", &["scope-a"]));
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let mut wallet = join_scoped(&s, "wallet", &["scope-a:kiosk"]).await;
+    let mut phone = s.join("phone").await;
+    let till = RecordTarget::new(family.sub_scope("till").unwrap(), b"t1");
+    phone
+        .put_record(&till, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&till).unwrap();
+    wallet.receive(None).await.unwrap();
+    s.w.clock.advance_ms(3_000);
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-a:kiosk", "scope-a:till"]);
+    store_parts_for(&s, &renewed);
+    renewal_another_device_took(&s, &earlier, &renewed);
+    for _ in 0..4 {
+        wallet.receive(None).await.unwrap();
+        if wallet.cert().hash() == renewed.hash() && !wallet.listing_owed().await.unwrap() {
+            break;
+        }
+    }
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    assert!(!wallet.listing_owed().await.unwrap());
+    assert!(
+        wallet.shared_record(&key).await.unwrap().is_some(),
+        "the widened family is listed"
+    );
+}
+
+#[tokio::test]
+async fn test_records_renewal_another_device_took_that_narrows_owes_no_listing() {
+    let s = Setup::new();
+    let family = Collection::with_sub_scopes("sample.items", Policy::new("scope-a", &["scope-a"]));
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let mut wallet = join_scoped(&s, "wallet", &["scope-a:kiosk", "scope-a:till"]).await;
+    wallet.receive(None).await.unwrap();
+    s.w.clock.advance_ms(3_000);
+    wallet.receive(None).await.unwrap();
+    assert!(!wallet.listing_owed().await.unwrap());
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-a:kiosk"]);
+    store_parts_for(&s, &renewed);
+    renewal_another_device_took(&s, &earlier, &renewed);
+    for _ in 0..3 {
+        wallet.receive(None).await.unwrap();
+        if wallet.cert().hash() == renewed.hash() {
+            break;
+        }
+    }
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    assert!(
+        !wallet.listing_owed().await.unwrap(),
+        "a narrowing owes none"
+    );
+    wallet.receive(None).await.unwrap();
 }
