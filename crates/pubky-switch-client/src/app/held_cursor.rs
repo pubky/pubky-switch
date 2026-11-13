@@ -76,7 +76,6 @@ pub(crate) struct RestoreCursor {
     pub(crate) seq: u64,
     /// When the restore ran, app clock: only a page read once the own `identity.json` was
     /// confirmed after it settles the verdict.
-    #[serde(default)]
     pub(crate) restored_at_ms: u64,
     /// `None` until a page settled it.
     pub(crate) verdict: Option<HeldCursor>,

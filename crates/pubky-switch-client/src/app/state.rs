@@ -632,8 +632,7 @@ pub(crate) struct RestoreState {
     /// Reconcile mode: no new attempts until the protocol's reconciliation ends it.
     pub(crate) reconcile: bool,
     /// Whether the key check found the restored receive key the current one, set with
-    /// `key_checked`; `None` before it, or for a record an earlier build wrote.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `key_checked`; `None` before it.
     pub(crate) key_current: Option<bool>,
 }
 
