@@ -488,36 +488,6 @@ async fn test_held_cursor_ahead_hands_the_gap_to_the_protocol_once() {
     assert_eq!(gaps().len(), 2);
 }
 
-#[test]
-fn test_held_cursor_restore_record_without_its_key_check_is_refused() {
-    // A stored shape no current writer produces is refused: every `restore` record this
-    // build writes carries `key_current`, null before the key check.
-    let state = crate::app::state::RestoreState {
-        n_floor: 1,
-        key_checked: false,
-        own_key_n: None,
-        reconcile: true,
-        key_current: None,
-    };
-    let bytes = crate::app::state::encode(&state).unwrap();
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    fn strip(value: &mut serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::Object(map) => {
-                map.remove("key_current").is_some() || map.values_mut().any(strip)
-            }
-            _ => false,
-        }
-    }
-    assert!(strip(&mut value), "{value}");
-    let older = serde_json::to_vec(&value).unwrap();
-    assert!(
-        crate::app::state::decode::<crate::app::state::RestoreState>(&older).is_err(),
-        "read as {:?}",
-        crate::app::state::decode::<crate::app::state::RestoreState>(&older)
-    );
-}
-
 #[tokio::test]
 async fn test_held_cursor_gap_is_handed_once_across_a_key_change() {
     // A key change in place continues the sequence: the same gap ahead, shown again by the

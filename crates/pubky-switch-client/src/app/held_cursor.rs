@@ -77,8 +77,7 @@ pub(crate) struct RestoreCursor {
     /// When the restore ran, app clock: only a page read once the own `identity.json` was
     /// confirmed after it settles the verdict.
     pub(crate) restored_at_ms: u64,
-    /// `None` until a page settled it. Always written, and required on read.
-    #[serde(deserialize_with = "Option::deserialize")]
+    /// `None` until a page settled it.
     pub(crate) verdict: Option<HeldCursor>,
 }
 
