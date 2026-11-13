@@ -590,7 +590,7 @@ impl App {
         {
             // An erasure's duty event stays kept until the host acknowledges it.
             if gone.reason == GoneReason::NotCurrent {
-                self.events.push(AppEvent::Removed);
+                self.push_once(AppEvent::Removed);
             }
             return Ok(ProviderStatus::Gone);
         }
@@ -1669,7 +1669,7 @@ impl App {
             self.events.push(AppEvent::PushRemoved);
         }
         if reason == GoneReason::NotCurrent {
-            self.events.push(AppEvent::Removed);
+            self.push_once(AppEvent::Removed);
         }
         Ok(())
     }

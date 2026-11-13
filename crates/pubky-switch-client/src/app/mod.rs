@@ -2079,6 +2079,15 @@ impl App {
         events
     }
 
+    /// Queue `event`, a stop the host acts on (`Removed`, `ProviderChanged`), unless it is
+    /// already queued and not yet taken: several steps of one call may find the same stop,
+    /// and the host is told once.
+    pub(crate) fn push_once(&mut self, event: AppEvent) {
+        if !self.events.contains(&event) {
+            self.events.push(event);
+        }
+    }
+
     /// Queue duty events for the host, in order, and keep how far they go.
     fn queue_duties(&mut self, duties: Vec<AppEvent>) {
         for id in duties.iter().filter_map(AppEvent::id) {
