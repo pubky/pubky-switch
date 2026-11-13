@@ -1,7 +1,8 @@
 //! `PUT /v1/{id}/push` (Switch wire 8.1, spec 9) on `chain.json`'s account: the wallet's
 //! push registration, its cases and refusals, one registration per app, its push key kept in
 //! the key store and deleted through the owed-deletion ledger when the registration is
-//! replaced or removed, and both sides of a crash around a key's commit.
+//! replaced or removed, its queued deliveries going with it, and both sides of a crash
+//! around a key's commit.
 //!
 //! Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run them; see `store::testing`.
 
@@ -129,8 +130,8 @@ impl Recording {
 }
 
 /// Relay hosts by name: `push.example` and `push.other.example` public, `private.example`
-/// a private address, `mixed.example` a public and a loopback one; any other doesn't
-/// resolve.
+/// a private address, `mixed.example` a public and a loopback one, `silent.example` never
+/// answered; any other doesn't resolve.
 fn resolver() -> Resolver {
     Arc::new(|host: String| {
         Box::pin(async move {
@@ -143,6 +144,7 @@ fn resolver() -> Resolver {
                     "93.184.216.34".parse().expect("address"),
                     "127.0.0.1".parse().expect("address"),
                 ],
+                "silent.example" => std::future::pending().await,
                 _ => return Err(std::io::Error::other("no such host")),
             };
             Ok(found)
@@ -266,6 +268,30 @@ async fn owed(replay: &Replay) -> Vec<String> {
 async fn registrations(replay: &Replay) -> i64 {
     let mut conn = conn(replay).await;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM push_registrations")
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    conn.close().await.expect("close");
+    count
+}
+
+/// Queue a webhook for the wallet's registration, as a `notify` entry would (wire 8.2).
+async fn queue_one(replay: &Replay) {
+    let mut conn = conn(replay).await;
+    sqlx::query(
+        "INSERT INTO push_deliveries (account_id, app_id, push_key_id, handle, entry_at_ms, \
+         next_attempt_ms) SELECT account_id, app_id, push_key_id, 'handle', 0, 0 \
+         FROM push_registrations",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("queued");
+    conn.close().await.expect("close");
+}
+
+async fn deliveries(replay: &Replay) -> i64 {
+    let mut conn = conn(replay).await;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM push_deliveries")
         .fetch_one(&mut conn)
         .await
         .expect("count");
@@ -639,6 +665,8 @@ async fn test_push_recovery_in_place_removes_every_registration() {
     };
     started(&replay, RELAY, None).await;
     let id = stored(&replay).await.expect("held").1;
+    queue_one(&replay).await;
+    assert_eq!(deliveries(&replay).await, 1);
     // An enrollment at the serving account: its pending key starts the next generation.
     let enrollment = {
         use pubky_switch_core::records::{Enrollment, EnrollmentBody};
@@ -696,6 +724,7 @@ async fn test_push_recovery_in_place_removes_every_registration() {
         String::from_utf8_lossy(&answer.body)
     );
     assert_eq!(registrations(&replay).await, 0);
+    assert_eq!(deliveries(&replay).await, 0);
     assert!(!exists(&keys, &id).await);
     assert!(owed(&replay).await.is_empty());
     replay.db.drop_database().await.expect("drop");
@@ -736,7 +765,9 @@ async fn test_push_erasure_deletes_the_push_keys() {
     };
     started(&replay, RELAY, None).await;
     let id = stored(&replay).await.expect("held").1;
+    queue_one(&replay).await;
     assert_eq!(erase(&replay).await.status, 200);
+    assert_eq!(deliveries(&replay).await, 0);
     assert!(!exists(&keys, &id).await);
     assert!(owed(&replay).await.is_empty());
     replay.db.drop_database().await.expect("drop");
@@ -855,6 +886,173 @@ async fn test_push_claim_of_a_key_no_longer_owed_is_refused() {
     let refused = txn.put_push_registration(&registration, None).await;
     assert!(matches!(refused, Err(StoreError::Raced(_))), "{refused:?}");
     drop(txn);
+    assert_eq!(registrations(&replay).await, 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_push_minted_key_of_a_cancelled_start_is_deleted() {
+    // The request is dropped (a client that hangs up) while the start waits for the
+    // account's lock, after its key was minted: the key and its debt go with it, with no
+    // sweep.
+    let Some((replay, keys)) = pushing().await else {
+        return;
+    };
+    let held = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        put(&replay, "wallet", &start(RELAY, None)),
+    )
+    .await;
+    assert!(answered.is_err(), "the start waits for the lock");
+    let minted = keys.minted();
+    assert_eq!(minted.len(), 1);
+    drop(held);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while exists(&keys, &minted[0]).await && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(!exists(&keys, &minted[0]).await, "no key left to a sweep");
+    assert!(owed(&replay).await.is_empty());
+    assert_eq!(registrations(&replay).await, 0);
+    started(&replay, RELAY, None).await;
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_push_replaced_key_of_a_start_dropped_during_its_commit_is_deleted() {
+    // The request is dropped while its commit, which owes the replaced key's deletion, is
+    // under way: the commit lands and the replaced key goes all the same, with no sweep.
+    let Some((replay, keys)) = pushing().await else {
+        return;
+    };
+    let old = started(&replay, RELAY, None).await;
+    let old_id = stored(&replay).await.expect("held").1;
+    let mut conn = conn(&replay).await;
+    for statement in [
+        format!(
+            "CREATE FUNCTION slow_commit() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN IF NEW.key_id = '{}' THEN PERFORM pg_sleep(2); END IF; \
+             RETURN NULL; END $$",
+            old_id.as_str()
+        ),
+        "CREATE CONSTRAINT TRIGGER slow_commit AFTER INSERT ON erased_keys \
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION slow_commit()"
+            .to_string(),
+    ] {
+        sqlx::query(&statement)
+            .execute(&mut conn)
+            .await
+            .expect("trigger");
+    }
+    conn.close().await.expect("close");
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_millis(1000),
+        put(&replay, "wallet", &start(RELAY, Some(old))),
+    )
+    .await;
+    assert!(answered.is_err(), "dropped during the commit");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while (exists(&keys, &old_id).await || !owed(&replay).await.is_empty())
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let new_id = stored(&replay).await.expect("held").1;
+    assert_ne!(new_id, old_id, "the replacement committed");
+    assert!(!exists(&keys, &old_id).await, "no key left to a sweep");
+    assert!(owed(&replay).await.is_empty());
+    assert!(exists(&keys, &new_id).await);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_push_relay_host_that_never_resolves_is_bad_request() {
+    // A resolver that never answers: the start is `400` once 5 seconds have passed (8.2),
+    // and nothing is minted or kept.
+    let Some((replay, keys)) = pushing().await else {
+        return;
+    };
+    let began = std::time::Instant::now();
+    let answer = put(
+        &replay,
+        "wallet",
+        &start("https://silent.example/hook", None),
+    )
+    .await;
+    let took = began.elapsed();
+    assert_eq!(code(&answer), (400, json!("bad_request")));
+    assert!(
+        took >= std::time::Duration::from_secs(5) && took < std::time::Duration::from_secs(8),
+        "{took:?}"
+    );
+    assert!(keys.minted().is_empty());
+    assert_eq!(registrations(&replay).await, 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// alice's version 3 as version 4, naming another switch: the account no longer serves
+/// here, and the wallet stays current.
+fn moved_away() -> IdentityDelivery {
+    let keys = vectors("keys.json");
+    let key = IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let v3: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .expect("version 3");
+    let mut next: IdentityBody =
+        serde_json::from_slice(&v3.body_bytes().expect("body")).expect("identity body");
+    next.version = 4;
+    next.inbox.url = "https://other.example".into();
+    IdentityDelivery {
+        identity: IdentityDoc::sign(&key, next)
+            .expect("sign")
+            .signed()
+            .clone(),
+        prev: Some(v3.doc_hash().expect("hash")),
+    }
+}
+
+#[tokio::test]
+async fn test_push_account_moved_away_is_staged() {
+    // An `identity.json` naming another switch: the account is staged (7.3 step 7), so a
+    // current own app's registration is `503 staged`, and nothing is kept: the key minted
+    // before the lock goes with the request.
+    let Some((replay, keys)) = pushing().await else {
+        return;
+    };
+    let path = format!("/v1/{}/identity", alice_id());
+    let delivered = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &path,
+            moved_away().to_json(),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(
+        delivered.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&delivered.body)
+    );
+    let answer = put(&replay, "wallet", &start(RELAY, None)).await;
+    assert_eq!(code(&answer), (503, json!("staged")));
+    for minted in keys.minted() {
+        assert!(!exists(&keys, &minted).await);
+    }
+    assert!(owed(&replay).await.is_empty());
     assert_eq!(registrations(&replay).await, 0);
     replay.db.drop_database().await.expect("drop");
 }

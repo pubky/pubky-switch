@@ -1151,3 +1151,196 @@ async fn test_enroll_staged_account_takes_at_most_max_enrollments() {
     assert_eq!(enroll(&replay, 51).await.status, 200);
     replay.db.drop_database().await.expect("drop");
 }
+
+/// A key store over the replay's that records the keys it makes and, once armed, waits
+/// after making one until released.
+struct MakePause {
+    inner: std::sync::Arc<pubky_switch::keys::FixedKeys>,
+    made: std::sync::Mutex<Vec<pubky_switch::keys::KeyId>>,
+    armed: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
+}
+
+impl pubky_switch::keys::KeyStore for MakePause {
+    fn generate(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceKey> {
+        Box::pin(async move {
+            let key = self.inner.generate().await?;
+            self.made.lock().expect("lock").push(key.id.clone());
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.release.notified().await;
+            }
+            Ok(key)
+        })
+    }
+    fn generate_as<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceKey> {
+        self.inner.generate_as(id)
+    }
+    fn public_key<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
+        self.inner.public_key(id)
+    }
+    fn signer<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceSigner> {
+        self.inner.signer(id)
+    }
+    fn operator(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceSigner> {
+        self.inner.operator()
+    }
+    fn mark<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, Option<pubky_switch::keys::Mark>> {
+        self.inner.mark(id)
+    }
+    fn advance_mark<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+        head: pubky_switch::keys::Mark,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::MarkCheck> {
+        self.inner.advance_mark(id, head)
+    }
+    fn delete<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, ()> {
+        self.inner.delete(id)
+    }
+    fn record_erasure<'a>(
+        &'a self,
+        identity: &'a str,
+        erased_at_ms: u64,
+    ) -> pubky_switch::keys::KeyFuture<'a, ()> {
+        self.inner.record_erasure(identity, erased_at_ms)
+    }
+    fn erasure<'a>(&'a self, identity: &'a str) -> pubky_switch::keys::KeyFuture<'a, Option<u64>> {
+        self.inner.erasure(identity)
+    }
+}
+
+/// The replay's service on a [`MakePause`] key store.
+async fn pausing() -> Option<(Replay, std::sync::Arc<MakePause>)> {
+    let mut replay = replay().await?;
+    let keys = std::sync::Arc::new(MakePause {
+        inner: replay.keys.clone(),
+        made: std::sync::Mutex::default(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        release: tokio::sync::Notify::new(),
+    });
+    replay.service = pubky_switch::service::Service::new(
+        ORIGIN.into(),
+        replay.db.store().clone(),
+        keys.clone(),
+        replay.time.clone(),
+        Limits::default(),
+    );
+    Some((replay, keys))
+}
+
+/// An enrollment from alice, dropped (a signer that hangs up) once `keys` made its key, then
+/// let go on: the key it made.
+async fn enroll_dropped(replay: &Replay, keys: &MakePause, nonce: u8) -> pubky_switch::keys::KeyId {
+    let before = keys.made.lock().expect("lock").len();
+    keys.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let request = signer_request("POST", "/v1/enroll", enrollment_body(nonce, ORIGIN), ms(T));
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        replay.service.handle(request),
+    )
+    .await;
+    assert!(answered.is_err(), "dropped while its key is made");
+    let made = keys.made.lock().expect("lock").clone();
+    assert_eq!(made.len(), before + 1);
+    keys.release.notify_one();
+    made[before].clone()
+}
+
+#[tokio::test]
+async fn test_enroll_dropped_while_its_key_is_made_leaves_no_key_unnamed() {
+    // A first enrollment whose signer hangs up once its key is made: the account is created
+    // with that key all the same, and the retry gets it.
+    let Some((replay, keys)) = pausing().await else {
+        return;
+    };
+    set_time(&replay.clock, T);
+    let made = enroll_dropped(&replay, &keys, 1).await;
+    let alice = alice_keys();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut named = None;
+    while named.is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        named = sqlx::query_scalar::<_, String>("SELECT service_key FROM accounts WHERE id = $1")
+            .bind(&alice.id)
+            .fetch_optional(&mut conn)
+            .await
+            .expect("key");
+        conn.close().await.expect("close");
+    }
+    assert_eq!(
+        named.as_deref(),
+        Some(made.as_str()),
+        "the account names the key"
+    );
+    let again = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            "/v1/enroll",
+            enrollment_body(1, ORIGIN),
+            ms(T),
+        ))
+        .await;
+    assert_eq!(again.status, 200);
+    assert_eq!(
+        keys.made.lock().expect("lock").len(),
+        1,
+        "no other key made"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_enroll_pending_key_of_a_dropped_enrollment_is_deleted() {
+    // A serving account's enrollment whose signer hangs up once its pending key is made:
+    // nothing names the key, so it goes, and the next enrollment gets a pending key of its own.
+    use pubky_switch::keys::KeyStore as _;
+    let Some((replay, keys)) = pausing().await else {
+        return;
+    };
+    serving(&replay).await;
+    let made = enroll_dropped(&replay, &keys, 3).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while keys.public_key(&made).await.is_ok() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(keys.public_key(&made).await.is_err(), "no key left unnamed");
+    let next = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            "/v1/enroll",
+            enrollment_body(4, ORIGIN),
+            ms(T),
+        ))
+        .await;
+    assert_eq!(next.status, 200);
+    let pending = keys
+        .made
+        .lock()
+        .expect("lock")
+        .last()
+        .cloned()
+        .expect("made");
+    assert_ne!(pending, made);
+    assert!(keys.public_key(&pending).await.is_ok());
+    replay.db.drop_database().await.expect("drop");
+}

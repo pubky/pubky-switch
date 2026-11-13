@@ -22,6 +22,8 @@
 //! account's key, without a head; the signer retries. Afterwards every request for the
 //! account, the retry of a lost `200` included, finds no account: the operator's `404`.
 
+use std::sync::Arc;
+
 use pubky_switch_core::http::{ERASED_BODY, parse_erase_body};
 
 use super::{Answer, Deferred, PublicKeyBytes, Service, keyed::Proof};
@@ -30,8 +32,8 @@ use crate::{
         SwitchResponse,
         error::{ApiError, ErrorCode},
     },
-    keys::{KeyId, ServiceSigner},
-    store::AccountTxn,
+    keys::{KeyId, KeyStore, ServiceSigner},
+    store::{AccountTxn, Store},
 };
 
 impl Service {
@@ -121,9 +123,20 @@ impl Service {
             .await;
         let account = txn.head().id.clone();
         let key = txn.head().service_key.clone();
-        match txn.erase(time_ms).await {
-            Ok(()) => {}
-            Err(failure) => {
+        // The deletion, and the keys' deletion after it, run to their end in a task of their
+        // own: a signer that hangs up between them leaves no key to the next sweep.
+        let (store, keys) = (self.store.clone(), self.keys.clone());
+        let erased = to_the_end(async move {
+            txn.erase(time_ms).await?;
+            Ok::<_, crate::store::StoreError>(sweep_owed(store, keys).await)
+        })
+        .await;
+        let left = match erased {
+            Some(Ok(left)) => left,
+            // A task that panicked: whether the deletion committed is unknown, so the
+            // operator's `503`, as for keys still owed.
+            None => None,
+            Some(Err(failure)) => {
                 // Dropped uncommitted: nothing is deleted, and the signer retries. The lock is
                 // gone, so the `503` is signed only while the account still names the key.
                 tracing::error!(%failure, "an erasure");
@@ -140,10 +153,9 @@ impl Service {
                     .await;
             }
         };
-        // The state is gone for good, and the keys' deletion owed with it. The keys go after
+        // The state is gone for good, and the keys' deletion owed with it. The keys went after
         // it: a key deleted before a commit that then failed would leave an account no key
         // answers for.
-        let left = self.sweep_erased_keys().await;
         self.forget_account(&account);
         // The answer is released only once the key and its mark are deleted and the erasure
         // recorded (7.4.16 Order). Otherwise the operator's `503`, without a head: the signer
@@ -163,75 +175,15 @@ impl Service {
     /// records none either, and drop what is done. Each row is locked while its key goes, so
     /// a start claiming the key it minted waits, then finds it gone (`store::push`). A
     /// failure leaves the key owed for the next sweep: at the next erasure, and at start. Run
-    /// at start by the service's binary.
+    /// at start by the service's binary. The sweep runs to its end in a task of its own, so a
+    /// request dropped meanwhile doesn't stop it.
     ///
     /// Returns the accounts whose keys are still owed, a key not deleted or its erasure not
     /// recorded; `None` when the owed keys can't be read.
     pub async fn sweep_erased_keys(&self) -> Option<Vec<String>> {
-        let owed = match self.store.erased_keys().await {
-            Ok(owed) => owed,
-            Err(failure) => {
-                tracing::error!(%failure, "reading the keys erasures owe deleting");
-                return None;
-            }
-        };
-        let mut left = Vec::new();
-        for erased in owed {
-            let row = match self.store.lock_owed_key(&erased.key).await {
-                Ok(Some(row)) => row,
-                // Done meanwhile: claimed by a start's commit, or deleted by another sweep.
-                Ok(None) => continue,
-                Err(failure) => {
-                    tracing::error!(%failure, "locking an owed key's row");
-                    left.push(erased.account);
-                    continue;
-                }
-            };
-            if !erased.retired
-                && let Err(failure) = self
-                    .keys
-                    .record_erasure(&erased.account, erased.erased_at_ms)
-                    .await
-            {
-                tracing::error!(%failure, "recording an erasure");
-                left.push(erased.account);
-                continue;
-            }
-            if let Err(failure) = self.keys.delete(&erased.key).await {
-                tracing::error!(%failure, "deleting an owed key");
-                left.push(erased.account);
-                continue;
-            }
-            // The key is gone and the erasure recorded: a row left behind is deleted again,
-            // which deletes nothing more.
-            if let Err(failure) = row.forget().await {
-                tracing::error!(%failure, "dropping a deleted key's row");
-            }
-        }
-        Some(left)
-    }
-
-    /// Delete `keys`, push keys one request owed deleting, once it is over (Switch wire 8.1):
-    /// those still owed go, each under its row's lock; one claimed meanwhile by a committed
-    /// registration stays. A failure leaves the key owed for the next sweep.
-    pub(super) async fn delete_owed_keys(&self, keys: &[KeyId]) {
-        for key in keys {
-            let row = match self.store.lock_owed_key(key).await {
-                Ok(Some(row)) => row,
-                Ok(None) => continue,
-                Err(failure) => {
-                    tracing::error!(%failure, "locking an owed key's row");
-                    continue;
-                }
-            };
-            if let Err(failure) = self.keys.delete(key).await {
-                tracing::error!(%failure, "deleting an owed push key");
-                continue;
-            }
-            if let Err(failure) = row.forget().await {
-                tracing::error!(%failure, "dropping a deleted key's row");
-            }
-        }
+        to_the_end(sweep_owed(self.store.clone(), self.keys.clone()))
+            .await
+            .flatten()
     }
 
     /// Forget every count the service keeps for `account` (Switch wire 7.4.16, 9.4).
@@ -248,5 +200,128 @@ impl Service {
         self.sender_app_rate.forget(|(at, _)| at == account);
         self.upload_rate.forget(|(at, _)| at == account);
         self.notify_rate.forget(|(at, _)| at == account);
+    }
+}
+
+/// Run `work` to its end in a task of its own: a request dropped meanwhile (a client that
+/// hangs up, whose request future goes at its next `.await`) can't stop it half-way. `None`
+/// if the task panicked.
+pub(super) async fn to_the_end<T: Send + 'static>(
+    work: impl Future<Output = T> + Send + 'static,
+) -> Option<T> {
+    tokio::spawn(work).await.ok()
+}
+
+/// [`Service::sweep_erased_keys`]'s work.
+pub(super) async fn sweep_owed(store: Store, keys: Arc<dyn KeyStore>) -> Option<Vec<String>> {
+    let owed = match store.erased_keys().await {
+        Ok(owed) => owed,
+        Err(failure) => {
+            tracing::error!(%failure, "reading the keys erasures owe deleting");
+            return None;
+        }
+    };
+    let mut left = Vec::new();
+    for erased in owed {
+        let row = match store.lock_owed_key(&erased.key).await {
+            Ok(Some(row)) => row,
+            // Done meanwhile: claimed by a start's commit, or deleted by another sweep.
+            Ok(None) => continue,
+            Err(failure) => {
+                tracing::error!(%failure, "locking an owed key's row");
+                left.push(erased.account);
+                continue;
+            }
+        };
+        if !erased.retired
+            && let Err(failure) = keys
+                .record_erasure(&erased.account, erased.erased_at_ms)
+                .await
+        {
+            tracing::error!(%failure, "recording an erasure");
+            left.push(erased.account);
+            continue;
+        }
+        if let Err(failure) = keys.delete(&erased.key).await {
+            tracing::error!(%failure, "deleting an owed key");
+            left.push(erased.account);
+            continue;
+        }
+        // The key is gone and the erasure recorded: a row left behind is deleted again,
+        // which deletes nothing more.
+        if let Err(failure) = row.forget().await {
+            tracing::error!(%failure, "dropping a deleted key's row");
+        }
+    }
+    Some(left)
+}
+
+/// Delete `ids`, push keys one request owed deleting, once it is over (Switch wire 8.1):
+/// those still owed go, each under its row's lock; one claimed meanwhile by a committed
+/// registration stays. A failure leaves the key owed for the next sweep.
+pub(super) async fn delete_owed(store: Store, keys: Arc<dyn KeyStore>, ids: Vec<KeyId>) {
+    for key in &ids {
+        let row = match store.lock_owed_key(key).await {
+            Ok(Some(row)) => row,
+            Ok(None) => continue,
+            Err(failure) => {
+                tracing::error!(%failure, "locking an owed key's row");
+                continue;
+            }
+        };
+        if let Err(failure) = keys.delete(key).await {
+            tracing::error!(%failure, "deleting an owed push key");
+            continue;
+        }
+        if let Err(failure) = row.forget().await {
+            tracing::error!(%failure, "dropping a deleted key's row");
+        }
+    }
+}
+
+/// Push keys a request owes deleting once it is over (Switch wire 8.1): deleted by
+/// [`OwedKeys::delete`] at its end or, when the request is dropped before that (a client that
+/// hangs up), by a task of their own as this drops. So no `.await` of the request leaves
+/// them to a sweep.
+pub(super) struct OwedKeys {
+    store: Store,
+    keys: Arc<dyn KeyStore>,
+    ids: Vec<KeyId>,
+}
+
+impl OwedKeys {
+    /// `ids`, owed in `store`'s ledger, deleted from `keys`.
+    pub(super) fn new(store: Store, keys: Arc<dyn KeyStore>, ids: Vec<KeyId>) -> Self {
+        Self { store, keys, ids }
+    }
+
+    /// Delete the keys still owed, waiting until it is done.
+    pub(super) async fn delete(mut self) {
+        let ids = std::mem::take(&mut self.ids);
+        if !ids.is_empty() {
+            to_the_end(delete_owed(self.store.clone(), self.keys.clone(), ids)).await;
+        }
+    }
+}
+
+impl Drop for OwedKeys {
+    fn drop(&mut self) {
+        let ids = std::mem::take(&mut self.ids);
+        if ids.is_empty() {
+            return;
+        }
+        // Without a runtime, which only a shutting-down service lacks, the keys stay owed
+        // for the sweep at start.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(delete_owed(self.store.clone(), self.keys.clone(), ids));
+        }
+    }
+}
+
+impl std::fmt::Debug for OwedKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwedKeys")
+            .field("keys", &self.ids.len())
+            .finish_non_exhaustive()
     }
 }

@@ -13,8 +13,9 @@
 //! `POST /v1/{id}/inbox`, `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`,
 //! `GET /v1/{id}/apps`, `POST /v1/{id}/apps/{app_id}/revoke`, `GET /v1/{id}/directory`,
 //! `GET` and `POST /v1/{id}/apps/{app_id}/keys`, `POST /v1/{id}/apps/{app_id}/leave`,
-//! `PUT` and `GET /v1/{id}/handover`, `POST /v1/{id}/erase`, and `PUT /v1/{id}/push`, whose
-//! registrations are kept while nothing is sent to a relay yet. Every other call is answered
+//! `PUT` and `GET /v1/{id}/handover`, `POST /v1/{id}/erase`, and `PUT /v1/{id}/push`. A
+//! `notify` entry's webhooks are queued with it and sent to the relays by a background
+//! worker ([`Service::deliver_pushes_until`]). Every other call is answered
 //! `503 unavailable`.
 
 mod admission;
@@ -40,9 +41,13 @@ mod recovery;
 pub mod rules;
 mod sweeps;
 mod upload;
+mod webhooks;
 
 pub use push::Resolver;
 pub use recovery::AdmissionEnd;
+pub use webhooks::PushRound;
+#[cfg(any(test, feature = "test-util"))]
+pub use webhooks::RelayRoute;
 
 pub use enroll::announced_limits;
 
@@ -123,6 +128,11 @@ pub struct Service {
     push_enabled: bool,
     /// Resolves relay hosts for the address check (Switch wire 8.1, 8.2).
     resolver: Resolver,
+    /// How many webhooks one round of delivery sends at once (`push.concurrency`).
+    push_concurrency: usize,
+    /// Where webhooks connect in tests.
+    #[cfg(any(test, feature = "test-util"))]
+    relay_route: Option<webhooks::RelayRoute>,
 }
 
 /// A source of entry IDs.
@@ -307,15 +317,34 @@ impl Service {
             entry_ids: Arc::new(random_entry_id),
             push_enabled: false,
             resolver: push::system_resolver(),
+            push_concurrency: crate::config::PushConfig::default().concurrency,
+            #[cfg(any(test, feature = "test-util"))]
+            relay_route: None,
         }
     }
 
     /// The service with push registrations on or off (`push.enabled`, Switch wire 8.1): off,
-    /// the default while no push is sent, `PUT /push` is `400`, as at a service that sends
-    /// no pushes.
+    /// `PUT /push` is `400`, as at a service that sends no pushes, and no entry queues a
+    /// webhook.
     #[must_use]
     pub fn with_push(mut self, enabled: bool) -> Self {
         self.push_enabled = enabled;
+        self
+    }
+
+    /// The service sending at most `concurrency` webhooks at once (`push.concurrency`).
+    #[must_use]
+    pub fn with_push_concurrency(mut self, concurrency: usize) -> Self {
+        self.push_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// The service connecting webhooks, over plain HTTP, to the listener `route` maps each
+    /// checked address to, for tests whose relays run in process.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_relay_route(mut self, route: webhooks::RelayRoute) -> Self {
+        self.relay_route = Some(route);
         self
     }
 
@@ -591,12 +620,6 @@ impl Service {
             },
             _ => None,
         };
-        // A key minted for a start goes once the request is over, unless its commit took it
-        // (Switch wire 8.1, `store::push`).
-        let reserved = match &prepared {
-            Some(Prepared::Push(push)) => push.reserved().cloned(),
-            _ => None,
-        };
         let response = async {
             // The reads that run after the lock on its snapshot take their account's turn and
             // their reader first, so the lock is never held waiting for one. Only an own app's
@@ -659,8 +682,11 @@ impl Service {
             .await
         }
         .await;
-        if let Some(key) = reserved {
-            self.delete_owed_keys(&[key]).await;
+        // A key minted for a start goes once the request is over, unless its commit took it
+        // (Switch wire 8.1, `store::push`); a request dropped before this deletes it as
+        // `prepared` drops.
+        if let Some(Prepared::Push(push)) = prepared {
+            push.done().await;
         }
         response
     }
@@ -1020,31 +1046,45 @@ impl Service {
         };
         // The push keys the request let go (Switch wire 8.1), deleted once it commits.
         let owed = txn.owed_keys().to_vec();
+        // The outgoing key, retired by the change, goes once the change is durable.
+        let sweep = rekeyed.is_some();
+        let after = !owed.is_empty() || sweep;
+        let (store, keys) = (self.store.clone(), self.keys.clone());
         // Durable, then answered (step 10). An answer is sent even when the request only
         // stamped the time, which must be durable before it is shown. A serving account's
         // commit moves the key's mark to the head the answer carries.
-        let committed = if marked {
-            txn.commit_marked(self.keys.as_ref())
-                .await
-                .map(|_| ())
-                .map_err(|failure| {
+        let commit = async move {
+            let committed = if marked {
+                txn.commit_marked(keys.as_ref())
+                    .await
+                    .map(|_| ())
+                    .map_err(|failure| {
+                        tracing::error!(%failure, "commit");
+                    })
+            } else {
+                txn.commit().await.map(|_| ()).map_err(|failure| {
                     tracing::error!(%failure, "commit");
                 })
+            };
+            if committed.is_ok() && sweep {
+                let _ = erase::sweep_owed(store, keys).await;
+            } else if committed.is_ok() && !owed.is_empty() {
+                erase::delete_owed(store, keys, owed).await;
+            }
+            committed
+        };
+        // A commit that owes deleting keys runs to its end, deletions included, in a task of
+        // its own: a request dropped meanwhile (a client that hangs up) leaves no key to a
+        // sweep.
+        let committed = if after {
+            erase::to_the_end(commit).await.unwrap_or(Err(()))
         } else {
-            txn.commit().await.map(|_| ()).map_err(|failure| {
-                tracing::error!(%failure, "commit");
-            })
+            commit.await
         };
         // Every answer from here on is signed once the lock is gone: only inside a keyed
         // section, while the account still names the key the request loaded (keyed.rs), so
         // none is signed with it after an erasure or a change of the key (7.4.16).
         let proof = Proof::checked(&txn_account, &txn_key);
-        // The outgoing key, retired by the change, goes once the change is durable.
-        if rekeyed.is_some() && committed.is_ok() {
-            let _ = self.sweep_erased_keys().await;
-        } else if !owed.is_empty() && committed.is_ok() {
-            self.delete_owed_keys(&owed).await;
-        }
         match committed {
             Ok(()) => {
                 let mut answer = answer;

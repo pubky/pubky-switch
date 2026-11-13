@@ -129,7 +129,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   good is its App ID, its revocation or departure time and rotation, and its kids (Switch
   spec 3.6), so no app registers one of them again and an envelope wrapped to one gets
   `409 stale_key` naming the app in `not_current`, as before the purge. `GET /apps` shows it
-  as the service does, with no unread entries.
+  as the service does, with no unread entries. Unlike a move by the spec (Switch wire 9.1,
+  10.3), `import_into` copies the kept kids to the next switch.
 - **Forgotten deleted keys** (Switch spec 10.3, wire 9.1), as at the service: a record
   whose current write is its delete, written here and not taken from a recovery upload,
   goes once the cursor of every app the held `identity.json` lists, neither revoked nor
@@ -172,7 +173,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   checks it before the account's lock (`400`, or `401` for a certificate that doesn't
   verify), so a staged or policy-off answer can come first here. A sender the allowlist admits is
   answered `pending` with nothing kept, as at the service. Neither switch sends the push
-  `policy.connect_requests.push` asks for yet: neither sends a webhook.
+  `policy.connect_requests.push` asks for yet.
 - **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
   by a write here, as at the service (Recovery uploads, below). `make_divergent`, public,
   sets it for one record the switch holds, without a loss or an upload (a key it holds no
@@ -406,8 +407,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   erasure. The service can owe the erased account's key when its key store fails, and until
   the key is gone it answers a request signed with the identity key, whatever its timestamp,
   with the operator's `503` in place of that `404`; every other caller gets the `404` at once.
-- **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay, as at the
-  service, which sends no webhook yet either. The same as the service: the body goes through
+- **Push** (Switch wire 8.1): registrations only. The service queues a webhook to each
+  handle for every `notify` entry and sends it to the relay (8.2); the scripted switch
+  neither sends nor records one, since a webhook goes to the relay, never to an app, so no
+  client flow sees it, and an app learns of the entry by reading its feed at either switch.
+  The same as the service: the body goes through
   the core's checks (`parse_push_body`, `400`), the signer is `403 permission_missing`, an
   app that isn't current `403 not_current`, a staged account `503 staged`, 8.1's start and handle cases and their `409 conflict`s, one registration per
   app, and the registration dropped when its app stops being current (a revocation, a

@@ -306,7 +306,10 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         // A restored app lacks the keys of a part it passed before its loss, which went.
         Call::RequestKeys(_) => Some("restore"),
         Call::PostConnect | Call::GetConnect | Call::DeleteConnect(_) => Some("connect request"),
-        // Served, with no flow yet: the test of served calls lists it as waiting.
+        // Served, with no flow: a flow would compare its webhooks, but the scripted switch
+        // sends none (FAKES.md), and a relay a test runs in process has a loopback address,
+        // which delivery refuses outside the service's test-only route. The test of served
+        // calls lists it as waiting.
         Call::PutPush => None,
         // Not served yet.
         Call::Freeze
