@@ -621,6 +621,9 @@ pub struct App {
     service_time_dirty: bool,
     /// The last Homeserver read that confirmed the own `identity.json`; kept in memory only.
     identity_confirmed: Option<identity::Confirmed>,
+    /// The listed certificates the own directory was read for to judge a record write, at
+    /// most once each while the app runs; kept in memory only.
+    directory_asked: Vec<[u8; 32]>,
     events: Vec<AppEvent>,
     /// The highest duty event counter queued in `events` since the app was made: a kept one
     /// above it is queued after a reload (`events` module, "Duty events").
@@ -891,6 +894,7 @@ impl App {
                 reload: false,
                 service_time_dirty: false,
                 identity_confirmed: None,
+                directory_asked: Vec::new(),
                 events: Vec::new(),
                 duty_queued: 0,
                 duty_handed: 0,
@@ -1030,6 +1034,7 @@ impl App {
                 reload: false,
                 service_time_dirty: false,
                 identity_confirmed: None,
+                directory_asked: Vec::new(),
                 events: Vec::new(),
                 duty_queued: 0,
                 duty_handed: 0,
@@ -1782,6 +1787,7 @@ impl App {
                 reload: false,
                 service_time_dirty: false,
                 identity_confirmed: None,
+                directory_asked: Vec::new(),
                 events: Vec::new(),
                 duty_queued: 0,
                 duty_handed: 0,
