@@ -379,6 +379,32 @@ impl Service {
             .acquire()
             .await
             .map_err(|_| Failure::Internal)?;
+        // A webhook of an account a restored database brought back after its erasure is
+        // never sent: the account is erased again first (Switch spec 6.5). Only an identity
+        // the ledger holds is looked up.
+        if self
+            .keys
+            .erasure(&push.account)
+            .await
+            .map_err(|_| Failure::Internal)?
+            .is_some()
+        {
+            let found = self
+                .store
+                .lookup(&push.account)
+                .await
+                .map_err(|_| Failure::Internal)?;
+            let Some(found) = found else {
+                return Ok(None);
+            };
+            if self
+                .erase_if_restored(&push.account, found.created_at_ms)
+                .await
+                .map_err(|_| Failure::Internal)?
+            {
+                return Ok(None);
+            }
+        }
         let Some(held) = self.sendable(push).await? else {
             return Ok(None);
         };

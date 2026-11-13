@@ -1164,6 +1164,14 @@ impl KeyStore for MarkStuck {
     fn erasure<'a>(&'a self, identity: &'a str) -> pubky_switch::keys::KeyFuture<'a, Option<u64>> {
         self.inner.erasure(identity)
     }
+
+    fn erasures(&self) -> pubky_switch::keys::KeyFuture<'_, Vec<(String, u64)>> {
+        self.inner.erasures()
+    }
+
+    fn forget_erasures_before(&self, before_ms: u64) -> pubky_switch::keys::KeyFuture<'_, usize> {
+        self.inner.forget_erasures_before(before_ms)
+    }
 }
 
 #[tokio::test]
