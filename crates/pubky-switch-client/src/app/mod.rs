@@ -82,11 +82,11 @@ pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PEEK_PAGES, PeekReport, Peeked};
 pub use protocol::{
-    Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
-    MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need,
-    OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS,
-    ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, WriteBase, decode_local_state,
-    encode_local_state, local_writes_bytes,
+    DenyListChange, Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS,
+    MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES,
+    MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer,
+    RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, WriteBase,
+    decode_local_state, encode_local_state, local_writes_bytes,
 };
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
@@ -2149,7 +2149,8 @@ impl App {
     }
 
     /// How many protocol calls the protocol answered with an error and the app still owes
-    /// it ([`Protocol::resend_needed`], [`Protocol::missed`]): each read makes them again,
+    /// it ([`Protocol::resend_needed`], [`Protocol::missed`], [`Protocol::deny_list_changed`],
+    /// with the deny list changes owed behind one): each read makes them again,
     /// so a count that stays up shows a protocol that keeps failing.
     ///
     /// # Errors

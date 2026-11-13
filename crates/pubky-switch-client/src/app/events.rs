@@ -42,7 +42,7 @@ use pubky_switch_core::enc::serde_b64;
 
 use super::error::Alarm;
 use super::feed::OwedCall;
-use super::protocol::{MissedEntries, ResendNeeded, StoreFailure};
+use super::protocol::{DenyListChange, MissedEntries, ResendNeeded, StoreFailure};
 use super::recovery::ProviderLoss;
 
 /// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
@@ -879,6 +879,8 @@ pub enum RefusedCall {
     },
     /// [`super::Protocol::missed`].
     Missed(MissedEntries),
+    /// [`super::Protocol::deny_list_changed`].
+    DenyListChanged(DenyListChange),
     /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at this loss;
     /// the loss went on without them.
     ProviderLost(ProviderLoss),

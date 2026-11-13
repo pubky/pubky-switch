@@ -82,10 +82,10 @@ use super::error::{Alarm, Refusal, RefusalPlace, refused_at, refused_for_good};
 use super::events::{AppEvent, Duty, KeptRefusal, ParkReason, RefusedCall};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
-    Effect, LocalWrite, MAX_CLAIM_READS, MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES,
-    MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ,
-    Protocol, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, Rules, StoreFailure,
-    local_writes_bytes,
+    DenyListChange, Effect, LocalWrite, MAX_CLAIM_READS, MAX_REGRESSION_REASON_BYTES,
+    MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome,
+    PARKED_RETRIES_PER_READ, Protocol, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded,
+    ResendReason, Rules, StoreFailure, local_writes_bytes,
 };
 use super::provider::TakeOver;
 use super::records::{Collection, LISTING_PAGES_PER_READ, Listing, pending_name_key};
@@ -191,7 +191,8 @@ enum Sent {
 }
 
 /// `owed/<generation>/<seq>`: a protocol call about a feed item that the protocol couldn't
-/// answer (`Protocol::resend_needed`, `Protocol::missed`), kept until it does.
+/// answer (`Protocol::resend_needed`, `Protocol::missed`, `Protocol::deny_list_changed`),
+/// kept until it does.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum OwedCall {
     Resend {
@@ -210,6 +211,15 @@ pub(crate) enum OwedCall {
         /// Absent in the form written before: no end is known.
         #[serde(default = "no_end")]
         accepted_until_ms: u64,
+    },
+    /// A deny list change, owed in feed order: the calls behind it wait for it.
+    Deny {
+        generation: u64,
+        seq: u64,
+        #[serde(with = "pubky_switch_core::enc::serde_b64")]
+        pubky: [u8; 32],
+        added: bool,
+        at_ms: u64,
     },
 }
 
@@ -235,6 +245,7 @@ impl OwedCall {
         match self.refused(0) {
             RefusedCall::ResendNeeded { needed, .. } => protocol.resend_needed(&needed),
             RefusedCall::Missed(missed) => protocol.missed(&missed),
+            RefusedCall::DenyListChanged(change) => protocol.deny_list_changed(&change),
             _ => Ok(Vec::new()),
         }
     }
@@ -271,6 +282,36 @@ impl OwedCall {
                 accepted_from_ms,
                 accepted_until_ms,
             }),
+            Self::Deny {
+                generation,
+                seq,
+                pubky,
+                added,
+                at_ms,
+            } => RefusedCall::DenyListChanged(DenyListChange {
+                generation,
+                seq,
+                pubky,
+                added,
+                at_ms,
+            }),
+        }
+    }
+
+    /// Whether the call is a deny list change, which goes in feed order.
+    fn is_deny(&self) -> bool {
+        matches!(self, Self::Deny { .. })
+    }
+}
+
+impl From<&DenyListChange> for OwedCall {
+    fn from(change: &DenyListChange) -> Self {
+        Self::Deny {
+            generation: change.generation,
+            seq: change.seq,
+            pubky: change.pubky,
+            added: change.added,
+            at_ms: change.at_ms,
         }
     }
 }
@@ -303,6 +344,9 @@ struct Read {
     /// A `missed` item owed a listing of the collections: no later item of the read is
     /// processed before it (Switch wire 7.4.4).
     list_first: bool,
+    /// A deny list change is owed, kept or in this read: later ones are owed behind it, so
+    /// the protocol gets them in feed order. Set from the store when the read starts.
+    deny_owed: bool,
 }
 
 /// How a page of the feed ended, when the read didn't stop on it.
@@ -326,6 +370,7 @@ impl Read {
             epoch_rose: false,
             pairs: HashMap::new(),
             list_first: false,
+            deny_owed: false,
         }
     }
 
@@ -864,6 +909,7 @@ impl App {
         // item, and blocks the cursor there if it is still held; later pages of the read
         // carry the block on.
         let mut read = Read::new(self.tx()?, *blocked, self.protocol.opaque_members());
+        read.deny_owed = self.deny_owed().await?;
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
         }
@@ -2653,6 +2699,40 @@ impl App {
         )
     }
 
+    /// Hand a deny list change to the protocol, its writes committed with the cursor passing
+    /// the item; owed when the protocol fails, or when an earlier change is still owed, so
+    /// the protocol gets them in feed order (Switch spec 8.3).
+    fn tell_deny_change(
+        &mut self,
+        change: &DenyListChange,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        let call = OwedCall::from(change);
+        if read.deny_owed {
+            return self.owe(change.seq, call, read);
+        }
+        match self.protocol.deny_list_changed(change) {
+            Ok(writes) if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES => {
+                self.local_writes_refused(change.seq, call, read)
+            }
+            Ok(writes) => read.tx.local(&writes),
+            Err(_) => {
+                read.deny_owed = true;
+                self.owe(change.seq, call, read)
+            }
+        }
+    }
+
+    /// Whether a deny list change is owed.
+    async fn deny_owed(&self) -> Result<bool, AppError> {
+        Ok(self
+            .reader()
+            .scan::<OwedCall>(key::OWED_PREFIX)
+            .await?
+            .iter()
+            .any(|(_, call)| call.is_deny()))
+    }
+
     /// A call the protocol couldn't answer: kept in the commit that passes its item, and
     /// made again by later reads ([`App::retry_owed`]), so the cursor never passes what the
     /// protocol wasn't told.
@@ -2664,11 +2744,19 @@ impl App {
     /// The calls the protocol couldn't answer before, made again, oldest first, each on its
     /// own: one answered commits its writes and goes, in one commit; one that fails again
     /// stays for the next read, and the others are still made.
+    ///
+    /// Deny list changes go in feed order, which their keys keep: the first that fails again
+    /// holds every later one back.
     async fn retry_owed(&mut self) -> Result<(), AppError> {
         let owed = self.reader().scan::<OwedCall>(key::OWED_PREFIX).await?;
+        let mut deny_held = false;
         for (rest, call) in owed {
+            if deny_held && call.is_deny() {
+                continue;
+            }
             let answer = call.make(self.protocol.as_ref());
             let Ok(writes) = answer else {
+                deny_held |= call.is_deny();
                 continue;
             };
             let mut tx = self.tx()?;
@@ -2807,6 +2895,16 @@ impl App {
                 };
                 let body = op.body();
                 self.note_list_op(body, &mut read.tx)?;
+                if let OpKind::DenyPut { pubky } | OpKind::DenyDelete { pubky } = &body.kind {
+                    let change = DenyListChange {
+                        generation: envelope.generation,
+                        seq: item.seq,
+                        pubky: *pubky,
+                        added: matches!(body.kind, OpKind::DenyPut { .. }),
+                        at_ms: envelope.server_time,
+                    };
+                    self.tell_deny_change(&change, read)?;
+                }
                 match &body.kind {
                     OpKind::ReceiveKeyPut { record } if body.app_id == Some(me) => {
                         match self.own_registration(
@@ -3148,8 +3246,8 @@ const PARK_ROOM_BYTES: u64 = 256 * 1024;
 ///   own at once (`send_effect`);
 /// - an effect without operations, its local writes at most 4 MiB as stored
 ///   (`MAX_STEP_LOCAL_BYTES`), with its processed pair;
-/// - a call's local writes ([`Protocol::resend_needed`], [`Protocol::missed`]), at most 4
-///   MiB, or a duty event refusing them;
+/// - a call's local writes ([`Protocol::resend_needed`], [`Protocol::missed`],
+///   [`Protocol::deny_list_changed`]), at most 4 MiB, or a duty event refusing them;
 /// - an entry stored locally ([`PARK_ROOM_BYTES`]) and its duty events;
 /// - a chain item's cached record write, its operation and proof and opened value, under
 ///   1.2 MiB.

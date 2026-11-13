@@ -23,6 +23,9 @@
 //!   A protocol that can't read its own state for it says so with a [`StoreFailure`]: the app
 //!   keeps what it handed over and hands it over again later, so nothing is lost to a
 //!   default.
+//! - **Deny list changes** ([`Protocol::deny_list_changed`]): each one the feed shows, in
+//!   feed order, with the local writes the protocol returns to keep it, held back and
+//!   handed over again as re-sends are, and in the same order (Switch spec 8.3).
 //!
 //! The protocol's local state lives in the app's namespace under [`LocalWrite`] keys, which
 //! the app keeps apart from its own (`STATE.md`).
@@ -119,7 +122,8 @@ pub struct ReceivedMessage {
 }
 
 /// The most bytes of local writes a protocol or host hands over at once: one receive step,
-/// one [`Protocol::resend_needed`] or [`Protocol::missed`] answer, or one
+/// one [`Protocol::resend_needed`], [`Protocol::missed`] or [`Protocol::deny_list_changed`]
+/// answer, or one
 /// [`super::OpBatch`]'s local writes ([`Protocol`], "Limits a receive step plans for").
 /// 4 MiB, counted by [`local_writes_bytes`].
 ///
@@ -542,6 +546,26 @@ pub struct MissedEntries {
     pub accepted_until_ms: u64,
 }
 
+/// A change to the identity's deny list, as the feed shows it to an app holding `lists.read`
+/// (Switch spec 8.3): a `deny.put` or a `deny.delete`, made by any of the identity's apps,
+/// this one included, or by the signer. The protocol gets each in feed order
+/// ([`Protocol::deny_list_changed`]), so one restored from a backup rebuilds who was denied
+/// since the backup's cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DenyListChange {
+    /// The generation of the feed item.
+    pub generation: u64,
+    /// The item's `seq` in that generation.
+    pub seq: u64,
+    /// The pubky the change is about.
+    pub pubky: [u8; 32],
+    /// `true` when the pubky was added to the deny list, `false` when it was removed.
+    pub added: bool,
+    /// The item's service time, in Unix milliseconds.
+    pub at_ms: u64,
+}
+
 /// A protocol on the Switch, as the app layer uses it. Object-safe; the app holds an
 /// `Arc<dyn Protocol>`.
 ///
@@ -569,7 +593,8 @@ pub struct MissedEntries {
 ///     there, and an effect over it is stored and passed as
 ///     [`super::ParkReason::EffectTooLarge`], with [`super::AppEvent::EffectRefused`],
 ///     never applied (Switch spec 8.2);
-///   - **[`Protocol::resend_needed`] and [`Protocol::missed`]**, made at once or again
+///   - **[`Protocol::resend_needed`], [`Protocol::missed`] and
+///     [`Protocol::deny_list_changed`]**, made at once or again
 ///     later: the writes aren't committed and the call isn't made again, since the same
 ///     answer would come; the item is passed, and the protocol told with
 ///     [`super::AppEvent::LocalWritesRefused`], a duty event;
@@ -675,6 +700,22 @@ pub trait Protocol: Send + Sync {
     ///
     /// As [`Protocol::resend_needed`].
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure>;
+
+    /// A change to the deny list the feed shows (Switch spec 8.3): the protocol keeps what
+    /// it needs of it and returns the local writes that keep it, committed with the cursor
+    /// passing the item. The app makes the calls in feed order. Nothing by default.
+    ///
+    /// # Errors
+    ///
+    /// As [`Protocol::resend_needed`], failure included. While a change is owed, the app owes
+    /// each later one behind it rather than call this, and makes them again oldest first,
+    /// stopping at the first that fails again, so the protocol never gets one before an
+    /// earlier one. Writes over [`MAX_STEP_LOCAL_BYTES`] aren't committed and the change isn't
+    /// made again, with [`super::AppEvent::LocalWritesRefused`].
+    fn deny_list_changed(&self, change: &DenyListChange) -> Result<Vec<LocalWrite>, StoreFailure> {
+        let _ = change;
+        Ok(Vec::new())
+    }
 
     /// A provider loss the app follows (Switch spec 12.6 steps 2 and 4): the protocol queues
     /// its re-send requests to the counterparties of its unfinished activity, for what their
