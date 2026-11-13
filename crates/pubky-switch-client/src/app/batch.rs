@@ -991,8 +991,13 @@ impl App {
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         tx.local(&pending.local)?;
+        // A message whose delivery the app gave up meanwhile, a copy `queue_stored` queued,
+        // isn't queued again: the protocol was told it wasn't delivered.
+        let now = self.now();
         for item in &pending.queued {
-            if !self.knows_message(item.msg_id()).await? {
+            if !self.knows_message(item.msg_id()).await?
+                && !super::send::given_up(&self.reader(), item.msg_id(), now).await?
+            {
                 super::send::put_outbox_item(tx, item)?;
             }
         }

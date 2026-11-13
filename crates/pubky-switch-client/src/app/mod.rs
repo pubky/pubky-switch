@@ -70,7 +70,7 @@ mod send;
 mod tests;
 
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
-pub use error::{Alarm, AppError, Refusal};
+pub use error::{Alarm, AppError, Refusal, WontDeliver};
 pub use events::{
     AppEvent, BackupRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId, EventIdError,
     ParkReason, RefusedCall,
@@ -1223,7 +1223,9 @@ impl App {
             }
             send::put_outbox_item(tx, &item)?;
         }
+        let now = self.now();
         for (msg_id, resend) in &backup.outbox_left_out {
+            send::note_given_up(tx, msg_id, now)?;
             self.keep_duty(
                 tx,
                 events::Duty::MessageUndelivered {

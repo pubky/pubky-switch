@@ -1381,6 +1381,7 @@ async fn test_loss_keeps_an_owed_call_from_the_lost_generation_and_makes_it() {
         seq: 9,
         entries: 2,
         accepted_from_ms: lost.note_at_ms,
+        accepted_until_ms: lost.note_at_ms + 1,
     };
     let mut tx = app.tx().unwrap();
     tx.put(&crate::app::state::key::owed(1, 9), &call).unwrap();
@@ -1394,9 +1395,10 @@ async fn test_loss_keeps_an_owed_call_from_the_lost_generation_and_makes_it() {
     assert_eq!(app.cursor().generation, 2);
     let missed = lost.protocol.sample.missed.lock().unwrap().clone();
     assert!(
-        missed
-            .iter()
-            .any(|m| m.seq == 9 && m.entries == 2 && m.accepted_from_ms == lost.note_at_ms),
+        missed.iter().any(|m| m.seq == 9
+            && m.entries == 2
+            && m.accepted_from_ms == lost.note_at_ms
+            && m.accepted_until_ms == lost.note_at_ms + 1),
         "{missed:?}"
     );
     assert!(app.reader().scan_raw("owed/").await.unwrap().is_empty());

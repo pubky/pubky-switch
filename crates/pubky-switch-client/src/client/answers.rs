@@ -151,8 +151,9 @@ pub enum FeedItem {
         seq: u64,
         /// How many entries.
         entries: u64,
-        /// The first acceptance time, in Unix milliseconds; `None` when it doesn't parse,
-        /// and the app then ignores the item.
+        /// The first acceptance time, in Unix milliseconds; `None` when it doesn't parse.
+        /// An item either of whose times doesn't parse asks for no re-send, but still owes
+        /// the listing (Switch wire 7.4.4).
         accepted_from: Option<u64>,
         /// The last acceptance time, as `accepted_from`.
         accepted_until: Option<u64>,

@@ -187,7 +187,15 @@ pub(crate) enum OwedCall {
         seq: u64,
         entries: u64,
         accepted_from_ms: u64,
+        /// Absent in the form written before: no end is known.
+        #[serde(default = "no_end")]
+        accepted_until_ms: u64,
     },
+}
+
+/// The end of a missed-entries call kept without one ([`OwedCall::Missed`]).
+fn no_end() -> u64 {
+    u64::MAX
 }
 
 impl From<&ResendNeeded> for OwedCall {
@@ -236,10 +244,12 @@ impl OwedCall {
                 seq,
                 entries,
                 accepted_from_ms,
+                accepted_until_ms,
             } => RefusedCall::Missed(MissedEntries {
                 seq,
                 entries,
                 accepted_from_ms,
+                accepted_until_ms,
             }),
         }
     }
@@ -715,8 +725,13 @@ impl App {
                     seq,
                     entries,
                     accepted_from,
-                    ..
-                } => self.handle_missed(*seq, *entries, *accepted_from, &mut read)?,
+                    accepted_until,
+                } => self.handle_missed(
+                    *seq,
+                    *entries,
+                    accepted_from.zip(*accepted_until),
+                    &mut read,
+                )?,
                 FeedItem::Chain(chain_item) => {
                     let Some(envelope) = checked.envelopes.get(&seq).copied() else {
                         continue;
@@ -2411,14 +2426,15 @@ impl App {
         Ok(Step::Pass)
     }
 
+    /// A `missed` item, with its first and last acceptance times when both parse.
     fn handle_missed(
         &mut self,
         seq: u64,
         entries: u64,
-        accepted_from: Option<u64>,
+        accepted: Option<(u64, u64)>,
         read: &mut Read,
     ) -> Result<Step, AppError> {
-        let Some(from) = accepted_from else {
+        let Some((from, until)) = accepted else {
             // The service writes the item: one whose times don't parse asks for no re-send,
             // but still owes the listing (Switch spec 8.2, wire 7.4.4).
             if self.state.asked.insert(seq) {
@@ -2429,32 +2445,25 @@ impl App {
             return Ok(Step::Pass);
         };
         if self.state.asked.insert(seq) {
+            let accepted_from_ms = from.max(self.resend_floor());
             let missed = MissedEntries {
                 seq,
                 entries,
-                accepted_from_ms: from.max(self.resend_floor()),
+                accepted_from_ms,
+                accepted_until_ms: until.max(accepted_from_ms),
+            };
+            let call = OwedCall::Missed {
+                seq,
+                entries,
+                accepted_from_ms: missed.accepted_from_ms,
+                accepted_until_ms: missed.accepted_until_ms,
             };
             match self.protocol.missed(&missed) {
-                Ok(writes) if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES => self
-                    .local_writes_refused(
-                        seq,
-                        OwedCall::Missed {
-                            seq,
-                            entries,
-                            accepted_from_ms: missed.accepted_from_ms,
-                        },
-                        read,
-                    )?,
+                Ok(writes) if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES => {
+                    self.local_writes_refused(seq, call, read)?;
+                }
                 Ok(writes) => read.tx.local(&writes)?,
-                Err(_) => self.owe(
-                    seq,
-                    OwedCall::Missed {
-                        seq,
-                        entries,
-                        accepted_from_ms: missed.accepted_from_ms,
-                    },
-                    read,
-                )?,
+                Err(_) => self.owe(seq, call, read)?,
             }
             read.tx.put(&key::asked(seq), &())?;
             super::records::owe_listing(&mut read.tx)?;
