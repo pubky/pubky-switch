@@ -117,6 +117,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   service retains too, the harness comparison is what shows the two agree;
   claims are deleted only when `GET /claims` finds them deletable; batch records are never
   dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`.
+- **Superseded documents** (Switch wire 7.5): unlike the service, which deletes a chain
+  item's document and proof once no app may read it in full, the switch keeps every
+  document and decides at each read which show (`Readers`). Every answer is the same, since
+  a superseded document shows as its stub to every app; only a test that looks inside the
+  switch's items could tell.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires.
 - **Lists**: `flagged` is always empty.
