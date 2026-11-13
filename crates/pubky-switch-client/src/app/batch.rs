@@ -385,7 +385,7 @@ impl App {
         refuse_lifecycle_ops(batch.ops.iter().map(|(_, kind)| kind))?;
         self.refuse_before_upload().await?;
         // At most one batch kept from an earlier call goes first; with more kept, this
-        // one is kept behind them (Switch wire 6.4 step 5), so the call sends at most two.
+        // one is kept behind them, so the call sends at most two batches.
         let resent = if again {
             Ok(self.kept_ahead().await?.is_some())
         } else {
@@ -393,14 +393,20 @@ impl App {
         };
         let behind = match resent {
             Ok(false) => None,
-            Ok(true) => self.kept_ahead().await?,
+            Ok(true) => self
+                .kept_ahead()
+                .await?
+                .map(|ahead| AppError::Refused(Refusal::KeptBatchesAhead(ahead))),
             // A frozen account takes no write, but the app queues its writes for the next
-            // service (Switch spec 12.5 step 2): the new batch is kept too, and the call
-            // reports the `410 moved` its own send gets.
-            Err(AppError::Switch(ClientError::Switch {
-                code: ErrorCode::Moved,
-                ..
-            })) => None,
+            // service (Switch spec 12.5 step 2): the new batch is kept too, unsent behind
+            // the kept batch the freeze refused, and the call reports that `410 moved`. Sent
+            // now, it would overtake that batch should the freeze be called off meanwhile.
+            Err(
+                error @ AppError::Switch(ClientError::Switch {
+                    code: ErrorCode::Moved,
+                    ..
+                }),
+            ) => self.kept_ahead().await?.map(|_| error),
             Err(error @ (AppError::Transport(_) | AppError::Switch(_))) => {
                 return Err(match self.kept_ahead().await? {
                     Some(ahead) => AppError::Ahead {
@@ -533,11 +539,12 @@ impl App {
     }
 
     /// [`App::submit_new`], keeping the batch unsent when batches kept from earlier calls
-    /// are `behind` it ([`Refusal::KeptBatchesAhead`]).
+    /// are ahead of it: `behind` is then the error the call returns around the kept batch
+    /// ([`Refusal::KeptBatchesAhead`], or the `410 moved` the oldest kept batch got).
     async fn submit_new_behind(
         &mut self,
         batch: OpBatch,
-        behind: Option<KeptAhead>,
+        behind: Option<AppError>,
     ) -> Result<Submitted, AppError> {
         if batch.ops.is_empty() || batch.ops.len() > MAX_BATCH_ENTRIES {
             return Err(
@@ -605,13 +612,13 @@ impl App {
         tx.put(KEPT_NEXT, &queued_n.saturating_add(1))?;
         tx.put(&pending_key(&id), &pending)?;
         index_kept(&mut tx, &id, &pending, &signed)?;
-        if let Some(ahead) = behind {
+        if let Some(error) = behind {
             // Kept behind the batches from earlier calls: it goes after them, by the reads
-            // and writes that send them again (Switch wire 6.4 step 5).
+            // and writes that send them again.
             self.commit(tx).await?;
             return Err(AppError::Kept {
                 batch_id: id,
-                error: Box::new(AppError::Refused(Refusal::KeptBatchesAhead(ahead))),
+                error: Box::new(error),
             });
         }
         // From the commit that keeps it, a failure that leaves the batch kept says so, so

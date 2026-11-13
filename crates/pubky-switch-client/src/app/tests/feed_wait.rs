@@ -1228,9 +1228,10 @@ impl Setup {
 
 #[tokio::test]
 async fn test_write_sends_one_kept_batch_again_and_keeps_its_own_behind_the_rest() {
-    // Three writes kept while the account was frozen. The next write sends the oldest again,
-    // and, two still kept, keeps its own behind them and says which one is ahead; reads then
-    // send them all, in the order they were kept.
+    // Three writes kept while the account was frozen: the first sent and refused, the two
+    // after it kept unsent behind it. The next write sends the oldest again, and, two still
+    // kept, keeps its own behind them and says which one is ahead; reads then send them all,
+    // in the order they were kept.
     let s = Setup::new(false);
     let mut app = s.join("wallet").await;
     let freeze = s.freeze();
@@ -1250,7 +1251,10 @@ async fn test_write_sends_one_kept_batch_again_and_keeps_its_own_behind_the_rest
         panic!("{error:?}");
     };
     assert_eq!(ahead.kept, 2, "the two still kept from before");
-    assert!(ahead.kept_since_ms.is_some() && ahead.answer_until_ms.is_some());
+    assert!(
+        ahead.kept_since_ms.is_none() && ahead.answer_until_ms.is_none(),
+        "never sent, so no window: {ahead:?}"
+    );
     assert_eq!(
         conversations(&s.w)[before..],
         [[10; 32]],
@@ -1282,6 +1286,11 @@ async fn test_write_behind_a_failing_kept_batch_names_it() {
     };
     assert_eq!(ahead.batch_id, first);
     assert_eq!(ahead.kept, 1);
+    let since = ahead.kept_since_ms.expect("sent before");
+    assert_eq!(
+        ahead.answer_until_ms,
+        Some(since + crate::app::KEPT_BATCH_ANSWER_MS)
+    );
     assert!(
         matches!(error.unkept(), AppError::Transport(TransportError::Timeout)),
         "{error:?}"
@@ -1507,8 +1516,9 @@ async fn test_kept_batches_behind_others_go_out_in_creation_order() {
 #[tokio::test]
 async fn test_write_during_a_freeze_goes_after_a_batch_kept_behind() {
     // A write kept behind an earlier one, never sent; then the account is frozen again,
-    // and a later write is sent and answered `410 moved`. Once the freeze is called off,
-    // every batch goes in the order the calls kept them.
+    // and a later write's resend of the earlier one is answered `410 moved`, the write kept
+    // too. Once the freeze is called off, every batch goes in the order the calls kept
+    // them.
     let s = Setup::new(false);
     let mut app = s.join("wallet").await;
     let before = conversations(&s.w).len();
@@ -1778,3 +1788,73 @@ async fn test_receive_with_its_time_spent_still_retries_every_stored_entry() {
     assert_eq!(unparked, 1, "carol's entry is retried at last");
 }
 
+/// The switch's transport, which calls a freeze off once the first batch sent through it is
+/// answered, as a signer that calls a move off while a write is under way.
+struct CallsOff {
+    inner: Arc<dyn Transport>,
+    switch: Arc<crate::testing::ScriptedSwitch>,
+    freeze: Mutex<Option<Freeze>>,
+}
+
+impl Transport for CallsOff {
+    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+        Box::pin(async move {
+            let batch = request.method == "POST" && request.path_and_query.ends_with("/ops");
+            let answer = self.inner.send(request).await;
+            if batch && let Some(freeze) = self.freeze.lock().unwrap().take() {
+                self.switch.unfreeze(&freeze).unwrap();
+            }
+            answer
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_write_during_a_freeze_called_off_goes_after_the_kept_batch() {
+    // A write kept during a freeze; the next write's resend of it is answered `410 moved`,
+    // and the freeze is called off right after. The write keeps its own batch unsent behind
+    // the kept one and reports the `410 moved`: sent at once it would be applied first.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let before = conversations(&s.w).len();
+    let freeze = s.freeze();
+    s.w.clock.advance_ms(1_000);
+    app.submit_batch(conversation([10; 32])).await.unwrap_err();
+    s.router.add(
+        ORIGIN,
+        Arc::new(CallsOff {
+            inner: Arc::clone(&s.gate) as Arc<dyn Transport>,
+            switch: Arc::clone(&s.w.switch),
+            freeze: Mutex::new(Some(freeze)),
+        }) as Arc<dyn Transport>,
+    );
+    let from = s.router.log().len();
+    s.w.clock.advance_ms(1_000);
+    let error = app.submit_batch(conversation([11; 32])).await.unwrap_err();
+    let own = error.kept_batch().expect("its own batch kept");
+    assert_eq!(
+        error.code(),
+        Some(pubky_switch_core::http::ErrorCode::Moved),
+        "{error:?}"
+    );
+    let batches = s
+        .sent_since(from)
+        .iter()
+        .filter(|line| line.contains("/ops"))
+        .count();
+    assert_eq!(batches, 1, "only the kept batch: {:?}", s.sent_since(from));
+    let kept = app.kept_batches().await.unwrap();
+    assert!(
+        kept.iter()
+            .any(|(id, pending)| *id == own && pending.kept_ms.is_none()),
+        "kept unsent"
+    );
+    assert!(conversations(&s.w)[before..].is_empty());
+    for _ in 0..4 {
+        if !app.receive(None).await.unwrap().more {
+            break;
+        }
+    }
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations(&s.w)[before..], [[10; 32], [11; 32]]);
+}
