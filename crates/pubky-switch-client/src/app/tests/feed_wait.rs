@@ -2589,3 +2589,123 @@ async fn test_flush_outbox_joint_pass_across_a_restart_with_newcomers() {
     }
     assert_eq!(requests("frank"), 1);
 }
+
+/// A delivery answered `409 stale_key` once its round's budget has passed: the reseal waits
+/// for the next try, which reseals and delivers. The message stays queued, not failed, and
+/// is sent once.
+#[tokio::test]
+async fn test_flush_outbox_stale_key_past_the_round_budget_is_resolved_by_the_next_try() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let (_, delivery) = app.send(note_to_bob(&s, "one")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    // Bob rotates; the cached directory still names the old key.
+    s.peer.rotate(0).unwrap();
+    let slow = s.slow_peer(21_000);
+    let (second, delivery) = app.send(note_to_bob(&s, "two")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Queued { .. }),
+        "{delivery:?}"
+    );
+    slow.ms.store(1_000, std::sync::atomic::Ordering::SeqCst);
+    s.w.clock.advance_ms(60_000);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![second.clone()], "{report:?}");
+    assert_eq!(
+        s.peer.received().iter().filter(|m| **m == second).count(),
+        1
+    );
+}
+
+/// A message whose conversation entry is in the second of two kept batches (kept while the
+/// account was frozen): each pass sends one kept batch again, oldest first, so it goes in
+/// the second pass, the one that sends its batch.
+#[tokio::test]
+async fn test_flush_outbox_message_behind_its_entry_in_the_second_kept_batch() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let freeze = s.freeze();
+    s.w.clock.advance_ms(1_000);
+    app.submit_batch(conversation([10; 32])).await.unwrap_err();
+    s.w.clock.advance_ms(1_000);
+    let msg_id = app.queue(note_to_bob(&s, "hello")).await.unwrap();
+    app.flush_outbox().await.unwrap();
+    assert_eq!(app.kept_batches().await.unwrap().len(), 2, "two kept");
+    s.w.switch.unfreeze(&freeze).unwrap();
+    let delivered = |delivery: Option<crate::app::Delivery>| {
+        matches!(delivery, Some(crate::app::Delivery::Accepted { .. }))
+    };
+    s.w.clock.advance_ms(60_000);
+    s.flush_while_more(&mut app).await;
+    let first = delivered(app.delivery(&msg_id).await.unwrap());
+    s.w.clock.advance_ms(60_000);
+    s.flush_while_more(&mut app).await;
+    let second = delivered(app.delivery(&msg_id).await.unwrap());
+    assert!(!first, "the first pass sends the batch ahead of its own");
+    assert!(second, "in the second pass, which sends its batch");
+}
+
+/// A kept batch whose resend takes 25 s and fails, sent again first in every pass: the
+/// messages of each pass still go, each once, in the same loop.
+#[tokio::test]
+async fn test_flush_outbox_slow_failing_kept_batch_starves_no_message() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let (_, delivery) = app.send(note_to_bob(&s, "first")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    for _ in 0..12 {
+        s.w.switch.fail_next(crate::testing::Fault::Unreachable {
+            path: "/ops".into(),
+            after: 0,
+        });
+    }
+    app.submit_batch(conversation([10; 32])).await.unwrap_err();
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    s.peer.set_staged(true);
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    s.slow(25_000);
+    for round in 1..=2u64 {
+        s.w.clock.advance_ms(60_000);
+        let flushes = s.flush_while_more(&mut app).await;
+        assert_eq!(tries(&app, &ids).await, [round; 3], "{flushes} flushes");
+    }
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1, "still kept");
+}
+
+/// The same with bob's switch slow at every try, so no round ever has time to reseal: the
+/// key the `409 stale_key` named is taken when the reseal is skipped, and the next try's
+/// first attempt seals to it and delivers.
+#[tokio::test]
+async fn test_flush_outbox_stale_key_skipped_every_time_is_sealed_at_the_next_try() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let (_, delivery) = app.send(note_to_bob(&s, "one")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    s.peer.rotate(0).unwrap();
+    s.slow_peer(21_000);
+    let (second, delivery) = app.send(note_to_bob(&s, "two")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Queued { .. }),
+        "{delivery:?}"
+    );
+    s.w.clock.advance_ms(60_000);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![second.clone()], "{report:?}");
+    assert_eq!(
+        s.peer.received().iter().filter(|m| **m == second).count(),
+        1
+    );
+}
