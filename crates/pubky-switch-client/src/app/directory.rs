@@ -131,9 +131,18 @@ struct PeersDoc {
     removed: Vec<String>,
     closed: Vec<String>,
     /// The Pubky IDs of the counterparties still owed the delivery, tried again at each
-    /// call until it goes or they stop being recent.
+    /// call until it goes or they stop being recent: those a call's budget left untried
+    /// first, then those whose delivery failed, in the order they failed.
     #[serde(default)]
     owed: Vec<String>,
+    /// How many of `owed`, from its start, the pass under way hasn't tried yet. While it is
+    /// above zero, a call tries only those; at zero, the next call starts a pass over all.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    untried: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// `ident/<pubky>/sw`: when the app last looked up a counterparty's switch copy of its
@@ -1346,16 +1355,32 @@ impl App {
         self.note_known_version(pubky, version).await
     }
 
+    /// Whether a pass of the deliveries of [`App::deliver_to_recent_peers`] is under way.
+    pub(crate) async fn peers_pass_open(&self) -> Result<bool, AppError> {
+        let judged: PeersDoc = self.reader().get(PEERS_DOC).await?.unwrap_or_default();
+        Ok(judged.untried > 0)
+    }
+
     /// After an own `identity.json` that removes an app or closes a renewal, deliver it to
     /// the switches the app wrote to in the last 30 days whose copy is older, by the
-    /// `known_version` they last answered (Switch spec 12.2 step 5, 3.2). Every switch owed
-    /// is tried; the ones that fail stay owed, each on its own, and are tried again at the
-    /// next call, so one unreachable switch holds up no other.
+    /// `known_version` they last answered (Switch spec 12.2 step 5, 3.2). The ones that fail
+    /// stay owed, each on its own, and are tried again by a later call.
+    ///
+    /// The deliveries go in passes, each trying every owed switch once. Past the call's
+    /// `budget`, once a unit of the call went (`units`, counted with the call's other
+    /// units), the rest of the pass is left to the next call, and it returns `true`; the next
+    /// call tries only those. A switch whose delivery failed goes behind them, so one slow
+    /// failing switch holds up no other. The call that ends a pass returns `false`, failed
+    /// switches still owed, and the call after starts a new pass.
     ///
     /// # Errors
     ///
     /// An alarm or a store failure; a switch's failure only keeps it owed.
-    pub(crate) async fn deliver_to_recent_peers(&mut self) -> Result<(), AppError> {
+    pub(crate) async fn deliver_to_recent_peers(
+        &mut self,
+        budget: &super::CallBudget,
+        units: &mut usize,
+    ) -> Result<bool, AppError> {
         let own = self.state.own_doc.clone();
         let mut judged: PeersDoc = self.reader().get(PEERS_DOC).await?.unwrap_or_default();
         let now = self.now();
@@ -1396,12 +1421,29 @@ impl App {
                 removed,
                 closed,
                 owed,
+                // Newly owed switches come after the pass under way.
+                untried: judged.untried,
             };
         } else if judged.owed.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
-        let mut still = Vec::new();
-        for rest in std::mem::take(&mut judged.owed) {
+        // A pass tries each owed switch once. A switch whose delivery failed goes behind
+        // those the budget left untried, so one slow failing switch holds up no other.
+        let mut owed = std::mem::take(&mut judged.owed);
+        let pass = match judged.untried {
+            0 => owed.len(),
+            untried => untried.min(owed.len()),
+        };
+        let tried_before = owed.split_off(pass);
+        let mut skipped = Vec::new();
+        let mut failed = Vec::new();
+        for rest in owed {
+            // Past the call's time budget, once a unit of the call went, the rest are owed to
+            // a later call.
+            if *units > 0 && self.spent(budget) {
+                skipped.push(rest);
+                continue;
+            }
             let Ok(pubky) = pubky_switch_core::enc::pubky_key(&rest) else {
                 continue;
             };
@@ -1409,17 +1451,23 @@ impl App {
             if !recent(&peer) {
                 continue;
             }
+            *units += 1;
             match self.deliver_own_identity(&pubky, None, false).await {
                 Ok(()) => {}
                 Err(error @ (AppError::Alarm(_) | AppError::Store(_))) => return Err(error),
                 // A switch that can't be reached now gets it at a later call.
-                Err(_) => still.push(rest),
+                Err(_) => failed.push(rest),
             }
         }
-        judged.owed = still;
+        let left = !skipped.is_empty();
+        judged.untried = skipped.len();
+        judged.owed = skipped;
+        judged.owed.extend(tried_before);
+        judged.owed.extend(failed);
         let mut tx = self.tx()?;
         tx.put(PEERS_DOC, &judged)?;
-        self.commit(tx).await
+        self.commit(tx).await?;
+        Ok(left)
     }
 }
 

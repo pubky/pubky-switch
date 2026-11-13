@@ -2018,7 +2018,7 @@ async fn test_records_write_before_a_reduction_is_kept_by_every_reader() {
     // (b) A tablet that joins after the renewal lists the collection and reads the record.
     s.w.clock.advance_ms(HOUR);
     let mut tablet = s.join("tablet").await;
-    assert_eq!(tablet.list_collection(&items()).await.unwrap(), 1);
+    assert_eq!(tablet.list_collection(&items()).await.unwrap().records, 1);
     let listed = tablet.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(listed.content.value()), vec!["a"]);
     assert!(!listed.flagged);
@@ -2978,7 +2978,7 @@ async fn test_records_removed_writer_is_judged_by_distrust_from_by_every_reader(
     );
 
     let mut tablet = s.join("tablet").await;
-    assert_eq!(tablet.list_collection(&items()).await.unwrap(), 2);
+    assert_eq!(tablet.list_collection(&items()).await.unwrap().records, 2);
     let rules = flagged_rules(&tablet.take_events());
     assert_eq!(rules.len(), 1, "{rules:?}");
     assert!(rules[0].contains("distrust"), "{rules:?}");
@@ -4823,6 +4823,98 @@ async fn test_send_unreachable_peer_doesnt_hold_up_the_others() {
     assert!(s.peer.routes().is_empty(), "{:?}", s.peer.routes());
 }
 
+/// A switch that takes `ms` of the app's clock for each request and then fails to connect,
+/// as a slow switch that is down.
+struct SlowDown {
+    clock: Arc<crate::clock::TestClock>,
+    ms: u64,
+}
+
+impl Transport for SlowDown {
+    fn send(
+        &self,
+        _: crate::transport::Request,
+    ) -> crate::transport::BoxFuture<
+        '_,
+        Result<crate::transport::Response, crate::error::TransportError>,
+    > {
+        Box::pin(async move {
+            self.clock.advance_ms(self.ms);
+            Err(crate::error::TransportError::Connect("down".into()))
+        })
+    }
+}
+
+/// A slow switch that keeps failing, met first among those owed an app's removal, uses each
+/// flush's budget: the healthy switch behind it still gets the removal within two flushes.
+#[tokio::test]
+async fn test_send_slow_failing_peer_doesnt_starve_the_others() {
+    const SLOW: &str = "https://slow.example";
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.send(s.note("hello")).await.unwrap();
+    let bob = pubky_switch_core::enc::pubky_id(&s.w.bob.public());
+    let slow_key = (0..100)
+        .map(|n| identity(&format!("peer{n}")))
+        .find(|key| pubky_switch_core::enc::pubky_id(&key.public()) < bob)
+        .unwrap();
+    let slow = slow_key.public();
+    // Its identity.json is published, naming the slow switch.
+    let published = PeerSwitch::new(
+        slow_key,
+        SLOW,
+        Arc::clone(&s.w.clock),
+        Arc::clone(&s.w.homeserver),
+    );
+    published
+        .add_app("shop", &AppSpec::new(&["scope-a"]), &["sample.note"], false)
+        .unwrap();
+    s.router.add(
+        SLOW,
+        Arc::new(SlowDown {
+            clock: Arc::clone(&s.w.clock),
+            ms: 25_000,
+        }) as Arc<dyn Transport>,
+    );
+    let ns = crate::store::client_namespace(&app.app_id());
+    let mut tx = crate::app::state::Tx::new(&ns);
+    crate::app::directory::put_peer(
+        &mut tx,
+        &slow,
+        &crate::app::directory::PeerSwitch {
+            known_version: Some(1),
+            last_sent_ms: Some(s.w.clock.now_ms()),
+        },
+    )
+    .unwrap();
+    tx.commit(&StoreHandle::inline(
+        Arc::clone(&s.w.store) as Arc<dyn StateStore>
+    ))
+    .await
+    .unwrap();
+    let doc = s.w.next_doc(|body| {
+        body.removed.push(RemovedApp {
+            app_id: [9; 16],
+            distrust_from: START,
+        })
+    });
+    app.refresh_identity().await.unwrap();
+    let bob_has_it = || {
+        s.peer
+            .lock()
+            .peers
+            .get(&s.w.alice.public())
+            .is_some_and(|held| held.version() == doc.version())
+    };
+    for _ in 0..2 {
+        app.flush_outbox().await.unwrap();
+        if bob_has_it() {
+            break;
+        }
+    }
+    assert!(bob_has_it(), "the healthy switch has the removal");
+}
+
 #[tokio::test]
 async fn test_directory_floor_only_rises_within_one_answer() {
     let s = Setup::new();
@@ -4918,7 +5010,7 @@ async fn test_records_listing_page_of_full_marks_commits_early() {
     }
     *s.protocol.pad.lock().unwrap() = MAX_SEEN_MARK_BYTES - 64;
     let mut phone = s.join("phone").await;
-    assert_eq!(phone.list_collection(&items()).await.unwrap(), 420);
+    assert_eq!(phone.list_collection(&items()).await.unwrap().records, 420);
     for name in [&names[0], &names[419]] {
         let key = phone.record_key(&s.target(name)).unwrap();
         assert!(phone.shared_record(&key).await.unwrap().is_some());
@@ -4947,13 +5039,66 @@ async fn test_records_listing_pages_by_bytes() {
     assert_ne!(second.records[0].key, first.records[0].key);
     // The app lists the whole collection by `next`.
     let before = s.w.switch.lock().shared.listings;
-    assert_eq!(app.list_collection(&items()).await.unwrap(), 3);
+    assert_eq!(app.list_collection(&items()).await.unwrap().records, 3);
     assert_eq!(s.w.switch.lock().shared.listings - before, 3);
     // Within the budget, one page holds them all.
     s.w.switch.lock().max_page_bytes = crate::testing::MAX_PAGE_BYTES;
     let all = app.client.records(&id, None, None).await.unwrap();
     assert_eq!(all.records.len(), 3);
     assert!(all.next.is_none());
+}
+
+#[tokio::test]
+async fn test_records_listing_reads_at_most_its_page_budget_and_goes_on() {
+    // Six records, one a page: a call lists four and says more; the next goes on from
+    // there to the end. The call after that starts at the beginning again.
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    for n in 0..6 {
+        let name = format!("n{n}");
+        app.put_record(&s.target(&name), &value(&[name.as_str()]), vec![])
+            .await
+            .unwrap();
+    }
+    s.w.switch.lock().max_page_bytes = 1;
+    let listings = || s.w.switch.lock().shared.listings;
+    let before = listings();
+    let first = app.list_collection(&items()).await.unwrap();
+    assert!(first.more, "{first:?}");
+    assert_eq!(first.records, 4);
+    assert_eq!(
+        listings() - before,
+        u64::from(crate::app::LISTING_PAGES_PER_READ)
+    );
+    let second = app.list_collection(&items()).await.unwrap();
+    assert!(!second.more, "{second:?}");
+    assert_eq!(second.records, 2);
+    let third = app.list_collection(&items()).await.unwrap();
+    assert!(third.more, "{third:?}");
+    assert_eq!(third.records, 4);
+}
+
+#[tokio::test]
+async fn test_records_list_collections_reads_at_most_its_page_budget_and_goes_on() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    for n in 0..6 {
+        let name = format!("n{n}");
+        app.put_record(&s.target(&name), &value(&[name.as_str()]), vec![])
+            .await
+            .unwrap();
+    }
+    s.w.switch.lock().max_page_bytes = 1;
+    let listings = || s.w.switch.lock().shared.listings;
+    let before = listings();
+    assert!(app.list_collections().await.unwrap(), "more");
+    assert_eq!(
+        listings() - before,
+        u64::from(crate::app::LISTING_PAGES_PER_READ)
+    );
+    assert!(!app.list_collections().await.unwrap(), "to the end");
+    assert_eq!(listings() - before, 6);
+    assert!(!app.listing_owed().await.unwrap());
 }
 
 #[test]
@@ -8728,4 +8873,184 @@ async fn test_records_own_write_read_in_the_feed_first_marks_b_before_and_after_
     assert_eq!(ids(held.content.value()), ["b", "c"]);
     assert!(!held.flagged);
     assert!(wallet.flagged_writes().await.unwrap().is_empty());
+}
+
+/// Device A of the wallet holds device B's `["a", "x", "y"]` unopened, sealed at data epoch
+/// 2, its mark still `["a", "x"]`; the phone holds B's write. Returns A, the phone, the
+/// target and the key.
+async fn second_device_write_unopened(s: &Setup) -> (App, App, RecordTarget, [u8; 32]) {
+    let mut a = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    a.set_multi_device(true).await.unwrap();
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a", "x"]), vec![])
+        .await
+        .unwrap();
+    a.receive(None).await.unwrap();
+    let key = a.record_key(&target).unwrap();
+    let backup = a.backup().await.unwrap();
+    let mut b = App::restore(
+        s.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    b.receive(None).await.unwrap();
+    b.end_reconcile(crate::app::UserConfirmed::new())
+        .await
+        .unwrap();
+    rotate_data_epoch(s, &[&a, &phone]);
+    b.put_record(&target, &value(&["a", "x", "y"]), vec![])
+        .await
+        .unwrap();
+    assert_eq!(b.data_epoch(), 2);
+    let read = a.read_record(&target).await.unwrap().unwrap();
+    assert!(
+        matches!(
+            read.content,
+            RecordContent::Unreadable(Unopened::KeyNotHeld { .. })
+        ),
+        "{:?}",
+        read.content
+    );
+    assert_eq!(
+        ids(a.record_seen(&key).await.unwrap().as_deref()),
+        ["a", "x"]
+    );
+    phone.receive(None).await.unwrap();
+    let at_phone = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(at_phone.content.value()), ["a", "x", "y"]);
+    (a, phone, target, key)
+}
+
+/// Once A reads on and takes the epoch's key, B's write opens: A's mark is what B wrote,
+/// and the phone's later write that drops y is flagged.
+#[tokio::test]
+async fn test_records_second_device_write_reopened_with_its_key_marks_its_value() {
+    let s = Setup::new();
+    let (mut a, mut phone, target, key) = second_device_write_unopened(&s).await;
+    a.receive(None).await.unwrap();
+    let held = a.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["a", "x", "y"]);
+    assert_eq!(
+        ids(a.record_seen(&key).await.unwrap().as_deref()),
+        ["a", "x", "y"],
+        "the mark once the record reopens"
+    );
+    phone
+        .put_record(&target, &value(&["a", "x"]), vec![])
+        .await
+        .unwrap();
+    let report = a.receive(None).await.unwrap();
+    assert!(
+        flagged_by(&report.events, &key, phone.app_id()),
+        "{:?}",
+        report.events
+    );
+    let held = a.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["a", "x", "y"], "not taken");
+}
+
+/// The same when A takes the key in a write of its own elsewhere (`409 stale_epoch`): the
+/// key fetch reopens the record there (`reopen_unreadable`), with no read of its feed.
+#[tokio::test]
+async fn test_records_second_device_write_reopened_by_a_key_fetch_marks_its_value() {
+    let s = Setup::new();
+    let (mut a, mut phone, target, key) = second_device_write_unopened(&s).await;
+    a.put_record(&s.target("n2"), &value(&["z"]), vec![])
+        .await
+        .unwrap();
+    assert_eq!(a.data_epoch(), 2, "the key taken by the write");
+    let held = a.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["a", "x", "y"], "reopened");
+    assert_eq!(
+        ids(a.record_seen(&key).await.unwrap().as_deref()),
+        ["a", "x", "y"],
+        "the mark once the record reopens"
+    );
+    phone
+        .put_record(&target, &value(&["a", "x"]), vec![])
+        .await
+        .unwrap();
+    let report = a.receive(None).await.unwrap();
+    assert!(
+        flagged_by(&report.events, &key, phone.app_id()),
+        "{:?}",
+        report.events
+    );
+}
+
+/// Two slow switches that keep failing, met first among those owed an app's removal: the
+/// healthy switch behind them gets it within one loop "flush while more" of the host.
+#[tokio::test]
+async fn test_send_two_slow_failing_peers_dont_starve_the_others() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.send(s.note("hello")).await.unwrap();
+    let bob = pubky_switch_core::enc::pubky_id(&s.w.bob.public());
+    let slow: Vec<_> = (0..300)
+        .map(|n| identity(&format!("peer{n}")))
+        .filter(|key| pubky_switch_core::enc::pubky_id(&key.public()) < bob)
+        .take(2)
+        .collect();
+    assert_eq!(slow.len(), 2);
+    let ns = crate::store::client_namespace(&app.app_id());
+    for (n, key) in slow.into_iter().enumerate() {
+        let origin = format!("https://slow{n}.example");
+        let pubky = key.public();
+        let published = PeerSwitch::new(
+            key,
+            &origin,
+            Arc::clone(&s.w.clock),
+            Arc::clone(&s.w.homeserver),
+        );
+        published
+            .add_app("shop", &AppSpec::new(&["scope-a"]), &["sample.note"], false)
+            .unwrap();
+        s.router.add(
+            &origin,
+            Arc::new(SlowDown {
+                clock: Arc::clone(&s.w.clock),
+                ms: 25_000,
+            }) as Arc<dyn Transport>,
+        );
+        let mut tx = crate::app::state::Tx::new(&ns);
+        crate::app::directory::put_peer(
+            &mut tx,
+            &pubky,
+            &crate::app::directory::PeerSwitch {
+                known_version: Some(1),
+                last_sent_ms: Some(s.w.clock.now_ms()),
+            },
+        )
+        .unwrap();
+        tx.commit(&StoreHandle::inline(
+            Arc::clone(&s.w.store) as Arc<dyn StateStore>
+        ))
+        .await
+        .unwrap();
+    }
+    let doc = s.w.next_doc(|body| {
+        body.removed.push(RemovedApp {
+            app_id: [9; 16],
+            distrust_from: START,
+        })
+    });
+    app.refresh_identity().await.unwrap();
+    let mut flushes = 0;
+    loop {
+        flushes += 1;
+        if !app.flush_outbox().await.unwrap().more {
+            break;
+        }
+        assert!(flushes < 10, "the loop settles");
+    }
+    let held = s.peer.lock().peers.get(&s.w.alice.public()).cloned();
+    assert!(
+        held.is_some_and(|held| held.version() == doc.version()),
+        "the healthy switch has the removal after {flushes} flushes"
+    );
 }

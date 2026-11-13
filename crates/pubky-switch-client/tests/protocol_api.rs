@@ -316,7 +316,7 @@ async fn test_protocol_api_two_identities_message_and_record_each_message() {
         .put_record(&kiosk_target, br#"{"text":"at the kiosk"}"#, vec![])
         .await
         .unwrap();
-    assert_eq!(desk.list_collection(&notes()).await.unwrap(), 3);
+    assert_eq!(desk.list_collection(&notes()).await.unwrap().records, 3);
     let held = desk.records_of("example.notes").await.unwrap();
     assert_eq!(held.len(), 3);
     assert!(
@@ -325,7 +325,7 @@ async fn test_protocol_api_two_identities_message_and_record_each_message() {
     );
     assert!(desk.flagged_writes().await.unwrap().is_empty());
     // The kiosk lists only what its sub-scope reads.
-    assert_eq!(kiosk.list_collection(&notes()).await.unwrap(), 1);
+    assert_eq!(kiosk.list_collection(&notes()).await.unwrap().records, 1);
 }
 
 #[tokio::test]

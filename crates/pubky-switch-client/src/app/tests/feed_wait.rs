@@ -1909,3 +1909,803 @@ async fn test_outbox_keeps_one_conversation_entry_behind_kept_batches() {
     let applied = conversations(&s.w);
     assert_eq!(applied.iter().filter(|pubky| **pubky == peer).count(), 1);
 }
+
+// -------------------------------------------------------------------------------------
+// Bounded calls: the outbox and a peek
+
+/// A note from alice's app to bob.
+fn note_to_bob(s: &Setup, text: &str) -> OutgoingMessage {
+    let mut body = Map::new();
+    body.insert("text".into(), json!(text));
+    OutgoingMessage::new(s.w.bob.public(), "sample.note", body)
+}
+
+/// How many times each of `ids`, all queued, was tried, in order.
+async fn tries(app: &App, ids: &[String]) -> Vec<u64> {
+    let mut out = Vec::new();
+    for id in ids {
+        match app.delivery(id).await.unwrap() {
+            Some(crate::app::Delivery::Queued { tries, .. }) => out.push(tries),
+            other => panic!("{other:?}"),
+        }
+    }
+    out
+}
+
+impl Setup {
+    /// From now on each request to bob's switch takes `ms` of the app's clock.
+    fn slow_peer(&self, ms: u64) -> Arc<Slow> {
+        let slow = Arc::new(Slow {
+            inner: self.peer.transport(),
+            clock: Arc::clone(&self.w.clock),
+            ms: std::sync::atomic::AtomicU64::new(ms),
+        });
+        self.router
+            .add(PEER_ORIGIN, Arc::clone(&slow) as Arc<dyn Transport>);
+        slow
+    }
+
+    /// Flush while a flush says more, at most `rounds` times; returns the messages done.
+    async fn flush_all(&self, app: &mut App, rounds: usize) -> Vec<String> {
+        let mut done = Vec::new();
+        for _ in 0..rounds {
+            let report = app.flush_outbox().await.unwrap();
+            done.extend(report.done.iter().cloned());
+            if !report.more {
+                return done;
+            }
+        }
+        panic!("still more after {rounds} flushes");
+    }
+}
+
+#[tokio::test]
+async fn test_flush_outbox_tries_at_most_its_budget_and_goes_round() {
+    // Six messages to bob, whose switch answers `503 staged`: a flush tries four and says
+    // more, and the next tries the two left and ends the pass. A new pass starts after the
+    // last one tried. Once bob's switch serves, flushes until none says more deliver each
+    // once.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    s.peer.set_staged(true);
+    let mut ids = Vec::new();
+    for n in 0..6 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    let report = app.flush_outbox().await.unwrap();
+    assert!(report.more, "{report:?}");
+    assert_eq!(report.queued.len(), 6, "{report:?}");
+    assert_eq!(tries(&app, &ids).await, [1, 1, 1, 1, 0, 0]);
+    // The pass goes on with the two left, and ends.
+    let report = app.flush_outbox().await.unwrap();
+    assert!(!report.more, "{report:?}");
+    assert_eq!(tries(&app, &ids).await, [1, 1, 1, 1, 1, 1]);
+    // The next flush starts a new pass, after the last one tried.
+    let report = app.flush_outbox().await.unwrap();
+    assert!(report.more, "{report:?}");
+    assert_eq!(tries(&app, &ids).await, [2, 2, 2, 2, 1, 1]);
+    s.peer.set_staged(false);
+    // The pass under way ends with the two it hadn't tried; the next trigger's pass takes
+    // the rest.
+    let mut done = s.flush_all(&mut app, 3).await;
+    done.extend(s.flush_all(&mut app, 3).await);
+    done.sort();
+    let mut all = ids.clone();
+    all.sort();
+    assert_eq!(done, all);
+    let received = s.peer.received();
+    for id in &ids {
+        assert_eq!(received.iter().filter(|m| *m == id).count(), 1, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn test_flush_outbox_on_a_slow_switch_stops_on_its_time_budget() {
+    // Each request to bob's switch takes 9 s of the app's clock: a flush tries no message
+    // past its 20 s once one went, and says more. Later flushes deliver the rest, each once.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    s.slow_peer(9_000);
+    let started = s.w.clock.now_ms();
+    let report = app.flush_outbox().await.unwrap();
+    assert!(report.more, "{report:?}");
+    assert!(
+        !report.done.is_empty() && report.done.len() < ids.len(),
+        "{report:?}"
+    );
+    assert!(
+        s.w.clock.now_ms() - started <= crate::app::DEFAULT_CALL_BUDGET_MS + 2 * 9_000,
+        "within the budget and one message's try"
+    );
+    let mut done = report.done.clone();
+    done.extend(s.flush_all(&mut app, 3).await);
+    done.sort();
+    let mut all = ids.clone();
+    all.sort();
+    assert_eq!(done, all);
+    let received = s.peer.received();
+    for id in &ids {
+        assert_eq!(received.iter().filter(|m| *m == id).count(), 1, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn test_flush_message_past_its_time_budget_writes_its_record_job_in_the_same_try() {
+    // Bob's switch takes 25 s to answer: the message is accepted past the call's budget, and
+    // its record job still goes in the same try, which is one unit and goes whole.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let target = RecordTarget::new(items(), b"n1");
+    let signed = app
+        .sign_message(note_to_bob(&s, "hello"))
+        .unwrap()
+        .with_record(crate::app::RecordJob {
+            target: target.clone(),
+            tag: b"sent".to_vec(),
+        });
+    let msg_id = app.queue_signed(signed).await.unwrap();
+    s.slow_peer(25_000);
+    let delivery = app.flush_message(&msg_id).await.unwrap();
+    assert!(
+        matches!(delivery, Some(crate::app::Delivery::Accepted { .. })),
+        "{delivery:?}"
+    );
+    let key = app.record_key(&target).unwrap();
+    let record = app.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        record.content,
+        crate::app::RecordContent::Value(value(&[msg_id.as_str()]))
+    );
+    assert!(app.outbox_record(&msg_id).await.is_none(), "every job done");
+}
+
+#[tokio::test]
+async fn test_peek_reads_at_most_its_page_budget() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    for _ in 0..3 {
+        s.note(app.app_id());
+    }
+    app.config.page_size = 1;
+    let from = s.router.log().len();
+    let report = app.peek().await.unwrap();
+    assert!(report.more, "{report:?}");
+    assert_eq!(report.items.len(), crate::app::PEEK_PAGES);
+    let pages = s
+        .sent_since(from)
+        .iter()
+        .filter(|line| line.contains("/feed?"))
+        .count();
+    assert_eq!(pages, crate::app::PEEK_PAGES);
+    // One page holds them all: no more.
+    app.config.page_size = 100;
+    let report = app.peek().await.unwrap();
+    assert!(!report.more, "{report:?}");
+    assert_eq!(report.items.len(), 3);
+}
+
+#[tokio::test]
+async fn test_flush_outbox_while_more_stops_after_one_pass() {
+    // Six messages to bob, whose switch answers `503 staged`, as in an outage: a host that
+    // flushes while a flush says more stops after one pass, each message tried once. Only a
+    // later flush, on the host's own triggers, tries them again.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    s.peer.set_staged(true);
+    let mut ids = Vec::new();
+    for n in 0..6 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    let mut flushes = 0;
+    loop {
+        flushes += 1;
+        let report = app.flush_outbox().await.unwrap();
+        if !report.more {
+            assert_eq!(report.queued.len(), ids.len(), "{report:?}");
+            break;
+        }
+        assert!(flushes < 10, "the loop settles");
+    }
+    assert_eq!(flushes, 2);
+    assert_eq!(tries(&app, &ids).await, [1; 6]);
+}
+
+// -------------------------------------------------------------------------------------
+// Checks: owed identity deliveries before the outbox, and passes under way
+
+/// A switch that takes `ms` of the app's clock for each request, then fails to connect.
+struct SlowFailing {
+    clock: Arc<crate::clock::TestClock>,
+    ms: u64,
+}
+
+impl Transport for SlowFailing {
+    fn send(&self, _: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+        Box::pin(async move {
+            self.clock.advance_ms(self.ms);
+            Err(TransportError::Connect("down".into()))
+        })
+    }
+}
+
+impl Setup {
+    /// The app in `store` wrote to `pubky`'s switch just now, which holds an older own
+    /// `identity.json`.
+    async fn mark_recent(&self, app: &App, store: &Arc<MemoryStore>, pubky: &[u8; 32]) {
+        let ns = crate::store::client_namespace(&app.app_id());
+        let mut tx = crate::app::state::Tx::new(&ns);
+        crate::app::directory::put_peer(
+            &mut tx,
+            pubky,
+            &crate::app::directory::PeerSwitch {
+                known_version: Some(1),
+                last_sent_ms: Some(self.w.clock.now_ms()),
+            },
+        )
+        .unwrap();
+        tx.commit(&crate::store::StoreHandle::inline(
+            Arc::clone(store) as Arc<dyn StateStore>
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// A counterparty `name` whose switch takes `ms` for each request and fails, recent for
+    /// the app in `store`. Returns its Pubky ID.
+    async fn slow_failing_counterparty(
+        &self,
+        app: &App,
+        store: &Arc<MemoryStore>,
+        name: &str,
+        ms: u64,
+    ) -> [u8; 32] {
+        let key = identity(name);
+        let pubky = key.public();
+        let origin = format!("https://{name}.example");
+        let published = PeerSwitch::new(
+            key,
+            &origin,
+            Arc::clone(&self.w.clock),
+            Arc::clone(&self.w.homeserver),
+        );
+        published
+            .add_app("shop", &AppSpec::new(&["scope-a"]), &["sample.note"], false)
+            .unwrap();
+        self.router.add(
+            &origin,
+            Arc::new(SlowFailing {
+                clock: Arc::clone(&self.w.clock),
+                ms,
+            }) as Arc<dyn Transport>,
+        );
+        self.mark_recent(app, store, &pubky).await;
+        pubky
+    }
+
+    /// An own `identity.json` that removes an app, taken by `app`.
+    async fn remove_an_app(&self, app: &mut App) {
+        let now = self.w.clock.now_ms();
+        self.w.next_doc(|body| {
+            body.removed.push(RemovedApp {
+                app_id: [9; 16],
+                distrust_from: now,
+            })
+        });
+        app.refresh_identity().await.unwrap();
+    }
+
+    /// One trigger of the host: flush while a flush says more.
+    async fn flush_while_more(&self, app: &mut App) -> usize {
+        for flushes in 1..=10 {
+            if !app.flush_outbox().await.unwrap().more {
+                return flushes;
+            }
+        }
+        panic!("still more after 10 flushes");
+    }
+}
+
+/// A record job owed while a slow switch that keeps failing is owed the own `identity.json`:
+/// the owed delivery spends each flush's budget before the outbox. The message's try, record
+/// job included, goes whole in the joint pass, so the host's triggers have the record written.
+#[tokio::test]
+async fn test_flush_outbox_record_job_behind_a_slow_failing_peer_is_written() {
+    let s = Setup::new(false);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = s
+        .join_on("wallet", Arc::clone(&store) as Arc<dyn StateStore>)
+        .await;
+    s.slow_failing_counterparty(&app, &store, "carol", 25_000)
+        .await;
+    s.remove_an_app(&mut app).await;
+    let target = RecordTarget::new(items(), b"n1");
+    let signed = app
+        .sign_message(note_to_bob(&s, "hello"))
+        .unwrap()
+        .with_record(crate::app::RecordJob {
+            target: target.clone(),
+            tag: b"sent".to_vec(),
+        });
+    let msg_id = app.queue_signed(signed).await.unwrap();
+    let key = app.record_key(&target).unwrap();
+    for _ in 0..5 {
+        s.flush_while_more(&mut app).await;
+        s.w.clock.advance_ms(60_000);
+    }
+    assert!(
+        matches!(
+            app.delivery(&msg_id).await.unwrap(),
+            Some(crate::app::Delivery::Accepted { .. })
+        ),
+        "delivered"
+    );
+    assert!(
+        app.shared_record(&key).await.unwrap().is_some(),
+        "the record job owed is written within five triggers"
+    );
+}
+
+/// The same record job, its counterparty's switch still written to (recent) all along:
+/// it isn't given up at the retention without a single try of its write.
+#[tokio::test]
+async fn test_flush_outbox_record_job_behind_a_slow_failing_peer_isnt_given_up() {
+    let s = Setup::new(false);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = s
+        .join_on("wallet", Arc::clone(&store) as Arc<dyn StateStore>)
+        .await;
+    let carol = s
+        .slow_failing_counterparty(&app, &store, "carol", 25_000)
+        .await;
+    s.remove_an_app(&mut app).await;
+    let target = RecordTarget::new(items(), b"n1");
+    let signed = app
+        .sign_message(note_to_bob(&s, "hello"))
+        .unwrap()
+        .with_record(crate::app::RecordJob {
+            target: target.clone(),
+            tag: b"sent".to_vec(),
+        });
+    let msg_id = app.queue_signed(signed).await.unwrap();
+    s.flush_while_more(&mut app).await;
+    let Some(crate::app::Delivery::Accepted { accepted_at_ms }) =
+        app.delivery(&msg_id).await.unwrap()
+    else {
+        panic!("accepted");
+    };
+    // The host flushes once a day for the 30 days of the retention.
+    for day in 1..=30u64 {
+        s.w.clock
+            .set_ms(accepted_at_ms + day * pubky_switch_core::records::DAY_MS);
+        s.mark_recent(&app, &store, &carol).await;
+        s.flush_while_more(&mut app).await;
+    }
+    let dropped = app
+        .unacknowledged_events()
+        .await
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, AppEvent::RecordJobDropped { msg_id: m, .. } if *m == msg_id));
+    let key = app.record_key(&target).unwrap();
+    assert!(
+        !dropped || app.shared_record(&key).await.unwrap().is_some(),
+        "the record job was given up without its write ever being tried"
+    );
+}
+
+/// The worst case of a flush: the budget and one unit started within it. Two owed
+/// deliveries of the own `identity.json` and one message, each request 25 s: the first
+/// delivery is the flush's one unit, and the rest wait for the next flushes of the loop.
+#[tokio::test]
+async fn test_flush_outbox_worst_case_is_the_budget_and_one_unit() {
+    let s = Setup::new(false);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = s
+        .join_on("wallet", Arc::clone(&store) as Arc<dyn StateStore>)
+        .await;
+    s.slow_failing_counterparty(&app, &store, "carol", 25_000)
+        .await;
+    s.slow_failing_counterparty(&app, &store, "dave", 25_000)
+        .await;
+    s.remove_an_app(&mut app).await;
+    app.queue(note_to_bob(&s, "n0")).await.unwrap();
+    s.slow_peer(25_000);
+    let started = s.w.clock.now_ms();
+    let report = app.flush_outbox().await.unwrap();
+    let took = s.w.clock.now_ms() - started;
+    assert!(
+        took <= crate::app::DEFAULT_CALL_BUDGET_MS + 25_000,
+        "the budget and one unit past it, took {took} ms"
+    );
+    // The message waits for the rest of the pass, in the same loop.
+    let mut done = report.done.clone();
+    let mut more = report.more;
+    while more {
+        let report = app.flush_outbox().await.unwrap();
+        done.extend(report.done.iter().cloned());
+        more = report.more;
+    }
+    assert_eq!(done.len(), 1, "delivered in the same loop");
+}
+
+/// A pass under way survives a restart, its first message leaving the outbox, and a message
+/// queued meanwhile: the next flush tries only what the pass hasn't reached, the new message
+/// included, and ends it; the flush after starts a new pass after the last one tried.
+#[tokio::test]
+async fn test_flush_outbox_pass_survives_a_restart_and_changes_under_way() {
+    let s = Setup::new(false);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = s
+        .join_on("wallet", Arc::clone(&store) as Arc<dyn StateStore>)
+        .await;
+    s.peer.set_staged(true);
+    let mut ids = Vec::new();
+    for n in 0..6 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    assert!(app.flush_outbox().await.unwrap().more);
+    assert_eq!(tries(&app, &ids).await, [1, 1, 1, 1, 0, 0]);
+    // The pass's first message is delivered on its own.
+    s.peer.set_staged(false);
+    assert!(matches!(
+        app.flush_message(&ids[0]).await.unwrap(),
+        Some(crate::app::Delivery::Accepted { .. })
+    ));
+    s.peer.set_staged(true);
+    s.w.clock.advance_ms(1);
+    ids.push(app.queue(note_to_bob(&s, "n6")).await.unwrap());
+    drop(app);
+    let env = s.w.signer.env_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&s.router) as Arc<dyn Transport>,
+    );
+    let mut app = App::load(
+        env,
+        s.protocol.clone(),
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    let report = app.flush_outbox().await.unwrap();
+    assert!(!report.more, "{report:?}");
+    assert_eq!(tries(&app, &ids[1..]).await, [1, 1, 1, 1, 1, 1]);
+    let report = app.flush_outbox().await.unwrap();
+    assert!(report.more, "{report:?}");
+    assert_eq!(tries(&app, &ids[1..]).await, [2, 2, 2, 2, 1, 1]);
+}
+
+/// Two messages whose tries fail, each past the time budget, then a healthy one: one
+/// trigger's loop "flush while more" delivers the healthy one, each tried once.
+#[tokio::test]
+async fn test_flush_outbox_two_slow_failures_then_a_healthy_message_in_one_loop() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    s.slow_peer(25_000);
+    for _ in 0..2 {
+        s.peer.fail_next(
+            "inbox",
+            pubky_switch_core::http::ErrorCode::Unavailable,
+            json!(null),
+        );
+    }
+    let mut done = Vec::new();
+    let mut flushes = 0;
+    loop {
+        flushes += 1;
+        let report = app.flush_outbox().await.unwrap();
+        done.extend(report.done.iter().cloned());
+        if !report.more {
+            break;
+        }
+        assert!(flushes < 10, "the loop settles");
+    }
+    assert_eq!(done, vec![ids[2].clone()]);
+    assert_eq!(tries(&app, &ids[..2]).await, [1, 1]);
+    assert_eq!(flushes, 3);
+}
+
+/// Held messages make no request and don't count: a flush of six held messages ends the
+/// pass at once.
+#[tokio::test]
+async fn test_flush_outbox_held_messages_end_the_pass_without_a_request() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    s.peer.set_staged(true);
+    let mut ids = Vec::new();
+    for n in 0..6 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    app.hold_queued(&s.w.bob.public()).await.unwrap();
+    let from = s.router.log().len();
+    let report = app.flush_outbox().await.unwrap();
+    assert!(!report.more, "{report:?}");
+    assert!(
+        !s.router.log()[from..]
+            .iter()
+            .any(|line| line.contains(PEER_ORIGIN)),
+        "no request to bob's switch"
+    );
+    assert_eq!(tries(&app, &ids).await, [0; 6]);
+}
+
+/// Three slow switches that keep failing are owed the own `identity.json`, each spending a
+/// flush's budget, and four messages wait on a switch that answers `503 staged`: a host
+/// that flushes while a flush says more stops after one pass, each message tried once.
+#[tokio::test]
+async fn test_flush_outbox_while_more_tries_each_message_once_with_owed_peers() {
+    let s = Setup::new(false);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = s
+        .join_on("wallet", Arc::clone(&store) as Arc<dyn StateStore>)
+        .await;
+    for name in ["carol", "dave", "erin"] {
+        s.slow_failing_counterparty(&app, &store, name, 25_000)
+            .await;
+    }
+    s.remove_an_app(&mut app).await;
+    s.peer.set_staged(true);
+    let mut ids = Vec::new();
+    for n in 0..4 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    let mut flushes = 0;
+    while app.flush_outbox().await.unwrap().more {
+        flushes += 1;
+        assert!(flushes < 50, "the loop settles");
+    }
+    flushes += 1;
+    assert_eq!(
+        tries(&app, &ids).await,
+        [1, 1, 1, 1],
+        "each message tried once in one loop, of {flushes} flushes"
+    );
+}
+
+/// A message to a new counterparty whose conversation entry's batch was kept, its answer
+/// lost: the host's flushes alone, with no read, still have it delivered.
+#[tokio::test]
+async fn test_flush_outbox_message_behind_its_kept_conversation_entry_goes_without_a_read() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    s.w.switch.fail_next(crate::testing::Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    let (msg_id, delivery) = app.send(note_to_bob(&s, "hello")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Queued { .. }),
+        "{delivery:?}"
+    );
+    assert_eq!(
+        app.kept_batches().await.unwrap().len(),
+        1,
+        "the entry is kept"
+    );
+    for _ in 0..3 {
+        s.w.clock.advance_ms(60_000);
+        s.flush_while_more(&mut app).await;
+    }
+    let delivery = app.delivery(&msg_id).await.unwrap();
+    assert!(
+        matches!(delivery, Some(crate::app::Delivery::Accepted { .. })),
+        "{delivery:?}, kept {}",
+        app.kept_batches().await.unwrap().len()
+    );
+}
+
+/// Three slow failing switches owed the own `identity.json` and four messages answered
+/// `503`. A joint pass under way across a restart, with a switch newly owed and a message
+/// queued after the pass began: the host's loop tries each switch and each message of the
+/// pass once, the new message with them, and leaves the new switch to the next pass, which
+/// tries every one once more.
+#[tokio::test]
+async fn test_flush_outbox_joint_pass_across_a_restart_with_newcomers() {
+    let s = Setup::new(false);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = s
+        .join_on("wallet", Arc::clone(&store) as Arc<dyn StateStore>)
+        .await;
+    let slow = ["carol", "dave", "erin"];
+    for name in slow {
+        s.slow_failing_counterparty(&app, &store, name, 25_000)
+            .await;
+    }
+    s.remove_an_app(&mut app).await;
+    s.peer.set_staged(true);
+    let mut ids = Vec::new();
+    for n in 0..4 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    let requests = |name: &str| {
+        let origin = format!("https://{name}.example");
+        s.router
+            .log()
+            .iter()
+            .filter(|line| line.contains(&origin))
+            .count()
+    };
+    assert!(app.flush_outbox().await.unwrap().more);
+    // After the pass began: a switch newly owed, by a second removal, and a new message.
+    s.slow_failing_counterparty(&app, &store, "frank", 25_000)
+        .await;
+    let now = s.w.clock.now_ms();
+    s.w.next_doc(|body| {
+        body.removed.push(RemovedApp {
+            app_id: [8; 16],
+            distrust_from: now,
+        })
+    });
+    app.refresh_identity().await.unwrap();
+    s.w.clock.advance_ms(1);
+    ids.push(app.queue(note_to_bob(&s, "n4")).await.unwrap());
+    drop(app);
+    let env = s.w.signer.env_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&s.router) as Arc<dyn Transport>,
+    );
+    let mut app = App::load(
+        env,
+        s.protocol.clone(),
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut flushes = 1;
+    while app.flush_outbox().await.unwrap().more {
+        flushes += 1;
+        assert!(flushes < 20, "the loop settles");
+    }
+    assert_eq!(tries(&app, &ids).await, [1; 5], "{flushes} flushes");
+    for name in slow {
+        assert_eq!(requests(name), 1, "{name}");
+    }
+    assert_eq!(
+        requests("frank"),
+        0,
+        "the new switch waits for the next pass"
+    );
+    s.flush_while_more(&mut app).await;
+    assert_eq!(tries(&app, &ids).await, [2; 5]);
+    for name in slow {
+        assert_eq!(requests(name), 2, "{name}");
+    }
+    assert_eq!(requests("frank"), 1);
+}
+
+/// A delivery answered `409 stale_key` once its round's budget has passed: the reseal waits
+/// for the next try, which reseals and delivers. The message stays queued, not failed, and
+/// is sent once.
+#[tokio::test]
+async fn test_flush_outbox_stale_key_past_the_round_budget_is_resolved_by_the_next_try() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let (_, delivery) = app.send(note_to_bob(&s, "one")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    // Bob rotates; the cached directory still names the old key.
+    s.peer.rotate(0).unwrap();
+    let slow = s.slow_peer(21_000);
+    let (second, delivery) = app.send(note_to_bob(&s, "two")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Queued { .. }),
+        "{delivery:?}"
+    );
+    slow.ms.store(1_000, std::sync::atomic::Ordering::SeqCst);
+    s.w.clock.advance_ms(60_000);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![second.clone()], "{report:?}");
+    assert_eq!(
+        s.peer.received().iter().filter(|m| **m == second).count(),
+        1
+    );
+}
+
+/// A message whose conversation entry is in the second of two kept batches (kept while the
+/// account was frozen): each pass sends one kept batch again, oldest first, so it goes in
+/// the second pass, the one that sends its batch.
+#[tokio::test]
+async fn test_flush_outbox_message_behind_its_entry_in_the_second_kept_batch() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let freeze = s.freeze();
+    s.w.clock.advance_ms(1_000);
+    app.submit_batch(conversation([10; 32])).await.unwrap_err();
+    s.w.clock.advance_ms(1_000);
+    let msg_id = app.queue(note_to_bob(&s, "hello")).await.unwrap();
+    app.flush_outbox().await.unwrap();
+    assert_eq!(app.kept_batches().await.unwrap().len(), 2, "two kept");
+    s.w.switch.unfreeze(&freeze).unwrap();
+    let delivered = |delivery: Option<crate::app::Delivery>| {
+        matches!(delivery, Some(crate::app::Delivery::Accepted { .. }))
+    };
+    s.w.clock.advance_ms(60_000);
+    s.flush_while_more(&mut app).await;
+    let first = delivered(app.delivery(&msg_id).await.unwrap());
+    s.w.clock.advance_ms(60_000);
+    s.flush_while_more(&mut app).await;
+    let second = delivered(app.delivery(&msg_id).await.unwrap());
+    assert!(!first, "the first pass sends the batch ahead of its own");
+    assert!(second, "in the second pass, which sends its batch");
+}
+
+/// A kept batch whose resend takes 25 s and fails, sent again first in every pass: the
+/// messages of each pass still go, each once, in the same loop.
+#[tokio::test]
+async fn test_flush_outbox_slow_failing_kept_batch_starves_no_message() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let (_, delivery) = app.send(note_to_bob(&s, "first")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    for _ in 0..12 {
+        s.w.switch.fail_next(crate::testing::Fault::Unreachable {
+            path: "/ops".into(),
+            after: 0,
+        });
+    }
+    app.submit_batch(conversation([10; 32])).await.unwrap_err();
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    s.peer.set_staged(true);
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    s.slow(25_000);
+    for round in 1..=2u64 {
+        s.w.clock.advance_ms(60_000);
+        let flushes = s.flush_while_more(&mut app).await;
+        assert_eq!(tries(&app, &ids).await, [round; 3], "{flushes} flushes");
+    }
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1, "still kept");
+}
+
+/// The same with bob's switch slow at every try, so no round ever has time to reseal: the
+/// key the `409 stale_key` named is taken when the reseal is skipped, and the next try's
+/// first attempt seals to it and delivers.
+#[tokio::test]
+async fn test_flush_outbox_stale_key_skipped_every_time_is_sealed_at_the_next_try() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let (_, delivery) = app.send(note_to_bob(&s, "one")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    s.peer.rotate(0).unwrap();
+    s.slow_peer(21_000);
+    let (second, delivery) = app.send(note_to_bob(&s, "two")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Queued { .. }),
+        "{delivery:?}"
+    );
+    s.w.clock.advance_ms(60_000);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![second.clone()], "{report:?}");
+    assert_eq!(
+        s.peer.received().iter().filter(|m| **m == second).count(),
+        1
+    );
+}

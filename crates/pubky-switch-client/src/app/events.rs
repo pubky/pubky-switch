@@ -446,7 +446,8 @@ pub enum AppEvent {
         version: u64,
     },
     /// The newest own `identity.json` names another generation: the provider changed.
-    /// Following it is the provider-change flow's.
+    /// Following it is the provider-change flow's. Queued once while the host hasn't taken
+    /// it, as [`AppEvent::Removed`].
     ProviderChanged {
         /// The new generation.
         generation: u64,
@@ -473,7 +474,8 @@ pub enum AppEvent {
     /// app asks for its full key bundle again at a bounded interval (Switch spec 3.5, 8.2).
     /// The read after the key arrives lists, then reads the feed.
     ListingWaitsForKey,
-    /// The own app was revoked or recorded as departed: it is no longer current.
+    /// The own app was revoked or recorded as departed: it is no longer current. Queued
+    /// once while the host hasn't taken it, however many steps of a call find it.
     Removed,
     /// Continuity since the verified position couldn't be verified: the app continued
     /// from the checkpoint as a recovery decision and is in reconcile mode (Switch spec

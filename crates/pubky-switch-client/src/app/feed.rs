@@ -502,7 +502,7 @@ impl App {
             return Ok(report);
         }
         if let Some(stop) = self.not_current_here() {
-            self.events.push(stop);
+            self.push_once(stop);
             return Ok(ReceiveReport {
                 stopped: true,
                 cursor: self.cursor(),
@@ -532,7 +532,7 @@ impl App {
                 // A newer own document the directory brought: the next read follows it.
                 super::renewal::Listed::NotCurrentHere => {
                     if let Some(stop) = self.not_current_here() {
-                        self.events.push(stop);
+                        self.push_once(stop);
                     }
                     return Ok(ReceiveReport {
                         stopped: true,
@@ -551,7 +551,7 @@ impl App {
             Some(super::renewal::Listed::NotCurrentHere)
         ) {
             if let Some(stop) = self.not_current_here() {
-                self.events.push(stop);
+                self.push_once(stop);
             }
             return Ok(ReceiveReport {
                 stopped: true,
@@ -2867,7 +2867,7 @@ impl App {
                     ServiceTransition::Leave { app_id, at }
                     | ServiceTransition::Revoke { app_id, at } => {
                         if app_id == me {
-                            self.events.push(AppEvent::Removed);
+                            self.push_once(AppEvent::Removed);
                             return Ok(Step::Stop);
                         }
                         read.tx.put(&key::departed(&app_id), &at)?;
@@ -2947,11 +2947,11 @@ impl App {
             version: doc.version(),
         });
         if doc.lists_removed(&me) {
-            self.events.push(AppEvent::Removed);
+            self.push_once(AppEvent::Removed);
             return Ok(Step::Stop);
         }
         if doc.generation() != self.state.meta.generation {
-            self.events.push(AppEvent::ProviderChanged {
+            self.push_once(AppEvent::ProviderChanged {
                 generation: doc.generation(),
             });
             return Ok(Step::Stop);

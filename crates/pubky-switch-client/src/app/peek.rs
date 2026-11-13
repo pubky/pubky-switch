@@ -31,8 +31,8 @@ use super::protocol::{ReceivedMessage, Rules};
 use super::state::{Processed, key};
 use crate::client::answers::{EntryItem, FeedItem, FeedQuery};
 
-/// The most feed pages one peek reads.
-const PEEK_PAGES: usize = 4;
+/// The most feed pages one peek reads ([`PeekReport::more`]).
+pub const PEEK_PAGES: usize = 2;
 
 /// What the extension shows for one entry.
 #[derive(Clone, PartialEq)]
@@ -69,17 +69,28 @@ impl std::fmt::Debug for Peeked {
 
 /// What a peek found.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct PeekReport {
     /// One item per entry to notify about, in feed order; a message already processed has
     /// none.
     pub items: Vec<Peeked>,
     /// Whether the pages read verified against a copy of the chain view.
     pub chain_verified: bool,
+    /// The peek stopped on its budget, [`PEEK_PAGES`] pages or the call's time
+    /// ([`super::AppConfig::call_budget_ms`]), with entries after the last one it checked:
+    /// the extension shows one generic notification for them. A peek keeps nothing, so the
+    /// next one starts at the cursor again; the app checks them when it next reads.
+    pub more: bool,
 }
 
 impl App {
     /// Peek at the feed for a push (Switch spec 9 step 5): the receive checks on each entry
-    /// after the cursor, read-only. Nothing is committed or changed.
+    /// after the cursor, read-only. Nothing is committed or changed, and nothing but the
+    /// feed is fetched.
+    ///
+    /// The call is bounded: it reads at most [`PEEK_PAGES`] pages, and no page after the
+    /// first past the call's time budget ([`super::AppConfig::call_budget_ms`]); what it
+    /// left is [`PeekReport::more`]. Its worst case at the defaults is two feed requests.
     ///
     /// # Errors
     ///
@@ -100,12 +111,18 @@ impl App {
             let cursor = self.state.cursor;
             let now = self.now();
             let multi = self.state.device.multi_device;
+            let budget = self.begin_budget();
             let mut report = PeekReport {
                 items: Vec::new(),
                 chain_verified: true,
+                more: false,
             };
             let mut after = cursor.seq;
-            for _ in 0..PEEK_PAGES {
+            for page_n in 0..PEEK_PAGES {
+                if page_n > 0 && self.spent(&budget) {
+                    report.more = true;
+                    break;
+                }
                 let query = FeedQuery {
                     after: Some(Position {
                         generation: cursor.generation,
@@ -131,6 +148,7 @@ impl App {
                     break;
                 }
                 after = page.scanned_through;
+                report.more = page_n + 1 == PEEK_PAGES;
             }
             Ok(report)
         })

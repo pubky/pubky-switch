@@ -222,3 +222,66 @@ async fn test_sender_key_failed_save_of_the_newer_document_doesnt_delay_the_rere
     assert!(s.peer.received().contains(&msg_id));
     assert_eq!(s.reads(), reads + 2);
 }
+
+/// Bob's switch through a transport that takes a minute and a second of the app's clock per
+/// request, after which bob publishes a newer `identity.json` naming another service key;
+/// at most 30 requests, then it fails to connect.
+struct Rotating {
+    inner: Arc<dyn Transport>,
+    peer: Arc<PeerSwitch>,
+    clock: Arc<crate::clock::TestClock>,
+    sent: std::sync::atomic::AtomicU8,
+}
+
+impl Transport for Rotating {
+    fn send(
+        &self,
+        request: crate::transport::Request,
+    ) -> crate::transport::BoxFuture<
+        '_,
+        Result<crate::transport::Response, crate::error::TransportError>,
+    > {
+        Box::pin(async move {
+            let n = self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= 30 {
+                return Err(crate::error::TransportError::Connect("down".into()));
+            }
+            self.clock.advance_ms(SENDER_REREAD_MS + 1_000);
+            let answer = self.inner.send(request).await;
+            self.peer
+                .recover_in_place([n.wrapping_add(100); 32])
+                .unwrap();
+            answer
+        })
+    }
+}
+
+/// A hostile switch answering every request under a key no document names, each answer
+/// taking longer than the reread window, while its identity publishes a newer document
+/// naming another key each time: one try reads the document again a bounded number of
+/// times, as the delivery's docs say.
+#[tokio::test]
+async fn test_sender_key_reread_is_bounded_per_try_however_slow_the_switch() {
+    let s = Setup::new();
+    let mut app = s.wallet().await;
+    s.peer.sign_with(Some(seed("bob/foreign")));
+    let rotating = Arc::new(Rotating {
+        inner: s.peer.transport(),
+        peer: Arc::clone(&s.peer),
+        clock: Arc::clone(&s.w.clock),
+        sent: std::sync::atomic::AtomicU8::new(0),
+    });
+    s.router
+        .add(PEER_ORIGIN, Arc::clone(&rotating) as Arc<dyn Transport>);
+    let reads = s.reads();
+    let started = s.w.clock.now_ms();
+    let (_, delivery) = app.send(s.note("slow")).await.unwrap();
+    assert!(!accepted(&delivery), "{delivery:?}");
+    let sent = rotating.sent.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        s.reads() <= reads + 2,
+        "one try read the document {} times, sent {sent} requests, took {} s",
+        s.reads() - reads,
+        (s.w.clock.now_ms() - started) / 1_000
+    );
+}
