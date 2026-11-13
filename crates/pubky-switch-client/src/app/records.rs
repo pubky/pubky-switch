@@ -720,7 +720,8 @@ struct Accepted {
 enum Refused {
     /// Signed evidence of misbehaviour: a rollback.
     Misbehaviour(String),
-    /// A failed check: ignored and shown with the app it names.
+    /// A failed check: ignored and shown with the app it names. Made only once the writer's
+    /// signature verified, and never for a write the app's own key signed.
     Invalid { writer: [u8; 16], reason: String },
     /// A value that doesn't open with its key held: as [`Refused::Invalid`], and a record
     /// held with this very write not open for now is held as not opening for good.
@@ -1545,20 +1546,17 @@ impl App {
         let Some(writer) = body.app_id else {
             return Ok(Err(Refused::Ignored));
         };
-        let invalid = |reason: &str| -> Result<Result<Accepted, Refused>, AppError> {
-            Ok(Err(Refused::Invalid {
-                writer,
-                reason: reason.to_owned(),
-            }))
-        };
-        if body.identity != identity {
-            return invalid("Switch wire 6.2 step 1: the operation names another identity");
-        }
-        // Step 3: the collection of the protocol, with its fixed policy.
+        // Nothing before the signature check below names the writer: the body isn't verified
+        // yet, so a faulty or hostile service could name any app in it. What fails before
+        // it is ignored, as a write the app doesn't take.
+        //
+        // Step 3: the collection of the protocol. A write for another record key than the
+        // one read is one the service served in its place: its writer wrote it for its own
+        // key, so it isn't the writer's failure.
         let collection = match expect {
             Some((key, collection)) => {
                 if put.key != *key {
-                    return invalid("Switch wire 6.2 step 3: another record key than the one read");
+                    return Ok(Err(Refused::Ignored));
                 }
                 collection.clone()
             }
@@ -1567,12 +1565,8 @@ impl App {
                 None => return Ok(Err(Refused::Ignored)),
             },
         };
-        if let Some(reason) = check_shape(put, &collection, &identity) {
-            return invalid(reason);
-        }
-        // The member of the collection's policy family the write names.
-        let collection = Collection::new(&collection.name, put.policy.clone());
-        // Step 1: the writer's certificates and the signature.
+        // Step 1: the writer's certificates and the signature, which binds the identity and
+        // the writer's App ID too.
         let Some(certs) = self.writer_certs(evidence, &writer, tx).await? else {
             // A feed write by a writer the newest own `identity.json` names, a removed one
             // included, whose certificate neither the app nor its directory holds: the
@@ -1582,10 +1576,44 @@ impl App {
             if evidence.cert.is_none()
                 && (doc.listed_cert(&writer).is_some() || doc.lists_removed(&writer))
             {
-                return Ok(Err(Refused::Unheld(collection)));
+                return Ok(Err(Refused::Unheld(Collection::new(
+                    &collection.name,
+                    put.policy.clone(),
+                ))));
             }
             return Ok(Err(Refused::Ignored));
         };
+        // The writer signed it: a failed check from here on names an app that made the write.
+        // One signed with this app's own key is the app's own write, since only this app
+        // holds that key, under whichever of its certificates it was made: the app checked
+        // its standing and scopes when it made it, so none of the checks of what it may
+        // write runs again, and a check only the service's word fails is passed over, the
+        // write ignored. A flag would name the app itself.
+        let own = writer == self.state.meta.app_id
+            && SignedOp::verify(
+                evidence.op,
+                &self.state.keys.signing_public(),
+                &identity,
+                Some(&writer),
+            )
+            .is_ok();
+        let invalid = |reason: &str| -> Result<Result<Accepted, Refused>, AppError> {
+            if own {
+                return Ok(Err(Refused::Ignored));
+            }
+            Ok(Err(Refused::Invalid {
+                writer,
+                reason: reason.to_owned(),
+            }))
+        };
+        if body.identity != identity {
+            return invalid("Switch wire 6.2 step 1: the operation names another identity");
+        }
+        if let Some(reason) = check_shape(put, &collection, &identity) {
+            return invalid(reason);
+        }
+        // The member of the collection's policy family the write names.
+        let collection = Collection::new(&collection.name, put.policy.clone());
         // Step 2: what dates the write and gives its version.
         let item_hash = certs.op.item_hash()?;
         let (time, proven) = match self.date(evidence, &certs.op, item_hash) {
@@ -1611,7 +1639,8 @@ impl App {
         }
         let holds_write_scope =
             |cert: &AppCert| write_scopes.iter().any(|scope| cert.holds_scope(scope));
-        if evidence.cert.is_none()
+        if !own
+            && evidence.cert.is_none()
             && let Some(at) = time
             && !(in_force(&self.state.own_doc, &cert, time) && holds_write_scope(&cert))
             && self.unheld_in_force(&writer, &certs, at)
@@ -1619,6 +1648,7 @@ impl App {
             return Ok(Err(Refused::Unheld(collection)));
         }
         match standing {
+            _ if own => {}
             Standing::Listed | Standing::RenewedOpen => {}
             Standing::RenewedClosed { until } => {
                 if time.is_none_or(|t| t >= until) {
@@ -1641,11 +1671,11 @@ impl App {
                 return invalid("Switch wire 6.2 step 4: the writer has no standing");
             }
         }
-        if time.is_some_and(|t| cert.expired_at(t)) {
+        if !own && time.is_some_and(|t| cert.expired_at(t)) {
             return invalid("Switch wire 6.2 step 4: the certificate had expired at the write");
         }
         // Step 5: a write scope.
-        if !holds_write_scope(&cert) {
+        if !own && !holds_write_scope(&cert) {
             return invalid("Switch wire 6.2 step 5: the writer holds none of the write scopes");
         }
         // Step 6: the version.
