@@ -1062,3 +1062,73 @@ async fn test_push_delivery_logs_no_handle_relay_or_key() {
     }
     setup.replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_push_delivery_connects_to_no_proxy_from_the_environment() {
+    // A proxy named in the environment: the webhook still goes to the address checked, never
+    // to the proxy, which would resolve the host itself (Switch wire 8.2). The proxy
+    // variables are set only for a run of this test in a process of its own: it runs itself
+    // again with them, and the proxy is a listener here that must see no connection.
+    const CHILD: &str = "PUBKY_SWITCH_PROXY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let Some((setup, _)) = registered(&[H1]).await else {
+            return;
+        };
+        let replay = &setup.replay;
+        append(replay, 1, true).await;
+        clock_at_entry(replay, 0).await;
+        let round = replay.service.deliver_pushes().await;
+        let to_relay = setup.relay.seen().len();
+        setup.replay.db.drop_database().await.expect("drop");
+        assert_eq!(to_relay, 1, "the relay, not the proxy: {round:?}");
+        return;
+    }
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", proxy.local_addr().expect("addr"));
+    let reached = Arc::new(AtomicBool::new(false));
+    tokio::spawn({
+        let reached = reached.clone();
+        async move {
+            while let Ok((mut socket, _)) = proxy.accept().await {
+                reached.store(true, Ordering::SeqCst);
+                use tokio::io::AsyncWriteExt;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        }
+    });
+    let mut child = std::process::Command::new(std::env::current_exe().expect("exe"));
+    child
+        .args([
+            "--exact",
+            "test_push_delivery_connects_to_no_proxy_from_the_environment",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy");
+    for name in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        child.env(name, &url);
+    }
+    // Run off this runtime's thread, so the proxy above can take a connection meanwhile.
+    let output = tokio::task::spawn_blocking(move || child.output())
+        .await
+        .expect("join")
+        .expect("the run with a proxy");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!reached.load(Ordering::SeqCst), "the proxy was reached");
+}

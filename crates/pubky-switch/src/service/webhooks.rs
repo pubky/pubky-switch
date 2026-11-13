@@ -13,7 +13,8 @@
 //!   not repeat one. It is signed with the registration's push key, never the service key.
 //! - **Connecting:** the relay's host is resolved again, refused if any address isn't public
 //!   (`check_addresses`, as at registration), and the connection goes to an address checked,
-//!   on port 443, with TLS checking the host name. Redirects aren't followed. The whole
+//!   on port 443, with TLS checking the host name, never through a proxy the environment
+//!   names. Redirects aren't followed. The whole
 //!   attempt, resolution included, has 5 s.
 //! - **Outcomes:** any 2xx is a delivery and the row goes. Anything else, a redirect or a
 //!   timeout is a failure, retried 20 s later, at most 3 attempts within 1 minute of the
@@ -326,7 +327,10 @@ impl Service {
         };
         #[cfg(not(any(test, feature = "test-util")))]
         let https_only = true;
+        // No proxy from the environment (`HTTPS_PROXY` and the like): a proxy would resolve
+        // the host itself, and the connection would go to an address never checked.
         let client = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .https_only(https_only)
             .pool_max_idle_per_host(0)
