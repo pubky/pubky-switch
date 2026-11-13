@@ -2,6 +2,11 @@
 //! owes its target apps' handles, sent from the queue the append filled (`store::push_queue`)
 //! by a worker in each instance, never during the append.
 //!
+//! - **Fair across accounts:** at most `push.concurrency` attempts run at once, as a stream,
+//!   not in rounds: as one ends, the next due row is claimed, so a relay that never answers
+//!   holds one slot, not the others' turn. An account has at most 8 rows in flight at once,
+//!   across instances (`store::push_queue`), so one account's slow relay leaves the other
+//!   slots to the others.
 //! - **One attempt** claims a due row, leased so no other instance sends it meanwhile, and
 //!   holds its registration while the webhook is signed: the registration must still name the
 //!   row's push key and handle, the key must not be owed deleting, and the account must still
@@ -11,16 +16,23 @@
 //!   nonce is fresh, since a relay refuses a `ts` more than 5 minutes off and a nonce it saw
 //!   in the last 10 (8.3), so an attempt sent again after a timeout the relay did take must
 //!   not repeat one. It is signed with the registration's push key, never the service key.
+//! - **One deadline:** an attempt ends within 10 s of its claim, 20 s before its lease does.
+//!   Its hold, key loads and signing get the first 5 s, and past them the webhook isn't sent
+//!   and the attempt fails; the connection gets the next 5 s. Attempts keep running while the
+//!   worker waits on its own statements (the claim, the drops, the settles), so their
+//!   deadlines and holds don't wait for those. At most a quarter of the request pool's
+//!   connections hold registrations at once, and the worker's own statements take one more,
+//!   so requests keep the rest.
 //! - **Connecting:** the relay's host is resolved again, refused if any address isn't public
 //!   (`check_addresses`, as at registration), and the connection goes to an address checked,
 //!   on port 443, with TLS checking the host name, never through a proxy the environment
-//!   names. Redirects aren't followed. The whole
-//!   attempt, resolution included, has 5 s.
+//!   names. Redirects aren't followed. The connection, resolution included, has 5 s.
 //! - **Outcomes:** any 2xx is a delivery and the row goes. Anything else, a redirect or a
-//!   timeout is a failure, retried 20 s later, at most 3 attempts within 1 minute of the
-//!   entry; then the row goes.
+//!   timeout is a failure, retried 20 s later, at most 3 attempts, each claimed within 1
+//!   minute of the entry, so the last ends at most 70 s after it; then the row goes.
 //! - **Without trusted time** nothing is sent: `ts` would be a time the service doesn't
-//!   trust (Switch wire 7.3), and the rows wait, then go once their minute has passed.
+//!   trust (Switch wire 7.3). The rows wait, and go once their minute has passed by the
+//!   database's clock, which needs no trusted time.
 //!
 //! Logs and metrics hold counts and failure kinds only: never a handle, a relay URL, a key
 //! or anything of a message.
@@ -31,32 +43,60 @@ use std::{
     time::Duration,
 };
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use pubky_switch_core::{
     enc::b64,
     http::{header, sign_webhook, webhook_body},
     net::{UrlUse, check_addresses, check_url},
 };
+use tokio::time::Instant;
 
 use pubky_switch_core::records::IdentityDoc;
 
 use super::{Service, rules::names_this_service};
 use crate::{
     keys::ServiceSigner,
-    store::{HeldRegistration, QueuedPush, StoreError},
+    store::{HeldRegistration, PUSH_LEASE_MS, PUSH_RETRY_MS, QueuedPush, StoreError},
 };
 
-/// How long one attempt may take, resolution included (Switch wire 8.2: 5 s).
+/// How long one connection may take, resolution included (Switch wire 8.2: 5 s).
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long after a failure the next attempt is due (Switch wire 8.2: 20 s). It is also the
-/// lease of a claimed row, longer than an attempt can take.
-const RETRY_MS: u64 = 20_000;
+/// How long an attempt may take from its claim, everything included: the first 10 s of its
+/// lease, while its row counts as in flight (`store::push_queue`), and 20 s before the lease
+/// ends, so no other instance claims the row while it runs.
+const ATTEMPT_DEADLINE_MS: i64 = 10_000;
+const _: () = assert!(ATTEMPT_DEADLINE_MS <= PUSH_LEASE_MS - PUSH_RETRY_MS);
+const _: () = assert!(ATTEMPT_DEADLINE_MS <= PUSH_LEASE_MS - 5_000);
 
-/// How long after its entry a delivery may be attempted (Switch wire 8.2: 1 minute).
-const WINDOW_MS: u64 = 60_000;
+/// How long after its claim an attempt may still send: the deadline less the connection's
+/// time, so the connection ends by the deadline.
+const SEND_BY: Duration =
+    Duration::from_millis(ATTEMPT_DEADLINE_MS.unsigned_abs()).saturating_sub(ATTEMPT_TIMEOUT);
 
-/// How long the worker waits for due rows when a round found fewer than it can send.
+/// How long the worker waits for due rows when it found fewer than it can send, and how
+/// often rows past their minute are dropped.
 const POLL: Duration = Duration::from_secs(1);
+
+/// Await `work`, a statement of the worker's own, while still running the attempts under
+/// way, keeping those that end in `ended`: so an attempt's deadline and its registration's
+/// hold don't wait for the worker's statements, which may wait for a connection.
+async fn polling<T, A>(
+    work: impl Future<Output = T>,
+    attempts: &mut FuturesUnordered<A>,
+    ended: &mut Vec<A::Output>,
+) -> T
+where
+    A: Future,
+{
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            out = &mut work => return out,
+            Some(done) = attempts.next(), if !attempts.is_empty() => ended.push(done),
+        }
+    }
+}
 
 /// Where webhooks connect in tests: the plain-HTTP listener a checked address maps to.
 #[cfg(any(test, feature = "test-util"))]
@@ -77,7 +117,10 @@ enum Failure {
     Redirect,
     /// Another answer that isn't 2xx.
     Status,
-    /// The push key couldn't be read, or the database failed.
+    /// The attempt's time to send ran out first: its registration's lock, the database or
+    /// the key store was slow.
+    Late,
+    /// The push key couldn't be read, the database failed, or trusted time was gone.
     Internal,
 }
 
@@ -90,12 +133,13 @@ impl Failure {
             Self::Connect => "connect",
             Self::Redirect => "redirect",
             Self::Status => "status",
+            Self::Late => "late",
             Self::Internal => "internal",
         }
     }
 }
 
-/// What one round of delivery did.
+/// What a run of [`Service::deliver_pushes`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PushRound {
     /// Webhooks a relay took (2xx).
@@ -137,97 +181,81 @@ fn routed(
 }
 
 impl Service {
-    /// Send due webhooks until `shutdown` resolves (Switch wire 8.2): a round at once, the
-    /// next as soon as a full one ends, otherwise after a second. Several instances may run
-    /// it against one database: each row is sent by one at a time. Run by the service's
-    /// binary while `push.enabled` is on.
+    /// Send due webhooks until `shutdown` resolves (Switch wire 8.2): a run of
+    /// [`Service::deliver_pushes`], then another a second after it finds nothing left.
+    /// Several instances may run it against one database: each row is sent by one at a time.
+    /// Run by the service's binary while `push.enabled` is on.
     pub async fn deliver_pushes_until(self: Arc<Self>, shutdown: impl Future<Output = ()>) {
         tokio::pin!(shutdown);
         loop {
-            let round = tokio::select! {
+            tokio::select! {
                 () = &mut shutdown => return,
-                round = self.deliver_pushes() => round,
-            };
-            if round.delivered + round.failed + round.dropped < self.push_concurrency {
-                tokio::select! {
-                    () = &mut shutdown => return,
-                    () = tokio::time::sleep(POLL) => {}
-                }
+                _ = self.deliver_pushes() => {}
+            }
+            tokio::select! {
+                () = &mut shutdown => return,
+                () = tokio::time::sleep(POLL) => {}
             }
         }
     }
 
-    /// One round: the rows whose time ran out go, then at most `push.concurrency` due rows
-    /// are claimed and attempted at once (Switch wire 8.2).
+    /// Send due webhooks until none is due and none in flight (Switch wire 8.2): rows past
+    /// their minute go, with or without trusted time, and then, with it, due rows are claimed
+    /// and attempted, at most `push.concurrency` at once, a free slot claiming the next at
+    /// once.
     pub async fn deliver_pushes(&self) -> PushRound {
         let mut round = PushRound::default();
         // A service that sends no pushes claims and sends nothing: the rows wait, and go
-        // unsent once their minute has passed, at the first round of a service that does.
+        // unsent once their minute has passed, at the first run of a service that does.
         if !self.push_enabled {
             return round;
         }
-        let reading = self.time.read();
-        if !reading.trusted {
-            return round;
-        }
-        let now = reading.base_ms;
-        match self.store.drop_stale_pushes(now, WINDOW_MS).await {
-            Ok(gone) => round.dropped = usize::try_from(gone).unwrap_or(usize::MAX),
-            Err(error) => {
-                tracing::warn!(%error, "push deliveries: dropping stale rows");
-                return round;
-            }
-        }
-        let claimed = match self
-            .store
-            .claim_pushes(
-                now,
-                WINDOW_MS,
-                now.saturating_add(RETRY_MS),
-                self.push_concurrency,
-            )
-            .await
-        {
-            Ok(claimed) => claimed,
-            Err(error) => {
-                tracing::warn!(%error, "push deliveries: claiming rows");
-                return round;
-            }
-        };
-        let attempts = claimed.iter().map(|push| self.attempt(push));
-        let outcomes = futures_util::future::join_all(attempts).await;
-        for (push, outcome) in claimed.iter().zip(outcomes) {
-            let done = match outcome {
-                Ok(true) => {
-                    round.delivered += 1;
-                    metrics::counter!("pubky_switch_push_webhooks_total", "result" => "delivered")
-                        .increment(1);
-                    true
-                }
-                Ok(false) => {
-                    round.dropped += 1;
-                    true
-                }
-                Err(failure) => {
-                    round.failed += 1;
-                    metrics::counter!("pubky_switch_push_webhooks_total", "result" => failure.kind())
-                        .increment(1);
-                    tracing::info!(
-                        kind = failure.kind(),
-                        attempt = push.attempts,
-                        "push deliveries: a webhook failed"
-                    );
-                    let retry_at = self.time.read().base_ms.saturating_add(RETRY_MS);
-                    let last = push.attempts >= 3
-                        || retry_at >= push.entry_at_ms.saturating_add(WINDOW_MS);
-                    if !last && let Err(error) = self.store.retry_push(push.id, retry_at).await {
-                        tracing::warn!(%error, "push deliveries: scheduling a retry");
+        let mut dropped_at: Option<Instant> = None;
+        let mut attempts = FuturesUnordered::new();
+        // Attempts that ended while the worker waited on the database, to settle.
+        let mut ended = Vec::new();
+        loop {
+            if dropped_at.is_none_or(|at| at.elapsed() >= POLL) {
+                dropped_at = Some(Instant::now());
+                let dropped =
+                    polling(self.store.drop_stale_pushes(), &mut attempts, &mut ended).await;
+                match dropped {
+                    Ok(gone) => {
+                        round.dropped += usize::try_from(gone).unwrap_or(usize::MAX);
                     }
-                    last
+                    Err(error) => tracing::warn!(%error, "push deliveries: dropping stale rows"),
                 }
-            };
-            if done && let Err(error) = self.store.finish_push(push.id).await {
-                tracing::warn!(%error, "push deliveries: dropping a row");
+            }
+            let free = self.push_concurrency.saturating_sub(attempts.len());
+            // Nothing is sent without trusted time: `ts` would be untrusted (Switch wire 7.3).
+            if free > 0 && self.time.read().trusted {
+                // Before the claim, so each deadline ends before its lease does.
+                let claimed_at = Instant::now();
+                let claim = self.store.claim_pushes(free);
+                match polling(claim, &mut attempts, &mut ended).await {
+                    Ok(claimed) => {
+                        for push in claimed {
+                            attempts.push(async move {
+                                let outcome = self.attempt(&push, claimed_at).await;
+                                (push, outcome)
+                            });
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "push deliveries: claiming rows"),
+                }
+            }
+            while let Some((push, outcome)) = ended.pop() {
+                let settle = self.settle(&push, outcome, &mut round);
+                polling(settle, &mut attempts, &mut ended).await;
+            }
+            if attempts.is_empty() {
+                break;
+            }
+            // The next attempt to end frees a slot; without one within a second, rows due
+            // meanwhile are looked for.
+            tokio::select! {
+                Some(done) = attempts.next() => ended.push(done),
+                () = tokio::time::sleep(POLL) => {}
             }
         }
         if round != PushRound::default() {
@@ -239,6 +267,42 @@ impl Service {
             );
         }
         round
+    }
+
+    /// Record how `push`'s attempt went: the row goes, or is retried 20 s later.
+    async fn settle(
+        &self,
+        push: &QueuedPush,
+        outcome: Result<bool, Failure>,
+        round: &mut PushRound,
+    ) {
+        let failure = match outcome {
+            Ok(delivered) => {
+                if delivered {
+                    round.delivered += 1;
+                    metrics::counter!("pubky_switch_push_webhooks_total", "result" => "delivered")
+                        .increment(1);
+                } else {
+                    round.dropped += 1;
+                }
+                if let Err(error) = self.store.finish_push(push.id).await {
+                    tracing::warn!(%error, "push deliveries: dropping a row");
+                }
+                return;
+            }
+            Err(failure) => failure,
+        };
+        round.failed += 1;
+        metrics::counter!("pubky_switch_push_webhooks_total", "result" => failure.kind())
+            .increment(1);
+        tracing::info!(
+            kind = failure.kind(),
+            attempt = push.attempts,
+            "push deliveries: a webhook failed"
+        );
+        if let Err(error) = self.store.fail_push(push.id).await {
+            tracing::warn!(%error, "push deliveries: scheduling a retry");
+        }
     }
 
     /// `push`'s registration, held while its webhook is signed, if it may be sent: the
@@ -278,11 +342,45 @@ impl Service {
         Ok(Some(held))
     }
 
-    /// One attempt of `push`: `Ok(true)` delivered, `Ok(false)` not to be sent
-    /// ([`Service::sendable`]).
-    async fn attempt(&self, push: &QueuedPush) -> Result<bool, Failure> {
-        let Some(held) = self.sendable(push).await? else {
+    /// One attempt of `push`, claimed at `claimed_at`: `Ok(true)` delivered, `Ok(false)`
+    /// not to be sent ([`Service::sendable`]). It ends within 10 s of its claim: what comes
+    /// before the connection has until 5 s, past which nothing is sent, and the connection
+    /// has 5 s.
+    async fn attempt(&self, push: &QueuedPush, claimed_at: Instant) -> Result<bool, Failure> {
+        let send_by = claimed_at + SEND_BY;
+        let signed = tokio::time::timeout_at(send_by, self.signed(push))
+            .await
+            .map_err(|_| Failure::Late)??;
+        let Some((relay_url, signature, body)) = signed else {
             return Ok(false);
+        };
+        // Checked again: the worker may poll this attempt late, while it claims or settles.
+        let now = Instant::now();
+        if now > send_by {
+            return Err(Failure::Late);
+        }
+        let deadline = claimed_at + Duration::from_millis(ATTEMPT_DEADLINE_MS.unsigned_abs());
+        let post = self.post(&relay_url, &signature, body);
+        tokio::time::timeout_at((now + ATTEMPT_TIMEOUT).min(deadline), post)
+            .await
+            .map_err(|_| Failure::Timeout)?
+            .map(|()| true)
+    }
+
+    /// `push`'s webhook, signed while its registration is held: the relay URL to send it
+    /// to, its `Switch-Signature` and its body. `None` when it isn't to be sent.
+    async fn signed(
+        &self,
+        push: &QueuedPush,
+    ) -> Result<Option<(String, String, Vec<u8>)>, Failure> {
+        // A hold keeps a connection of the request pool: a few at most (`push_holds`).
+        let _turn = self
+            .push_holds
+            .acquire()
+            .await
+            .map_err(|_| Failure::Internal)?;
+        let Some(held) = self.sendable(push).await? else {
+            return Ok(None);
         };
         let signer = self.keys.signer(&push.push_key).await.map_err(|failure| {
             tracing::error!(%failure, "push deliveries: a push key");
@@ -290,16 +388,19 @@ impl Service {
         })?;
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).map_err(|_| Failure::Internal)?;
-        let sent_at = self.time.read().base_ms;
-        let (body, signature) =
-            signed_webhook(&signer, &held.relay_url, &push.handle, sent_at, &nonce)
-                .ok_or(Failure::Refused)?;
-        let relay_url = held.relay_url.clone();
-        drop(held);
-        tokio::time::timeout(ATTEMPT_TIMEOUT, self.post(&relay_url, &signature, body))
-            .await
-            .map_err(|_| Failure::Timeout)?
-            .map(|()| true)
+        let reading = self.time.read();
+        if !reading.trusted {
+            return Err(Failure::Internal);
+        }
+        let (body, signature) = signed_webhook(
+            &signer,
+            &held.relay_url,
+            &push.handle,
+            reading.base_ms,
+            &nonce,
+        )
+        .ok_or(Failure::Refused)?;
+        Ok(Some((held.relay_url.clone(), signature, body)))
     }
 
     /// POST the webhook to `relay_url`, connecting only to an address checked now.

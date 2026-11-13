@@ -682,3 +682,28 @@ async fn test_push_switch_drops_the_registration_when_the_app_leaves() {
     let (code, _) = put_raw(&app, RELAY, &[], None, None).await.unwrap_err();
     assert_eq!(code, ErrorCode::NotCurrent);
 }
+
+#[tokio::test]
+async fn test_push_handles_past_8_at_one_relay_host_are_refused() {
+    // Another app of the account holds 8 handles at the relay's host, spelt otherwise: this
+    // app's handle there is refused, as at the service. With 7 there, it is taken.
+    for (held, taken) in [(8, false), (7, true)] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join(&w, &router).await;
+        let me = app.app_id();
+        w.switch.lock().push.insert(
+            [7; 16],
+            crate::testing::PushReg {
+                relay_url: "https://PUSH.example/other".into(),
+                key: ed25519_dalek::SigningKey::from_bytes(&[3; 32]),
+                handles: (0..held).map(|i| format!("other-{i}")).collect(),
+            },
+        );
+        let relay = FakeRelay::default();
+        let set = app.register_push(&relay, RELAY, "device-1").await;
+        let (_, _, handles) = w.switch.push_of(&me).unwrap();
+        assert_eq!(set.is_ok(), taken, "{held} held: {set:?}");
+        assert_eq!(handles.len(), usize::from(taken), "{held} held");
+    }
+}
