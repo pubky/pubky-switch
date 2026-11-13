@@ -55,6 +55,7 @@ mod rotation;
 mod state;
 mod unverified;
 mod uploaded;
+mod wait;
 mod writer_certs;
 
 mod admission;
@@ -96,9 +97,12 @@ pub use unverified::{
     UNVERIFIED_DROPS_PER_COMMIT,
 };
 pub use uploaded::{MAX_RECORD_MARKS, RECORD_REREADS_PER_READ};
+pub use wait::{
+    FeedWait, MAX_PAUSE_MS, MAX_WAIT_SECONDS, MIN_PAUSE_MS, UPKEEP_READ_MS, WaitPace, Woken,
+};
 
 pub use admission::{INVITE_CODE_BYTES, InviteCode, LISTS_TOO_LARGE_RETRY_MS, SenderDisposition};
-pub use batch::{MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};
+pub use batch::{KEPT_RESENDS_PER_READ, MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};
 pub use claims::{
     CLAIM_REREADS_PER_READ, ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead,
     ClaimWritten, ObligationDeadline, claim_conflict,
@@ -109,8 +113,8 @@ pub use directory::{
     SwitchAnswer, SwitchCopy, SwitchLookup,
 };
 pub use records::{
-    Collection, FlaggedWrite, KeptOp, KeptReason, PolicyFamily, RecordContent, RecordRead,
-    RecordTarget, SharedEvidence, SharedRecord, Unopened,
+    Collection, FlaggedWrite, KeptOp, KeptReason, LISTING_PAGES_PER_READ, PolicyFamily,
+    RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord, Unopened,
 };
 pub use send::{
     Delivery, MAX_CARRIED_OUTBOX_BYTES, OutboxReport, OutgoingMessage, RecordJob,
@@ -602,12 +606,22 @@ pub struct App {
     peer_rereads: HashMap<[u8; 32], u64>,
     /// How many reads ([`App::receive`]) this app began since it was loaded.
     reads_begun: u64,
+    /// How many times an owed reopening failed in the read under way ([`App::receive`]):
+    /// after [`records::REOPEN_TRIES_PER_READ`], it is left for the next read. In memory
+    /// only.
+    reopen_failures: u32,
     /// When the Homeserver copy of the app's record was last read to compare it with the
     /// newest record the switch accepted, device clock (`own_record.rs`). In memory only.
     published_checked_ms: Option<u64>,
     /// When this app last asked for its full key bundle, device clock (`keys.rs`,
     /// [`keys::KEY_REQUEST_RETRY_MS`]). In memory only.
     bundle_asked_ms: Option<u64>,
+    /// Where a wait for the feed starts, as the last read left it ([`App::feed_wait`]). In
+    /// memory only: a restart waits from the cursor.
+    next_wait: wait::NextWait,
+    /// The device time the last read that succeeded ended, in memory only: a quiet wait
+    /// past [`UPKEEP_READ_MS`] after it is a read ([`App::feed_wait`]).
+    read_done_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for App {
@@ -839,8 +853,11 @@ impl App {
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
                 bundle_asked_ms: None,
+                next_wait: wait::NextWait::Cursor,
+                read_done_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
+                reopen_failures: 0,
             };
             app.update_keys_through();
             app.events.clear();
@@ -869,7 +886,7 @@ impl App {
             tx.put(key::DEVICE, &app.state.device)?;
             tx.put(key::CURSOR, &app.state.cursor)?;
             tx.put(key::JOIN, &app.state.join)?;
-            tx.put(records::LIST_DUE, &true)?;
+            records::owe_listing(&mut tx)?;
             tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
             tx.commit(&app.env.store).await?;
             app.finish_join().await?;
@@ -974,8 +991,11 @@ impl App {
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
                 bundle_asked_ms: None,
+                next_wait: wait::NextWait::Cursor,
+                read_done_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
+                reopen_failures: 0,
             };
             // A store an earlier build wrote keeps the epoch read now.
             if !app.reader().exists(key::DUTY_EPOCH).await? {
@@ -1702,8 +1722,11 @@ impl App {
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
                 bundle_asked_ms: None,
+                next_wait: wait::NextWait::Cursor,
+                read_done_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
+                reopen_failures: 0,
             };
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.
@@ -1717,7 +1740,7 @@ impl App {
                 for (sender, msg_id, record) in &processed {
                     feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
                 }
-                tx.put(records::LIST_DUE, &true)?;
+                records::owe_listing(&mut tx)?;
                 // The entries it brings back are told to the protocol again, in steps after
                 // the restore commits (Switch spec 12.4).
                 parked::Retell::start(&app.state, &mut tx)?;

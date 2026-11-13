@@ -84,7 +84,7 @@ impl App {
         self.rebuild_client()?;
         let mut tx = self.tx()?;
         if widened {
-            tx.put(super::records::LIST_DUE, &true)?;
+            super::records::owe_listing(&mut tx)?;
         }
         tx.put(key::CERT, self.state.cert.signed())?;
         tx.put(key::RECORD, &record)?;

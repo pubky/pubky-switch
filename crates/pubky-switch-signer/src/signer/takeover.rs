@@ -237,6 +237,8 @@ impl Signer {
             state,
             flow: Some(flow),
             unsure: false,
+            left: super::RunDue::default(),
+            run: std::sync::Arc::default(),
         };
         Ok((signer, records))
     }

@@ -691,11 +691,20 @@ async fn test_keys_a_cursor_move_drops_the_parts_it_passes() {
     store_parts(&replay, &[(1, 1)], 60, &at).await;
     // Before the wallet passes it, its feed shows the part in full.
     assert_eq!(wallet_item(&replay, 9, 10, &at).await["type"], "chain");
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), 10).await,
+        (true, true)
+    );
     // Its cursor passes the part, which its keys_through covers: the part goes, and its
-    // item is a stub, to the wallet too.
+    // item is a stub, to the wallet too; its document and proof are deleted with it
+    // (Switch wire 7.5).
     wallet_cursor(&replay, 10, &at).await;
     assert_eq!(bundle_ranges(&replay, &at).await, json!([]));
     assert_eq!(wallet_item(&replay, 9, 10, &at).await["type"], "stub");
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), 10).await,
+        (false, false)
+    );
     let answer = keys_call(&replay, "wallet", "GET", "wallet", Vec::new(), &at).await;
     assert_eq!(code(&answer), (404, json!("not_found")));
     replay.db.drop_database().await.expect("drop");
