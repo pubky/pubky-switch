@@ -181,3 +181,44 @@ async fn test_sender_key_verified_refusal_reads_nothing() {
     assert!(!accepted(&delivery), "{delivery:?}");
     assert_eq!(s.reads(), reads);
 }
+
+/// The newer document read after an answer that didn't verify fails to commit: the read
+/// counts for nothing, so the next try, within [`SENDER_REREAD_MS`], reads it again and
+/// delivers under the new key, rather than waiting out the window under the old one.
+#[tokio::test]
+async fn test_sender_key_failed_save_of_the_newer_document_doesnt_delay_the_reread() {
+    use crate::store::{Fault as StoreFault, FaultStore};
+    let s = Setup::new();
+    let id = s.wallet().await.app_id();
+    let faulty = Arc::new(FaultStore::new(
+        Arc::clone(&s.w.store) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    let env = s.w.signer.env_with(
+        Arc::clone(&faulty) as Arc<dyn StateStore>,
+        Arc::clone(&s.router) as Arc<dyn Transport>,
+    );
+    let mut app = App::load(env, s.w.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    s.peer.recover_in_place(seed("bob/next-service")).unwrap();
+    let received = s.peer.received().len();
+    let reads = s.reads();
+    // Every key of bob's copy: the newer document's commit is refused once.
+    let doc = crate::app::state::key::ident_doc(&s.w.bob.public());
+    let bob = doc.trim_end_matches("doc");
+    faulty.fail_put_once(bob.as_bytes());
+    let msg_id = app.queue(s.note("after the loss")).await.unwrap();
+    let error = app.flush_outbox().await.unwrap_err();
+    assert!(matches!(error, crate::app::AppError::Store(_)), "{error:?}");
+    assert_eq!(s.reads(), reads + 1);
+    assert_eq!(s.peer.received().len(), received);
+    // Serving again, a second later: the try reads the document again and delivers.
+    s.peer.set_staged(false);
+    s.w.clock.advance_ms(1_000);
+    let report = app.flush_outbox().await.unwrap();
+    let delivery = app.delivery(&msg_id).await.unwrap();
+    assert_eq!(report.done, vec![msg_id.clone()], "{report:?} {delivery:?}");
+    assert!(s.peer.received().contains(&msg_id));
+    assert_eq!(s.reads(), reads + 2);
+}

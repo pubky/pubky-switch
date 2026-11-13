@@ -16,6 +16,7 @@ use pubky_switch::http::source::ProxyConfig;
 use pubky_switch::keys::{FileKeyStore, FixedKeys};
 use pubky_switch::limits::Limits;
 use pubky_switch::service::Service;
+use pubky_switch::store::Store;
 use pubky_switch::store::testing::{
     REQUIRE_DB_ENV, TEST_DATABASE_URL_ENV, TestDatabase, test_database,
 };
@@ -255,9 +256,16 @@ impl RealSwitch {
     /// Close the service's connections to its database, as a server that takes no more:
     /// every later request fails in the service's storage. For a test of how that shows.
     pub async fn close_connections(&self) {
-        if let Some(database) = &self.database {
-            database.store().close().await;
+        if let Some(store) = self.store() {
+            store.close().await;
         }
+    }
+
+    /// The service's store; `None` once its database is dropped.
+    pub(crate) fn store(&self) -> Option<Store> {
+        self.database
+            .as_ref()
+            .map(|database| database.store().clone())
     }
 
     /// The test database's name; empty once it is dropped.
