@@ -3,7 +3,7 @@
 //! A shared record is a protocol's: its collections and their fixed policies come from
 //! [`super::Protocol::collections`], or from the caller as a [`Collection`]. The app keeps,
 //! per record key, the write it took (`rec/<key>`), the protocol's mark of what it has seen
-//! there (`hw/<key>`), and the writes it refused (`flag/<key>/<version>`).
+//! there (`hw/<key>`), and the writes it refused (`flag/<key>/<write>`).
 //!
 //! - **Keys** come from the naming key: `derive("pubky-switch/v1/record", collection,
 //!   blind(natural key), policy hash)` (Switch spec 13.3).
@@ -16,8 +16,14 @@
 //!   writer's certificate and signature, the proof or stub that dates it and gives its
 //!   version, the collection's fixed policy and the key's derivation, the writer's standing
 //!   at the write's time, its write scope, and the sealed value opening. Signed evidence of
-//!   misbehaviour is a rollback (Switch spec 10.1); any other failure leaves the write
-//!   ignored and shown with the app it names (Switch spec 8.2).
+//!   misbehaviour is a rollback (Switch spec 10.1). A failure that is only the service's
+//!   word, and any failure of the app's own write but a value that doesn't open, leaves the
+//!   write ignored, naming no app. Of those, a write refused for the certificate the service
+//!   shows or a missing date, at a plausible version, is followed, so the next write builds
+//!   on it; the others (a write served for another record, a signature that doesn't verify,
+//!   a version missing or not plausible, an own write) aren't. Any other failure leaves the
+//!   write ignored and shown with the app it names (Switch spec 8.2), once for each write,
+//!   at most eight for a record, and followed.
 //! - **A write replaces the one held** only if it is newer by the core's rule
 //!   ([`WriteVersion::replaces`]), and only if the protocol finds it doesn't go back on what
 //!   the app has seen there ([`super::Protocol::record_regression_on`]). A write refused that
@@ -41,7 +47,7 @@ use super::batch::OpBatch;
 use super::error::{Alarm, Refusal};
 use super::events::{AppEvent, Duty};
 use super::protocol::{MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, WriteBase};
-use super::state::{Tx, key};
+use super::state::Tx;
 use super::{App, AppError, IdentityRefresh};
 use crate::client::answers::{ChainItem, SharedRecordView};
 use crate::error::ClientError;
@@ -49,6 +55,8 @@ use crate::error::ClientError;
 const RECORD_PREFIX: &str = "rec/";
 const SEEN_PREFIX: &str = "hw/";
 const FLAG_PREFIX: &str = "flag/";
+/// The most flagged writes kept for one record ([`App::flagged_writes`]).
+const FLAGGED_WRITES_PER_RECORD: usize = 8;
 const CERT_PREFIX: &str = "ocert/";
 /// Set while the app owes a listing of its collections: at join, after a `missed` item.
 pub(crate) const LIST_DUE: &str = "list_due";
@@ -188,13 +196,22 @@ pub(crate) fn seen_key(key: &[u8; 32]) -> String {
     format!("{SEEN_PREFIX}{}", b64(key))
 }
 
-fn flag_key(key: &[u8; 32], version: RecordVersion) -> String {
-    format!(
-        "{FLAG_PREFIX}{}/{}/{}",
-        b64(key),
-        key::num(version.generation),
-        key::num(version.version)
-    )
+/// Where a record's flagged writes are kept. A store kept by an earlier build may hold
+/// them keyed by their version, under the same prefix.
+fn flag_prefix(key: &[u8; 32]) -> String {
+    format!("{FLAG_PREFIX}{}/", b64(key))
+}
+
+/// A flagged write, by its item hash.
+fn flag_key(key: &[u8; 32], write: &[u8; 32]) -> String {
+    format!("{}{}", flag_prefix(key), b64(write))
+}
+
+/// A refused write as shown: its record key, the version shown, and its item hash.
+struct Shown {
+    key: [u8; 32],
+    version: RecordVersion,
+    write: [u8; 32],
 }
 
 fn cert_key(app_id: &[u8; 16], cert_hash: &[u8; 32]) -> String {
@@ -615,6 +632,15 @@ pub(crate) struct HeldRecord {
     /// on a delete the app holds (Switch wire 6.2), since the service may forget the key.
     #[serde(default)]
     follow_deleted: bool,
+    /// Whether the refused write followed names the app that signed it (Switch spec 8.2):
+    /// `false` for one refused only on the service's word, which names nobody and reads as
+    /// not flagged. A record an earlier build kept followed only named writes.
+    #[serde(default = "named_by_default")]
+    follow_named: bool,
+}
+
+fn named_by_default() -> bool {
+    true
 }
 
 impl std::fmt::Debug for HeldRecord {
@@ -672,7 +698,7 @@ impl HeldRecord {
                 ref content => content.clone(),
             },
             doubtful: self.doubtful,
-            flagged: self.follow.is_some(),
+            flagged: self.follow.is_some() && self.follow_named,
             divergent,
         }
     }
@@ -751,13 +777,30 @@ struct Accepted {
 enum Refused {
     /// Signed evidence of misbehaviour: a rollback.
     Misbehaviour(String),
-    /// A failed check: ignored and shown with the app it names.
-    Invalid { writer: [u8; 16], reason: String },
-    /// A value that doesn't open with its key held: as [`Refused::Invalid`], and a record
-    /// held with this very write not open for now is held as not opening for good.
-    DoesNotOpen { writer: [u8; 16], reason: String },
+    /// A failed check: ignored and shown with the app it names. Made only once the writer's
+    /// signature verified, never for a write the app's own key signed, and never for a
+    /// failure that is only the service's word. `write` is the write's item hash.
+    Invalid {
+        writer: [u8; 16],
+        write: [u8; 32],
+        reason: String,
+    },
+    /// A value that doesn't open with its key held: shown with the app it names, as
+    /// [`Refused::Invalid`], and a record held with this very write not open for now is held
+    /// as not opening for good. The signature covers the sealed value, so only a device of
+    /// the writer sealed it: this holds for a write the app's own key signed too.
+    DoesNotOpen {
+        writer: [u8; 16],
+        write: [u8; 32],
+        reason: String,
+    },
     /// Not a write the app takes: another collection, or a writer it can't find.
     Ignored,
+    /// A write at the key read, its version plausible, that the app doesn't take on the
+    /// service's word only: a missing date, or the certificate the service chose. It names
+    /// nobody, but its version is followed, so the app's next write builds on it and puts
+    /// back what it trusts, as over a flagged write (Switch spec 8.2).
+    Unnamed,
     /// A write without a record view, that no certificate the app holds authorizes, while
     /// the newest own `identity.json` names a certificate of the writer in force at its
     /// time that the app doesn't hold: the record's view decides (Switch wire 6.2
@@ -894,7 +937,9 @@ impl App {
         Ok(out)
     }
 
-    /// The writes the app refused (Switch spec 8.2), oldest key first.
+    /// The writes the app refused (Switch spec 8.2), by record key. Each write is kept once,
+    /// at the version it was last shown at, and at most eight for each record, the one shown
+    /// at the lowest version going first.
     ///
     /// # Errors
     ///
@@ -1546,12 +1591,24 @@ impl App {
             Err(Refused::Misbehaviour(reason)) => {
                 return Err(self.raise(Alarm::Rollback { reason }).await);
             }
-            Err(Refused::Invalid { writer, reason }) => {
+            Err(Refused::Invalid {
+                writer,
+                write,
+                reason,
+            }) => {
                 let deleted = writes_a_delete(evidence.op);
-                self.flag_write(&shown_key, version, writer, reason, deleted, tx)
-                    .await?;
+                let shown = Shown {
+                    key: shown_key,
+                    version,
+                    write,
+                };
+                self.flag_write(shown, writer, reason, deleted, tx).await?;
             }
-            Err(Refused::DoesNotOpen { writer, reason }) => {
+            Err(Refused::DoesNotOpen {
+                writer,
+                write,
+                reason,
+            }) => {
                 // The record held with this very write, not open for now, won't open: its
                 // version is the write's, so the flag below doesn't write it again.
                 if let Some(mut held) = self.held_record(&shown_key).await?
@@ -1562,7 +1619,16 @@ impl App {
                     tx.put(&record_key_of(&shown_key), &held)?;
                 }
                 let deleted = writes_a_delete(evidence.op);
-                self.flag_write(&shown_key, version, writer, reason, deleted, tx)
+                let shown = Shown {
+                    key: shown_key,
+                    version,
+                    write,
+                };
+                self.flag_write(shown, writer, reason, deleted, tx).await?;
+            }
+            Err(Refused::Unnamed) => {
+                let deleted = writes_a_delete(evidence.op);
+                self.follow_write(&shown_key, version, deleted, false, tx)
                     .await?;
             }
             Err(Refused::Ignored | Refused::Unheld(_)) => {}
@@ -1572,15 +1638,25 @@ impl App {
 
     /// Record a refused write, and follow its version when it is the switch's current one
     /// for a record the app holds.
+    ///
+    /// A write is kept once, by its item hash, which its writer signed, at the version it was
+    /// last shown at: the same write shown again, at any version, replaces its entry. A
+    /// record keeps at most [`FLAGGED_WRITES_PER_RECORD`], the one shown at the lowest
+    /// version going first, so a service showing writes never grows them without bound.
     async fn flag_write(
         &mut self,
-        key: &[u8; 32],
-        version: RecordVersion,
+        shown: Shown,
         writer: [u8; 16],
         reason: String,
         deleted: bool,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        let Shown {
+            key,
+            version,
+            write,
+        } = shown;
+        let key = &key;
         let reason = cut_reason(reason);
         let flagged = FlaggedWrite {
             key: *key,
@@ -1588,19 +1664,64 @@ impl App {
             writer,
             reason: reason.clone(),
         };
-        tx.put(&flag_key(key, version), &flagged)?;
-        if let Some(mut held) = self.held_record(key).await?
-            && version > held.base_version()
-        {
-            held.follow = Some(version);
-            held.follow_deleted = deleted;
-            tx.put(&record_key_of(key), &held)?;
+        let entry = flag_key(key, &write);
+        let prefix = flag_prefix(key);
+        let mut present: Vec<(String, Option<RecordVersion>)> = self
+            .reader()
+            .scan::<FlaggedWrite>(&prefix)
+            .await?
+            .into_iter()
+            .map(|(rest, kept)| (format!("{prefix}{rest}"), Some(kept.version)))
+            .filter(|(at, _)| tx.pending_state(at) != Some(false))
+            .collect();
+        for rest in tx.pending_put_keys(&prefix) {
+            let at = format!("{prefix}{rest}");
+            match present.iter_mut().find(|(held, _)| *held == at) {
+                // Put again in this transaction: not dropped below.
+                Some(held) => held.1 = None,
+                None => present.push((at, None)),
+            }
         }
+        if !present.iter().any(|(at, _)| *at == entry) {
+            let over = (present.len() + 1).saturating_sub(FLAGGED_WRITES_PER_RECORD);
+            let mut stored: Vec<(String, RecordVersion)> = present
+                .into_iter()
+                .filter_map(|(at, version)| Some((at, version?)))
+                .collect();
+            stored.sort_by_key(|(_, version)| *version);
+            for (at, _) in stored.iter().take(over) {
+                tx.delete(at)?;
+            }
+        }
+        tx.put(&entry, &flagged)?;
+        self.follow_write(key, version, deleted, true, tx).await?;
         self.events.push(AppEvent::WriteFlagged {
             key: *key,
             writer,
             reason,
         });
+        Ok(())
+    }
+
+    /// Follow a refused write's version when it is the switch's current one for a record the
+    /// app holds, so the next write builds on it (Switch spec 8.2); `named` when the refusal
+    /// names the app that signed it.
+    async fn follow_write(
+        &mut self,
+        key: &[u8; 32],
+        version: RecordVersion,
+        deleted: bool,
+        named: bool,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        if let Some(mut held) = self.held_record(key).await?
+            && version > held.base_version()
+        {
+            held.follow = Some(version);
+            held.follow_deleted = deleted;
+            held.follow_named = named;
+            tx.put(&record_key_of(key), &held)?;
+        }
         Ok(())
     }
 
@@ -1626,20 +1747,17 @@ impl App {
         let Some(writer) = body.app_id else {
             return Ok(Err(Refused::Ignored));
         };
-        let invalid = |reason: &str| -> Result<Result<Accepted, Refused>, AppError> {
-            Ok(Err(Refused::Invalid {
-                writer,
-                reason: reason.to_owned(),
-            }))
-        };
-        if body.identity != identity {
-            return invalid("Switch wire 6.2 step 1: the operation names another identity");
-        }
-        // Step 3: the collection of the protocol, with its fixed policy.
+        // Nothing before the signature check below names the writer: the body isn't verified
+        // yet, so a faulty or hostile service could name any app in it. What fails before
+        // it is ignored, as a write the app doesn't take.
+        //
+        // Step 3: the collection of the protocol. A write for another record key than the
+        // one read is one the service served in its place: its writer wrote it for its own
+        // key, so it isn't the writer's failure.
         let collection = match expect {
             Some((key, collection)) => {
                 if put.key != *key {
-                    return invalid("Switch wire 6.2 step 3: another record key than the one read");
+                    return Ok(Err(Refused::Ignored));
                 }
                 collection.clone()
             }
@@ -1648,13 +1766,9 @@ impl App {
                 None => return Ok(Err(Refused::Ignored)),
             },
         };
-        if let Some(reason) = check_shape(put, &collection, &identity) {
-            return invalid(reason);
-        }
-        // The member of the collection's policy family the write names.
-        let collection = Collection::new(&collection.name, put.policy.clone());
-        // Step 1: the writer's certificates and the signature.
-        let Some(certs) = self.writer_certs(evidence, &writer, tx).await? else {
+        // Step 1: the writer's certificates and the signature, which binds the identity and
+        // the writer's App ID too.
+        let Some(mut certs) = self.writer_certs(evidence, &writer, tx).await? else {
             // A feed write by a writer the newest own `identity.json` names, a removed one
             // included, whose certificate neither the app nor its directory holds: the
             // directory lists only current apps, and its read may fail. The record's view
@@ -1663,24 +1777,87 @@ impl App {
             if evidence.cert.is_none()
                 && (doc.listed_cert(&writer).is_some() || doc.lists_removed(&writer))
             {
-                return Ok(Err(Refused::Unheld(collection)));
+                return Ok(Err(Refused::Unheld(Collection::new(
+                    &collection.name,
+                    put.policy.clone(),
+                ))));
             }
             return Ok(Err(Refused::Ignored));
         };
-        // Step 2: what dates the write and gives its version.
+        // The writer signed it, and the signature binds the identity (`SignedOp::verify`
+        // refuses a body naming another): a failed check from here on names an app that made
+        // the write, by the write's item hash, which its writer signed.
+        //
+        // One signed with this app's own key is the app's own write, under whichever of its
+        // certificates it was made: the app checked its scopes when it made it, so the checks
+        // of what it may write don't run again, but for the cutoff of its own removal (below).
+        // A check it fails otherwise leaves it ignored, naming no app: a flag would name the
+        // app itself.
+        let own = writer == self.state.meta.app_id
+            && SignedOp::verify(
+                evidence.op,
+                &self.state.keys.signing_public(),
+                &identity,
+                Some(&writer),
+            )
+            .is_ok();
         let item_hash = certs.op.item_hash()?;
+        let invalid = |reason: &str| -> Result<Result<Accepted, Refused>, AppError> {
+            if own {
+                return Ok(Err(Refused::Ignored));
+            }
+            Ok(Err(Refused::Invalid {
+                writer,
+                write: item_hash,
+                reason: reason.to_owned(),
+            }))
+        };
+        if let Some(reason) = check_shape(put, &collection, &identity) {
+            return invalid(reason);
+        }
+        // The member of the collection's policy family the write names.
+        let collection = Collection::new(&collection.name, put.policy.clone());
+        // Step 2: what dates the write and gives its version.
         let (time, proven) = match self.date(evidence, &certs.op, item_hash) {
             Ok(dated) => dated,
             Err(reason) => return Ok(Err(Refused::Misbehaviour(reason))),
         };
-        // Step 4: standing at the write's time, of the certificate the write was made under.
+        // The version step 6 checks, `None` when nothing gives one.
+        let shown = match (proven, evidence.view_version) {
+            (Some(version), _) => Some(WriteVersion {
+                version,
+                authenticated: true,
+                expected_version: put.expected_version,
+            }),
+            (None, Some(version)) => Some(WriteVersion {
+                version,
+                authenticated: false,
+                expected_version: put.expected_version,
+            }),
+            (None, None) => None,
+        };
+        let plausible = shown.is_some_and(|version| version.plausible(body.generation));
+        // A write refused on the service's word only, at the key read: followed, naming
+        // nobody, when its version is plausible, so an honest service's record stays
+        // writable, as one taken from a recovery upload under a renewal closed since; else
+        // ignored.
+        let unnamed = || -> Result<Result<Accepted, Refused>, AppError> {
+            Ok(Err(if plausible {
+                Refused::Unnamed
+            } else {
+                Refused::Ignored
+            }))
+        };
+        // Step 4: standing at the write's time, of a certificate of the writer that counts
+        // for it (`write_cert`).
         let mut doubtful = false;
         let write_scopes = &put.policy.write_scopes;
         let Some(mut cert) = self.write_cert(&certs, time, write_scopes) else {
             return Ok(Err(Refused::Ignored));
         };
         let mut standing = self.state.own_doc.standing(&writer, &cert.hash());
-        if standing == Standing::None
+        if !own
+            && standing == Standing::None
             && matches!(
                 self.refresh_identity().await,
                 Ok(IdentityRefresh::Newer { .. })
@@ -1692,23 +1869,75 @@ impl App {
         }
         let holds_write_scope =
             |cert: &AppCert| write_scopes.iter().any(|scope| cert.holds_scope(scope));
-        if evidence.cert.is_none()
-            && let Some(at) = time
-            && !(in_force(&self.state.own_doc, &cert, time) && holds_write_scope(&cert))
-            && self.unheld_in_force(&writer, &certs, at)
+        let mut counts = in_force(&self.state.own_doc, &cert, time) && holds_write_scope(&cert);
+        // No certificate of the writer the app holds counts for the write, while the newest
+        // own `identity.json` names one in force at its time that the app doesn't hold: the
+        // write may be the writer's under that one. Without a record view, the view decides
+        // (step 1). With one, its `cert` is only the service's pick, as the write names no
+        // certificate: the app reads its directory for the writer's listed certificate, once
+        // for each the directory answers for while it runs. If that doesn't settle it, a
+        // failure of steps 4 and 5 is the service's word, and the write is ignored, naming no
+        // app. A read that fails marks nothing: a later write's judging reads again, once
+        // `SENDER_REREAD_MS` has passed, so a failing directory costs at most one request a
+        // minute.
+        let mut unheld = !own && !counts && self.unheld_in_force(&writer, &certs, time);
+        let now = self.now();
+        let paced = self
+            .directory_failed_ms
+            .is_some_and(|at| at <= now && now - at < super::SENDER_REREAD_MS);
+        if unheld
+            && evidence.cert.is_some()
+            && !paced
+            && let Some(listed) = self.state.own_doc.listed_cert(&writer)
+            && !certs.known.iter().any(|cert| cert.hash() == listed)
+            && !self.directory_asked.contains(&listed)
         {
+            let answered = self.refresh_own_apps().await.is_ok();
+            if answered {
+                self.directory_failed_ms = None;
+                self.directory_asked.push(listed);
+            } else {
+                self.directory_failed_ms = Some(now);
+            }
+            if answered
+                && let Some(again) = self.writer_certs(evidence, &writer, tx).await?
+                && let Some(found) = self.write_cert(&again, time, write_scopes)
+            {
+                certs = again;
+                cert = found;
+                standing = self.state.own_doc.standing(&writer, &cert.hash());
+                counts = in_force(&self.state.own_doc, &cert, time) && holds_write_scope(&cert);
+                unheld = !counts && self.unheld_in_force(&writer, &certs, time);
+            }
+        }
+        if unheld && evidence.cert.is_none() && time.is_some() {
             return Ok(Err(Refused::Unheld(collection)));
         }
+        let invalid = |reason: &str| -> Result<Result<Accepted, Refused>, AppError> {
+            if unheld {
+                return unnamed();
+            }
+            invalid(reason)
+        };
         match standing {
+            // A removed app's key may be a lost device's (Switch spec 3.1, 12.2 step 3): its
+            // own writes keep the `distrust_from` cutoff, ignored after it (`invalid` names
+            // no app for an own write) and doubtful when nothing dates them.
+            _ if own && !matches!(standing, Standing::Removed { .. }) => {}
             Standing::Listed | Standing::RenewedOpen => {}
-            Standing::RenewedClosed { until } => {
-                if time.is_none_or(|t| t >= until) {
+            Standing::RenewedClosed { until } => match time {
+                Some(t) if t >= until => {
                     return invalid(
-                        "Switch wire 6.2 step 4: an earlier certificate's write not dated before \
-                         its renewal closed",
+                        "Switch wire 6.2 step 4: an earlier certificate's write dated after its \
+                         renewal closed",
                     );
                 }
-            }
+                Some(_) => {}
+                // Nothing dates it: the service keeps the proof of every current write (Switch
+                // wire 7.4.9), so a missing one is the service's word. The write isn't taken
+                // and names no app; its version is followed.
+                None => return unnamed(),
+            },
             Standing::Removed { distrust_from } => match time {
                 Some(t) if t > distrust_from => {
                     return invalid(
@@ -1722,33 +1951,20 @@ impl App {
                 return invalid("Switch wire 6.2 step 4: the writer has no standing");
             }
         }
-        if time.is_some_and(|t| cert.expired_at(t)) {
+        if !own && time.is_some_and(|t| cert.expired_at(t)) {
             return invalid("Switch wire 6.2 step 4: the certificate had expired at the write");
         }
         // Step 5: a write scope.
-        if !holds_write_scope(&cert) {
+        if !own && !holds_write_scope(&cert) {
             return invalid("Switch wire 6.2 step 5: the writer holds none of the write scopes");
         }
-        // Step 6: the version.
-        let version = match (proven, evidence.view_version) {
-            (Some(version), _) => WriteVersion {
-                version,
-                authenticated: true,
-                expected_version: put.expected_version,
-            },
-            (None, Some(version)) => WriteVersion {
-                version,
-                authenticated: false,
-                expected_version: put.expected_version,
-            },
-            (None, None) => return invalid("Switch wire 6.2 step 6: nothing gives the version"),
+        // Step 6: the version. It is the service's word, not the writer's: a write whose
+        // version is missing or not plausible is ignored, naming no app and followed by
+        // nothing. A client loses nothing by it that a service withholding the write couldn't
+        // take.
+        let Some(version) = shown.filter(|_| plausible) else {
+            return Ok(Err(Refused::Ignored));
         };
-        if !version.plausible(body.generation) {
-            return invalid(
-                "Switch wire 6.2 step 6: the version isn't of the operation's generation, after \
-                 its expected_version",
-            );
-        }
         // Step 7: the content.
         let content = match put
             .value_sealed
@@ -1770,6 +1986,7 @@ impl App {
             Err(_) => {
                 return Ok(Err(Refused::DoesNotOpen {
                     writer,
+                    write: item_hash,
                     reason: "Switch wire 6.2 step 7: the value doesn't open".into(),
                 }));
             }
@@ -1850,24 +2067,32 @@ impl App {
         }))
     }
 
-    /// The certificate a write is judged with (Switch wire 6.2 "Accepting a write" steps 1
-    /// and 4, 7.4.9). A record view's `cert` is the one the service checked the write
-    /// against, and the write is judged with it, whatever certificate the writer holds now:
-    /// a renewal later doesn't change which certificate a write was made under. Without one
-    /// (a write from the feed), a known certificate in force at the write's time, one that
-    /// holds a write scope first, and of those the one in the best standing now, which
-    /// still authorizes the write when nothing dates it, as after an upload; only when no
-    /// known certificate was in force, the one in the best standing now.
+    /// The certificate a write is judged with (Switch wire 6.2 "Accepting a write" steps 1,
+    /// 4 and 5, 7.4.9). A write names no certificate: every certificate of its writer has
+    /// the signing key that verifies it. So it is judged with one of the writer's
+    /// certificates that counts for it, in force at its time and holding a write scope:
+    /// the record view's `cert`, the one the service checked the write against, when it
+    /// counts, so a renewal later doesn't change what an earlier write is judged with;
+    /// else a known certificate, of those the one in the best standing now, which still
+    /// authorizes the write when nothing dates it, as after an upload. When none counts,
+    /// the view's `cert`, or a known certificate in force, or the one in the best standing
+    /// now, whose failure the checks give.
     fn write_cert(
         &self,
         certs: &WriterCerts,
         time: Option<u64>,
         write_scopes: &[String],
     ) -> Option<AppCert> {
-        if let Some(cert) = &certs.view {
+        let doc = &self.state.own_doc;
+        let holds_write_scope =
+            |cert: &AppCert| write_scopes.iter().any(|scope| cert.holds_scope(scope));
+        if let Some(cert) = certs
+            .view
+            .as_ref()
+            .filter(|cert| in_force(doc, cert, time) && holds_write_scope(cert))
+        {
             return Some(cert.clone());
         }
-        let doc = &self.state.own_doc;
         let rank = |cert: &&AppCert| match doc.standing(&cert.app_id(), &cert.hash()) {
             Standing::Listed => 0,
             Standing::RenewedOpen => 1,
@@ -1881,21 +2106,29 @@ impl App {
             .filter(|cert| in_force(doc, cert, time))
             .collect();
         counting.sort_by_key(|cert| (rank(cert), cert.issued_at()));
-        let found = counting
-            .iter()
-            .find(|cert| write_scopes.iter().any(|scope| cert.holds_scope(scope)))
-            .or(counting.first());
-        if let Some(cert) = found {
+        if let Some(cert) = counting.iter().find(|cert| holds_write_scope(cert)) {
             return Some((*cert).clone());
         }
-        certs.known.iter().min_by_key(rank).cloned()
+        if let Some(cert) = &certs.view {
+            return Some(cert.clone());
+        }
+        counting
+            .first()
+            .map(|cert| (*cert).clone())
+            .or_else(|| certs.known.iter().min_by_key(rank).cloned())
     }
 
     /// Whether the newest own `identity.json` names a certificate of `writer` in force at
-    /// `time` that the app doesn't hold (Switch wire 6.2 "Accepting a write" step 1).
-    fn unheld_in_force(&self, writer: &[u8; 16], certs: &WriterCerts, time: u64) -> bool {
+    /// `time` that the app doesn't hold (Switch wire 6.2 "Accepting a write" step 1); when
+    /// nothing dates the write, one that counts without a date.
+    fn unheld_in_force(&self, writer: &[u8; 16], certs: &WriterCerts, time: Option<u64>) -> bool {
         let doc = &self.state.own_doc;
-        let held: Vec<[u8; 32]> = certs.known.iter().map(AppCert::hash).collect();
+        let held: Vec<[u8; 32]> = certs
+            .known
+            .iter()
+            .chain(certs.view.as_ref())
+            .map(AppCert::hash)
+            .collect();
         doc.listed_cert(writer)
             .into_iter()
             .chain(
@@ -1905,7 +2138,7 @@ impl App {
                     .filter(|entry| &entry.app_id == writer)
                     .map(|entry| entry.cert),
             )
-            .any(|hash| counts_at(doc.standing(writer, &hash), Some(time)) && !held.contains(&hash))
+            .any(|hash| counts_at(doc.standing(writer, &hash), time) && !held.contains(&hash))
     }
 
     /// The certificates of `app_id` that `tx` keeps, not committed yet: those of the writes
@@ -2108,9 +2341,13 @@ impl App {
                 base,
             )
         {
-            let version = accepted.version.version;
+            let shown = Shown {
+                key,
+                version: accepted.version.version,
+                write: accepted.item_hash,
+            };
             let deleted = accepted.content == RecordContent::Deleted;
-            self.flag_write(&key, version, accepted.writer, reason, deleted, tx)
+            self.flag_write(shown, accepted.writer, reason, deleted, tx)
                 .await?;
             return Ok(Taken::Flagged);
         }
@@ -2178,6 +2415,7 @@ impl App {
                 .and_then(|held| held.follow)
                 .filter(|_| reopened),
             follow_deleted: held.as_ref().is_some_and(|held| held.follow_deleted) && reopened,
+            follow_named: held.as_ref().is_none_or(|held| held.follow_named) || !reopened,
         };
         tx.put(&record_key_of(&key), &record)?;
         self.events.push(AppEvent::RecordChanged { key });

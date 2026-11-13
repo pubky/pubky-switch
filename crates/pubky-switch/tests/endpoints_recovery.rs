@@ -17,7 +17,7 @@ use pubky_switch_core::{
     claims::{ClaimFields, ClaimType},
     http::{IdentityDelivery, header},
     keys::IdentityKey,
-    ops::{OpKind, RecordPut, RecordVersion, SignedOp},
+    ops::{OpKind, OpsRequest, Position, RecordPut, RecordVersion, SignedOp},
     records::{Enrollment, EnrollmentBody, IdentityBody, IdentityDoc},
     sig::SignedDoc,
     time::rfc3339,
@@ -443,6 +443,78 @@ async fn test_recovery_in_place_starts_afresh_under_the_pending_key() {
     assert_eq!(apps.status, 200);
     assert!(signed_by(&apps, &pending, &read_signature));
     assert_eq!(json_of(&apps)["recovery"]["recovery_from"], 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The `cursor` the wallet's feed page after `after` reports, at `at`.
+async fn wallet_cursor(replay: &Replay, after: &str, at: u64) -> Value {
+    let keys = vectors("keys.json");
+    let path = format!("/v1/{}/feed?after={after}", alice_id());
+    let answer = replay
+        .service
+        .handle(app_request(
+            app(&keys, "wallet"),
+            "GET",
+            &path,
+            Vec::new(),
+            at,
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    json_of(&answer)["cursor"].clone()
+}
+
+#[tokio::test]
+async fn test_recovery_in_place_holds_no_cursor_of_the_lost_sequence() {
+    // A provider loss starts the account's apps afresh: the new sequence holds no cursor
+    // from the lost one, so the wallet's first page there reports 0, before any move of its
+    // own, whatever it held at generation 1 (Switch spec 8.3, 12.6 step 1).
+    let Some(replay) = replay().await else { return };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let keys = vectors("keys.json");
+    let body = OpsRequest::new(
+        &[],
+        Some(Position {
+            generation: 1,
+            seq: 8,
+        }),
+    )
+    .to_json();
+    let path = format!("/v1/{}/ops", alice_id());
+    let moved = replay
+        .service
+        .handle(app_request(app(&keys, "wallet"), "POST", &path, body, at))
+        .await;
+    assert_eq!(
+        moved.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&moved.body)
+    );
+    assert_eq!(wallet_cursor(&replay, "1:9", at).await, json!(8));
+    let before = held(&replay).await;
+    let (answer, _) = deliver(
+        &replay,
+        next_generation(&before, pending, Some(1)),
+        Some(before.hash()),
+        at,
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    // Its first call at the new generation registers it again, and moves no cursor.
+    let (status, body) = wallet_registers(&replay, 77, 2, 3, true, at).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(wallet_cursor(&replay, "1:9", at).await, json!(0));
     replay.db.drop_database().await.expect("drop");
 }
 

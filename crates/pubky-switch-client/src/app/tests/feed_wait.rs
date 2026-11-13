@@ -2709,3 +2709,132 @@ async fn test_flush_outbox_stale_key_skipped_every_time_is_sealed_at_the_next_tr
         1
     );
 }
+
+/// `409 identity_needed` once the round's budget has passed: the next try delivers the own
+/// `identity.json` once, on its first attempt, then the message; a later send delivers it
+/// no more.
+#[tokio::test]
+async fn test_flush_outbox_identity_needed_past_the_round_budget_is_delivered_once_next_try() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let (_, delivery) = app.send(note_to_bob(&s, "one")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    let peers_puts = || {
+        s.peer
+            .routes()
+            .iter()
+            .filter(|route| *route == "PUT peers")
+            .count()
+    };
+    let slow = s.slow_peer(21_000);
+    s.peer.fail_next(
+        "inbox",
+        pubky_switch_core::http::ErrorCode::IdentityNeeded,
+        json!(null),
+    );
+    let before = peers_puts();
+    let (second, delivery) = app.send(note_to_bob(&s, "two")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Queued { .. }),
+        "{delivery:?}"
+    );
+    assert_eq!(peers_puts(), before, "no redelivery past the round's time");
+    slow.ms.store(1_000, std::sync::atomic::Ordering::SeqCst);
+    s.w.clock.advance_ms(60_000);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![second.clone()], "{report:?}");
+    assert_eq!(peers_puts(), before + 1, "delivered once at the next try");
+    let (_, delivery) = app.send(note_to_bob(&s, "three")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    assert_eq!(peers_puts(), before + 1, "not again");
+    assert_eq!(
+        s.peer.received().iter().filter(|m| **m == second).count(),
+        1
+    );
+}
+
+/// The process dies between taking the keys a `409 stale_key` named and dropping the
+/// envelope: the item keeps its old envelope, and the next try is refused again, reseals
+/// within its own round and delivers once.
+#[tokio::test]
+async fn test_flush_outbox_stale_key_skip_cut_before_the_drop_is_delivered_once() {
+    use crate::store::{Fault as StoreFault, FaultStore};
+    let s = Setup::new(false);
+    let faulty = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    let mut app = s
+        .join_on("wallet", Arc::clone(&faulty) as Arc<dyn StateStore>)
+        .await;
+    let (_, delivery) = app.send(note_to_bob(&s, "one")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    // Sealed under bob's old key, its first try answered `503 staged`.
+    s.peer.set_staged(true);
+    let (second, _) = app.send(note_to_bob(&s, "two")).await.unwrap();
+    s.peer.set_staged(false);
+    s.peer.rotate(0).unwrap();
+    let slow = s.slow_peer(21_000);
+    faulty.fail_put_once(format!("out/{second}").as_bytes());
+    let error = app.flush_outbox().await.unwrap_err();
+    assert!(matches!(error, crate::app::AppError::Store(_)), "{error:?}");
+    slow.ms.store(1_000, std::sync::atomic::Ordering::SeqCst);
+    s.w.clock.advance_ms(60_000);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![second.clone()], "{report:?}");
+    assert_eq!(
+        s.peer.received().iter().filter(|m| **m == second).count(),
+        1
+    );
+}
+
+/// A switch answering `409 stale_key` to every append: each try sends a bounded number of
+/// appends, and the message stays queued.
+#[tokio::test]
+async fn test_flush_outbox_stale_key_every_time_is_bounded_per_try() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let (_, delivery) = app.send(note_to_bob(&s, "one")).await.unwrap();
+    assert!(
+        matches!(delivery, crate::app::Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    for _ in 0..40 {
+        s.peer.fail_next(
+            "inbox",
+            pubky_switch_core::http::ErrorCode::StaleKey,
+            json!(null),
+        );
+    }
+    let appends = || {
+        s.peer
+            .routes()
+            .iter()
+            .filter(|route| *route == "POST inbox")
+            .count()
+    };
+    let msg_id = app.queue(note_to_bob(&s, "two")).await.unwrap();
+    for _ in 0..3 {
+        let before = appends();
+        s.w.clock.advance_ms(60_000);
+        app.flush_outbox().await.unwrap();
+        assert!(
+            appends() - before <= 3,
+            "{} appends in one try",
+            appends() - before
+        );
+        assert!(matches!(
+            app.delivery(&msg_id).await.unwrap(),
+            Some(crate::app::Delivery::Queued { .. })
+        ));
+    }
+}

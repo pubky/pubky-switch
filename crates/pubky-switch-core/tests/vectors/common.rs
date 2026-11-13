@@ -291,6 +291,9 @@ pub enum Place<'a> {
     Member(&'a str),
     /// A case of an array, found by its `name`.
     Case(&'a str),
+    /// An array element the core rewrote, at its index, for an array whose cases have no
+    /// `name`.
+    Element(&'a str),
 }
 
 /// The environment variable that makes the vector tests write the cases the core generates
@@ -314,6 +317,12 @@ pub fn generated(name: &str, cases: &[(Place<'_>, Value)]) {
                         .unwrap_or_else(|| panic!("{name}: no object at {parent}"))
                         .insert(member.to_owned(), value.clone());
                 }
+                Place::Element(pointer) => {
+                    *file
+                        .pointer_mut(pointer)
+                        .unwrap_or_else(|| panic!("{name}: no element at {pointer}")) =
+                        value.clone();
+                }
                 Place::Case(pointer) => {
                     let list = file
                         .pointer_mut(pointer)
@@ -333,7 +342,7 @@ pub fn generated(name: &str, cases: &[(Place<'_>, Value)]) {
     let file = load(name);
     for (place, value) in cases {
         let held = match place {
-            Place::Member(pointer) => file.pointer(pointer),
+            Place::Member(pointer) | Place::Element(pointer) => file.pointer(pointer),
             Place::Case(pointer) => file
                 .pointer(pointer)
                 .and_then(Value::as_array)
