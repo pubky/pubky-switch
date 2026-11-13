@@ -165,8 +165,8 @@ pub struct SwitchApp {
     /// data epoch than at its departure: its rotation is done for good (`awaiting_rotation`,
     /// Switch wire 7.4.12).
     pub rotated: bool,
-    /// Whether the switch purged what it held of the removed app, down to its App ID and
-    /// its revocation or departure time (Switch wire 9.1).
+    /// Whether the switch purged what it held of the removed app, down to its App ID, its
+    /// revocation or departure time and its kids (Switch wire 9.1).
     pub purged: bool,
 }
 

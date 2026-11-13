@@ -2,7 +2,7 @@
 //! departed app's record, receive key records, key bundle parts, cursor, last-seen time and
 //! listing go at the request that leaves the newest `identity.json` listing it in neither
 //! `apps` nor `removed`, with its rotation done and no attempt open or `unknown` it owns;
-//! its App ID stays for good (7.4.12, 7.6 `not_current`).
+//! its App ID and its kids stay for good (7.4.12, 7.6 `not_current`, spec 3.6).
 //!
 //! Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run them; see `store::testing`.
 
@@ -14,11 +14,15 @@ mod support;
 use pubky_switch::http::{Handler, SwitchResponse};
 use pubky_switch_core::{
     claims::{Basis, ClaimType},
-    enc::zbase32_encode,
-    http::header,
-    keys::IdentityKey,
-    ops::{KeyBundlePut, OpKind, OpsRequest, sign_batch},
-    records::{AppRecord, RemovedApp},
+    enc::{unb64, zbase32_encode},
+    envelope::{Recipient, seal},
+    http::{IdentityDelivery, header},
+    keys::{AppKeys, IdentityKey},
+    ops::{AllowKind, KeyBundlePut, OpKind, OpsRequest, sign_batch},
+    records::{
+        AppCert, AppRecord, IdentityBody, IdentityDoc, ListedApp, ReceiveKeyBody, ReceiveKeyRecord,
+        RemovedApp,
+    },
     sig::SignedDoc,
 };
 use serde_json::{Value, json};
@@ -521,5 +525,229 @@ async fn test_purge_deletes_the_documents_of_its_record_and_parts() {
             "seq {seq} after the purge"
         );
     }
+    replay.db.drop_database().await.expect("drop");
+}
+
+fn doc(name: &str) -> SignedDoc {
+    serde_json::from_value(named(&vectors("documents.json")["documents"], name)["signed"].clone())
+        .expect("document")
+}
+
+/// The executor's first receive key record, for the wallet's receive key: the same
+/// `x25519`, so the same kid.
+fn executor_record_with_wallets_kid() -> SignedDoc {
+    let keys = vectors("keys.json");
+    let alice_key = hex32(&alice(&keys)["public_hex"]);
+    let wallet_body: Value =
+        serde_json::from_slice(&doc("wallet receive key record").body_bytes().expect("body"))
+            .expect("json");
+    let kid: [u8; 8] = unb64(wallet_body["kid"].as_str().expect("kid"))
+        .expect("b64")
+        .try_into()
+        .expect("8");
+    let x25519: [u8; 32] = unb64(wallet_body["x25519"].as_str().expect("x25519"))
+        .expect("b64")
+        .try_into()
+        .expect("32");
+    let cert = AppCert::verify(&doc("executor certificate"), &alice_key).expect("cert");
+    let executor = app(&keys, "executor");
+    let app_keys = AppKeys::from_secrets(
+        hex32(&executor["signing_secret_hex"]),
+        hex32(&executor["bundle_secret_hex"]),
+    );
+    let body = ReceiveKeyBody {
+        identity: cert.identity(),
+        app_id: cert.app_id(),
+        n: 0,
+        kid,
+        x25519,
+        suite_keys: None,
+    };
+    ReceiveKeyRecord::sign(&app_keys, &cert, body)
+        .expect("record")
+        .signed()
+        .clone()
+}
+
+/// The executor's first call, registering a receive key with the wallet's kid.
+async fn register_executor(replay: &Replay, batch: u8, at_ms: u64) -> SwitchResponse {
+    app_batch(
+        replay,
+        "executor",
+        batch,
+        vec![
+            OpKind::AppPut {
+                record: doc("executor app record"),
+            },
+            OpKind::ReceiveKeyPut {
+                record: executor_record_with_wallets_kid(),
+            },
+        ],
+        at_ms,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_purge_purged_app_id_never_listed_again() {
+    let Some(replay) = replay().await else { return };
+    let (newest, at) = purge_wallet(&replay).await;
+    let wallet = app_id_of("wallet");
+    let cert = doc("wallet certificate").doc_hash().expect("hash");
+    let mut next: IdentityBody =
+        serde_json::from_slice(&newest.body_bytes().expect("body")).expect("body");
+    next.version += 1;
+    next.apps.push(ListedApp {
+        app_id: wallet,
+        cert,
+    });
+    let keys = vectors("keys.json");
+    let key = IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let signed = IdentityDoc::sign(&key, next)
+        .expect("sign")
+        .signed()
+        .clone();
+    let delivery = IdentityDelivery {
+        identity: signed,
+        prev: Some(newest.doc_hash().expect("hash")),
+    }
+    .to_json();
+    let path = format!("/v1/{}/identity", alice_id());
+    let answer = replay
+        .service
+        .handle(signer_request("PUT", &path, delivery, at))
+        .await;
+    assert_eq!(answer.status, 400);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_purge_kid_of_a_revoked_app_refused_before_its_purge() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let answer = register_executor(&replay, 95, revoke_time()).await;
+    assert_eq!(answer.status, 400);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_purge_kid_of_a_purged_app_refused_after_its_purge() {
+    // Switch spec 3.6: "The service refuses a registration whose kid any app of the identity
+    // has registered before (`400`)": the purge keeps the kids with their App ID.
+    let Some(replay) = replay().await else { return };
+    let (_, at) = purge_wallet(&replay).await;
+    let wallet = app_id_of("wallet");
+    assert_eq!(holdings(&replay, &wallet).await, [0, 0, 0, 0]);
+    assert_eq!(
+        rows_naming(&replay, "receive_keys", "app_id", &wallet).await,
+        1
+    );
+    let answer = register_executor(&replay, 96, at).await;
+    assert_eq!(answer.status, 400, "a purged app's kid registered again");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_purge_envelope_to_a_purged_apps_kid_is_not_current() {
+    // An envelope wrapped to the purged wallet's kid: `409 stale_key` naming the wallet in
+    // `not_current`, as for a removed app before its purge (Switch wire 7.6), not as a kid
+    // the service never registered.
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let wallet = app_id_of("wallet");
+    let keys = vectors("keys.json");
+    let alice_key = hex32(&alice(&keys)["public_hex"]);
+    let bob = keys["identities"]
+        .as_array()
+        .expect("identities")
+        .iter()
+        .find(|identity| identity["name"] == "bob")
+        .cloned()
+        .expect("bob");
+    // bob a contact, while the wallet can still admit him.
+    let allowed = app_batch(
+        &replay,
+        "wallet",
+        89,
+        vec![OpKind::AllowPut {
+            pubky: hex32(&bob["public_hex"]),
+            kind: AllowKind::Contact,
+        }],
+        at,
+    )
+    .await;
+    assert_eq!(
+        allowed.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&allowed.body)
+    );
+    let peers = format!("/v1/{}/peers", alice_id());
+    let body = serde_json::to_vec(&doc("bob identity.json")).expect("body");
+    let answer = replay
+        .service
+        .handle(other_request("shop", ORIGIN, "PUT", &peers, body, None, at))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let failed = app_batch(
+        &replay,
+        "wallet",
+        90,
+        vec![on_wallet_attempt(ClaimType::Failed, 1, None)],
+        at,
+    )
+    .await;
+    assert_eq!(failed.status, 200);
+    assert_eq!(revoke(&replay, "wallet", at).await.status, 200);
+    let removing = wallet_removed(&replay, at).await;
+    deliver_next(&replay, &removing, at, |body| {
+        body.removed.retain(|removed| removed.app_id != wallet);
+    })
+    .await;
+    assert_eq!(holdings(&replay, &wallet).await, [0, 0, 0, 0]);
+    let public: [u8; 32] = unb64(
+        app(&keys, "wallet")["receive_key"]["public"]
+            .as_str()
+            .expect("public"),
+    )
+    .expect("b64")
+    .try_into()
+    .expect("32");
+    let envelope = seal(&alice_key, &[Recipient::new(public)], &[1; 100], false).expect("seal");
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let version: i64 = sqlx::query_scalar("SELECT apps_version FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("apps_version");
+    let inbox = format!("/v1/{}/inbox?apps_version={version}", alice_id());
+    let answer = replay
+        .service
+        .handle(other_request(
+            "shop", ORIGIN, "POST", &inbox, envelope, None, at,
+        ))
+        .await;
+    let body = json_of(&answer);
+    assert_eq!(
+        (answer.status, body["code"].clone()),
+        (409, json!("stale_key")),
+        "{body}"
+    );
+    assert_eq!(
+        (
+            body["current"]["not_current"].clone(),
+            body["current"]["unknown_kids"].clone()
+        ),
+        (json!([zbase32_encode(&wallet)]), json!([])),
+        "{body}"
+    );
     replay.db.drop_database().await.expect("drop");
 }

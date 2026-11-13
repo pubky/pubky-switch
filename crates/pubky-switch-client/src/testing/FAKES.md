@@ -123,10 +123,12 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `removed`, whose departure's rotation is done and that owns no attempt open or `unknown`,
   is purged at the delivery that leaves it out, at its revocation, and at the batch or
   recovery upload that resolves the last such attempt it owned (and at the test call
-  `fail_attempt` that does). Its record, certificates, receive keys and their kids, cursor,
-  last-seen time, lagging mark, full-bundle request, key bundle parts and listing go; its
-  App ID, revocation or departure time and rotation stay, and `GET /apps` shows it as the
-  service does, with no unread entries.
+  `fail_attempt` that does). Its record, certificates, receive keys, cursor, last-seen
+  time, lagging mark, full-bundle request, key bundle parts and listing go; what stays for
+  good is its App ID, its revocation or departure time and rotation, and its kids (Switch
+  spec 3.6), so no app registers one of them again and an envelope wrapped to one gets
+  `409 stale_key` naming the app in `not_current`, as before the purge. `GET /apps` shows it
+  as the service does, with no unread entries.
 - **Superseded documents** (Switch wire 7.5): unlike the service, which deletes a chain
   item's document and proof once no app may read it in full, the switch keeps every
   document and decides at each read which show (`Readers`). Every answer is the same, since

@@ -923,12 +923,31 @@ pub async fn rows_naming(replay: &Replay, table: &str, column: &str, app: &[u8; 
     count
 }
 
-/// What the service holds of `app` in the tables a purge of a removed app empties (Switch
-/// wire 9.1): its record, receive keys, key bundle parts and listing.
+/// What the service holds of `app` that a purge of a removed app deletes (Switch wire 9.1):
+/// its record, receive key records, key bundle parts and listing. Its kids stay
+/// ([`rows_naming`] on `receive_keys`).
 pub async fn holdings(replay: &Replay, app: &[u8; 16]) -> [i64; 4] {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let records: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM receive_keys WHERE account_id = $1 AND app_id = $2 \
+         AND record IS NOT NULL",
+    )
+    .bind(
+        alice(&vectors("keys.json"))["pubky_id"]
+            .as_str()
+            .expect("id"),
+    )
+    .bind(app.as_slice())
+    .fetch_one(&mut conn)
+    .await
+    .expect("count");
+    conn.close().await.expect("close");
     [
         rows_naming(replay, "apps", "app_id", app).await,
-        rows_naming(replay, "receive_keys", "app_id", app).await,
+        records,
         rows_naming(replay, "key_bundle_parts", "target_app_id", app).await,
         rows_naming(replay, "app_listings", "app_id", app).await,
     ]

@@ -244,14 +244,16 @@ impl AccountTxn {
     /// or `unknown` (Switch wire 9.1 "Departure, revoked app"): its app record, renewed
     /// certificate, cursor, last-seen time and lagging mark (its `apps` row), its receive
     /// key records, its key bundle parts and its listing go. Its `kept_app_ids` row stays
-    /// for good, so it is never current again. Everything other rules depend on stays: the
-    /// claims and attempts it wrote, the shared records it wrote with their `writer` and
-    /// certificate, the list entries it wrote, the inbox entries naming it as a target,
-    /// whose release judges current apps only, and the chain items, its key bundle parts'
-    /// included; the documents of its `app.put` and `cert.put` items and of its deleted
-    /// parts' `key_bundle.put` items go before the commit, as no app may read them in full
-    /// any more (Switch wire 7.5). Returns the App IDs purged; one that holds nothing any
-    /// more is passed by.
+    /// for good, so it is never current again, and so do its kids, each with its App ID and
+    /// no record, so none is registered again (Switch spec 3.6) and an envelope wrapped to
+    /// one is told the app isn't current (wire 7.6 `not_current`). Everything other rules
+    /// depend on stays: the claims and attempts it wrote, the shared records it wrote with
+    /// their `writer` and certificate, the list entries it wrote, the inbox entries naming
+    /// it as a target, whose release judges current apps only, and the chain items, its key
+    /// bundle parts' included; the documents of its `app.put` and `cert.put` items and of
+    /// its deleted parts' `key_bundle.put` items go before the commit, as no app may read
+    /// them in full any more (wire 7.5). Returns the App IDs purged; one that holds nothing
+    /// any more is passed by.
     pub async fn purge_apps(&mut self, apps: &[[u8; 16]]) -> Result<Vec<[u8; 16]>, StoreError> {
         let id = self.head().id.clone();
         let apps: Vec<Vec<u8>> = apps.iter().map(|app| app.to_vec()).collect();
@@ -263,7 +265,8 @@ impl AccountTxn {
                  EXISTS (SELECT 1 FROM apps a \
                          WHERE a.account_id = $1 AND a.app_id = k.app_id) \
                  OR EXISTS (SELECT 1 FROM receive_keys r \
-                            WHERE r.account_id = $1 AND r.app_id = k.app_id) \
+                            WHERE r.account_id = $1 AND r.app_id = k.app_id \
+                            AND r.record IS NOT NULL) \
                  OR EXISTS (SELECT 1 FROM key_bundle_parts p \
                             WHERE p.account_id = $1 AND p.target_app_id = k.app_id) \
                  OR EXISTS (SELECT 1 FROM app_listings l \
@@ -297,9 +300,12 @@ impl AccountTxn {
         if gone.is_empty() {
             return Ok(Vec::new());
         }
+        // Its kids stay, each row with its record cleared: the rows are the account's kid
+        // index, which keeps a kid from being registered twice and names the app an
+        // envelope wrapped to it (Switch spec 3.6).
         for statement in [
             "DELETE FROM apps WHERE account_id = $1 AND app_id = ANY($2)",
-            "DELETE FROM receive_keys WHERE account_id = $1 AND app_id = ANY($2)",
+            "UPDATE receive_keys SET record = NULL WHERE account_id = $1 AND app_id = ANY($2)",
             "DELETE FROM app_listings WHERE account_id = $1 AND app_id = ANY($2)",
         ] {
             sqlx::query(statement)

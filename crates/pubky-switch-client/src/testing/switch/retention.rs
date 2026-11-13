@@ -185,9 +185,11 @@ impl Inner {
     }
 
     /// What the switch holds of `app` goes, down to its App ID, its revocation or departure
-    /// time and its rotation (Switch wire 9.1): its record and certificates, receive keys,
-    /// cursor, last-seen time, lagging mark, full-bundle request, key bundle parts and
-    /// listing. Its claims, records and the entries naming it stay.
+    /// time and rotation, and its kids (Switch wire 9.1, spec 3.6): its record and
+    /// certificates, receive keys, cursor, last-seen time, lagging mark, full-bundle
+    /// request, key bundle parts and listing. Its claims, records and the entries naming it
+    /// stay, and so do its kids, so none is registered again and an envelope wrapped to one
+    /// is told the app isn't current.
     fn purge_app(&mut self, app: &[u8; 16]) {
         if let Some(held) = self.apps.get_mut(app) {
             held.record = None;
@@ -205,7 +207,6 @@ impl Inner {
         }
         self.bundles.remove(app);
         self.listed_at_epoch.remove(app);
-        self.kids.retain(|_, holder| holder != app);
     }
 
     /// After the chain item of a delivery, a revocation or a leave, `was` holding the apps

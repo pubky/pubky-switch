@@ -6,7 +6,7 @@
 //! `identity.json` delivery that leaves it in neither list, the revocation of an app the
 //! newest document lists in neither, or the batch or recovery upload that resolves the last
 //! attempt it owned. Its App ID, with its revocation or departure time and its rotation,
-//! stays for good ([`AccountTxn::purge_apps`]).
+//! stays for good, and so do its kids (Switch spec 3.6) ([`AccountTxn::purge_apps`]).
 
 use std::collections::BTreeSet;
 
