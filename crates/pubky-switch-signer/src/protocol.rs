@@ -324,6 +324,23 @@ impl Protocols {
         self.owner(scope).is_some_and(|o| o.has_keys)
     }
 
+    /// The registered protocols that own some of `scopes`, each once, in the order they were
+    /// registered.
+    pub fn protocols_of(&self, scopes: &[String]) -> Vec<&str> {
+        let mut owners: Vec<usize> = scopes
+            .iter()
+            .filter_map(|scope| self.owner(scope))
+            .map(|owner| owner.protocol)
+            .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        owners
+            .into_iter()
+            .filter_map(|protocol| self.protocols.get(protocol))
+            .map(|protocol| protocol.name())
+            .collect()
+    }
+
     /// The scopes of `scopes` that no registered protocol owns, in their order. A certificate
     /// holding one blocks every step that needs its app's keys, and a hand-over or a backup
     /// whose certificates hold one is refused.
@@ -1041,6 +1058,18 @@ mod roots {
         fn permissions(&self, _: &[&str]) -> Vec<Permission> {
             Vec::new()
         }
+    }
+
+    #[test]
+    fn test_protocols_of_scopes_in_registration_order() {
+        let protocols = Protocols::new(vec![
+            Arc::new(Claims("chat", "chat")),
+            Arc::new(Claims("notes", "notes")),
+        ])
+        .unwrap();
+        let scopes = ["notes", "chat:team", "notes", "other"].map(String::from);
+        assert_eq!(protocols.protocols_of(&scopes), ["chat", "notes"]);
+        assert!(protocols.protocols_of(&["other".into()]).is_empty());
     }
 
     #[test]

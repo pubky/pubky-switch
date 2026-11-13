@@ -51,6 +51,7 @@ use crate::protocol::Protocols;
 use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 
 mod approval;
+mod apps;
 mod clients;
 mod erasure;
 pub(crate) mod gate;
@@ -67,6 +68,7 @@ mod vector_cases;
 mod vector_protocol;
 
 pub use approval::{AppReview, ApprovedRequest};
+pub use apps::{AppStanding, AppSummary};
 use clients::{RequestClient, SigningClient, Target};
 pub use handover::AbortOutcome;
 pub use renewal::{CertChange, RunDue};
