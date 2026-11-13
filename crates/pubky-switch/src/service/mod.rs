@@ -1339,17 +1339,21 @@ impl Service {
         // with the outgoing key on its path (`recover_in_place`). Every check of the delivery
         // still runs; a delivery that is refused all the same is answered as any other
         // request in this state.
-        let behind_mark = || Refused {
-            error: ApiError::unavailable(
-                "7.3: the state is behind its service key's mark; a new generation is needed",
-            ),
+        let mut lost = false;
+        let behind_mark = |lost: bool| Refused {
+            error: ApiError::unavailable(if lost {
+                "7.3: the service key's mark is lost; a new generation is needed"
+            } else {
+                "7.3: the state is behind its service key's mark; a new generation is needed"
+            }),
             serving: false,
             head: false,
         };
         let mut behind = false;
         if serving && *call != Call::Erase {
             match txn.mark_check(self.keys.as_ref()).await {
-                Ok(MarkCheck::Behind | MarkCheck::Fork | MarkCheck::Lost) => {
+                Ok(check @ (MarkCheck::Behind | MarkCheck::Fork | MarkCheck::Lost)) => {
+                    lost = check == MarkCheck::Lost;
                     // The signer's own delivery only: an own app or another identity's has
                     // no app or certificate of its own here.
                     let by_signer = verified.is_none() && other.is_none();
@@ -1357,7 +1361,7 @@ impl Service {
                         && by_signer
                         && self.delivers_a_recovery(txn, request, held.as_ref()).await)
                     {
-                        return Err(behind_mark());
+                        return Err(behind_mark(lost));
                     }
                     behind = true;
                 }
@@ -1836,7 +1840,7 @@ impl Service {
             .await
             .map_err(|error| {
                 if behind {
-                    behind_mark()
+                    behind_mark(lost)
                 } else {
                     Refused::with_head(error, serving)
                 }

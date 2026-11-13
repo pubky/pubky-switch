@@ -24,7 +24,7 @@ use crate::{
         SwitchRequest, SwitchResponse,
         error::{ApiError, ErrorCode},
     },
-    keys::{KeyId, KeyStore, ServiceKey},
+    keys::{KeyId, KeyStore, KeyStoreError, ServiceKey},
     limits::{Limits, fixed},
     store::{NewAccount, StoreError},
 };
@@ -276,6 +276,20 @@ impl Service {
             .ok_or_else(unavailable)?;
         let time_ms = txn.stamp(base_ms);
         let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
+        // A pending key whose mark is lost or doesn't read, or that is gone, may have served
+        // a generation the service lost: it is retired before any answer could name it, so
+        // a retry of an enrollment it answered is told to enroll anew, and a new one gets a
+        // fresh pending key, with its mark (Switch spec 6.5).
+        if let Some(pending) = txn.pending_key().await.map_err(|e| store_error(&e))?
+            && matches!(
+                self.keys.mark(&pending).await,
+                Err(KeyStoreError::MarkLost | KeyStoreError::Corrupt(_) | KeyStoreError::NotFound)
+            )
+        {
+            txn.retire_pending_key(time_ms, self.limits.max_enrollments)
+                .await
+                .map_err(|e| store_error(&e))?;
+        }
         // The same enrollment again gets the same answer, whatever the account did since
         // (Switch wire 3.7): the key it named, recognized by the enrollment's hash. An answer
         // drops only while a rebuild would give it byte for byte: one naming the pending key,

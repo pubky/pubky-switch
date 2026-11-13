@@ -3490,3 +3490,110 @@ async fn test_upload_reopened_tombstone_shows_its_earlier_entries_as_stubs() {
     }
     replay.db.drop_database().await.expect("drop");
 }
+
+/// The ID of the account's pending key.
+async fn pending_key_id(replay: &Replay) -> KeyId {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let key: String = sqlx::query_scalar("SELECT pending_key FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("pending key");
+    conn.close().await.expect("close");
+    KeyId::parse(&key).expect("key id")
+}
+
+#[tokio::test]
+async fn test_recovery_pending_key_whose_mark_is_lost_is_retired() {
+    // A pending key that lost its mark may have served a generation the service lost: the
+    // next enrollment retires it, owed deleting, so the enrollment it answered is told to
+    // enroll anew, and a new enrollment gets a fresh key (Switch spec 6.5, wire 3.7).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let pending_id = pending_key_id(&replay).await;
+    std::fs::remove_file(replay.key_dir().join("marks").join(pending_id.as_str()))
+        .expect("lose the mark");
+    replay.service = replay.restarted();
+    let again = enroll(&replay, enrollment(3, Some(vec![HELD_REVOKED])), at).await;
+    assert_eq!(code(&again), (409, "conflict".into()));
+    assert_eq!(
+        scalar_i64(
+            &replay,
+            "SELECT count(*) FROM erased_keys WHERE account_id = $1 AND reason = 'retired'"
+        )
+        .await,
+        1,
+        "owed deleting"
+    );
+    let fresh = enroll(&replay, enrollment(5, Some(vec![HELD_REVOKED])), at).await;
+    assert_eq!(fresh.status, 200);
+    assert_ne!(answered_key(&fresh), pending);
+    assert_ne!(pending_key_id(&replay).await, pending_id);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_in_place_gets_past_a_lost_marks_directory() {
+    // The key store lost its whole `marks` directory: the account's key and the pending key
+    // an enrollment answered before the loss both lost their marks. The signer's way out at
+    // this service is still the recovery: it enrolls, and the identity.json naming the key
+    // that enrollment answers starts the next generation (Switch spec 6.5, wire 7.3 step 10).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let (_pending, at) = serving_with_a_pending_key(&replay).await;
+    let old_key = service_key_id(&replay).await;
+    let pending_id = pending_key_id(&replay).await;
+    let before = held(&replay).await;
+    for id in [&old_key, &pending_id] {
+        std::fs::remove_file(replay.key_dir().join("marks").join(id.as_str()))
+            .expect("lose the mark");
+    }
+    replay.service = replay.restarted();
+    let enrolled = enroll(&replay, enrollment(4, Some(vec![HELD_REVOKED])), at).await;
+    assert_eq!(enrolled.status, 200);
+    let key = answered_key(&enrolled);
+    let recovery = next_generation(&before, key, Some(1));
+    let (answer, signature) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(signed_by(&answer, &key, &signature));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_in_place_gets_past_a_corrupt_mark() {
+    // A mark file that doesn't decode tells no more than a missing one: the account fails
+    // stop, and the recovery naming the pending key is its way out (Switch spec 6.5).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let old_key = service_key_id(&replay).await;
+    let before = held(&replay).await;
+    std::fs::write(replay.key_dir().join("marks").join(old_key.as_str()), b"{")
+        .expect("corrupt the mark");
+    replay.service = replay.restarted();
+    let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
+    assert_eq!(
+        code(&replay.service.handle(request).await),
+        (503, "unavailable".into())
+    );
+    let recovery = next_generation(&before, pending, Some(1));
+    let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    replay.db.drop_database().await.expect("drop");
+}

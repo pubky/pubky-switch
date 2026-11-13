@@ -426,7 +426,7 @@ impl Store {
     /// ledger entry is read: `None`, changing nothing, when one exists for the identity
     /// already.
     pub async fn begin_create(&self, account: &NewAccount) -> Result<Option<Creation>, StoreError> {
-        account::begin_create(&self.pool, account).await
+        account::begin_create(&self.pool, account, self.lock_timeout_ms).await
     }
 
     /// For tests: create an account with no erasure ledger to read; `false`, changing

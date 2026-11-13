@@ -1835,3 +1835,74 @@ async fn test_store_forget_compares_whole_positions() {
     conn.close().await.expect("close");
     fx.finish().await;
 }
+
+#[tokio::test]
+async fn test_store_creation_waiting_on_an_erasure_never_commits_before_it() {
+    // An account inserted while an erasure of the same ID is still committing waits for the
+    // deletion, then is created after that erasure, which the database still owes keys for;
+    // with a database that gives new sessions another isolation level, it is created after
+    // it or not at all (Switch spec 6.5).
+    for level in ["read committed", "repeatable read", "serializable"] {
+        let Some(fx) = fixture().await else { return };
+        let old = fx.account(ID_A).await;
+        let mut admin = fx.db.admin().await.expect("admin");
+        admin
+            .execute(
+                format!(
+                    "ALTER DATABASE {} SET default_transaction_isolation = '{level}'",
+                    fx.db.name()
+                )
+                .as_str(),
+            )
+            .await
+            .expect("default isolation");
+        admin.close().await.expect("close");
+        let store = Store::connect_with(fx.db.options().clone(), &DatabaseConfig::default())
+            .await
+            .expect("store");
+        let erased_at = T0 + 60_000;
+        let mut erasing = PgConnection::connect_with(fx.db.options())
+            .await
+            .expect("conn");
+        erasing.execute("BEGIN").await.expect("begin");
+        sqlx::query("DELETE FROM accounts WHERE id = $1")
+            .bind(ID_A)
+            .execute(&mut erasing)
+            .await
+            .expect("delete");
+        sqlx::query(
+            "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, $3)",
+        )
+        .bind(old.service_key.as_str())
+        .bind(ID_A)
+        .bind(i64::try_from(erased_at).expect("time"))
+        .execute(&mut erasing)
+        .await
+        .expect("owed");
+        let key = fx.keys.generate().await.expect("service key");
+        let account = NewAccount {
+            service_key: key.id,
+            created_at_ms: T0 + 1_000,
+            ..old.clone()
+        };
+        let (created, ()) = tokio::join!(
+            async {
+                match store.begin_create(&account).await {
+                    Ok(Some(creation)) => creation.commit(None).await.ok(),
+                    _ => None,
+                }
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                erasing.execute("COMMIT").await.expect("commit");
+            }
+        );
+        match created {
+            Some(created) => assert!(created > erased_at, "{level}: created at {created}"),
+            None => assert_ne!(level, "read committed", "created"),
+        }
+        erasing.close().await.expect("close");
+        store.close().await;
+        fx.finish().await;
+    }
+}

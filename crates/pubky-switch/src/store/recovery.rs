@@ -180,6 +180,73 @@ impl AccountTxn {
         Ok(())
     }
 
+    /// Retire the account's pending key, whose mark is lost or doesn't read (Switch spec 6.5):
+    /// it may have served a generation the service lost, so it never signs again. Its
+    /// deletion is owed, the enrollments answered with it are retired, so a retry of one is
+    /// told to enroll anew (Switch wire 3.7), and the `revoked_apps` held with it count for
+    /// nothing; the next enrollment that asks for a pending key gets a fresh one. Nothing
+    /// without a pending key.
+    pub async fn retire_pending_key(
+        &mut self,
+        at_ms: u64,
+        max_enrollments: u64,
+    ) -> Result<(), StoreError> {
+        let Some(key) = self.pending_key().await? else {
+            return Ok(());
+        };
+        let id = self.head().id.clone();
+        let generation = self.head().generation;
+        sqlx::query(
+            "INSERT INTO retired_enrollments (account_id, enrollment_hash, generation) \
+             SELECT account_id, enrollment_hash, $3 FROM enrollment_answers \
+             WHERE account_id = $1 AND service_key = $2 ORDER BY kept_order \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&id)
+        .bind(key.as_str())
+        .bind(to_db(generation, "generation")?)
+        .execute(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        sqlx::query(
+            "DELETE FROM retired_enrollments WHERE account_id = $1 AND enrollment_hash IN ( \
+             SELECT enrollment_hash FROM retired_enrollments WHERE account_id = $1 \
+             ORDER BY retired_order DESC OFFSET $2)",
+        )
+        .bind(&id)
+        .bind(to_db(max_enrollments, "max_enrollments")?)
+        .execute(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        for statement in [
+            "DELETE FROM enrollment_answers WHERE account_id = $1 AND service_key = $2",
+            "UPDATE accounts SET pending_key = NULL WHERE id = $1 AND pending_key = $2",
+        ] {
+            sqlx::query(statement)
+                .bind(&id)
+                .bind(key.as_str())
+                .execute(self.conn())
+                .await
+                .map_err(StoreError::from_db)?;
+        }
+        sqlx::query("DELETE FROM pending_revoked_apps WHERE account_id = $1")
+            .bind(&id)
+            .execute(self.conn())
+            .await
+            .map_err(StoreError::from_db)?;
+        sqlx::query(
+            "INSERT INTO erased_keys (key_id, account_id, erased_at_ms, reason) \
+             VALUES ($1, $2, $3, 'retired') ON CONFLICT (key_id) DO NOTHING",
+        )
+        .bind(key.as_str())
+        .bind(&id)
+        .bind(time_to_db(at_ms)?)
+        .execute(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        Ok(())
+    }
+
     /// The generation of the key the account answered the enrollment with document hash
     /// `hash` with, if a generation change has retired that key since (Switch wire 3.7).
     pub async fn retired_enrollment(&mut self, hash: &[u8; 32]) -> Result<Option<u64>, StoreError> {
