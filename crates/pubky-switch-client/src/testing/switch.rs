@@ -10,7 +10,7 @@ use std::task::{Context, Poll, Waker};
 
 use ed25519_dalek::SigningKey;
 use pubky_switch_core::chain::{
-    ChainTip, ItemType, ProofBody, ProofState, ServiceTransition, SignedHead, Stub,
+    ChainEnvelope, ChainTip, ItemType, ProofBody, ProofState, ServiceTransition, SignedHead, Stub,
     TransitionProof, ZERO_HASH, item_hash,
 };
 use pubky_switch_core::enc::{app_id_decode, b64, pubky_id, unb64_array, zbase32_encode};
@@ -174,6 +174,35 @@ pub struct SwitchApp {
 /// 9.2 `max_page_bytes`).
 pub const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
+/// How the scripted switch keeps its chain, by the service's rule (Switch wire 7.4.4, 9.1,
+/// 9.2): it signs a checkpoint once `checkpoint_behind` chain items may go, and drops the
+/// stubs behind it that every current app's cursor has passed or that are `cursor_hold_ms`
+/// old, oldest first, never inside a batch, at most `per_request` of them at one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retention {
+    /// Chain items that may go before a checkpoint is signed (`checkpoint_behind`).
+    pub checkpoint_behind: u64,
+    /// How long an app's cursor holds a stub back (`cursor_hold_ms`).
+    pub cursor_hold_ms: u64,
+    /// Sign each checkpoint at the newest chain item (`checkpoint_at_head`).
+    pub at_head: bool,
+    /// The most stubs looked at and dropped at one request (`retention_per_request`).
+    pub per_request: usize,
+}
+
+impl Default for Retention {
+    /// The service's defaults: 1,000 items, 30 days, at the newest item that may go, 1,000 a
+    /// request.
+    fn default() -> Self {
+        Self {
+            checkpoint_behind: 1_000,
+            cursor_hold_ms: 30 * 24 * 60 * 60 * 1000,
+            at_head: false,
+            per_request: 1_000,
+        }
+    }
+}
+
 /// A fault the switch applies to the next request whose path contains `path`.
 #[derive(Clone, Debug)]
 pub enum Fault {
@@ -266,6 +295,9 @@ pub(crate) struct Inner {
     pub(crate) checkpoint: Option<SignedHead>,
     /// Stubs at or below this `seq` are gone (dropped behind a checkpoint).
     pub(crate) dropped_through: u64,
+    /// How the chain is kept, as the service keeps it; `None` keeps every stub, with only
+    /// the checkpoints a test scripts (Switch wire 7.4.4, 9.1).
+    pub(crate) retention: Option<Retention>,
     pub(crate) faults: VecDeque<Fault>,
     /// Every operation applied, in order, for counting effects.
     pub(crate) applied: Vec<SignedOp>,
@@ -403,6 +435,7 @@ impl Inner {
             batches: HashMap::new(),
             checkpoint: None,
             dropped_through: 0,
+            retention: Some(Retention::default()),
             faults: VecDeque::new(),
             applied: Vec::new(),
             frozen: None,
@@ -1114,6 +1147,19 @@ impl ScriptedSwitch {
         Some(inner.respond_with(&operator, request, status, &body))
     }
 
+    /// Keep the chain by `retention`, or, with `None`, keep every stub and sign no checkpoint
+    /// but those a test scripts. By the service's defaults until set.
+    pub fn set_retention(&self, retention: Option<Retention>) {
+        self.lock().retention = retention;
+    }
+
+    /// The latest checkpoint the switch signed, if any, and the `seq` it dropped stubs
+    /// through (Switch wire 7.4.4).
+    pub fn retained(&self) -> (Option<SignedHead>, u64) {
+        let inner = self.lock();
+        (inner.checkpoint, inner.dropped_through)
+    }
+
     /// Apply `fault` to the next request it matches; faults apply in the order added.
     pub fn fail_next(&self, fault: Fault) {
         self.lock().faults.push_back(fault);
@@ -1281,6 +1327,9 @@ impl ScriptedSwitch {
             }
             return Ok(inner.respond(request, status, &body));
         }
+        // The account's sweep, at each request of its own apps and its signer, before the
+        // request is handled, as the service sweeps at step 4 (Switch wire 7.3, 9.1).
+        inner.sweep_chain();
         let answer = match inner.route_shared(request, caller, &rest) {
             Some(answer) => Ok(answer),
             None => inner.route(request, caller, &rest),
@@ -1769,6 +1818,108 @@ impl Inner {
 
     fn now(&self) -> u64 {
         self.clock.now_ms()
+    }
+
+    /// The retention sweep (Switch wire 7.4.4, 9.1): a checkpoint signed once enough chain
+    /// items may go, and the stubs behind it dropped, oldest first. A stub may go once it is
+    /// `cursor_hold_ms` old, or every current app (`current_app_ids`) has moved its cursor
+    /// past it; an app that hasn't moved its cursor yet holds the stubs from its
+    /// registration, here from the time the switch took its first record. It never cuts
+    /// inside a batch. Nothing goes while the account is frozen, staged or erased.
+    fn sweep_chain(&mut self) {
+        let Some(retention) = self.retention else {
+            return;
+        };
+        if self.frozen.is_some() || self.staged || self.erased || self.enrolled.is_none() {
+            return;
+        }
+        if self.doc.is_none() {
+            return;
+        }
+        let now = self.now();
+        // The current apps, as the inbox's retention counts them (`current_app_ids`).
+        let holders: Vec<(u64, Option<u64>)> = self
+            .current_app_ids()
+            .iter()
+            .filter_map(|app| self.apps.get(app))
+            .map(|app| (app.cursor, app.record_at))
+            .collect();
+        let holds = |seq: u64, at: u64| {
+            at.saturating_add(retention.cursor_hold_ms) > now
+                && holders.iter().any(|(cursor, joined)| {
+                    *cursor < seq && (*cursor > 0 || joined.is_some_and(|joined| at >= joined))
+                })
+        };
+        // The newest chain item that may go and ends a batch, or is of none.
+        let mut cut: Option<ChainTip> = None;
+        let mut may_go = 0;
+        let mut since_cut = 0;
+        let mut left_in_batch = 0;
+        let mut looked = 0;
+        for item in &self.items {
+            let Item::Chain { seq, stub, .. } = item else {
+                continue;
+            };
+            if *seq <= self.dropped_through {
+                continue;
+            }
+            looked += 1;
+            if looked > retention.per_request {
+                break;
+            }
+            let Ok(envelope) = ChainEnvelope::parse(&stub.envelope) else {
+                break;
+            };
+            if holds(*seq, envelope.server_time) {
+                break;
+            }
+            since_cut += 1;
+            let ends = match envelope.batch {
+                Some(batch) => {
+                    if left_in_batch == 0 {
+                        left_in_batch = batch.count;
+                    }
+                    left_in_batch = left_in_batch.saturating_sub(1);
+                    left_in_batch == 0
+                }
+                None => true,
+            };
+            if ends {
+                may_go += since_cut;
+                since_cut = 0;
+                cut = Some(ChainTip {
+                    generation: envelope.generation,
+                    seq: *seq,
+                    chain_hash: stub.chain_hash,
+                });
+            }
+        }
+        let checkpointed = self.checkpoint.as_ref().map_or(0, |c| c.seq);
+        if retention.at_head {
+            let added = self
+                .items
+                .iter()
+                .filter(|item| matches!(item, Item::Chain { seq, .. } if *seq > checkpointed))
+                .count();
+            if u64::try_from(added).unwrap_or(u64::MAX) >= retention.checkpoint_behind {
+                self.checkpoint = Some(SignedHead::sign(
+                    &self.service,
+                    &self.identity.public(),
+                    &self.tip,
+                ));
+            }
+        } else if let Some(cut) = cut.filter(|_| may_go >= retention.checkpoint_behind) {
+            self.checkpoint = Some(SignedHead::sign(
+                &self.service,
+                &self.identity.public(),
+                &cut,
+            ));
+        }
+        // Behind the latest checkpoint, what the rule lets go.
+        let through = cut
+            .map_or(0, |c| c.seq)
+            .min(self.checkpoint.as_ref().map_or(0, |c| c.seq));
+        self.dropped_through = self.dropped_through.max(through);
     }
 
     /// `app` departed: it stops being reachable (Switch wire 7.4.10).
