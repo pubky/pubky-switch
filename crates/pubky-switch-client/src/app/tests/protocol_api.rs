@@ -67,6 +67,8 @@ struct Seen {
     context: Option<Value>,
     /// What the context knew of the sender's standing in the lists.
     disposition: Option<SenderDisposition>,
+    /// The condition the context named on `inbox`, in the record modes.
+    condition: Option<Condition>,
 }
 
 /// [`ItemsProtocol`], with a receive step that uses the [`ReceiveContext`].
@@ -149,6 +151,7 @@ impl Protocol for ApiProtocol {
             writes: Vec::new(),
             context: message.context.clone(),
             disposition: cx.sender_disposition(&message.sender).ok(),
+            condition: None,
         };
         {
             let mut reject = self.reject.lock().unwrap();
@@ -165,6 +168,8 @@ impl Protocol for ApiProtocol {
             Mode::Record | Mode::RecordTwice | Mode::DropAfterWrite => {
                 let held = cx.record(&inbox()).unwrap();
                 seen.held = held.as_ref().map(|r| r.version);
+                let key = cx.record_key(&inbox()).unwrap();
+                seen.condition = Some(cx.record_condition(&key).unwrap());
                 let mut all = ids(held.as_ref().and_then(|r| r.content.value()));
                 if !all.contains(&msg_id) {
                     // A record that reflects the message already needs no write (Switch
@@ -325,6 +330,38 @@ async fn test_receive_context_writes_the_record_with_the_cursor_move() {
     assert!(app.protocol_get(local.as_bytes()).await.unwrap().is_some());
     // The message seen again writes nothing more.
     assert!(protocol.seen()[0].held.is_none());
+}
+
+#[tokio::test]
+async fn test_receive_context_condition_names_zero_for_a_held_delete() {
+    // The receive step's condition on a record: `{0, 0}` for one the app holds nothing of
+    // and for one it holds as deleted, which `{0, 0}` matches as it matches a forgotten key
+    // (Switch wire 6.3, spec 10.3); the held version for a live one.
+    let w = World::new();
+    let protocol = ApiProtocol::new(Mode::Record);
+    let mut app = join(&w, &protocol, "wallet").await;
+    let key = app.record_key(&inbox()).unwrap();
+    let zero = Condition::RecordVersion {
+        key,
+        version: RecordVersion::NONE,
+    };
+    w.note(app.app_id(), "one");
+    app.receive(None).await.unwrap();
+    let live = app.shared_record(&key).await.unwrap().unwrap().version;
+    w.note(app.app_id(), "two");
+    app.receive(None).await.unwrap();
+    app.delete_record(&inbox(), vec![]).await.unwrap();
+    w.note(app.app_id(), "three");
+    app.receive(None).await.unwrap();
+    let seen = protocol.seen();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert_eq!(seen[0].condition, Some(zero), "absent");
+    assert_eq!(
+        seen[1].condition,
+        Some(Condition::RecordVersion { key, version: live }),
+        "live"
+    );
+    assert_eq!(seen[2].condition, Some(zero), "held as deleted");
 }
 
 #[tokio::test]
