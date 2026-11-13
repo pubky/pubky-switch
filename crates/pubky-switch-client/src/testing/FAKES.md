@@ -203,7 +203,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `parse_query`; Switch wire 7.1): names and values percent-decoded, and a bad escape or a
   parameter given twice `400` before the endpoint's checks, at `GET /feed` (after the
   signer's refusal, as at the service), `POST /inbox` (before the retry by content) and
-  `GET /records`, and at the peer switch's `POST /inbox`. The feed's `limit` (1 to 500) and
+  `GET /records`, and at the peer switch's `POST /inbox`. The feed's `limit` (0 to 500; 0 shows no item, covers no position, ends no lagging mark, and refuses `wait`) and
   `wait` (at most 25) and the inbox's `apps_version` are digits only. A feed page scans
   every item to the end unless a test bounds the items or batches it scans
   (`max_page_scan`), which gives pages of items the reader isn't shown, with `more`.
