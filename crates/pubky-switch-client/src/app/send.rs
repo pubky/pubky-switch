@@ -1598,6 +1598,9 @@ impl App {
 
     /// The conversation entry for `pubky`, unless the app knows it holds one, or a contact
     /// (Switch spec 7). An app whose certificate lacks `conversation.add` can't write one.
+    /// One a batch kept from an earlier call carries isn't written again: the call fails
+    /// with [`Refusal::NotNow`] until that batch is answered, so the item is tried again,
+    /// and no copy of the entry is kept behind another.
     async fn conversation_entry(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         let reader = self.reader();
         if reader
@@ -1608,11 +1611,21 @@ impl App {
         {
             return Ok(());
         }
-        self.submit_batch(OpBatch::new().op(OpKind::AllowPut {
+        let entry = OpKind::AllowPut {
             pubky: *pubky,
             kind: AllowKind::Conversation,
-        }))
-        .await?;
+        };
+        for (_, pending) in self.kept_batches().await? {
+            let kept = crate::client::Batch::from_body(pending.body)?;
+            if kept.ops().iter().any(|op| op.body().kind == entry) {
+                return Err(Refusal::NotNow(
+                    "the conversation entry is kept, to be sent after the batches ahead of it"
+                        .into(),
+                )
+                .into());
+            }
+        }
+        self.submit_batch(OpBatch::new().op(entry)).await?;
         Ok(())
     }
 

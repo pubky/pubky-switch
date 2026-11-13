@@ -1858,3 +1858,54 @@ async fn test_write_during_a_freeze_called_off_goes_after_the_kept_batch() {
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert_eq!(conversations(&s.w)[before..], [[10; 32], [11; 32]]);
 }
+
+#[tokio::test]
+async fn test_outbox_keeps_one_conversation_entry_behind_kept_batches() {
+    // Two batches kept while the account is frozen. A message to a new peer keeps its
+    // conversation entry behind them; flushing the outbox again keeps no second copy, and
+    // once the freeze is called off every batch goes, the entry once.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let freeze = s.freeze();
+    for n in 10..12u8 {
+        s.w.clock.advance_ms(1_000);
+        app.submit_batch(conversation([n; 32])).await.unwrap_err();
+    }
+    let peer = identity("carol").public();
+    let mut body = Map::new();
+    body.insert("text".into(), json!("hello"));
+    app.queue(OutgoingMessage::new(peer, "sample.note", body))
+        .await
+        .unwrap();
+    let entry = OpKind::AllowPut {
+        pubky: peer,
+        kind: AllowKind::Conversation,
+    };
+    let kept_entries = |kept: &[([u8; 16], crate::app::batch::PendingBatch)]| {
+        kept.iter()
+            .filter(|(_, pending)| {
+                crate::client::Batch::from_body(pending.body.clone())
+                    .unwrap()
+                    .ops()
+                    .iter()
+                    .any(|op| op.body().kind == entry)
+            })
+            .count()
+    };
+    for _ in 0..3 {
+        s.w.clock.advance_ms(1_000);
+        app.flush_outbox().await.unwrap();
+    }
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept_entries(&kept), 1, "one copy kept");
+    assert_eq!(kept.len(), 3);
+    s.w.switch.unfreeze(&freeze).unwrap();
+    for _ in 0..4 {
+        if !app.receive(None).await.unwrap().more {
+            break;
+        }
+    }
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    let applied = conversations(&s.w);
+    assert_eq!(applied.iter().filter(|pubky| **pubky == peer).count(), 1);
+}
