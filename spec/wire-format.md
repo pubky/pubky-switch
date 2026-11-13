@@ -1872,7 +1872,7 @@ For every request the service:
 - **`missed` items:** when the service deletes an entry a lagging target hasn't read, it records the miss in a `missed` item for that app, which takes a new `seq` like an unreadable entry, so the app's cursor reaches it whatever its position. A later miss replaces an item the app hasn't passed with one covering both. On a `missed` item the app asks the counterparties of its unfinished records to re-send what their inboxes accepted from the later of the item's `accepted_from` and its cursor's time, less the clock tolerance, by its protocol's re-send, and lists its collections again (7.4.9), to check what it holds after the gap; no key it hasn't read past the delete of is forgotten meanwhile (9.1). It owes that listing from the commit that passes the item and makes it before it hands any entry to its protocol, a stored one included, so no entry is judged on records the listing would change. An item whose times don't parse asks for no re-send, but still owes the listing.
 - **Errors:** `403 permission_missing` for callers that aren't own apps; `400` for a malformed `after`.
 
-Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four chain items: the record's create, the attempt batch and a service transition; long values cut short):
+Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's create at `seq` 6 as its stub, since the attempt batch's write at `seq` 8 supersedes it (7.5); the attempt batch's two operations; and a service transition; long values cut short):
 
 ```json
 {
@@ -1890,20 +1890,11 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
       "envelope": "UFNXMQEBAQFDyTFC9V6clYCvyk8-AtxlrRQYynxH..."
     },
     {
-      "type": "chain",
+      "type": "stub",
       "seq": 6,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
         "chain_hash": "jjMkxY3N9g4KTZ5l0nIgjk9pCBnf0fLun1aMA8OWYPw"
-      },
-      "item_type": "op",
-      "item": {
-        "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-        "sig": "wx2FGV4NTwj05WG3e69sBzhWxhOLnqAwQOaljrI6Sf_BDUvzV5nyQje-41lBrWpFioOj307D9IbTZxZJxLQMAw"
-      },
-      "proof": {
-        "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "QppRuhYSAfva26GHAUWg7i9c-Qro0TWufEbFspMU-N9-WMrlJ7KrTAbo6wCmqQnXcYbdt4IKRGhsGtnD5H-eBA"
       }
     },
     {
