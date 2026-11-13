@@ -12,11 +12,11 @@ use pubky_switch_core::{
 
 use super::{
     Answer, Service,
+    erase::to_the_end,
     keyed::Proof,
     rules::{
         AccountState, Caller, EnrollmentKey, decode_claim, enrollment_key, names_this_service,
     },
-    erase::to_the_end,
     store_error,
 };
 use crate::{
@@ -334,7 +334,9 @@ impl Service {
         // kept once it is under way: a commit whose result is lost may have landed.
         to_the_end(async move {
             let committed = txn.commit().await;
-            made.map(MadeKey::keep);
+            if let Some(made) = made {
+                made.keep();
+            }
             committed
         })
         .await

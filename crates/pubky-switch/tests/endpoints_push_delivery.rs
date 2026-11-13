@@ -338,15 +338,7 @@ async fn append_envelope(replay: &Replay, service: &Service, envelope: Vec<u8>) 
         .expect("apps_version");
     conn.close().await.expect("close");
     let path = format!("/v1/{}/inbox?apps_version={version}", alice_id());
-    let request = other_request(
-        "shop",
-        ORIGIN,
-        "POST",
-        &path,
-        envelope,
-        None,
-        ms(&at()),
-    );
+    let request = other_request("shop", ORIGIN, "POST", &path, envelope, None, ms(&at()));
     let answer = service.handle(request).await;
     assert_eq!(
         answer.status,

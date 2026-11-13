@@ -1245,11 +1245,7 @@ async fn pausing() -> Option<(Replay, std::sync::Arc<MakePause>)> {
 
 /// An enrollment from alice, dropped (a signer that hangs up) once `keys` made its key, then
 /// let go on: the key it made.
-async fn enroll_dropped(
-    replay: &Replay,
-    keys: &MakePause,
-    nonce: u8,
-) -> pubky_switch::keys::KeyId {
+async fn enroll_dropped(replay: &Replay, keys: &MakePause, nonce: u8) -> pubky_switch::keys::KeyId {
     let before = keys.made.lock().expect("lock").len();
     keys.armed.store(true, std::sync::atomic::Ordering::SeqCst);
     let request = signer_request("POST", "/v1/enroll", enrollment_body(nonce, ORIGIN), ms(T));
@@ -1289,7 +1285,11 @@ async fn test_enroll_dropped_while_its_key_is_made_leaves_no_key_unnamed() {
             .expect("key");
         conn.close().await.expect("close");
     }
-    assert_eq!(named.as_deref(), Some(made.as_str()), "the account names the key");
+    assert_eq!(
+        named.as_deref(),
+        Some(made.as_str()),
+        "the account names the key"
+    );
     let again = replay
         .service
         .handle(signer_request(
@@ -1300,7 +1300,11 @@ async fn test_enroll_dropped_while_its_key_is_made_leaves_no_key_unnamed() {
         ))
         .await;
     assert_eq!(again.status, 200);
-    assert_eq!(keys.made.lock().expect("lock").len(), 1, "no other key made");
+    assert_eq!(
+        keys.made.lock().expect("lock").len(),
+        1,
+        "no other key made"
+    );
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1329,7 +1333,13 @@ async fn test_enroll_pending_key_of_a_dropped_enrollment_is_deleted() {
         ))
         .await;
     assert_eq!(next.status, 200);
-    let pending = keys.made.lock().expect("lock").last().cloned().expect("made");
+    let pending = keys
+        .made
+        .lock()
+        .expect("lock")
+        .last()
+        .cloned()
+        .expect("made");
     assert_ne!(pending, made);
     assert!(keys.public_key(&pending).await.is_ok());
     replay.db.drop_database().await.expect("drop");

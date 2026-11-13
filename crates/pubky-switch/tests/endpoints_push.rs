@@ -980,7 +980,12 @@ async fn test_push_relay_host_that_never_resolves_is_bad_request() {
         return;
     };
     let began = std::time::Instant::now();
-    let answer = put(&replay, "wallet", &start("https://silent.example/hook", None)).await;
+    let answer = put(
+        &replay,
+        "wallet",
+        &start("https://silent.example/hook", None),
+    )
+    .await;
     let took = began.elapsed();
     assert_eq!(code(&answer), (400, json!("bad_request")));
     assert!(
@@ -1010,7 +1015,10 @@ fn moved_away() -> IdentityDelivery {
     next.version = 4;
     next.inbox.url = "https://other.example".into();
     IdentityDelivery {
-        identity: IdentityDoc::sign(&key, next).expect("sign").signed().clone(),
+        identity: IdentityDoc::sign(&key, next)
+            .expect("sign")
+            .signed()
+            .clone(),
         prev: Some(v3.doc_hash().expect("hash")),
     }
 }
@@ -1026,7 +1034,12 @@ async fn test_push_account_moved_away_is_staged() {
     let path = format!("/v1/{}/identity", alice_id());
     let delivered = replay
         .service
-        .handle(signer_request("PUT", &path, moved_away().to_json(), ms(&at())))
+        .handle(signer_request(
+            "PUT",
+            &path,
+            moved_away().to_json(),
+            ms(&at()),
+        ))
         .await;
     assert_eq!(
         delivered.status,
