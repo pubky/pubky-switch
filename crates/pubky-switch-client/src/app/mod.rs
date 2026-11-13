@@ -97,7 +97,9 @@ pub use unverified::{
     UNVERIFIED_DROPS_PER_COMMIT,
 };
 pub use uploaded::{MAX_RECORD_MARKS, RECORD_REREADS_PER_READ};
-pub use wait::{FeedWait, MAX_WAIT_SECONDS, Woken};
+pub use wait::{
+    FeedWait, MAX_PAUSE_MS, MAX_WAIT_SECONDS, MIN_PAUSE_MS, UPKEEP_READ_MS, WaitPace, Woken,
+};
 
 pub use admission::{INVITE_CODE_BYTES, InviteCode, LISTS_TOO_LARGE_RETRY_MS, SenderDisposition};
 pub use batch::{KEPT_RESENDS_PER_READ, MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};
@@ -612,7 +614,10 @@ pub struct App {
     bundle_asked_ms: Option<u64>,
     /// Where a wait for the feed starts, as the last read left it ([`App::feed_wait`]). In
     /// memory only: a restart waits from the cursor.
-    wait_from: Option<wait::WaitFrom>,
+    next_wait: wait::NextWait,
+    /// The device time the last read that succeeded ended, in memory only: a quiet wait
+    /// past [`UPKEEP_READ_MS`] after it is a read ([`App::feed_wait`]).
+    read_done_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for App {
@@ -843,7 +848,8 @@ impl App {
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
                 bundle_asked_ms: None,
-                wait_from: None,
+                next_wait: wait::NextWait::Cursor,
+                read_done_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
@@ -979,7 +985,8 @@ impl App {
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
                 bundle_asked_ms: None,
-                wait_from: None,
+                next_wait: wait::NextWait::Cursor,
+                read_done_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
@@ -1706,7 +1713,8 @@ impl App {
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
                 bundle_asked_ms: None,
-                wait_from: None,
+                next_wait: wait::NextWait::Cursor,
+                read_done_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };

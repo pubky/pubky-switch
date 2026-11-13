@@ -139,7 +139,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   parameter given twice `400` before the endpoint's checks, at `GET /feed` (after the
   signer's refusal, as at the service), `POST /inbox` (before the retry by content) and
   `GET /records`, and at the peer switch's `POST /inbox`. The feed's `limit` (1 to 500) and
-  `wait` (at most 25) and the inbox's `apps_version` are digits only.
+  `wait` (at most 25) and the inbox's `apps_version` are digits only. A feed page scans
+  every item to the end unless a test bounds the items or batches it scans
+  (`max_page_scan`), which gives pages of items the reader isn't shown, with `more`.
 - **Injected entries**: `send` and `send_envelope` add entries without admission, quotas,
   size buckets or `409 stale_key`; entry IDs are made up from the `seq`.
 - **`POST /inbox`** (Switch wire 7.4.3), in `switch/inbox.rs`, from apps of other

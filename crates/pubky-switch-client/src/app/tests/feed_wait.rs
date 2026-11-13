@@ -9,8 +9,11 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use pubky_switch_core::ops::{AllowKind, OpKind};
-use pubky_switch_core::records::{Freeze, FreezeBody, Inbox};
+use pubky_switch_core::keys::ReceiveKey;
+use pubky_switch_core::ops::{AllowKind, OpKind, Position};
+use pubky_switch_core::records::{
+    Freeze, FreezeBody, Inbox, ReceiveKeyBody, ReceiveKeyRecord, RemovedApp,
+};
 use pubky_switch_core::scopes::Permission;
 use serde_json::{Map, json};
 
@@ -18,8 +21,9 @@ use super::held_reads::Recording;
 use super::shared_flows::{ItemsProtocol, items, value};
 use super::*;
 use crate::app::{
-    AppEvent, FeedWait, KEPT_RESENDS_PER_READ, LISTING_PAGES_PER_READ, OpBatch, OutgoingMessage,
-    RecordTarget, Woken,
+    AppError, AppEvent, FeedWait, KEPT_RESENDS_PER_READ, LISTING_PAGES_PER_READ, LeaveMode,
+    LeaveReport, MAX_PAUSE_MS, MAX_WAIT_SECONDS, MIN_PAUSE_MS, OpBatch, OutgoingMessage,
+    RecordTarget, UPKEEP_READ_MS, WaitPace, Woken,
 };
 use crate::error::TransportError;
 use crate::testing::SWITCH_ORIGIN as ORIGIN;
@@ -619,4 +623,542 @@ async fn test_receive_lists_within_its_page_budget_and_goes_on_at_the_next_read(
     assert_eq!(pages() - before, 10, "the listing goes on, not again");
     assert!(!app.listing_owed().await.unwrap());
     assert_eq!(received(&report.events), vec![note]);
+}
+
+// -------------------------------------------------------------------------------------
+// The host's loop
+
+/// What the host's loop of the [`FeedWait`] docs did.
+#[derive(Debug, Default)]
+struct LoopRun {
+    /// The reads and the waits it made, the steps it was given.
+    steps: usize,
+    /// The reads among them.
+    reads: usize,
+    /// The requests the app and its handles sent.
+    requests: usize,
+    /// The pauses [`WaitPace`] gave, in order.
+    pauses: Vec<Duration>,
+    /// The loop came to a wait the switch holds, and waits there.
+    held: bool,
+}
+
+/// The host's loop of the [`FeedWait`] docs, for `steps` reads and waits. Its pauses are
+/// recorded, not slept, and no time passes: every wait that ends took no time, and one the
+/// switch holds ends the run, the loop waiting there.
+async fn host_loop(s: &Setup, app: &mut App, steps: usize) -> LoopRun {
+    let before = s.router.log().len();
+    let mut pace = WaitPace::new();
+    let mut run = LoopRun::default();
+    'reads: while run.steps < steps {
+        run.steps += 1;
+        run.reads += 1;
+        match app.receive(None).await {
+            Ok(report) if report.more => continue,
+            Ok(_) => {}
+            Err(_) => {
+                run.pauses.push(pace.after_failed_read());
+                continue;
+            }
+        }
+        while run.steps < steps {
+            run.steps += 1;
+            let wait = app.feed_wait(MAX_WAIT_SECONDS);
+            let asked = wait.seconds();
+            let Ok(woken) = tokio::time::timeout(Duration::from_millis(200), wait.wait()).await
+            else {
+                run.held = true;
+                break 'reads;
+            };
+            if let Some(pause) = pace.after_wait(woken, asked, Duration::ZERO) {
+                run.pauses.push(pause);
+            }
+            if woken != Woken::Quiet {
+                break;
+            }
+        }
+    }
+    run.requests = s.router.log().len() - before;
+    run
+}
+
+/// Every round of `run` paused, the pauses doubling to [`MAX_PAUSE_MS`]: the loop doesn't
+/// spin, however many rounds it is given.
+fn paced(run: &LoopRun, rounds: usize) {
+    assert!(!run.held, "{run:?}");
+    assert_eq!(run.pauses.len(), rounds, "{run:?}");
+    assert_eq!(run.pauses[0], Duration::from_millis(MIN_PAUSE_MS));
+    assert_eq!(
+        run.pauses.last(),
+        Some(&Duration::from_millis(MAX_PAUSE_MS)),
+        "{run:?}"
+    );
+}
+
+fn waits_for_key(report: &crate::app::ReceiveReport) -> bool {
+    report
+        .events
+        .iter()
+        .any(|e| matches!(e, AppEvent::ListingWaitsForKey))
+}
+
+/// The wallet with no scope key, and a `missed` item it has read past: its listing waits
+/// for the key, and every read says so.
+async fn listing_waiting_for_a_key(s: &Setup, store: &Arc<MemoryStore>) -> App {
+    let mut app = s
+        .join_on("wallet", Arc::clone(store) as Arc<dyn StateStore>)
+        .await;
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    s.note(app.app_id());
+    app.receive(None).await.unwrap();
+    assert!(app.listing_owed().await.unwrap());
+    let report = app.receive(None).await.unwrap();
+    assert!(waits_for_key(&report), "{:?}", report.events);
+    app
+}
+
+#[tokio::test]
+async fn test_feed_wait_loop_waits_on_a_quiet_feed_with_no_pause() {
+    let s = Setup::new(true);
+    let mut app = s.join("wallet").await;
+    let run = host_loop(&s, &mut app, 100).await;
+    assert!(run.held, "{run:?}");
+    assert!(run.pauses.is_empty(), "{run:?}");
+    assert_eq!(run.reads, 1);
+}
+
+#[tokio::test]
+async fn test_feed_wait_loop_on_a_removed_app_pauses_every_round_and_sends_nothing() {
+    let s = Setup::new(true);
+    let mut app = s.join("wallet").await;
+    let me = app.app_id();
+    s.w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.removed.push(RemovedApp {
+            app_id: me,
+            distrust_from: START,
+        });
+    });
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.feed_wait(25).wait().await, Woken::ReadLater);
+    let run = host_loop(&s, &mut app, 40).await;
+    paced(&run, 20);
+    assert_eq!(run.requests, 0, "{:?}", s.router.log());
+}
+
+#[tokio::test]
+async fn test_feed_wait_loop_on_an_app_that_left_pauses_every_round_and_sends_nothing() {
+    let s = Setup::new(true);
+    let mut app = s.join("wallet").await;
+    assert_eq!(
+        app.leave(LeaveMode::TwoStep).await.unwrap(),
+        LeaveReport::AwaitingRemoval
+    );
+    let before = s.router.log().len();
+    assert_eq!(app.feed_wait(25).wait().await, Woken::ReadLater);
+    assert_eq!(s.router.log().len(), before, "no wait is sent");
+    // Every read is refused for good, with no request: each pauses.
+    let run = host_loop(&s, &mut app, 20).await;
+    paced(&run, 20);
+    assert_eq!(run.requests, 0, "{:?}", s.router.log());
+}
+
+#[tokio::test]
+async fn test_feed_wait_loop_awaiting_device_sync_pauses_every_round() {
+    let s = Setup::new(true);
+    let mut app = s.join("wallet").await;
+    app.set_multi_device(true).await.unwrap();
+    let foreign = ReceiveKey::from_secret(1, [44; 32]);
+    let record = ReceiveKeyRecord::sign(
+        &app_keys("wallet"),
+        app.cert(),
+        ReceiveKeyBody::new(app.cert(), &foreign),
+    )
+    .unwrap();
+    s.w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::ReceiveKeyPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    assert!(app.receive(None).await.unwrap().stopped);
+    let cursor = app.cursor();
+    let waits = s.gate.waits().len();
+    let run = host_loop(&s, &mut app, 40).await;
+    paced(&run, 20);
+    // No wait is sent, and each read stops where the last did.
+    assert_eq!(s.gate.waits().len(), waits);
+    assert_eq!(app.cursor(), cursor);
+    assert!(run.requests <= 2 * run.reads, "{run:?}");
+}
+
+#[tokio::test]
+async fn test_feed_wait_loop_with_a_listing_waiting_for_a_key_pauses_after_an_entry() {
+    let s = Setup::new(true);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = listing_waiting_for_a_key(&s, &store).await;
+    assert_eq!(app.feed_wait(25).wait().await, Woken::ReadLater);
+    // A new entry doesn't make the loop read again and again: no wait can show the key.
+    s.note(app.app_id());
+    let waits = s.gate.waits().len();
+    let run = host_loop(&s, &mut app, 40).await;
+    paced(&run, 20);
+    assert_eq!(s.gate.waits().len(), waits);
+    assert!(run.requests <= 2 * run.reads, "{run:?}");
+}
+
+#[tokio::test]
+async fn test_feed_wait_loop_with_a_listing_waiting_for_a_key_pauses_after_a_restart() {
+    let s = Setup::new(true);
+    let store = Arc::new(MemoryStore::new());
+    let app = listing_waiting_for_a_key(&s, &store).await;
+    let id = app.app_id();
+    drop(app);
+    let env =
+        s.w.signer
+            .env_with(store, Arc::clone(&s.router) as Arc<dyn Transport>);
+    let mut app = App::load(env, s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    let waits = s.gate.waits().len();
+    let run = host_loop(&s, &mut app, 40).await;
+    paced(&run, 20);
+    assert_eq!(s.gate.waits().len(), waits);
+    assert!(run.requests <= 2 * run.reads, "{run:?}");
+}
+
+#[tokio::test]
+async fn test_feed_wait_loop_pauses_when_the_switch_ends_every_wait_at_once() {
+    // A switch, or a proxy before it, that answers a wait at once with an empty page, and
+    // one that refuses every wait: each wait ends sooner than it asked, and pauses.
+    for refuse in [false, true] {
+        let s = Setup::new(false);
+        let mut app = s.join("wallet").await;
+        s.gate.set(|mode| mode.refuse_waits = refuse);
+        let waits = s.gate.waits().len();
+        let run = host_loop(&s, &mut app, 40).await;
+        let sent = s.gate.waits().len() - waits;
+        assert_eq!(run.pauses.len(), sent, "{run:?}");
+        assert!(run.pauses.len() >= 20, "{run:?}");
+        assert_eq!(
+            run.pauses.last(),
+            Some(&Duration::from_millis(MAX_PAUSE_MS)),
+            "{run:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_feed_wait_reads_a_quiet_feed_once_the_upkeep_interval_has_passed() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    s.settle(&mut app).await;
+    // A wait that ends before the interval is quiet; one that ends at it is a read.
+    s.w.clock.advance_ms(UPKEEP_READ_MS - 25_000 - 1);
+    assert_eq!(app.feed_wait(25).wait().await, Woken::Quiet);
+    s.w.clock.advance_ms(1);
+    assert_eq!(app.feed_wait(25).wait().await, Woken::ReadNow);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.feed_wait(25).wait().await, Woken::Quiet);
+    // An app loaded and not read since: a quiet wait is a read.
+    let store = Arc::new(MemoryStore::new());
+    let app = s
+        .join_on("phone", Arc::clone(&store) as Arc<dyn StateStore>)
+        .await;
+    let id = app.app_id();
+    drop(app);
+    let env =
+        s.w.signer
+            .env_with(store, Arc::clone(&s.router) as Arc<dyn Transport>);
+    let app = App::load(env, s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    assert_eq!(app.feed_wait(25).wait().await, Woken::ReadNow);
+}
+
+#[tokio::test]
+async fn test_feed_wait_asks_a_second_once_a_deferred_move_is_due() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let phone = s.join("phone").await;
+    s.settle(&mut app).await;
+    s.notice(&phone, app.app_id());
+    app.receive(None).await.unwrap();
+    assert!(app.state.cursor.deferred_since_ms.is_some());
+    // Due, and not sent yet: the wait is one second, and a read.
+    s.w.clock.advance_ms(5_000);
+    let wait = app.feed_wait(25);
+    assert_eq!(wait.seconds(), 1);
+    assert_eq!(wait.wait().await, Woken::ReadNow);
+    assert_eq!(s.gate.last("wait"), "1");
+}
+
+#[tokio::test]
+async fn test_feed_wait_cut_to_exactly_its_seconds_is_a_read() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let phone = s.join("phone").await;
+    s.settle(&mut app).await;
+    s.notice(&phone, app.app_id());
+    app.receive(None).await.unwrap();
+    assert!(app.state.cursor.deferred_since_ms.is_some());
+    // The move falls due in 2 s, the wait asked for: the wait ends with it.
+    let wait = app.feed_wait(2);
+    assert_eq!(wait.seconds(), 2);
+    assert_eq!(wait.wait().await, Woken::ReadNow);
+    let wait = app.feed_wait(3);
+    assert_eq!(wait.seconds(), 2);
+    assert_eq!(wait.wait().await, Woken::ReadNow);
+}
+
+#[tokio::test]
+async fn test_feed_wait_never_goes_from_before_the_cursor() {
+    // A read records a position at or past the cursor. Should the cursor be past it all
+    // the same, the wait goes from the cursor, never from behind it.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let cursor = app.cursor();
+    assert!(cursor.seq > 0);
+    let behind = Position {
+        seq: cursor.seq - 1,
+        ..cursor
+    };
+    app.next_wait = crate::app::wait::NextWait::From(crate::app::wait::WaitFrom {
+        position: behind,
+        again: false,
+    });
+    assert_eq!(app.feed_wait(25).wait().await, Woken::Quiet);
+    assert_eq!(s.gate.last("after"), cursor.to_string());
+}
+
+#[tokio::test]
+async fn test_feed_wait_on_a_frozen_account_is_read_now() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    s.settle(&mut app).await;
+    let next = SigningKey::from_bytes(&seed("service/alice/next"));
+    let freeze = Freeze::sign(
+        &s.w.alice,
+        FreezeBody {
+            identity: s.w.alice.public(),
+            inbox: Inbox::new("https://next.example", next.verifying_key().to_bytes()),
+            next_generation: 2,
+            issued_at: s.w.clock.now_ms(),
+            nonce: [2; 16],
+        },
+    )
+    .unwrap();
+    s.w.switch.freeze(&freeze).unwrap();
+    let sent = s.gate.waits().len();
+    assert_eq!(app.feed_wait(25).wait().await, Woken::ReadNow);
+    assert_eq!(s.gate.waits().len(), sent + 1, "the wait was sent");
+}
+
+#[tokio::test]
+async fn test_feed_wait_on_a_page_of_items_not_shown_with_more_is_ready() {
+    // The switch scans one item a page, here an entry for another app of the account: the
+    // page shows nothing and says there is more, which only a read can follow.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let phone = s.join("phone").await;
+    s.settle(&mut app).await;
+    s.note(phone.app_id());
+    s.note(app.app_id());
+    s.w.switch.lock().max_page_scan = Some(1);
+    assert_eq!(app.feed_wait(25).wait().await, Woken::Ready);
+    s.w.switch.lock().max_page_scan = None;
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(received(&report.events).len(), 1, "{:?}", report.events);
+}
+
+// -------------------------------------------------------------------------------------
+// The read's budgets, at their edges and across a restart
+
+/// The switch applies a write, and its answer is lost to a timeout.
+struct LostAnswers {
+    inner: Arc<dyn Transport>,
+    on: std::sync::atomic::AtomicBool,
+}
+
+impl Transport for LostAnswers {
+    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+        Box::pin(async move {
+            let lose = self.on.load(std::sync::atomic::Ordering::SeqCst)
+                && request.method == "POST"
+                && request.path_and_query.ends_with("/ops");
+            let answer = self.inner.send(request).await;
+            if lose {
+                return Err(TransportError::Timeout);
+            }
+            answer
+        })
+    }
+}
+
+impl Setup {
+    /// Lose the answer of every batch the switch applies, until `found` is called.
+    fn lose_answers(&self) -> Arc<LostAnswers> {
+        let lost = Arc::new(LostAnswers {
+            inner: Arc::clone(&self.gate) as Arc<dyn Transport>,
+            on: std::sync::atomic::AtomicBool::new(true),
+        });
+        self.router
+            .add(ORIGIN, Arc::clone(&lost) as Arc<dyn Transport>);
+        lost
+    }
+}
+
+impl LostAnswers {
+    fn found(&self) {
+        self.on.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn test_receive_settles_a_write_whose_answer_timed_out_as_applied_once() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let lost = s.lose_answers();
+    let target = RecordTarget::new(items(), b"n1");
+    let puts = || {
+        s.w.switch
+            .applied()
+            .iter()
+            .filter(|op| matches!(op.body().kind, OpKind::RecordPut(_)))
+            .count()
+    };
+    let error = app
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.unkept(), AppError::Transport(TransportError::Timeout)),
+        "{error:?}"
+    );
+    let id = error.kept_batch().expect("kept");
+    assert_eq!(puts(), 1, "applied at the switch");
+    lost.found();
+    app.receive(None).await.unwrap();
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(crate::app::KeptBatchStatus::Applied { .. })
+    ));
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(puts(), 1, "applied once");
+    let key = app.record_key(&target).unwrap();
+    let held = app.shared_record(&key).await.unwrap().expect("cached");
+    assert_eq!(super::shared_flows::ids(held.content.value()), vec!["a"]);
+}
+
+#[tokio::test]
+async fn test_receive_goes_on_with_a_listing_across_a_restart() {
+    let s = Setup::new(false);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = s
+        .join_on("wallet", Arc::clone(&store) as Arc<dyn StateStore>)
+        .await;
+    let id = app.app_id();
+    for n in 0..10 {
+        let target = RecordTarget::new(items(), format!("n{n}").as_bytes());
+        app.put_record(&target, &value(&["a"]), vec![])
+            .await
+            .unwrap();
+    }
+    s.settle(&mut app).await;
+    s.w.switch.lock().max_page_bytes = 1;
+    s.w.switch.push_missed(1, START, START);
+    let note = s.note(app.app_id());
+    let pages = || {
+        s.router
+            .log()
+            .iter()
+            .filter(|line| line.contains("/records?"))
+            .count()
+    };
+    let before = pages();
+    assert!(app.receive(None).await.unwrap().more);
+    assert_eq!(pages() - before, 4);
+    drop(app);
+    let env =
+        s.w.signer
+            .env_with(store, Arc::clone(&s.router) as Arc<dyn Transport>);
+    let mut app = App::load(env, s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    assert!(app.receive(None).await.unwrap().more);
+    let report = app.receive(None).await.unwrap();
+    assert!(!report.more);
+    assert_eq!(pages() - before, 10, "the listing goes on, not again");
+    assert_eq!(received(&report.events), vec![note]);
+}
+
+#[tokio::test]
+async fn test_receive_says_more_only_past_the_kept_batch_budget() {
+    for (writes, more) in [
+        (KEPT_RESENDS_PER_READ, false),
+        (KEPT_RESENDS_PER_READ + 1, true),
+    ] {
+        let s = Setup::new(false);
+        let mut app = s.join("wallet").await;
+        let next = SigningKey::from_bytes(&seed("service/alice/next"));
+        let freeze = Freeze::sign(
+            &s.w.alice,
+            FreezeBody {
+                identity: s.w.alice.public(),
+                inbox: Inbox::new("https://next.example", next.verifying_key().to_bytes()),
+                next_generation: 2,
+                issued_at: s.w.clock.now_ms(),
+                nonce: [2; 16],
+            },
+        )
+        .unwrap();
+        s.w.switch.freeze(&freeze).unwrap();
+        for n in 0..writes {
+            s.w.clock.advance_ms(1_000);
+            let pubky = [u8::try_from(n).unwrap() + 10; 32];
+            let error = app.submit_batch(conversation(pubky)).await.unwrap_err();
+            assert!(error.kept_batch().is_some(), "{error:?}");
+        }
+        s.w.switch.unfreeze(&freeze).unwrap();
+        let report = app.receive(None).await.unwrap();
+        assert_eq!(report.more, more, "{writes} kept");
+    }
+}
+
+#[tokio::test]
+async fn test_receive_with_kept_batches_whose_answers_are_lost_says_no_more() {
+    // The read reports the batches waiting and no `more`, so the host doesn't read again at
+    // once.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let _lost = s.lose_answers();
+    for n in 0..6u8 {
+        s.w.clock.advance_ms(1_000);
+        let error = app
+            .submit_batch(conversation([n + 10; 32]))
+            .await
+            .unwrap_err();
+        // The first is kept; each later write first sends the kept ones, times out, and
+        // keeps nothing of its own.
+        assert!(
+            matches!(error.unkept(), AppError::Transport(TransportError::Timeout)),
+            "{error:?}"
+        );
+    }
+    let report = app.receive(None).await.unwrap();
+    assert!(!report.more);
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::KeptBatchesWaiting { .. })),
+        "{:?}",
+        report.events
+    );
 }

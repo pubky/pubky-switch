@@ -39,11 +39,15 @@
 //! Before the feed, a read sends the batches kept from earlier calls again
 //! ([`App::submit_batch`]), so a lost answer is settled by the next read too.
 //!
-//! Each read keeps to per-call budgets: the kept batches it sends again, the pages of an
-//! owed listing, the entries stored locally it tries again and the records and claims it
-//! reads again. What a budget leaves goes at the next read, in the same order; the report
-//! says when that is now ([`ReceiveReport::more`]). A host that waits for the feed between
-//! reads does so with a handle that doesn't hold the app ([`App::feed_wait`]).
+//! A read keeps to per-call budgets: the kept batches it sends again, the pages of an owed
+//! listing, the entries stored locally it tries again and the records and claims it reads
+//! again. What a budget leaves goes at the next read, in the same order. The report says
+//! when that is now for the kept batches and the listing ([`ReceiveReport::more`]); the
+//! entries stored locally and the records and claims read again go on at the next read,
+//! which a quiet feed brings within [`super::UPKEEP_READ_MS`]. The feed's pages have no
+//! budget: a read follows the feed to its end. A host that waits for the feed between reads
+//! does so with a handle that doesn't hold the app ([`App::feed_wait`]), paced with
+//! [`super::WaitPace`].
 //!
 //! Cursor moves that apply nothing are deferred, for at most a few seconds while the app
 //! runs, and go with the next batch or alone ([`App::flush_cursor`]).
@@ -91,13 +95,15 @@ use crate::store::{MAX_BATCH_BYTES, MAX_VALUE_BYTES};
 
 /// What one read did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReceiveReport {
     /// Everything that happened, in order.
     pub events: Vec<AppEvent>,
     /// The position processed to.
     pub cursor: Position,
     /// The read stopped before the end of the feed: a key another device made that this
-    /// one lacks, the app's removal, or a provider change.
+    /// one lacks, the app's removal, or a provider change. A wait taken after it is
+    /// [`super::Woken::ReadLater`] at once, until a read gets further.
     pub stopped: bool,
     /// The read stopped on one of its per-call budgets with more to do now, all of it
     /// left for the next read, nothing lost or reordered: kept batches beyond
@@ -343,6 +349,12 @@ impl App {
                 self.reload = true;
             }
             let mut report = result?;
+            // A read that stopped stops at the same place until something no wait on the
+            // feed shows changes ([`super::Woken::ReadLater`]).
+            if report.stopped {
+                self.next_wait = super::wait::NextWait::Later;
+            }
+            self.read_done_ms = Some(self.now());
             report.events = self.take_events();
             Ok(report)
         })
@@ -369,7 +381,7 @@ impl App {
         self.reads_begun = self.reads_begun.wrapping_add(1);
         // Where a wait for the feed starts once this read is done ([`App::feed_wait`]): set
         // again by a read that gets that far.
-        let earlier_wait = self.wait_from.take();
+        self.next_wait = super::wait::NextWait::Cursor;
         if matches!(self.state.alarm, Some(Alarm::Compromise { .. })) {
             self.leave_on_compromise().await;
         }
@@ -457,6 +469,9 @@ impl App {
         };
         // Where a wait for the feed starts once this read is done ([`App::feed_wait`]).
         let mut reached = None;
+        // The read's listing waits for a scope key: no wait on the feed shows the key
+        // arrive, so the host reads again after a pause ([`super::Woken::ReadLater`]).
+        let mut key_wait = waits_for_key;
         if waits_for_key {
             // Receiving waits for the key, and the read says so. The feed item that would
             // answer the full-bundle request isn't read meanwhile, so the request is made
@@ -464,7 +479,6 @@ impl App {
             // The read's upkeep below goes on.
             self.ask_again_while_a_listing_waits().await?;
             self.events.push(AppEvent::ListingWaitsForKey);
-            reached = earlier_wait.map(|wait| (wait.position, true));
         } else if !unfinished {
             // The stored entries' retries, the owed calls, and the feed to its end.
             self.retry_parked().await?;
@@ -495,16 +509,16 @@ impl App {
                         // Read to the end: a wait goes on past everything shown, the entries
                         // held behind the cursor included.
                         let seq = after.max(scanned);
-                        reached = Some((Position { generation, seq }, false));
+                        reached = Some(Position { generation, seq });
                         break;
                     }
                     // The listing a `missed` item owes, before any later item: ending the page's
                     // processing at the item and committing it keeps the cursor rules as they
                     // are, the listing's own commits never interleaving with a page's open
                     // writes. A listing that can't be made yet, for want of a scope key, ends
-                    // the read there, and a wait goes on past what the page showed; the next
-                    // read lists first, and so does one past the read's one listing or its
-                    // page budget, which the report says.
+                    // the read there, and the host reads again after a pause; the next read
+                    // lists first, and so does one past the read's one listing or its page
+                    // budget, which the report says.
                     Some(PageEnd::ListFirst(through)) => {
                         if listed {
                             report.more = true;
@@ -522,8 +536,7 @@ impl App {
                                 break;
                             }
                             Listing::WaitsForKey | Listing::NotDue => {
-                                let seq = after.max(scanned);
-                                reached = Some((Position { generation, seq }, true));
+                                key_wait = true;
                                 break;
                             }
                         }
@@ -554,12 +567,15 @@ impl App {
         // Entries the cursor stays before come again at each read, with nothing new on the
         // feed: a wait past them ends in a read when nothing comes.
         let again = !self.state.held.is_empty() || !self.state.retries.is_empty();
-        self.wait_from = reached
-            .filter(|(position, _)| position.generation == self.state.cursor.generation)
-            .map(|(position, key)| super::wait::WaitFrom {
-                position,
-                again: key || again,
-            });
+        self.next_wait = if key_wait {
+            super::wait::NextWait::Later
+        } else {
+            reached
+                .filter(|position: &Position| position.generation == self.state.cursor.generation)
+                .map_or(super::wait::NextWait::Cursor, |position| {
+                    super::wait::NextWait::From(super::wait::WaitFrom { position, again })
+                })
+        };
         report.cursor = self.cursor();
         Ok(report)
     }
