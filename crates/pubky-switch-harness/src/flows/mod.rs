@@ -34,6 +34,7 @@ mod restore;
 mod retries;
 mod revocations;
 mod superseded;
+mod sweeps;
 mod upload;
 mod waiting;
 mod watching;
@@ -83,6 +84,7 @@ pub use retries::{
 };
 pub use revocations::{departure_time, revocation_cleanup, revocation_times, revocation_unread};
 pub use superseded::superseded_writes_read_late;
+pub use sweeps::{deleted_key_forgotten, invite_codes_swept};
 pub use upload::{
     recovery_upload_claim, recovery_upload_deny_only, recovery_upload_records,
     recovery_upload_refused, recovery_upload_slots_before_the_loss,
@@ -145,6 +147,12 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("records", |world| Box::pin(records(world))),
     ("records, superseded writes read late", |world| {
         Box::pin(superseded_writes_read_late(world))
+    }),
+    ("records, a deleted key forgotten", |world| {
+        Box::pin(deleted_key_forgotten(world))
+    }),
+    ("invite code, spent and expired codes swept", |world| {
+        Box::pin(invite_codes_swept(world))
     }),
     ("erasure", |world| Box::pin(erasure(world))),
     ("erasure, answer lost", |world| {

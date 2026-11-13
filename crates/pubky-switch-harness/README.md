@@ -121,6 +121,14 @@ The flows send every call the service serves, each at both switches. What they l
   request queues; a request an invite code's first admitted append answers; one to a
   frozen account; and a `POST /connect` from an own app or from the signer.
 - **Longer lives:** a renewal that adds a scope, and a claim that runs out by time.
+- **More of the sweeps** (Switch wire 9.1). The `deleted key forgotten` and `codes swept`
+  flows look a step after what frees a key or spends a code, where both switches have
+  swept: the service sweeps before the first request a minute on from a caller that has
+  verified, the scripted switch forgets keys at a cursor move. Not sent: a key freed by
+  removing the app that held it, which the scripted switch forgets only at the next cursor
+  move; a deleted key a divergent upload names or an upload brought; more than 256 keys
+  or codes due in one minute; and a batch retried after its proofs went, which takes an
+  app that retries a write 30 days late.
 - **The Homeserver's side of a grant.** The `approval` flows hold the capabilities the
   signer grants when the user declines a protocol's paths, and that the switch is sent
   the same with the paths declined as with them allowed. The grant itself is given and
@@ -177,7 +185,7 @@ Each flow's run against the service makes one test database and drops it, also w
 test panics; the flows run one after another. Each run is on a thread of its own with 16 MiB
 of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flow used
 1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
-that ran the flows had less left. Seventy-seven flows take about three minutes in a
+that ran the flows had less left. Seventy-nine flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.
 
