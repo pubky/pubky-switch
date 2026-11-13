@@ -29,16 +29,17 @@ impl AccountTxn {
         Ok(row.is_some())
     }
 
-    /// The cursors of `apps` that have a row here, by App ID: `None` for one with no cursor
-    /// yet. An app with no row has none either; the caller holds every key for it.
+    /// The cursors of `apps` that have a row here, by App ID, with whether the app has
+    /// registered, its app record stored: `None` for one with no cursor yet. An app with no
+    /// row has none either; the caller holds every key for it.
     pub async fn waited_cursors(
         &mut self,
         apps: &[[u8; 16]],
-    ) -> Result<Vec<([u8; 16], Option<Position>)>, StoreError> {
+    ) -> Result<Vec<([u8; 16], Option<Position>, bool)>, StoreError> {
         let id = self.head().id.clone();
         let rows = sqlx::query(
-            "SELECT app_id, cursor_generation, cursor_seq FROM apps \
-             WHERE account_id = $1 AND app_id = ANY($2)",
+            "SELECT app_id, cursor_generation, cursor_seq, record IS NOT NULL AS registered \
+             FROM apps WHERE account_id = $1 AND app_id = ANY($2)",
         )
         .bind(&id)
         .bind(app_ids(apps))
@@ -59,7 +60,7 @@ impl AccountTxn {
                 }),
                 _ => None,
             };
-            cursors.push((app, cursor));
+            cursors.push((app, cursor, row.try_get("registered")?));
         }
         Ok(cursors)
     }
@@ -135,11 +136,9 @@ impl AccountTxn {
 
     /// Drop the transition proofs of at most `bound` batches past `proofs_ms` at service
     /// time `now_ms`, the oldest first (Switch wire 6.4 step 5, 9.1): their ID and operation
-    /// hash stay, so a retry is still answered `409 conflict`. The number dropped.
-    ///
-    /// Not yet: wire 9.1 deletes the whole record once its proofs are gone and none of the
-    /// batch's chain stubs is kept. No stub is dropped yet, so no record goes; the delete
-    /// comes with chain stub retention.
+    /// hash stay, so a retry is still answered `409 conflict`. The number dropped. The whole
+    /// record goes once none of the batch's chain stubs is kept either (wire 9.1,
+    /// [`Self::drop_spent_batches`]).
     pub async fn drop_expired_batch_proofs(
         &mut self,
         now_ms: u64,

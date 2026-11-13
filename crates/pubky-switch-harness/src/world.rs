@@ -223,6 +223,16 @@ impl World {
                         quota_bytes: limits.quota_bytes,
                         ..pubky_switch_core::records::Limits::default()
                     });
+                    // Chain stub retention by the service's settings (Switch wire 9.2).
+                    switch.set_retention(limits.chain_retention.then(|| {
+                        pubky_switch_client::testing::Retention {
+                            checkpoint_behind: limits.checkpoint_behind,
+                            cursor_hold_ms: limits.cursor_hold_ms,
+                            at_head: limits.checkpoint_at_head,
+                            per_request: usize::try_from(limits.retention_per_request)
+                                .unwrap_or(usize::MAX),
+                        }
+                    }));
                     switch.set_uploads_per_app_per_hour(limits.uploads_per_app_per_hour);
                     accounts.push((identity.key().id(), switch.holding_transport()));
                     lock(&self.scripted).push(switch);

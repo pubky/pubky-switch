@@ -37,6 +37,7 @@ mod push;
 mod push_queue;
 mod records;
 mod recovery;
+mod retention;
 mod snapshot;
 mod sweeps;
 #[cfg(any(test, feature = "test-util"))]
@@ -68,6 +69,7 @@ pub use peers::{HeldPeer, PeerFloor};
 pub use push::{OwedKey, PushRegistration};
 pub use push_queue::{HeldRegistration, QueuedPush};
 pub use recovery::{RECOVERY_KEEPS, Recovery, recovery_clears};
+pub use retention::{ChainRetention, KeptStub};
 pub use snapshot::SnapshotRead;
 
 use crate::admin::{CheckFuture, ReadinessCheck};
