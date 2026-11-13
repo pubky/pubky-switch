@@ -579,6 +579,8 @@ The **deny list** overrides all three. The same rule admits a sender to the dire
 
   Each page also returns `scanned_through`, the last `seq` it covered, including items it shows nothing for, and whether more items follow, so an app always makes progress.
 
+  An app that reads deny list changes in full hands each to its protocol, in feed order: the Pubky ID, whether it was added or removed, and the item's service time, with the protocol's local writes committed as the cursor passes the item, as for its other notices (Section 8.2). One the protocol can't take yet is kept, and the later ones wait behind it. So a protocol restored from a backup rebuilds who was denied since the backup's cursor.
+
   A feed page never ends inside a batch. Every app can therefore verify the chain from its cursor onward.
 - **One cursor per app,** shared by its devices, written as `<generation>:<seq>`. The cursor only moves forward: a move to a position behind it changes nothing and is no error, so a batch sent again or replayed can't take it back (`spec/wire-format.md` Section 6.2). An app that wants earlier items reads the feed from an earlier position, which shows the entries the service still holds; deleted entries don't come back. A cursor from a sequence that a provider loss ended reads from the start of the current sequence, whose first item is the recovery record (Section 12.6).
 - **Chain version:** this spec defines chain version 1, a linear hash chain (Section 13.6), which a service serves by default. A later version, such as a Merkle log, can be added without breaking anything (Section 17).
