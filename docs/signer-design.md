@@ -4,7 +4,7 @@ Status: for review, before any code. Scope: identity management on the Pubky Swi
 
 ## 1. What the crate is
 
-`pubky-switch-signer` manages one Pubky identity on the Switch. It holds the identity key through the host, approves apps, signs and versions `identity.json`, derives and seals key bundles, enrolls at a switch, and runs the lifecycle flows of spec 12, among them the hand-over to another signer and the backup of its own records. Any app can be its identity's signer through it (decision 24). Bitkit is the first.
+`pubky-switch-signer` manages one Pubky identity on the Switch. It holds the identity key through the host, approves apps, signs and versions `identity.json`, derives and seals key bundles, enrolls at a switch, and runs the lifecycle flows of spec 12, among them the hand-over to another signer and the backup of its own records. Any app can be its identity's signer through it (decision 24); the first host is a wallet app acting as signer.
 
 **It knows no protocol.** A protocol on the Switch (spec 1) tells it which scopes exist, which switch permissions each needs and which have Shared Data Keys. The signer applies the Switch's generic rules on top of that (section 3).
 
@@ -24,7 +24,7 @@ So the direction is `pubky-switch-signer -> pubky-switch-client -> pubky-switch-
 
 From the moment an install becomes the signer, keeping the key safe and backed up is its job (spec 12.8). The core's document builders all take its `IdentityKey`, a secret held in memory, and neither the Secure Enclave nor the Android Keystore supports Ed25519, so the key has to be in software while it signs. The interface has two layers.
 
-### 2.1 `SecretVault` (host callback, what Bitkit implements)
+### 2.1 `SecretVault` (host callback, what the host app implements)
 
 ```rust
 pub trait SecretVault: Send + Sync {
@@ -422,7 +422,7 @@ There are no panics on network input, and all arithmetic is checked.
 6. Revocations, departures, epoch rotation and full-bundle requests.
 7. Service key change, moves and abort, provider loss, and erasure.
 8. The hand-over sending and receiving, restore, and take-over.
-9. Alerts, end-to-end tests against the service and a Homeserver, and the integration guide for Bitkit.
+9. Alerts, end-to-end tests against the service and a Homeserver, and a signer host integration guide for any app that hosts the signer.
 
 PR 2 starts once `pubky-switch-core` has the types it needs, and the network flows build on `pubky-switch-client`.
 
