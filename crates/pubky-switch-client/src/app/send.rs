@@ -374,9 +374,32 @@ pub enum UndeliverableReason {
 /// flush goes on with the rest, from where this one stopped ([`OutboxReport::more`]).
 pub const OUTBOX_TRIES_PER_FLUSH: usize = 4;
 
-/// The queue time and ID of the last message a flush tried: the next flush starts after it,
-/// so no message waits for ever behind others that keep failing (`outnext`, `STATE.md`).
+/// Where flushing the outbox stands (`outnext`, `STATE.md`).
 const OUT_NEXT: &str = "outnext";
+
+/// `outnext`: where flushing the outbox stands. A flush tries messages in queue order from
+/// after `last`, round the queue, so no message waits for ever behind others that keep
+/// failing. A pass goes once round: while `pass_first` is set, a flush its budget stopped
+/// left messages of the pass untried, and the next flush tries only those, the ones after
+/// `last` and before `pass_first`. The flush that ends the pass says no more, and the next
+/// flush starts a new one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct OutNext {
+    /// The queue time and ID of the last message tried.
+    last: (u64, String),
+    /// The first message the pass under way tried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pass_first: Option<(u64, String)>,
+}
+
+/// Whether `key` comes after `from` and before `to`, going round the queue from `from`.
+fn between(from: &(u64, String), key: &(u64, String), to: &(u64, String)) -> bool {
+    if from < to {
+        from < key && key < to
+    } else {
+        key > from || key < to
+    }
+}
 
 /// What a flush of the outbox did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -393,8 +416,11 @@ pub struct OutboxReport {
     /// store ([`StoreError::TooLarge`]).
     pub undelivered: Vec<String>,
     /// The flush stopped on its budget, [`OUTBOX_TRIES_PER_FLUSH`] messages or the call's
-    /// time ([`super::AppConfig::call_budget_ms`]), with messages it didn't try: the host
-    /// flushes again at once. The next flush starts after the last one tried.
+    /// time ([`super::AppConfig::call_budget_ms`]), with messages of its pass, or owed
+    /// deliveries of the own `identity.json`, it didn't try: the host flushes again at once,
+    /// and the next flush tries only those. It is `false` once every message queued was tried
+    /// in the pass, so a host that flushes while it is `true` stops after one pass, even with
+    /// messages still queued; it flushes again on its own triggers ([`App::flush_outbox`]).
     pub more: bool,
 }
 
@@ -1412,6 +1438,14 @@ impl App {
     ///   [`OutboxReport::more`] says so: the host flushes again at once.
     /// - The next flush starts after the last message this one tried, by queue time, and
     ///   goes round, so a message that keeps failing holds up none behind it.
+    /// - Flushes go in passes, each trying every queued message once. While a pass is under
+    ///   way, a flush tries only the messages it hasn't reached; the flush that reaches the
+    ///   last ends it with `more` false. A held message ([`App::hold_queued`]) makes no
+    ///   request for its delivery and doesn't count towards the bound.
+    ///
+    /// After a pass, messages still queued wait for the host's next flush, on the triggers of
+    /// Switch spec 11: on start, on returning to the foreground, when the network comes back,
+    /// or on a timer of the host's own. A send, a resend or a read doesn't flush the others.
     ///
     /// Its worst case is the budget and one message's try past it: a conversation entry, one
     /// delivery round and a record job, each a bounded call of its own.
@@ -1438,20 +1472,30 @@ impl App {
             items
                 .sort_by(|(a_id, a), (b_id, b)| a.queued_ms.cmp(&b.queued_ms).then(a_id.cmp(b_id)));
             // From after the last message the flush before tried, round the queue.
-            let last: Option<(u64, String)> = self.reader().get(OUT_NEXT).await?;
-            if let Some((at, id)) = &last {
+            let next: Option<OutNext> = self.reader().get(OUT_NEXT).await?;
+            if let Some(OutNext { last: (at, id), .. }) = &next {
                 let start = items
                     .iter()
                     .position(|(msg_id, item)| (item.queued_ms, msg_id) > (*at, id))
                     .unwrap_or(0);
                 items.rotate_left(start);
             }
+            // A pass under way tries only the messages it hasn't reached yet.
+            let in_pass = |key: &(u64, String)| match &next {
+                Some(OutNext {
+                    last,
+                    pass_first: Some(first),
+                }) => between(last, key, first),
+                _ => true,
+            };
             let mut report = OutboxReport {
                 more: peers_left,
                 ..OutboxReport::default()
             };
             let cutoff = self.now().saturating_sub(SENT_RETENTION_MS);
             let mut tried = 0usize;
+            let mut messages_left = false;
+            let mut first_tried = None;
             let mut last_tried = None;
             for (msg_id, item) in items {
                 if item.failed.is_some() {
@@ -1465,15 +1509,28 @@ impl App {
                     }
                     continue;
                 }
+                let key = (item.queued_ms, msg_id.clone());
+                // Tried already in this pass: the next pass tries it again.
+                if !in_pass(&key) {
+                    report.queued.push(msg_id);
+                    continue;
+                }
                 // At most OUTBOX_TRIES_PER_FLUSH a flush, and none past its time once one
                 // went: the next flush goes on from here.
                 if tried >= OUTBOX_TRIES_PER_FLUSH || (tried > 0 && self.spent(&budget)) {
+                    messages_left = true;
                     report.more = true;
                     report.queued.push(msg_id);
                     continue;
                 }
-                tried += 1;
-                last_tried = Some((item.queued_ms, msg_id.clone()));
+                // A held message makes no request for its delivery: it doesn't count.
+                let held =
+                    item.delivery_owed() && self.reader().exists(&hold_key(&item.to)).await?;
+                if !held {
+                    tried += 1;
+                }
+                first_tried.get_or_insert_with(|| key.clone());
+                last_tried = Some(key);
                 if self.flush_item(&msg_id, &budget).await? {
                     report.undelivered.push(msg_id);
                     continue;
@@ -1487,9 +1544,30 @@ impl App {
                     _ => report.done.push(msg_id),
                 }
             }
-            if let Some(last_tried) = last_tried {
+            // Messages of the pass left untried keep it under way, from where it began;
+            // otherwise it is over, and the next flush starts a new one.
+            let pass_first = if messages_left {
+                match &next {
+                    Some(OutNext {
+                        pass_first: Some(first),
+                        ..
+                    }) => Some(first.clone()),
+                    _ => first_tried,
+                }
+            } else {
+                None
+            };
+            let left = OutNext {
+                last: match (last_tried, &next) {
+                    (Some(last), _) => last,
+                    (None, Some(next)) => next.last.clone(),
+                    (None, None) => (0, String::new()),
+                },
+                pass_first,
+            };
+            if next.as_ref() != Some(&left) {
                 let mut tx = self.tx()?;
-                tx.put(OUT_NEXT, &last_tried)?;
+                tx.put(OUT_NEXT, &left)?;
                 self.commit(tx).await?;
             }
             self.prune_sent().await?;
