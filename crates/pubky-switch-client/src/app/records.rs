@@ -52,6 +52,24 @@ const FLAG_PREFIX: &str = "flag/";
 const CERT_PREFIX: &str = "ocert/";
 /// Set while the app owes a listing of its collections: at join, after a `missed` item.
 pub(crate) const LIST_DUE: &str = "list_due";
+/// How far an owed listing got ([`ListProgress`]), while it is owed.
+const LIST_AT: &str = "list_at";
+
+/// Owe a listing of the collections from their beginning, in `tx`: `list_due` set and
+/// `list_at` deleted. Every new obligation starts the listing over, so a collection a
+/// listing under way already listed to its end is listed again: it may read members it
+/// didn't, such as after a renewal that widens the certificate (Switch spec 8.2, 8.3).
+pub(crate) fn owe_listing(tx: &mut Tx) -> Result<(), AppError> {
+    tx.put(LIST_DUE, &true)?;
+    tx.delete(LIST_AT)?;
+    Ok(())
+}
+
+/// The most listing pages one read of the feed asks for while it makes an owed listing
+/// ([`App::receive`]): a listing that needs more goes on at the next read from the page
+/// it reached, and the read stops before any entry meanwhile (Switch spec 8.2, wire
+/// 7.4.4).
+pub const LISTING_PAGES_PER_READ: u32 = 4;
 
 /// The most records one listing page asks for (Switch wire 7.4.9).
 const LIST_PAGE: u32 = 1000;
@@ -67,6 +85,60 @@ const _: () = assert!(LISTED_RECORD_ROOM_BYTES < crate::store::MAX_BATCH_BYTES);
 
 /// How many times a write is built again after a conflict before the call gives up.
 const UPDATE_TRIES: usize = 4;
+
+/// Whether the signed operation `op` is a `record.put` that deletes its record.
+fn writes_a_delete(op: &SignedDoc) -> bool {
+    SignedOp::peek(op).is_ok_and(|op| {
+        matches!(&op.body().kind, OpKind::RecordPut(put) if put.value_sealed.looks_like_delete())
+    })
+}
+
+/// What became of an owed listing of the collections at a read
+/// ([`App::list_collections_if_due`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Listing {
+    /// None is owed.
+    NotDue,
+    /// Made to its end.
+    Listed,
+    /// Owed, and waiting for a scope key the certificate lacks.
+    WaitsForKey,
+    /// Begun or carried on, and stopped on the read's page budget: the next read goes on.
+    Unfinished,
+}
+
+/// How one collection's listing ended: listed to its end, or stopped on the page budget,
+/// with the records listed either way.
+enum Listed {
+    Done(u64),
+    Paused(u64),
+}
+
+/// `list_at`: how far an owed listing got, kept with each page it takes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct ListProgress {
+    /// The collections listed to their end, by collection ID in base64url.
+    done: Vec<String>,
+    /// The collection being listed, and the last key of its last page taken.
+    at: Option<(String, String)>,
+}
+
+impl ListProgress {
+    /// A page of the collection `id` was taken; `next` is where the listing goes on, `None`
+    /// at the collection's end.
+    fn reached(&mut self, id: &[u8; 32], next: Option<&[u8; 32]>) {
+        let id = b64(id);
+        match next {
+            Some(next) => self.at = Some((id, b64(next))),
+            None => {
+                self.at = None;
+                if !self.done.contains(&id) {
+                    self.done.push(id);
+                }
+            }
+        }
+    }
+}
 
 pub(crate) fn record_key_of(key: &[u8; 32]) -> String {
     format!("{RECORD_PREFIX}{}", b64(key))
@@ -499,6 +571,10 @@ pub(crate) struct HeldRecord {
     /// The switch's current write, which the app refused: its version.
     #[serde(with = "opt_version_serde")]
     follow: Option<RecordVersion>,
+    /// Whether that refused write is a delete: the next write then builds on `{0, 0}`, as
+    /// on a delete the app holds (Switch wire 6.2), since the service may forget the key.
+    #[serde(default)]
+    follow_deleted: bool,
 }
 
 impl std::fmt::Debug for HeldRecord {
@@ -512,6 +588,20 @@ impl HeldRecord {
     /// app refused it.
     pub(crate) fn base_version(&self) -> RecordVersion {
         self.follow.unwrap_or(self.version)
+    }
+
+    /// The version the next write names, and a condition on the record: the base
+    /// ([`HeldRecord::base_version`]), or `{0, 0}` when that base is a delete, held or
+    /// followed. `{0, 0}` matches a record that is absent, forgotten or deleted (Switch wire
+    /// 6.2, 6.3), so it stays right once the service forgets the key (Switch spec 10.3); the
+    /// delete's own version would be `409 conflict` for good then.
+    pub(crate) fn write_base(&self) -> RecordVersion {
+        match self.follow {
+            Some(_) if self.follow_deleted => RecordVersion::NONE,
+            Some(version) => version,
+            None if self.content == RecordContent::Deleted => RecordVersion::NONE,
+            None => self.version,
+        }
     }
 
     fn write_version(&self) -> WriteVersion {
@@ -938,43 +1028,67 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
-            let id = collection.id(&self.state.meta.identity);
-            let mut after: Option<[u8; 32]> = None;
-            let mut listed = 0u64;
-            loop {
-                let result = self
-                    .client
-                    .records(&id, after.as_ref(), Some(LIST_PAGE))
-                    .await;
-                let page = self.take(result).await?;
-                let mut tx = self.tx()?;
-                for view in &page.records {
-                    // A page holds up to 1,000 views, each cached with its mark: the views
-                    // taken so far are committed first once one more might not fit.
-                    if tx.size().saturating_add(LISTED_RECORD_ROOM_BYTES)
-                        > crate::store::MAX_BATCH_BYTES
-                    {
-                        let full = std::mem::replace(&mut tx, self.tx()?);
-                        self.commit(full).await?;
-                    }
-                    self.take_view(view, Some((&view.key, collection)), &mut tx)
-                        .await?;
-                    listed = listed.saturating_add(1);
-                }
-                self.commit(tx).await?;
-                // Records are listed by the base64url text of their keys, compared as ASCII
-                // (Switch wire 7.4.9): a `next` that doesn't move past the key asked after ends
-                // the listing, so a service that names keys back and forth can't keep the app
-                // reading.
-                match page.next {
-                    Some(next) if after.is_none_or(|after| b64(&next) > b64(&after)) => {
-                        after = Some(next);
-                    }
-                    _ => return Ok(listed),
-                }
+            let mut pages = u32::MAX;
+            match self.list_from(collection, None, &mut pages, None).await? {
+                Listed::Done(listed) | Listed::Paused(listed) => Ok(listed),
             }
         })
         .await
+    }
+
+    /// List `collection` from after the key `after`, at most `pages` pages, each counted
+    /// off as it is asked for. With `progress`, each page's commit records how far the
+    /// listing got, so an owed listing goes on from there at the next read.
+    async fn list_from(
+        &mut self,
+        collection: &Collection,
+        mut after: Option<[u8; 32]>,
+        pages: &mut u32,
+        mut progress: Option<&mut ListProgress>,
+    ) -> Result<Listed, AppError> {
+        let id = collection.id(&self.state.meta.identity);
+        let mut listed = 0u64;
+        loop {
+            if *pages == 0 {
+                return Ok(Listed::Paused(listed));
+            }
+            *pages -= 1;
+            let result = self
+                .client
+                .records(&id, after.as_ref(), Some(LIST_PAGE))
+                .await;
+            let page = self.take(result).await?;
+            let mut tx = self.tx()?;
+            for view in &page.records {
+                // A page holds up to 1,000 views, each cached with its mark: the views taken
+                // so far are committed first once one more might not fit.
+                if tx.size().saturating_add(LISTED_RECORD_ROOM_BYTES)
+                    > crate::store::MAX_BATCH_BYTES
+                {
+                    let full = std::mem::replace(&mut tx, self.tx()?);
+                    self.commit(full).await?;
+                }
+                self.take_view(view, Some((&view.key, collection)), &mut tx)
+                    .await?;
+                listed = listed.saturating_add(1);
+            }
+            // Records are listed by the base64url text of their keys, compared as ASCII
+            // (Switch wire 7.4.9): a `next` that doesn't move past the key asked after ends
+            // the listing, so a service that names keys back and forth can't keep the app
+            // reading.
+            let next = page
+                .next
+                .filter(|next| after.is_none_or(|after| b64(next) > b64(&after)));
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.reached(&id, next.as_ref());
+                tx.put(LIST_AT, &*progress)?;
+            }
+            self.commit(tx).await?;
+            match next {
+                Some(next) => after = Some(next),
+                None => return Ok(Listed::Done(listed)),
+            }
+        }
     }
 
     /// Whether a listing of the collections is owed (`list_due`): from joining or a restore,
@@ -1010,6 +1124,7 @@ impl App {
             }
             let mut tx = self.tx()?;
             tx.delete(LIST_DUE)?;
+            tx.delete(LIST_AT)?;
             self.commit(tx).await
         })
         .await
@@ -1023,13 +1138,54 @@ impl App {
     /// a read scope of a collection it lists, such as after a renewal that adds one: listed
     /// before its key arrives, a record would be held `Unreadable` until the key opened it
     /// ([`App::reopen_unreadable`]). `list_due` stays, so the read after the key arrives
-    /// lists. Returns whether it listed.
-    pub(crate) async fn list_collections_if_due(&mut self) -> Result<bool, AppError> {
-        if !self.reader().exists(LIST_DUE).await? || self.listing_lacks_keys() {
-            return Ok(false);
+    /// lists.
+    ///
+    /// The listing asks for at most `pages` pages, counted off as they go. One that needs
+    /// more is [`Listing::Unfinished`]: each page's commit records how far it got, and the
+    /// next call goes on from there, the collections listed to their end skipped. Records
+    /// written meanwhile come on the feed past the item that owed the listing, which no
+    /// read processes before the listing ends (Switch spec 8.2).
+    pub(crate) async fn list_collections_if_due(
+        &mut self,
+        pages: &mut u32,
+    ) -> Result<Listing, AppError> {
+        if !self.reader().exists(LIST_DUE).await? {
+            return Ok(Listing::NotDue);
         }
-        self.list_collections().await?;
-        Ok(true)
+        if self.listing_lacks_keys() {
+            return Ok(Listing::WaitsForKey);
+        }
+        let mut progress: ListProgress = self.reader().get(LIST_AT).await?.unwrap_or_default();
+        let collections: Vec<Collection> = self
+            .protocol
+            .collections()
+            .into_iter()
+            .filter(|c| c.readable_by(&self.state.cert))
+            .collect();
+        for collection in &collections {
+            let id = b64(&collection.id(&self.state.meta.identity));
+            if progress.done.contains(&id) {
+                continue;
+            }
+            let after = match &progress.at {
+                Some((at, key)) if *at == id => Some(
+                    unb64_array::<32>(key)
+                        .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?,
+                ),
+                _ => None,
+            };
+            if let Listed::Paused(_) = self
+                .list_from(collection, after, pages, Some(&mut progress))
+                .await?
+            {
+                return Ok(Listing::Unfinished);
+            }
+        }
+        let mut tx = self.tx()?;
+        tx.delete(LIST_DUE)?;
+        tx.delete(LIST_AT)?;
+        self.commit(tx).await?;
+        Ok(Listing::Listed)
     }
 
     /// Whether the certificate lacks, at the current data epoch, the key of a scope it
@@ -1232,7 +1388,8 @@ impl App {
                 return Err(self.raise(Alarm::Rollback { reason }).await);
             }
             Err(Refused::Invalid { writer, reason }) => {
-                self.flag_write(&shown_key, version, writer, reason, tx)
+                let deleted = writes_a_delete(evidence.op);
+                self.flag_write(&shown_key, version, writer, reason, deleted, tx)
                     .await?;
             }
             Err(Refused::DoesNotOpen { writer, reason }) => {
@@ -1245,7 +1402,8 @@ impl App {
                     held.content = RecordContent::Unreadable(Unopened::DoesNotOpen);
                     tx.put(&record_key_of(&shown_key), &held)?;
                 }
-                self.flag_write(&shown_key, version, writer, reason, tx)
+                let deleted = writes_a_delete(evidence.op);
+                self.flag_write(&shown_key, version, writer, reason, deleted, tx)
                     .await?;
             }
             Err(Refused::Ignored | Refused::Unheld(_)) => {}
@@ -1261,6 +1419,7 @@ impl App {
         version: RecordVersion,
         writer: [u8; 16],
         reason: String,
+        deleted: bool,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let reason = cut_reason(reason);
@@ -1275,6 +1434,7 @@ impl App {
             && version > held.base_version()
         {
             held.follow = Some(version);
+            held.follow_deleted = deleted;
             tx.put(&record_key_of(key), &held)?;
         }
         self.events.push(AppEvent::WriteFlagged {
@@ -1778,7 +1938,8 @@ impl App {
             )
         {
             let version = accepted.version.version;
-            self.flag_write(&key, version, accepted.writer, reason, tx)
+            let deleted = accepted.content == RecordContent::Deleted;
+            self.flag_write(&key, version, accepted.writer, reason, deleted, tx)
                 .await?;
             return Ok(Taken::Flagged);
         }
@@ -1829,7 +1990,11 @@ impl App {
             item_hash: accepted.item_hash,
             content: accepted.content,
             doubtful: accepted.doubtful,
-            follow: held.and_then(|held| held.follow).filter(|_| reopened),
+            follow: held
+                .as_ref()
+                .and_then(|held| held.follow)
+                .filter(|_| reopened),
+            follow_deleted: held.as_ref().is_some_and(|held| held.follow_deleted) && reopened,
         };
         tx.put(&record_key_of(&key), &record)?;
         self.events.push(AppEvent::RecordChanged { key });
@@ -2183,12 +2348,7 @@ pub(crate) fn record_put(
         &key,
         value.unwrap_or_default(),
     )?;
-    let base = match held {
-        Some(held) if held.follow.is_some() || held.content != RecordContent::Deleted => {
-            held.base_version()
-        }
-        _ => RecordVersion::NONE,
-    };
+    let base = held.map_or(RecordVersion::NONE, HeldRecord::write_base);
     let id_inputs = base.is_none().then(|| IdInputs {
         collection: target.collection.name.clone(),
         blinded_key: state.naming.blind(&target.natural_key),

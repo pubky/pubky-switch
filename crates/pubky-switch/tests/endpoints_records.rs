@@ -869,3 +869,1009 @@ async fn test_records_create_over_an_uploaded_delete_keeps_its_base() {
     assert_eq!(divergent_count(&replay, &key).await, (false, 0));
     replay.db.drop_database().await.expect("drop");
 }
+
+/// Move app `name`'s cursor to `seq` at `at`, in a request of its own.
+async fn move_cursor(replay: &Replay, name: &str, seq: u64, at: &str) {
+    let keys = vectors("keys.json");
+    let cursor = pubky_switch_core::ops::Position { generation: 1, seq };
+    let request = app_request(
+        app(&keys, name),
+        "POST",
+        &format!("/v1/{}/ops", alice_id()),
+        OpsRequest::new(&[], Some(cursor)).to_json(),
+        ms(at),
+    );
+    let answer = replay.service.handle(request).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+/// A minute on: the next request runs the minute's sweep (Switch wire 9.1).
+fn next_minute(replay: &Replay) {
+    use pubky_switch::time::Clock;
+    let at = replay.clock.now_ms() + 61_000;
+    set_time(&replay.clock, &pubky_switch_core::time::rfc3339(at));
+}
+
+/// alice's executor, which her `identity.json` lists beside the wallet and the phone,
+/// registers its app record.
+async fn register_executor(replay: &Replay) {
+    let keys = vectors("keys.json");
+    let executor = app(&keys, "executor");
+    let record = document("executor app record");
+    let ops = sign_batch(
+        &ed25519_dalek::SigningKey::from_bytes(&hex32(&executor["signing_secret_hex"])),
+        &alice_key().public(),
+        Some(
+            pubky_switch_core::enc::app_id_decode(executor["app_id"].as_str().expect("id"))
+                .expect("app id"),
+        ),
+        1,
+        [76; 16],
+        vec![(Vec::new(), OpKind::AppPut { record })],
+    )
+    .expect("batch");
+    post(replay, "executor", &ops, AT).await;
+}
+
+/// Every app alice's `identity.json` lists moves its cursor to `seq`.
+async fn all_past(replay: &Replay, seq: u64) {
+    for name in ["wallet", "phone", "executor"] {
+        move_cursor(replay, name, seq, AT).await;
+    }
+}
+
+/// A record the wallet creates at `natural`, then deletes: its key and the delete's `seq`.
+async fn created_and_deleted(replay: &Replay, id: u8, natural: &[u8]) -> ([u8; 32], u64) {
+    let (key, ..) = create(replay, id, natural, "pay").await;
+    let version =
+        body(&get_as(replay, "wallet", &format!("records/{}", b64(&key))).await)["version"]
+            .as_u64()
+            .expect("version");
+    let delete = record_put(
+        PAYMENTS,
+        natural,
+        "pay",
+        RecordVersion::new(1, version),
+        b"",
+    );
+    post(
+        replay,
+        "wallet",
+        &batch("wallet", id + 1, vec![OpKind::RecordPut(delete)]),
+        AT,
+    )
+    .await;
+    (key, last_seq(replay).await)
+}
+
+async fn record_rows(replay: &Replay, key: &[u8; 32]) -> i64 {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query_scalar("SELECT count(*) FROM shared_records WHERE account_id = $1 AND key = $2")
+        .bind(alice_id())
+        .bind(key.as_slice())
+        .fetch_one(&mut conn)
+        .await
+        .expect("count")
+}
+
+async fn execute(replay: &Replay, sql: &str, key: &[u8; 32]) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(sql)
+        .bind(alice_id())
+        .bind(key.as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("sql");
+}
+
+#[tokio::test]
+async fn test_records_deleted_key_every_reader_passed_is_forgotten() {
+    // Once the cursor of every app the held `identity.json` lists is past the delete, the
+    // minute's sweep at a later request forgets the key: its view is `404`, and a create at it starts again, at a newer
+    // version (Switch spec 10.3, wire 9.1).
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let (live, ..) = create(&replay, 7, b"live", "pay").await;
+    let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
+    move_cursor(&replay, "wallet", deleted_at, AT).await;
+    move_cursor(&replay, "phone", deleted_at, AT).await;
+    // The executor, listed but not registered here yet, holds the key: it may still read
+    // the delete or, after a provider loss, upload its copy of the record.
+    next_minute(&replay);
+    let answer = get_as(&replay, "phone", &format!("records/{}", b64(&key))).await;
+    assert_eq!(
+        body(&answer)["deleted"],
+        true,
+        "the executor hasn't read it"
+    );
+    register_executor(&replay).await;
+    move_cursor(&replay, "executor", deleted_at, AT).await;
+    assert_eq!(
+        record_rows(&replay, &key).await,
+        1,
+        "not before the minute's sweep"
+    );
+    // A request in the same minute as the last sweep sweeps nothing.
+    let answer = get_as(&replay, "phone", &format!("records/{}", b64(&key))).await;
+    assert_eq!(body(&answer)["deleted"], true, "once a minute");
+    // The held delete is the record's current write: its document and proof stay.
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), deleted_at).await,
+        (true, true)
+    );
+    next_minute(&replay);
+    let answer = get_as(&replay, "phone", &format!("records/{}", b64(&key))).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    assert_eq!(record_rows(&replay, &key).await, 0);
+    // Forgotten, it is no record's current write: its document goes with the key, and the
+    // feed shows its stub (Switch wire 7.5).
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), deleted_at).await,
+        (false, false)
+    );
+    assert_eq!(record_rows(&replay, &live).await, 1, "a live record stays");
+    // A write naming the forgotten delete's own version is refused for good; a writer that
+    // held or followed the delete names `{0, 0}` instead (Switch spec 8.2, 10.3).
+    let on_the_delete = record_put(
+        PAYMENTS,
+        b"gone",
+        "pay",
+        RecordVersion::new(1, deleted_at),
+        b"{\"n\":2}",
+    );
+    let refused = post_answer(
+        &replay,
+        "wallet",
+        &batch("wallet", 9, vec![OpKind::RecordPut(on_the_delete)]),
+        AT,
+    )
+    .await;
+    assert_eq!(code_of(&refused), (409, json!("conflict")));
+    let (again, ..) = create(&replay, 3, b"gone", "pay").await;
+    assert_eq!(again, key);
+    let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
+    assert!(
+        view["version"].as_u64().expect("version") > deleted_at,
+        "{view}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The App ID of alice's app `name`.
+fn app_id(name: &str) -> Vec<u8> {
+    pubky_switch_core::enc::app_id_decode(
+        app(&vectors("keys.json"), name)["app_id"]
+            .as_str()
+            .expect("id"),
+    )
+    .expect("app id")
+    .to_vec()
+}
+
+async fn sql_account(replay: &Replay, sql: &str) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(sql)
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("sql");
+}
+
+async fn sql_app(replay: &Replay, sql: &str, name: &str) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(sql)
+        .bind(alice_id())
+        .bind(app_id(name))
+        .execute(&mut conn)
+        .await
+        .expect("sql");
+}
+
+#[tokio::test]
+async fn test_records_deleted_key_waits_for_a_reader_short_of_it() {
+    // An app whose cursor is short of the delete holds the key, sweep after sweep, lagging
+    // or not, with a `missed` item to pass or not: a listing doesn't show a key the service
+    // forgot, so an app that missed the delete would keep the record (Switch spec 10.3).
+    // Once it reads past the delete, the key goes.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    register_executor(&replay).await;
+    let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
+    move_cursor(&replay, "wallet", deleted_at, AT).await;
+    move_cursor(&replay, "executor", deleted_at, AT).await;
+    move_cursor(&replay, "phone", deleted_at - 1, AT).await;
+    next_minute(&replay);
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(body(&answer)["deleted"], true, "the phone hasn't passed it");
+    // Marked lagging, with a `missed` item ahead of its cursor: still waited for.
+    sql_app(
+        &replay,
+        "UPDATE apps SET lagging = true WHERE account_id = $1 AND app_id = $2",
+        "phone",
+    )
+    .await;
+    let missed_at = deleted_at + 1;
+    sql_account(
+        &replay,
+        &format!("UPDATE accounts SET last_seq = {missed_at} WHERE id = $1"),
+    )
+    .await;
+    sql_app(
+        &replay,
+        &format!(
+            "INSERT INTO inbox_entries (account_id, generation, seq, kind, accepted_at_ms, \
+             envelope, targets, quota_bytes, missed_entries, missed_from_ms, missed_until_ms) \
+             VALUES ($1, 1, {missed_at}, 'missed', {at}, '\\x', ARRAY[$2::BYTEA], 0, 1, {at}, {at})",
+            at = ms(AT)
+        ),
+        "phone",
+    )
+    .await;
+    next_minute(&replay);
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(
+        body(&answer)["deleted"],
+        true,
+        "a lagging app is waited for"
+    );
+    assert_eq!(record_rows(&replay, &key).await, 1);
+    // The phone reads past it: the next minute's sweep forgets it.
+    move_cursor(&replay, "phone", missed_at, AT).await;
+    next_minute(&replay);
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_records_deleted_key_doesnt_wait_for_a_revoked_app() {
+    // A revoked app, kept for good, no longer reads or uploads: the keys it hadn't passed
+    // go once every other listed app has (Switch spec 10.3). Removing the app is what frees
+    // a key a silent app holds.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    register_executor(&replay).await;
+    let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
+    move_cursor(&replay, "wallet", deleted_at, AT).await;
+    move_cursor(&replay, "phone", deleted_at, AT).await;
+    next_minute(&replay);
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(
+        body(&answer)["deleted"],
+        true,
+        "the executor hasn't passed it"
+    );
+    sql_app(
+        &replay,
+        &format!(
+            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms, data_epoch) \
+             VALUES ($1, $2, 'revoked', {at}, 1)",
+            at = ms(AT)
+        ),
+        "executor",
+    )
+    .await;
+    next_minute(&replay);
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_records_deleted_key_a_divergent_upload_names_is_kept() {
+    // A divergent upload names the key: it stays, every reader past it or not.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    register_executor(&replay).await;
+    let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
+    all_past(&replay, deleted_at).await;
+    execute(
+        &replay,
+        "INSERT INTO divergent_uploads (account_id, key, position, op, op_hash) \
+         VALUES ($1, $2, 0, '\\x00', decode(repeat('11', 32), 'hex'))",
+        &key,
+    )
+    .await;
+    next_minute(&replay);
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(record_rows(&replay, &key).await, 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_records_deleted_key_taken_from_an_upload_is_kept() {
+    // A delete taken from a recovery upload has no chain item here to stand for it: its
+    // key stays, every reader past it or not (Switch spec 10.3, wire 7.4.14).
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let (key, uploaded_at) = created_and_deleted(&replay, 1, b"gone").await;
+    as_uploaded(&replay, &key, uploaded_at, false).await;
+    // A delete written here beside it, which the same sweep forgets.
+    let (here, deleted_at) = created_and_deleted(&replay, 3, b"here").await;
+    register_executor(&replay).await;
+    all_past(&replay, deleted_at).await;
+    next_minute(&replay);
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(record_rows(&replay, &key).await, 1);
+    assert_eq!(
+        record_rows(&replay, &here).await,
+        0,
+        "the one written here goes"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A batch of the wallet's with batch ID `[id; 16]`: a create at `natural` under the
+/// condition that the record at `key` is at `version`.
+fn conditioned(id: u8, key: [u8; 32], version: RecordVersion, natural: &[u8]) -> Vec<SignedOp> {
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet");
+    let signing = ed25519_dalek::SigningKey::from_bytes(&hex32(&wallet["signing_secret_hex"]));
+    let app_id = pubky_switch_core::enc::app_id_decode(wallet["app_id"].as_str().expect("id"))
+        .expect("app id");
+    let put = record_put(PAYMENTS, natural, "pay", RecordVersion::NONE, b"{\"n\":1}");
+    sign_batch(
+        &signing,
+        &alice_key().public(),
+        Some(app_id),
+        1,
+        [id; 16],
+        vec![(
+            vec![pubky_switch_core::ops::Condition::RecordVersion { key, version }],
+            OpKind::RecordPut(put),
+        )],
+    )
+    .expect("batch")
+}
+
+#[tokio::test]
+async fn test_records_condition_zero_matches_a_held_delete_and_a_forgotten_key() {
+    // A `record_version` condition of `{0, 0}` holds for a record that is absent,
+    // forgotten or deleted, as `expected_version` `{0, 0}` does: a writer holding a delete
+    // names it the same way before the key is forgotten and after (Switch wire 6.3). A live
+    // record fails it, `409 conflict`.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    register_executor(&replay).await;
+    let (live, ..) = create(&replay, 1, b"live", "pay").await;
+    let keys = vectors("keys.json");
+    let refused = replay
+        .service
+        .handle(app_request(
+            app(&keys, "wallet"),
+            "POST",
+            &format!("/v1/{}/ops", alice_id()),
+            OpsRequest::new(&conditioned(2, live, RecordVersion::NONE, b"c1"), None).to_json(),
+            ms(AT),
+        ))
+        .await;
+    assert_eq!(code_of(&refused), (409, json!("conflict")));
+    let (key, deleted_at) = created_and_deleted(&replay, 3, b"gone").await;
+    post(
+        &replay,
+        "wallet",
+        &conditioned(5, key, RecordVersion::NONE, b"c2"),
+        AT,
+    )
+    .await;
+    // The delete's own version holds too, while the service keeps it.
+    post(
+        &replay,
+        "wallet",
+        &conditioned(6, key, RecordVersion::new(1, deleted_at), b"c3"),
+        AT,
+    )
+    .await;
+    all_past(&replay, last_seq(&replay).await).await;
+    next_minute(&replay);
+    get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(record_rows(&replay, &key).await, 0, "forgotten");
+    post(
+        &replay,
+        "wallet",
+        &conditioned(7, key, RecordVersion::NONE, b"c4"),
+        AT,
+    )
+    .await;
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_records_superseded_write_loses_its_document() {
+    // A record's write keeps its document and proof while it is the record's current one;
+    // the write that supersedes it deletes both in its own transaction, so only the stub is
+    // left (Switch wire 7.5). The phone, which hasn't read past either, sees the first as a
+    // stub and the second in full, as before; the delete later does the same to the update.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let before = last_seq(&replay).await;
+    let (key, ..) = create(&replay, 1, b"n1", "pay").await;
+    let created = last_seq(&replay).await;
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), created).await,
+        (true, true)
+    );
+    let update = record_put(
+        PAYMENTS,
+        b"n1",
+        "pay",
+        RecordVersion::new(1, created),
+        b"{\"n\":2}",
+    );
+    post(
+        &replay,
+        "wallet",
+        &batch("wallet", 2, vec![OpKind::RecordPut(update)]),
+        AT,
+    )
+    .await;
+    let updated = last_seq(&replay).await;
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), created).await,
+        (false, false)
+    );
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), updated).await,
+        (true, true)
+    );
+    let feed = body(&get_as(&replay, "phone", &format!("feed?after=1:{before}")).await);
+    let shown = |seq: u64| {
+        feed["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["seq"] == seq)
+            .expect("item")["type"]
+            .clone()
+    };
+    assert_eq!(shown(created), json!("stub"));
+    assert_eq!(shown(updated), json!("chain"));
+    let delete = record_put(PAYMENTS, b"n1", "pay", RecordVersion::new(1, updated), b"");
+    post(
+        &replay,
+        "wallet",
+        &batch("wallet", 3, vec![OpKind::RecordPut(delete)]),
+        AT,
+    )
+    .await;
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), updated).await,
+        (false, false)
+    );
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), last_seq(&replay).await).await,
+        (true, true),
+        "the delete is the record's current write"
+    );
+    assert_eq!(record_rows(&replay, &key).await, 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_records_documents_chained_before_the_rule_are_checked_a_bounded_number_at_a_time() {
+    // Documents from before superseded ones were deleted: a superseded write's document is
+    // put back, as an earlier service left it, and the account's items marked unchecked.
+    // The next requests check 64 a request, oldest first, and delete it; a current write
+    // keeps its document.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    create(&replay, 1, b"n1", "pay").await;
+    let created = last_seq(&replay).await;
+    let update = record_put(
+        PAYMENTS,
+        b"n1",
+        "pay",
+        RecordVersion::new(1, created),
+        b"{\"n\":2}",
+    );
+    post(
+        &replay,
+        "wallet",
+        &batch("wallet", 2, vec![OpKind::RecordPut(update)]),
+        AT,
+    )
+    .await;
+    let updated = last_seq(&replay).await;
+    for n in 0..70u8 {
+        create(&replay, n.wrapping_add(10), &[b'k', n], "pay").await;
+    }
+    let end = last_seq(&replay).await;
+    assert!(end > 64 + updated, "more than one request's bound");
+    sql_account(
+        &replay,
+        &format!(
+            "UPDATE chain_items SET item_bytes = (SELECT item_bytes FROM chain_items \
+             WHERE account_id = $1 AND seq = {updated}), proof = (SELECT proof FROM \
+             chain_items WHERE account_id = $1 AND seq = {updated}) \
+             WHERE account_id = $1 AND seq = {created}"
+        ),
+    )
+    .await;
+    sql_account(
+        &replay,
+        &format!(
+            "UPDATE accounts SET documents_checked_seq = 0, documents_check_end = {end} \
+             WHERE id = $1"
+        ),
+    )
+    .await;
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), created).await,
+        (true, true)
+    );
+    get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+    assert_eq!(checked(&replay).await, 64);
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), created).await,
+        (false, false)
+    );
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), updated).await,
+        (true, true)
+    );
+    get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+    assert_eq!(checked(&replay).await, i64::try_from(end).expect("end"));
+    get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+    assert_eq!(
+        checked(&replay).await,
+        i64::try_from(end).expect("end"),
+        "done"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+async fn checked(replay: &Replay) -> i64 {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query_scalar("SELECT documents_checked_seq FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("checked")
+}
+
+/// The items of `name`'s feed read at `query`, in one page.
+async fn feed_items(replay: &Replay, name: &str, query: &str) -> Vec<Value> {
+    let answer = get_as(replay, name, &format!("feed?limit=500{query}")).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let page = body(&answer);
+    assert_eq!(page["more"], json!(false), "one page");
+    page["items"].as_array().expect("items").clone()
+}
+
+/// Update the wallet's record at `natural` read under `read_scope` from `version`, in
+/// batch `id`; the new version.
+async fn update(
+    replay: &Replay,
+    id: u8,
+    natural: &[u8],
+    read_scope: &str,
+    version: u64,
+    value: &[u8],
+) -> u64 {
+    let put = record_put(
+        PAYMENTS,
+        natural,
+        read_scope,
+        RecordVersion::new(1, version),
+        value,
+    );
+    post(
+        replay,
+        "wallet",
+        &batch("wallet", id, vec![OpKind::RecordPut(put)]),
+        AT,
+    )
+    .await;
+    last_seq(replay).await
+}
+
+#[tokio::test]
+async fn test_records_feed_is_the_same_with_deleted_documents_put_back() {
+    // Every read of the feed, by either app and from any position (none, behind every
+    // write, between them), answers the same whether the superseded documents are deleted
+    // or put back as an earlier service kept them.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let mut docs = std::collections::BTreeMap::new();
+    let id = alice_id();
+    capture_documents(&replay, &id, &mut docs).await;
+    let before = last_seq(&replay).await;
+    create(&replay, 1, b"a1", "pay").await;
+    let v1 = last_seq(&replay).await;
+    capture_documents(&replay, &id, &mut docs).await;
+    let v2 = update(&replay, 2, b"a1", "pay", v1, b"{\"n\":2}").await;
+    capture_documents(&replay, &id, &mut docs).await;
+    let v3 = update(&replay, 3, b"a1", "pay", v2, b"{\"n\":3}").await;
+    capture_documents(&replay, &id, &mut docs).await;
+    create(&replay, 4, b"c1", "contacts").await;
+    let c1 = last_seq(&replay).await;
+    capture_documents(&replay, &id, &mut docs).await;
+    let c2 = update(&replay, 5, b"c1", "contacts", c1, b"{\"n\":2}").await;
+    capture_documents(&replay, &id, &mut docs).await;
+    let deleted = update(&replay, 6, b"a1", "pay", v3, b"").await;
+    capture_documents(&replay, &id, &mut docs).await;
+    for seq in [v1, v2, v3, c1] {
+        assert_eq!(
+            chain_document_kept(&replay, &id, seq).await,
+            (false, false),
+            "seq {seq}"
+        );
+    }
+    for seq in [c2, deleted] {
+        assert_eq!(
+            chain_document_kept(&replay, &id, seq).await,
+            (true, true),
+            "seq {seq}"
+        );
+    }
+    let queries = [
+        String::new(),
+        format!("&after=1:{before}"),
+        format!("&after=1:{v2}"),
+        format!("&after=1:{c1}"),
+    ];
+    let mut gone = Vec::new();
+    for name in ["phone", "wallet"] {
+        for query in &queries {
+            gone.push(feed_items(&replay, name, query).await);
+        }
+    }
+    assert_eq!(restore_documents(&replay, &id, &docs).await, 4);
+    assert_eq!(
+        chain_document_kept(&replay, &id, v1).await,
+        (true, true),
+        "put back"
+    );
+    let mut kept = Vec::new();
+    for name in ["phone", "wallet"] {
+        for query in &queries {
+            kept.push(feed_items(&replay, name, query).await);
+        }
+    }
+    assert_eq!(gone, kept);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_records_old_documents_check_takes_every_stale_one_over_several_requests() {
+    // 150 superseded writes of one record, their documents put back as an earlier service
+    // kept them, and the account marked unchecked: each request checks the next 64, the
+    // stale ones go and the current write, the app records and receive keys stay, and no
+    // feed read changes.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let id = alice_id();
+    let mut docs = std::collections::BTreeMap::new();
+    create(&replay, 99, b"n1", "pay").await;
+    let mut version = last_seq(&replay).await;
+    let mut stale = vec![version];
+    capture_documents(&replay, &id, &mut docs).await;
+    for n in 0..150u8 {
+        version = update(
+            &replay,
+            100 + n,
+            b"n1",
+            "pay",
+            version,
+            format!("{{\"n\":{n}}}").as_bytes(),
+        )
+        .await;
+        stale.push(version);
+        capture_documents(&replay, &id, &mut docs).await;
+    }
+    let current = stale.pop().expect("current");
+    let end = last_seq(&replay).await;
+    assert!(end > 2 * 64, "more than two requests' bound");
+    let feed_before = feed_items(&replay, "phone", "").await;
+    assert_eq!(
+        restore_documents(&replay, &id, &docs).await,
+        u64::try_from(stale.len()).expect("len")
+    );
+    sql_on(
+        &replay,
+        &id,
+        "UPDATE chain_items SET doc_app = NULL WHERE account_id = $1",
+    )
+    .await;
+    sql_on(
+        &replay,
+        &id,
+        &format!(
+            "UPDATE accounts SET documents_checked_seq = 0, documents_check_end = {end} \
+             WHERE id = $1"
+        ),
+    )
+    .await;
+    let end = i64::try_from(end).expect("end");
+    let mut requests = 0;
+    loop {
+        let (checked, _) = documents_check(&replay, &id).await;
+        assert_eq!(checked, (64 * requests).min(end), "request {requests}");
+        if checked == end {
+            break;
+        }
+        get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+        requests += 1;
+    }
+    assert_eq!(requests, (end + 63) / 64);
+    for seq in &stale {
+        assert_eq!(
+            chain_document_kept(&replay, &id, *seq).await,
+            (false, false),
+            "seq {seq}"
+        );
+    }
+    assert_eq!(
+        chain_document_kept(&replay, &id, current).await,
+        (true, true)
+    );
+    // Every other item keeps its document: the registrations, deliveries and transitions.
+    let mut left = std::collections::BTreeMap::new();
+    capture_documents(&replay, &id, &mut left).await;
+    let expected: Vec<i64> = docs
+        .keys()
+        .copied()
+        .filter(|seq| !stale.contains(&u64::try_from(*seq).expect("seq")))
+        .collect();
+    assert_eq!(left.keys().copied().collect::<Vec<_>>(), expected);
+    // The app records the check went past name their app again.
+    let named: i64 = {
+        use sqlx::Connection;
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        sqlx::query_scalar(
+            "SELECT count(*) FROM chain_items WHERE account_id = $1 AND doc_app IS NOT NULL",
+        )
+        .bind(&id)
+        .fetch_one(&mut conn)
+        .await
+        .expect("count")
+    };
+    assert_eq!(named, 2, "the wallet's and the phone's app.put");
+    assert_eq!(feed_items(&replay, "phone", "").await, feed_before);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_records_migration_marks_older_documents_and_holds_feed_reads() {
+    // The account as a service from before migration 0022 left it: a superseded write
+    // keeps its document, and the schema has none of 0022's columns, nor 0025's index on
+    // one of them. The migration, run as one transaction, holds a read of `chain_items` until
+    // it commits, as its `ALTER TABLE` locks the table for the whole transaction; 0025's
+    // index build, in a transaction of its own, holds no read. Then the account's items are
+    // marked for the check, and the next request deletes the stale document.
+    use sqlx::{Connection, Executor};
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let id = alice_id();
+    let mut docs = std::collections::BTreeMap::new();
+    create(&replay, 1, b"n1", "pay").await;
+    let created = last_seq(&replay).await;
+    capture_documents(&replay, &id, &mut docs).await;
+    update(&replay, 2, b"n1", "pay", created, b"{\"n\":2}").await;
+    assert_eq!(restore_documents(&replay, &id, &docs).await, 1);
+    let mut admin = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    admin
+        .execute(sqlx::raw_sql(
+            "ALTER TABLE chain_items DROP COLUMN doc_app; \
+             ALTER TABLE accounts DROP COLUMN documents_checked_seq, \
+             DROP COLUMN documents_check_end",
+        ))
+        .await
+        .expect("as before 0022");
+    let mut migration = admin.begin().await.expect("begin");
+    migration
+        .execute(sqlx::raw_sql(include_str!(
+            "../migrations/0022_superseded_documents.sql"
+        )))
+        .await
+        .expect("0022");
+    let mut reader = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    reader
+        .execute("SET lock_timeout = '500ms'")
+        .await
+        .expect("timeout");
+    let read =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM chain_items WHERE account_id = $1")
+            .bind(&id)
+            .fetch_one(&mut reader)
+            .await;
+    let code = read
+        .as_ref()
+        .err()
+        .and_then(|error| error.as_database_error())
+        .and_then(|error| error.code().map(|code| code.into_owned()));
+    assert_eq!(
+        code.as_deref(),
+        Some("55P03"),
+        "a feed read waits for the migration: {read:?}"
+    );
+    migration.commit().await.expect("commit");
+    let mut index = admin.begin().await.expect("begin");
+    index
+        .execute(sqlx::raw_sql(include_str!(
+            "../migrations/0025_chain_items_by_doc_app.sql"
+        )))
+        .await
+        .expect("0025");
+    let read =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM chain_items WHERE account_id = $1")
+            .bind(&id)
+            .fetch_one(&mut reader)
+            .await;
+    assert!(
+        read.is_ok(),
+        "a feed read goes on during the build: {read:?}"
+    );
+    index.commit().await.expect("commit");
+    reader.close().await.expect("close");
+    admin.close().await.expect("close");
+    let end = i64::try_from(last_seq(&replay).await).expect("end");
+    assert_eq!(documents_check(&replay, &id).await, (0, end));
+    assert_eq!(
+        chain_document_kept(&replay, &id, created).await,
+        (true, true)
+    );
+    get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+    assert_eq!(documents_check(&replay, &id).await, (end, end));
+    assert_eq!(
+        chain_document_kept(&replay, &id, created).await,
+        (false, false)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_records_old_documents_check_past_an_item_that_doesnt_read() {
+    // An older chain item whose stored document doesn't read, left for the check of older
+    // documents: the account's other requests go on answering, as they did before the
+    // check existed (only a feed page over that item fails), and the check moves past it.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let id = alice_id();
+    create(&replay, 1, b"n1", "pay").await;
+    let created = last_seq(&replay).await;
+    sql_on(
+        &replay,
+        &id,
+        &format!(
+            "UPDATE chain_items SET item_bytes = '\\x00'::BYTEA \
+             WHERE account_id = $1 AND seq = {created}"
+        ),
+    )
+    .await;
+    let end = last_seq(&replay).await;
+    sql_on(
+        &replay,
+        &id,
+        &format!(
+            "UPDATE accounts SET documents_checked_seq = 0, documents_check_end = {end} \
+             WHERE id = $1"
+        ),
+    )
+    .await;
+    for _ in 0..2 {
+        let answer = get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "the wallet's list: {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        let apps = replay
+            .service
+            .handle(signer_request(
+                "GET",
+                &format!("/v1/{id}/apps"),
+                Vec::new(),
+                ms(AT),
+            ))
+            .await;
+        assert_eq!(
+            apps.status,
+            200,
+            "the signer's GET /apps: {}",
+            String::from_utf8_lossy(&apps.body)
+        );
+    }
+    assert_eq!(
+        documents_check(&replay, &id).await,
+        (
+            i64::try_from(end).expect("end"),
+            i64::try_from(end).expect("end")
+        )
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_records_write_superseding_an_item_that_doesnt_read_still_commits() {
+    // The record's create, whose stored document doesn't read: the update that supersedes
+    // it commits, and the create keeps what it holds, while a readable superseded write loses
+    // its document as before.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let id = alice_id();
+    create(&replay, 1, b"n1", "pay").await;
+    let created = last_seq(&replay).await;
+    create(&replay, 2, b"n2", "pay").await;
+    let other = last_seq(&replay).await;
+    sql_on(
+        &replay,
+        &id,
+        &format!(
+            "UPDATE chain_items SET item_bytes = '\\x00'::BYTEA \
+             WHERE account_id = $1 AND seq = {created}"
+        ),
+    )
+    .await;
+    let updated = update(&replay, 3, b"n1", "pay", created, b"{\"n\":2}").await;
+    assert!(updated > created, "the update committed");
+    assert_eq!(
+        chain_document_kept(&replay, &id, created).await,
+        (true, true),
+        "kept"
+    );
+    let replaced = update(&replay, 4, b"n2", "pay", other, b"{\"n\":2}").await;
+    assert!(replaced > updated);
+    assert_eq!(
+        chain_document_kept(&replay, &id, other).await,
+        (false, false)
+    );
+    replay.db.drop_database().await.expect("drop");
+}

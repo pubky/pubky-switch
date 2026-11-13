@@ -392,6 +392,14 @@ async fn test_recovery_in_place_starts_afresh_under_the_pending_key() {
         chain(&replay).await,
         [(2, 1, "service".into()), (2, 2, "identity".into())]
     );
+    // The new sequence's items keep their documents: what the recovery superseded at the
+    // generation it left touches none of them (Switch wire 7.5).
+    for seq in [1, 2] {
+        assert_eq!(
+            chain_document_kept(&replay, &alice_id(), seq).await,
+            (true, false)
+        );
+    }
     // The new document's apps are listed afresh, in the new generation.
     assert_eq!(
         scalar_i64(
@@ -2868,6 +2876,148 @@ async fn test_upload_from_a_revoked_app_is_refused_without_its_judgment() {
     replay.db.drop_database().await.expect("drop");
 }
 
+/// Wait until `n` backends of the test database wait for a lock.
+async fn lock_waiters(options: &sqlx::postgres::PgConnectOptions, n: i64) {
+    let mut watcher = sqlx::PgConnection::connect_with(options)
+        .await
+        .expect("conn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+             AND datname = current_database()",
+        )
+        .fetch_one(&mut watcher)
+        .await
+        .expect("count");
+        if count >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{count} waiting, not {n}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// `first`, then `second`, queued in that order behind a hold on alice's account row, and
+/// answered once the hold ends: so they run one after the other, as two requests that come
+/// at the same moment do.
+async fn queued(
+    replay: &Replay,
+    first: impl std::future::Future<Output = SwitchResponse>,
+    second: impl std::future::Future<Output = SwitchResponse>,
+) -> (SwitchResponse, SwitchResponse) {
+    let mut holder = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(alice_id())
+        .execute(&mut holder)
+        .await
+        .expect("lock");
+    let options = replay.db.options().clone();
+    let (first, (second, ())) = tokio::join!(first, async {
+        lock_waiters(&options, 1).await;
+        tokio::join!(second, async {
+            lock_waiters(&options, 2).await;
+            sqlx::query("COMMIT")
+                .execute(&mut holder)
+                .await
+                .expect("commit");
+        })
+    });
+    (first, second)
+}
+
+#[tokio::test]
+async fn test_recovery_in_place_and_a_sweep_at_the_same_moment_run_one_after_the_other() {
+    // A request that sweeps and a recovery in place, at the same moment, in either order:
+    // each takes the account's lock, so one runs after the other, and both are answered.
+    // The recovery starts the account afresh either way: a sweep before it dropped what it
+    // could from the old state, one after it sweeps the fresh state and takes nothing of
+    // it (Switch wire 7.3 step 4, 3.3).
+    for sweep_first in [true, false] {
+        let Some(replay) = replay().await else { return };
+        let (pending, at) = serving_with_a_pending_key(&replay).await;
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        sqlx::query(
+            "INSERT INTO invite_codes (account_id, code_hash, max_uses, writer, \
+             expires_at_ms, context) VALUES ($1, decode(repeat('ab', 32), 'hex'), 1, \
+             decode(repeat('cd', 16), 'hex'), $2, 'null')",
+        )
+        .bind(alice_id())
+        .bind(i64::try_from(at).expect("ms"))
+        .execute(&mut conn)
+        .await
+        .expect("invite");
+        // Due now: the minute's mark cleared, and each sweep's deletes logged.
+        sqlx::query("UPDATE accounts SET swept_at_ms = NULL WHERE id = $1")
+            .bind(alice_id())
+            .execute(&mut conn)
+            .await
+            .expect("due");
+        log_swept_invite_codes(&replay).await;
+        let before = held(&replay).await;
+        let recovery = next_generation(&before, pending, Some(1));
+        let apps = || {
+            replay.service.handle(signer_request(
+                "GET",
+                &format!("/v1/{}/apps", alice_id()),
+                Vec::new(),
+                at,
+            ))
+        };
+        let deliver = async { deliver(&replay, recovery, Some(before.hash()), at).await.0 };
+        let (swept, recovered) = if sweep_first {
+            queued(&replay, apps(), deliver).await
+        } else {
+            let (recovered, swept) = queued(&replay, deliver, apps()).await;
+            (swept, recovered)
+        };
+        assert_eq!(
+            recovered.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&recovered.body)
+        );
+        assert_eq!(
+            swept.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&swept.body)
+        );
+        assert_eq!(
+            chain(&replay).await,
+            [(2, 1, "service".into()), (2, 2, "identity".into())],
+            "sweep first: {sweep_first}"
+        );
+        assert_eq!(
+            scalar_i64(
+                &replay,
+                "SELECT count(*) FROM invite_codes WHERE account_id = $1"
+            )
+            .await,
+            0
+        );
+        // A sweep ran: whichever request came first swept the expired code at its step 4.
+        assert_eq!(
+            swept_invite_codes(&replay).await,
+            1,
+            "sweep first: {sweep_first}"
+        );
+        conn.close().await.expect("close");
+        replay.db.drop_database().await.expect("drop");
+    }
+}
+
 #[tokio::test]
 async fn test_admission_staged_holds_back_connect_requests_whatever_the_policy() {
     // The recovery document takes no connect requests: while admission is staged a
@@ -2908,5 +3058,146 @@ async fn test_admission_staged_holds_back_connect_requests_whatever_the_policy()
         code(&replay.service.handle(ask()).await),
         (403, "not_admitted".into())
     );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_after_the_lost_generation_deleted_a_superseded_document() {
+    // At generation 1 the record's update (seq 8) deleted its create's document (seq 6).
+    // After the loss of generation 1 the wallet uploads both writes, with the lost service's
+    // proofs, from what it holds: the service takes the record at (1, 8), as it would with
+    // the create's document kept, since an upload reads nothing the chain kept.
+    let Some(replay) = replay().await else { return };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), 6).await,
+        (false, false)
+    );
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), 8).await,
+        (true, true)
+    );
+    let before = held(&replay).await;
+    let recovery = next_generation(&before, pending, Some(1));
+    let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    let (status, body) = wallet_registers(&replay, 77, 2, 3, true, at).await;
+    assert_eq!(status, 200, "{body}");
+    let body = json!({
+        "lost_identity": before.signed(),
+        "records": [uploaded_op(6, Some(CREATED)), uploaded_op(8, Some(UPDATED))],
+    });
+    let answer = upload(&replay, &body, at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let (record, _) = record_and_claim_keys();
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    assert_eq!(
+        (view["generation"].clone(), view["version"].clone()),
+        (json!(1), json!(8))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_in_place_old_documents_check_runs_on_over_the_new_sequence() {
+    // The check of older documents half done when a recovery in place empties the chain:
+    // it runs on to its end over the new generation's seqs and deletes none of their
+    // documents, which are all current; requests succeed throughout.
+    let Some(replay) = replay().await else { return };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let id = alice_id();
+    sql_on(
+        &replay,
+        &id,
+        "UPDATE accounts SET documents_checked_seq = 0, documents_check_end = 200 \
+         WHERE id = $1",
+    )
+    .await;
+    let before = held(&replay).await;
+    let recovery = next_generation(&before, pending, Some(1));
+    let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    let (checked, end) = documents_check(&replay, &id).await;
+    assert!(checked < end, "{checked} of {end}");
+    let (status, body) = wallet_registers(&replay, 77, 2, 3, true, at).await;
+    assert_eq!(status, 200, "{body}");
+    let mut reads = 0;
+    while documents_check(&replay, &id).await.0 < end {
+        wallet_get(&replay, "feed?limit=500", at).await;
+        reads += 1;
+        assert!(reads < 10, "the check ends");
+    }
+    let items = chain(&replay).await;
+    assert!(items.iter().all(|(generation, ..)| *generation == 2));
+    for (_, seq, kind) in &items {
+        let kept = chain_document_kept(&replay, &id, u64::try_from(*seq).expect("seq")).await;
+        assert!(kept.0, "seq {seq} ({kind}) keeps its document");
+    }
+    let feed = wallet_get(&replay, "feed?limit=500", at).await;
+    for item in feed["items"].as_array().expect("items") {
+        assert_ne!(item["type"], json!("stub"), "{item}");
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_reopened_tombstone_shows_its_earlier_entries_as_stubs() {
+    // The wallet's attempt and its `done` compact the claim to a tombstone, which keeps no
+    // entries (Switch wire 7.4.8). An upload then adds an attempt of the lost generation and
+    // reopens it: the claim reads as the upload left it, at step 3 with no entry from before,
+    // and the feed shows the two earlier entries as their stubs (Switch wire 10.5).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let (fields, key) = live_attempt(&replay, at).await;
+    let attempt = scalar_i64(&replay, "SELECT last_seq FROM accounts WHERE id = $1").await;
+    let mut done = fields.clone();
+    done.kind = ClaimType::Done;
+    done.expected_step = 1;
+    done.orphan_after = None;
+    done.basis = Some(pubky_switch_core::claims::Basis::Owner);
+    let batch = wallet_batch(92, 2, vec![(Vec::new(), OpKind::Claim(done))]);
+    let written = wallet_ops(&replay, &batch, at).await;
+    assert_eq!(
+        written.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&written.body)
+    );
+    let settled = scalar_i64(&replay, "SELECT last_seq FROM accounts WHERE id = $1").await;
+    let rows = "SELECT count(*) FROM claim_entries WHERE account_id = $1";
+    assert_eq!(scalar_i64(&replay, rows).await, 0, "a tombstone keeps none");
+    let read = wallet_get(&replay, &format!("claims/{key}"), at).await;
+    assert_eq!(read["claim"]["tombstone"], json!(true), "{read}");
+    assert_eq!(read["entries"], json!([]), "{read}");
+    let mut uploaded = fields;
+    uploaded.attempt_id = vec![10; 16];
+    let lost_op = wallet_batch(93, 1, vec![(Vec::new(), OpKind::Claim(uploaded))]);
+    let answer = upload(&replay, &json!({ "claims": [proofless(&lost_op[0])] }), at).await;
+    assert_eq!(
+        json_of(&answer)["result"]["claims"],
+        json!([key]),
+        "{}",
+        json_of(&answer)
+    );
+    let read = wallet_get(&replay, &format!("claims/{key}"), at).await;
+    assert_eq!(read["claim"]["tombstone"], json!(false), "{read}");
+    assert_eq!(read["claim"]["step"], json!(3), "{read}");
+    assert_eq!(read["entries"], json!([]), "{read}");
+    let feed = wallet_get(&replay, "feed?limit=500", at).await;
+    for seq in [attempt, settled] {
+        let item = feed["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["seq"] == json!(seq))
+            .cloned()
+            .expect("the entry");
+        assert_eq!(item["type"], json!("stub"), "{item}");
+    }
     replay.db.drop_database().await.expect("drop");
 }

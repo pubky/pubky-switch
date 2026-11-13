@@ -25,7 +25,7 @@
 //!    it is older or another body at the high-water version;
 //! 7. publish it on the Homeserver.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use pubky_switch_client::client::answers::AppsAnswer;
 use pubky_switch_client::clock::Clock;
@@ -66,7 +66,7 @@ mod vector_cases;
 pub use approval::{AppReview, ApprovedRequest};
 use clients::{RequestClient, SigningClient, Target};
 pub use handover::AbortOutcome;
-pub use renewal::CertChange;
+pub use renewal::{CertChange, RunDue};
 pub use revocation::UserConfirmed;
 pub use takeover::ReceivingApp;
 
@@ -215,6 +215,12 @@ pub struct Signer {
     /// A commit answered that the store can't tell whether it applied: the records and the
     /// flow are read again before the next step.
     unsure: bool,
+    /// What the [`Signer::run_due`] in progress left because a bound cut it short.
+    left: RunDue,
+    /// What the public call in progress may still do: one budget for the whole call, however
+    /// its steps nest, a [`Signer::run_due`] or a direct one. Empty between calls; a guard
+    /// empties it when the call ends, also when its future is dropped part way.
+    run: Arc<Mutex<Option<Allowance>>>,
 }
 
 impl std::fmt::Debug for Signer {
@@ -272,6 +278,8 @@ impl Signer {
             state,
             flow: Some(flow),
             unsure: false,
+            left: RunDue::default(),
+            run: Arc::default(),
         })
     }
 
@@ -294,6 +302,8 @@ impl Signer {
             state,
             flow,
             unsure: false,
+            left: RunDue::default(),
+            run: Arc::default(),
         };
         // Records of a hand-over that took effect: the deletion is finished now.
         if let Some(install) = handed_over {
@@ -312,6 +322,8 @@ impl Signer {
     /// rollback or an equivocation; [`Refusal::RecordsBehind`] when the switch or the
     /// Homeserver holds a newer version this install signed itself.
     pub async fn resume(&mut self) -> Result<()> {
+        // One budget for this call and what it runs, unless a call in progress holds one.
+        let _budget = self.budget();
         self.refresh().await?;
         loop {
             self.finish_flow().await?;
@@ -945,6 +957,32 @@ impl Signer {
         RequestClient::new(&self.env, &self.service_target(&service), &self.keyring)
     }
 
+    /// What the call in progress may still do: a full budget when none was taken.
+    pub(crate) fn allowance(&self) -> Allowance {
+        let run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
+        run.unwrap_or(Allowance::RUN)
+    }
+
+    /// Spend from the call's budget.
+    pub(crate) fn spend(&mut self, spend: impl FnOnce(&mut Allowance)) {
+        let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(run) = run.as_mut() {
+            spend(run);
+        }
+    }
+
+    /// Take one budget for the public call that begins here, unless a call in progress holds
+    /// one already, which its nested steps share. The guard returned gives it back when the
+    /// call ends, or when its future is dropped part way.
+    pub(crate) fn budget(&self) -> Option<BudgetGuard> {
+        let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
+        if run.is_some() {
+            return None;
+        }
+        *run = Some(Allowance::RUN);
+        Some(BudgetGuard(Arc::clone(&self.run)))
+    }
+
     /// Whether the key a recovery in place's service served the lost generation with is
     /// pinned for the service the signer goes to ([`Signer::service_target`]).
     fn pins_the_lost_generations_key(&self) -> Result<bool> {
@@ -958,11 +996,9 @@ impl Signer {
 
     /// While recovering, whether the service the signer goes to took a version of this
     /// recovery under a key an earlier declaration's enrollment answered there, read under
-    /// each such key ([`Signer::taken_under_an_earlier_key`]): that version is then delivered.
+    /// each such key but the one pinned ([`Signer::taken_under_an_earlier_key`], which reads
+    /// nothing unless recovering): that version is then delivered.
     async fn taken_under_a_remembered_key(&mut self) -> Result<bool> {
-        if !self.state.recovering {
-            return Ok(false);
-        }
         let origin = self.service()?.origin;
         self.taken_under_an_earlier_key(&origin, true).await
     }
@@ -1441,7 +1477,12 @@ impl Signer {
                     return self.commit(state, self.flow.clone()).await;
                 }
                 // Not the version's key either: it may still be the key an earlier
-                // declaration's enrollment answered here, whatever the refusal, as below.
+                // declaration's enrollment answered here, as below. The service refuses a
+                // version of this recovery sent after it took an earlier one with `409`,
+                // `stale_identity` or `conflict`, and the read is made whatever the refusal.
+                // So one failed delivery reads `GET /apps` at most 1 + R times after its send:
+                // once under the version's key, once under each of the R keys earlier
+                // declarations' enrollments answered at this service.
                 if self.taken_under_a_remembered_key().await? {
                     return Ok(());
                 }
@@ -1812,23 +1853,24 @@ impl Signer {
     /// body at that version stays the alarm and a newer copy stops this install. Only a
     /// version published already is published again: the first publication is
     /// [`Signer::publish`]'s, which a take-over's first version passes only once its backup is
-    /// written. A write that fails is tried again at the next run.
-    pub(super) async fn republish(&mut self) -> Result<()> {
+    /// written. A write that fails is tried again at the next run. Returns whether it wrote,
+    /// failed or not.
+    pub(super) async fn republish(&mut self) -> Result<bool> {
         self.ready().await?;
         let Some(newest) = self.state.newest.clone() else {
-            return Ok(());
+            return Ok(false);
         };
         if !newest.published {
-            return Ok(());
+            return Ok(false);
         }
         let mine = IdentityDoc::verify(&newest.doc, &self.state.identity)?;
         if self.judge_homeserver(&mine).await? {
-            return Ok(());
+            return Ok(false);
         }
         let bytes =
             serde_json::to_vec(&newest.doc).map_err(|e| SignerError::Records(e.to_string()))?;
         let _ = self.env.homeserver.put(IDENTITY_PATH, bytes).await;
-        Ok(())
+        Ok(true)
     }
 
     /// Publish the newest version on the Homeserver once the switch accepted it (Switch spec
@@ -1997,6 +2039,61 @@ pub(super) fn version_size(
 /// wire 2.2); without it, a version signed at the cap leaves its closing over it, and an owed
 /// reduction closing then blocks every signing step.
 const CAP_HEADROOM: usize = 16;
+
+/// The most certificates one call renews by itself, the soonest to expire first: the rest are
+/// renewed at the next run, which half a lifetime leaves months for (design note, section
+/// 4.5). Each renewal is a few requests: its read, its `cert.put` and key bundle parts, its
+/// delivery and its publication.
+pub(crate) const RENEWALS_PER_RUN: usize = 4;
+
+/// The most full-bundle requests one call answers, the oldest first: the rest are answered at
+/// the next run, and an app asking again goes behind the others (design note, section 4.5).
+pub(crate) const FULL_BUNDLES_PER_RUN: usize = 4;
+
+/// The most removed apps' records one call deletes from the Homeserver, each one request: the
+/// rest stay owed, deleted at the next run (design note, section 4.5).
+pub(crate) const RECORD_DELETIONS_PER_RUN: usize = 32;
+
+/// Empties the call's budget when dropped ([`Signer::budget`]).
+pub(crate) struct BudgetGuard(Arc<Mutex<Option<Allowance>>>);
+
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+/// What one run, or one call outside a run, may still do (design note, section 4.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Allowance {
+    /// Certificates renewed by themselves.
+    pub(crate) renewals: usize,
+    /// Full-bundle requests answered.
+    pub(crate) full_bundles: usize,
+    /// Removed apps' records deleted, or tried.
+    pub(crate) deletions: usize,
+    /// Owed deletions checked, or tried.
+    pub(crate) checks: usize,
+}
+
+impl Allowance {
+    /// One run's.
+    pub(crate) const RUN: Self = Self {
+        renewals: RENEWALS_PER_RUN,
+        full_bundles: FULL_BUNDLES_PER_RUN,
+        deletions: RECORD_DELETIONS_PER_RUN,
+        checks: DELETION_CHECKS_PER_RUN,
+    };
+}
+
+/// The most owed deletions one run checks on the Homeserver, each one request: the rest at
+/// the next run (design note, section 4.5).
+pub(crate) const DELETION_CHECKS_PER_RUN: usize = 32;
+
+/// How long, on the device clock, [`Signer::run_due`] goes on starting its later steps: once
+/// this has passed since the run began, it starts none, and they come at the next run. The
+/// step in progress finishes its unit of work; each step's own work is bounded too.
+pub(crate) const RUN_DUE_STEPS_MS: u64 = 30_000;
 
 /// How much room a version must leave under the cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

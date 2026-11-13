@@ -133,6 +133,11 @@ pub struct AccountTxn {
     max_flags: u64,
     /// The push keys this request owes deleting once it commits (`store::push`).
     pub(super) owed: Vec<KeyId>,
+    /// Chain items this request may have superseded, whose documents go before the commit
+    /// if no app may read them any more (`documents.rs`).
+    pub(super) superseded: std::collections::BTreeSet<u64>,
+    /// Apps whose record or renewed certificate this request may have changed.
+    pub(super) documents_of_apps: std::collections::BTreeSet<[u8; 16]>,
     /// A transaction on the reader pool, begun before the lock, to export this one's
     /// snapshot to ([`AccountTxn::snapshot_read`]).
     pub(super) reader: Option<Transaction<'static, Postgres>>,
@@ -272,6 +277,8 @@ impl AccountTxn {
             flag_hits: Vec::new(),
             max_flags: 0,
             owed: Vec::new(),
+            superseded: std::collections::BTreeSet::new(),
+            documents_of_apps: std::collections::BTreeSet::new(),
             reader: None,
             snapshot: None,
             read_turn: None,
@@ -399,6 +406,8 @@ impl AccountTxn {
     /// answer may go out. For a staged account, or a request whose answer carries no head;
     /// a serving account's answer with a head goes through [`AccountTxn::commit_marked`].
     pub async fn commit(mut self) -> Result<Committed, StoreError> {
+        // The documents this request superseded go with it (Switch wire 7.5).
+        self.drop_stale_documents().await?;
         if self.head != self.loaded {
             let chain_seq = self
                 .head

@@ -276,6 +276,7 @@ impl Inner {
         fresh.max_deny = self.max_deny;
         fresh.feed_limit = self.feed_limit;
         fresh.max_page_bytes = self.max_page_bytes;
+        fresh.max_page_scan = self.max_page_scan;
         fresh.keep_passed = self.keep_passed;
         fresh.open_admission = self.open_admission;
         fresh.faults = std::mem::take(&mut self.faults);
@@ -336,6 +337,7 @@ impl Inner {
         // What a test set of the switch's configuration stays set, as a service's does.
         fresh.feed_limit = self.feed_limit;
         fresh.max_page_bytes = self.max_page_bytes;
+        fresh.max_page_scan = self.max_page_scan;
         fresh.keep_passed = self.keep_passed;
         fresh.open_admission = self.open_admission;
         fresh.faults = std::mem::take(&mut self.faults);

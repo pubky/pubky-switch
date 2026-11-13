@@ -72,6 +72,8 @@ impl Signer {
             state: SignerState::new(identity, install),
             flow: None,
             unsure: false,
+            left: super::RunDue::default(),
+            run: std::sync::Arc::default(),
         };
         signer.restore_records(false, confirmed).await?;
         Ok(signer)
@@ -605,14 +607,21 @@ impl Signer {
         if self.state.deletion_checks.is_empty() {
             return Ok(());
         }
+        // The run's budget, shared with every other check this run makes.
+        let allowed = self.allowance().checks;
+        if self.state.deletion_checks.len() > allowed {
+            self.left.deletions_left = true;
+        }
         let mut state = self.state.clone();
         let batch: Vec<[u8; 16]> = state
             .deletion_checks
             .iter()
-            .take(DELETION_CHECKS_PER_RUN)
+            .take(allowed)
             .copied()
             .collect();
+        let mut tried = 0;
         for app_id in batch {
+            tried += 1;
             match self.env.homeserver.get(&app_record_path(&app_id)).await {
                 Ok(found) => {
                     state.deletion_checks.retain(|a| *a != app_id);
@@ -620,9 +629,16 @@ impl Signer {
                         state.cleanup.push(app_id);
                     }
                 }
-                Err(_) => break,
+                // The Homeserver failed: the rest wait for the next run, and this one goes
+                // behind them, so a path that keeps failing holds none of them back.
+                Err(_) => {
+                    state.deletion_checks.retain(|a| *a != app_id);
+                    state.deletion_checks.push(app_id);
+                    break;
+                }
             }
         }
+        self.spend(|run| run.checks = run.checks.saturating_sub(tried));
         if state != self.state {
             self.commit(state, self.flow.clone()).await?;
         }
@@ -646,9 +662,6 @@ pub(super) fn removed_at_switch<'a>(
         .map(|s| s.app_id)
         .filter(|id| version.listed_cert(id).is_some())
 }
-
-/// How many removed apps' records a run checks for.
-const DELETION_CHECKS_PER_RUN: usize = 32;
 
 /// A `GET /apps` answer that shows no copy, nothing revoked and no epoch: a recovery's
 /// service before it takes the version (Switch wire 3.13).

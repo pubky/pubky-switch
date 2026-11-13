@@ -800,7 +800,8 @@ async fn test_restore_in_place_keeps_an_owed_deletion_whose_record_is_gone() {
         drop(signer);
         (world, memory, a)
     };
-    // The revocation's commits, counted on a run that doesn't stop: the cleanup's is the last.
+    // The revocation's commits, counted on a run that doesn't stop: the cleanup's two are the
+    // last, its reminders' and then its deletion's.
     let (world, memory, a) = setup().await;
     let counting = Arc::new(FaultStore::new(memory, Fault::None));
     let store: Arc<dyn StateStore> = counting.clone();
@@ -812,11 +813,11 @@ async fn test_restore_in_place_keeps_an_owed_deletion_whose_record_is_gone() {
         .await
         .unwrap();
     let last = counting.commits();
-    // The same, stopping before that commit.
+    // The same, stopping before the reminders' commit.
     let (world, memory, a) = setup().await;
     let id = a.keys.app_id_bytes();
     let faulty: Arc<dyn StateStore> =
-        Arc::new(FaultStore::new(memory.clone(), Fault::StopBefore(last)));
+        Arc::new(FaultStore::new(memory.clone(), Fault::StopBefore(last - 1)));
     let mut signer = Signer::open(world.env(faulty), world.keyring())
         .await
         .unwrap();

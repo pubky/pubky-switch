@@ -110,6 +110,11 @@ fn refused_before_lookup(error: &AppError) -> bool {
     )
 }
 
+/// The most kept batches one read of the feed sends again before the feed
+/// ([`App::receive`]), oldest first: the rest go at the next read, in the same order, and
+/// the read says so ([`super::ReceiveReport::more`]).
+pub const KEPT_RESENDS_PER_READ: usize = 4;
+
 /// `opq/<batch_id>`: a kept batch, under the batch ID it was first kept under, whatever ID
 /// its bytes carry once signed again (`kept.rs`).
 pub(crate) fn pending_key(batch_id: &[u8; 16]) -> String {
@@ -646,8 +651,10 @@ impl App {
         Ok(())
     }
 
-    /// Send the batches kept from earlier calls, oldest first by ID order, and commit their
-    /// answers. One refused for good is dropped and reported ([`AppEvent::BatchRefused`]);
+    /// Send the batches kept from earlier calls, oldest first, and commit their answers:
+    /// those sent before by the time their first send left ([`PendingBatch::kept_ms`]),
+    /// then those never sent, each group in ID order. One refused for good is dropped and
+    /// reported ([`AppEvent::BatchRefused`]);
     /// any other failure stops here, the batch still kept, and is the caller's error, so
     /// later writes don't overtake it. Nothing is sent while the evidence of a provider loss
     /// isn't uploaded yet. A batch never sent that holds an `attempt` is a new attempt, so
@@ -656,13 +663,19 @@ impl App {
     /// dropped unsent, never applied, and reported with its attempts
     /// ([`AppEvent::KeptBatchDropped`]).
     pub(crate) async fn resume_batches(&mut self) -> Result<(), AppError> {
+        self.resume_kept(usize::MAX).await.map(|_| ())
+    }
+
+    /// [`App::resume_batches`], for at most `limit` kept batches: returns whether more are
+    /// kept that this call didn't reach, left for the next one in the same order.
+    async fn resume_kept(&mut self, limit: usize) -> Result<bool, AppError> {
         if self.refuse_before_upload().await.is_err() {
-            return Ok(());
+            return Ok(false);
         }
-        let kept = self.reader().scan::<PendingBatch>(PENDING_PREFIX).await?;
-        for (id, pending) in kept {
-            let id = pubky_switch_core::enc::unb64_array::<16>(&id)
-                .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
+        let mut kept = self.kept_batches().await?;
+        kept.sort_by_key(|(id, pending)| (pending.kept_ms.is_none(), pending.kept_ms, *id));
+        let left = kept.len() > limit;
+        for (id, pending) in kept.into_iter().take(limit) {
             let batch = self.without_stale_cursor(Batch::from_body(pending.body.clone())?)?;
             // Never sent, as its record shows: no answer of it can be ambiguous, so it has
             // no window, and goes out as a first send would, an attempt in it only while the
@@ -711,7 +724,7 @@ impl App {
                 },
             }
         }
-        Ok(())
+        Ok(left)
     }
 
     /// The own attempts of a batch sent again, or of a received message's effect: their
@@ -759,9 +772,12 @@ impl App {
     /// as any of its steps does; so does a kept batch whose record under `opq/` doesn't
     /// read, at every read until the store is repaired or restored, since corruption must
     /// not pass silently, and a write would meet it as well.
+    ///
+    /// At most [`KEPT_RESENDS_PER_READ`] kept batches go in one read, oldest first; the
+    /// second value says more are kept, for the next read.
     pub(crate) async fn resume_batches_before_feed(
         &mut self,
-    ) -> Result<Option<AppEvent>, AppError> {
+    ) -> Result<(Option<AppEvent>, bool), AppError> {
         let now = self.now();
         let waiting = |kept: usize, code: Option<ErrorCode>| AppEvent::KeptBatchesWaiting {
             kept: u64::try_from(kept).unwrap_or(u64::MAX),
@@ -773,14 +789,14 @@ impl App {
         {
             let kept = self.reader().scan_raw(PENDING_PREFIX).await?.len();
             if kept > 0 {
-                return Ok(Some(waiting(kept, Some(ErrorCode::RateLimited))));
+                return Ok((Some(waiting(kept, Some(ErrorCode::RateLimited))), false));
             }
         }
-        match self.resume_batches().await {
-            Ok(()) => Ok(None),
+        match self.resume_kept(KEPT_RESENDS_PER_READ).await {
+            Ok(left) => Ok((None, left)),
             Err(error @ (AppError::Transport(_) | AppError::Switch(_))) => {
                 let kept = self.reader().scan_raw(PENDING_PREFIX).await?.len();
-                Ok(Some(waiting(kept, error.code())))
+                Ok((Some(waiting(kept, error.code())), false))
             }
             Err(error) => Err(error),
         }
@@ -1039,7 +1055,9 @@ impl App {
     /// A `record_version` condition on the version of record `key` the app holds, or the
     /// version the switch showed for it when the app refused that write: the next write
     /// builds on it (Switch wire 6.3, Switch spec 10.3). `{0, 0}` for a record the app holds
-    /// nothing of.
+    /// nothing of, and when that write, held or refused, is a delete: `{0, 0}` matches a
+    /// deleted record as an absent or forgotten one, so the condition holds once the service
+    /// forgets the key.
     ///
     /// # Errors
     ///
@@ -1048,7 +1066,7 @@ impl App {
         let version = self
             .held_record(key)
             .await?
-            .map_or(RecordVersion::NONE, |held| held.base_version());
+            .map_or(RecordVersion::NONE, |held| held.write_base());
         Ok(Condition::RecordVersion { key: *key, version })
     }
 

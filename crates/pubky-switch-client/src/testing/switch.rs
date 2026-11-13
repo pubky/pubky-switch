@@ -351,6 +351,10 @@ pub(crate) struct Inner {
     /// The byte budget of a feed page's items and a record page's views, [`MAX_PAGE_BYTES`]
     /// unless a test lowers it (Switch wire 7.4.4, 7.4.9).
     pub(crate) max_page_bytes: usize,
+    /// The most items or batches a feed page scans, shown to the reader or not, unless
+    /// `None`: a lower bound gives pages of items the reader isn't shown, with `more`
+    /// (Switch wire 7.4.4).
+    pub(crate) max_page_scan: Option<usize>,
     /// The bodies of the requests an `Unreachable` fault failed.
     pub(crate) unreached: Vec<Vec<u8>>,
     /// The peer copies of other identities' `identity.json` (Switch wire 7.4.5).
@@ -457,6 +461,7 @@ impl Inner {
             seen_at_arrival: false,
             feed_limit: None,
             max_page_bytes: MAX_PAGE_BYTES,
+            max_page_scan: None,
             unreached: Vec::new(),
             peers: HashMap::new(),
             appended: HashMap::new(),
@@ -1190,6 +1195,7 @@ impl ScriptedSwitch {
         inner.seen_at_arrival = held;
         // A held read whose wait has passed is answered now at the latest.
         inner.wake_held();
+        inner.minute_sweep();
         let path = request.path_and_query.clone();
         let mut lose = false;
         let mut leave_out = None;
@@ -1503,6 +1509,49 @@ impl ScriptedSwitch {
     /// takes from each app in an hour of its clock.
     pub fn set_uploads_per_app_per_hour(&self, uploads: u32) {
         self.lock().uploads_per_app_per_hour = uploads;
+    }
+
+    /// Make record `key`, one the switch holds, divergent, as a recovery upload with a
+    /// conflicting write of it does (Switch spec 12.6, wire 7.4.14), without the provider
+    /// loss and the signed upload: the
+    /// switch keeps `doc_hash` among the record's divergent uploads, so every view of the
+    /// record shows it `divergent` until a newer write, and chains an `upload` transition by
+    /// `by` that lists the key as divergent and merges nothing, so an app that holds the
+    /// record reads it again at its next read and raises
+    /// [`crate::app::AppEvent::RecordDivergent`]. For a protocol's tests of what it does with
+    /// a divergent record.
+    ///
+    /// # Errors
+    ///
+    /// [`ScriptError::Missing`] for a key the switch holds no record at: a service keeps no
+    /// divergent uploads for a key it lacks, and fills it instead. Otherwise as
+    /// [`ScriptedSwitch::signer_op`].
+    pub fn make_divergent(
+        &self,
+        by: [u8; 16],
+        key: [u8; 32],
+        doc_hash: [u8; 32],
+    ) -> Result<(), ScriptError> {
+        let mut inner = self.lock();
+        if !inner.shared.records.contains_key(&key) {
+            return Err(ScriptError::Missing("no record at the key".into()));
+        }
+        let kept = inner.shared.divergent.entry(key).or_default();
+        if !kept.contains(&doc_hash) {
+            kept.push(doc_hash);
+        }
+        let changes = UploadChanges {
+            divergent: std::collections::BTreeSet::from([key]),
+            ..UploadChanges::default()
+        };
+        let at = inner.now();
+        inner.service_transition(ServiceTransition::Upload {
+            by,
+            changes: changes.to_value(),
+            proofs: 0,
+            at,
+        })?;
+        Ok(())
     }
 
     /// A `missed` item whose times don't parse, as a faulty service may write one (Switch
@@ -2380,8 +2429,8 @@ impl Inner {
                 _ => groups.push(vec![item]),
             }
         }
-        for group in groups {
-            if items.len() >= limit {
+        for (scanned, group) in groups.into_iter().enumerate() {
+            if items.len() >= limit || self.max_page_scan.is_some_and(|max| scanned >= max) {
                 truncated = true;
                 break;
             }

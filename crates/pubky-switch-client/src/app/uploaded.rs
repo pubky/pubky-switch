@@ -10,7 +10,7 @@
 //!
 //! - **claims it holds** (`clread/<claim_key>`, as after a stub), by an app with
 //!   `claims.read`: read again by [`App::reread_claims`], which raises
-//!   [`AppEvent::ClaimChanged`] for a held view the read changed. A divergent claim is
+//!   [`super::AppEvent::ClaimChanged`] for a held view the read changed. A divergent claim is
 //!   doubtful, so no automatic attempt relies on it ([`App::claim_doubt`]). A claim the app
 //!   doesn't hold isn't marked: it reads it when it first attempts on it. So the claim marks
 //!   are bounded by the claims the app holds, whatever the switch lists.
@@ -36,8 +36,8 @@ use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::scopes::Permission;
 
 use super::claims::{claim_key_of, reread_key};
-use super::events::AppEvent;
-use super::records::{LIST_DUE, record_key_of};
+use super::events::Duty;
+use super::records::{owe_listing, record_key_of};
 use super::state::Tx;
 use super::{App, AppError};
 use crate::error::{ClientError, StoreError};
@@ -132,7 +132,7 @@ impl App {
                     .map(|collection| collection.name)
                     .collect();
                 tx.delete_prefix(RECORD_REREAD_PREFIX)?;
-                tx.put(LIST_DUE, &true)?;
+                owe_listing(tx)?;
                 for key in keys {
                     if let Some(held) = self.held_collection(&key).await?
                         && !listed.contains(&held.name)
@@ -216,8 +216,9 @@ impl App {
     }
 
     /// Hold the divergent uploads of record `key`, `tx`'s writes included:
-    /// [`AppEvent::RecordDivergent`] once the record becomes divergent, not again while it
-    /// stays so.
+    /// [`super::AppEvent::RecordDivergent`] once the record becomes divergent, not again while it
+    /// stays so, a duty event kept in `tx` beside the mark, so no crash separates the two
+    /// and a mark cleared later in the same read doesn't take the event with it.
     pub(crate) async fn note_divergent(
         &mut self,
         key: &[u8; 32],
@@ -231,7 +232,7 @@ impl App {
         };
         if divergent && !held {
             tx.put(&mark, &())?;
-            self.events.push(AppEvent::RecordDivergent { key: *key });
+            self.keep_duty(tx, Duty::RecordDivergent { key: *key })?;
         } else if !divergent && held {
             tx.delete(&mark)?;
         }
