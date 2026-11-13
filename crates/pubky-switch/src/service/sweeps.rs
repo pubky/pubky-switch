@@ -27,7 +27,7 @@
 
 use pubky_switch_core::records::IdentityDoc;
 
-use super::{DUE_CLAIMS_PER_REQUEST, Service};
+use super::{DUE_CLAIMS_PER_REQUEST, OLD_DOCUMENTS_PER_REQUEST, Service};
 use crate::store::{AccountTxn, StoreError};
 
 /// The most deleted keys, invite codes and batches' proofs one minute's sweep takes, of
@@ -35,8 +35,8 @@ use crate::store::{AccountTxn, StoreError};
 pub(super) const PER_MINUTE: u64 = 256;
 
 impl Service {
-    /// Step 4 at service time `base`: the due claims go, then, once a minute, the sweeps
-    /// (the module's doc).
+    /// Step 4 at service time `base`: the due claims go and older documents are checked,
+    /// then, once a minute, the sweeps (the module's doc).
     pub(super) async fn step_four(
         &self,
         txn: &mut AccountTxn,
@@ -44,6 +44,10 @@ impl Service {
     ) -> Result<(), StoreError> {
         txn.delete_due_claims(base, self.limits.max_claim_age_ms, DUE_CLAIMS_PER_REQUEST)
             .await?;
+        // Every request with trusted time from a verified caller, not once a minute: a
+        // bounded batch of the documents chained before superseded ones were deleted
+        // (Switch wire 7.5).
+        txn.check_old_documents(OLD_DOCUMENTS_PER_REQUEST).await?;
         if !txn.minute_sweep_due(base).await? {
             return Ok(());
         }

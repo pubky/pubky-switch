@@ -30,7 +30,7 @@ use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppStatus;
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{
-    IdentityDoc, RemovedApp, SIGNER_BACKUP_PATH, app_record_path, seal_bundle_parts,
+    IdentityDoc, ListedApp, RemovedApp, SIGNER_BACKUP_PATH, app_record_path, seal_bundle_parts,
 };
 
 use super::Signer;
@@ -576,9 +576,28 @@ impl Signer {
             // Once no version lists the app: removed, or purged from `removed` since.
             .filter(|app| newest.listed_cert(app).is_none())
             .collect();
-        // The grant reminder is raised once for each owed deletion, whether or not the record
-        // goes now; a deletion that fails stays owed, and doesn't hold back the next app's.
-        for app_id in done {
+        // The grant reminder is raised once for each owed deletion, every one at once, whether
+        // or not its record goes in this run.
+        let mut state = self.state.clone();
+        for app_id in &done {
+            if !state.grant_reminded.contains(app_id) {
+                state.alert(Alert::GrantRevocationOwed { app_id: *app_id });
+                state.grant_reminded.push(*app_id);
+            }
+        }
+        if state != self.state {
+            self.commit(state, self.flow.clone()).await?;
+        }
+        // A bounded number each run, from the run's budget; the rest stay owed for the next.
+        let allowed = self.allowance().deletions;
+        if done.len() > allowed {
+            self.left.deletions_left = true;
+        }
+        let tried = done.len().min(allowed);
+        self.spend(|run| run.deletions = run.deletions.saturating_sub(tried));
+        // A deletion that fails stays owed and goes behind the others, so a record that keeps
+        // failing holds back no other app's.
+        for app_id in done.into_iter().take(allowed) {
             let deleted = self
                 .env
                 .homeserver
@@ -586,14 +605,12 @@ impl Signer {
                 .await
                 .is_ok();
             let mut state = self.state.clone();
-            if !state.grant_reminded.contains(&app_id) {
-                state.alert(Alert::GrantRevocationOwed { app_id });
-                state.grant_reminded.push(app_id);
-            }
+            state.cleanup.retain(|a| *a != app_id);
             if deleted {
-                state.cleanup.retain(|a| *a != app_id);
                 state.revoking.retain(|r| r.app_id != app_id);
                 state.grant_reminded.retain(|a| *a != app_id);
+            } else {
+                state.cleanup.push(app_id);
             }
             if state != self.state {
                 self.commit(state, self.flow.clone()).await?;
@@ -629,12 +646,16 @@ impl Signer {
     /// again, at the same version. Returns the apps answered.
     ///
     /// An app whose certificate holds a scope no registered protocol owns gets nothing, with
-    /// [`Alert::RotationSkipped`] (design note, decision 2).
+    /// [`Alert::RotationSkipped`] (design note, decision 2). At most four requests are
+    /// answered in one call, the oldest first; the others at the next run. Outside a run the
+    /// call has a budget of its own, which the steps each answer runs again share
+    /// ([`Signer::run_due`]).
     ///
     /// # Errors
     ///
     /// As [`Signer::resume`].
     pub async fn serve_full_bundles(&mut self) -> Result<Vec<[u8; 16]>> {
+        let _budget = self.budget();
         // Served is judged on the switch's signed time, not the device clock.
         let read = self.ready_at_switch().await?;
         let (statuses, now) = (read.answer.apps, read.answer.server_time);
@@ -644,16 +665,25 @@ impl Signer {
         let protocols = self.env.protocols.clone();
         let keyed = keyed(&protocols);
         let key = self.signing_key()?;
-        // One flow for each app, so a refused one doesn't hold back the others.
+        // One flow for each app, so a refused one doesn't hold back the others. The oldest
+        // requests first, and only those the run's budget answers: the rest are answered at
+        // the next run, and an app asking again goes behind the others. A request that can't
+        // be answered now (an app not served, cut off, refused before or with a scope no
+        // protocol owns) takes no place in the budget.
+        let allowed = self.allowance().full_bundles;
         let mut requests: Vec<(RefusedRequest, Vec<Op>)> = Vec::new();
         let mut alerts = Vec::new();
-        for listed in &newest.body().apps {
-            let Some(status) = statuses.iter().find(|s| s.app_id == listed.app_id) else {
-                continue;
-            };
-            let Some(requested) = status.full_bundle_requested else {
-                continue;
-            };
+        let mut asking: Vec<(&ListedApp, &AppStatus, u64)> = newest
+            .body()
+            .apps
+            .iter()
+            .filter_map(|listed| {
+                let status = statuses.iter().find(|s| s.app_id == listed.app_id)?;
+                Some((listed, status, status.full_bundle_requested?))
+            })
+            .collect();
+        asking.sort_by_key(|(_, _, requested)| *requested);
+        for (listed, status, requested) in asking {
             let request = RefusedRequest {
                 app_id: listed.app_id,
                 requested,
@@ -680,6 +710,11 @@ impl Signer {
                 });
                 continue;
             }
+            // One more request to answer than the run's budget answers: the next run does.
+            if requests.len() >= allowed {
+                self.left.full_bundles_left = true;
+                break;
+            }
             // Every epoch from 1, whatever the parts stored for its certificate already cover:
             // the app may have lost its copy, and asks again until a put completes the range,
             // which clears the request (Switch wire 3.5 "Full bundles on request").
@@ -700,6 +735,8 @@ impl Signer {
             }
             requests.push((request, ops));
         }
+        let answering = requests.len();
+        self.spend(|run| run.full_bundles = run.full_bundles.saturating_sub(answering));
         let signed: Vec<(RefusedRequest, Vec<RenewBatch>)> = requests
             .into_iter()
             .map(|(request, ops)| Ok((request, self.sign_batches(&key, newest.generation(), ops)?)))

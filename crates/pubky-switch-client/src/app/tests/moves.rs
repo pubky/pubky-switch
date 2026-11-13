@@ -17,7 +17,7 @@ use super::*;
 use crate::app::{
     AppBackup, AppError, AppEvent, ClaimOp, Collection, Evidence, LocalWrite, LossActions,
     MAX_STEP_LOCAL_BYTES, ObligationDeadline, ParkReason, ProviderLoss, ProviderStatus, PushRelay,
-    Refusal, RefusedCall, UserConfirmed,
+    Refusal, RefusedCall, UserConfirmed, Woken,
 };
 use crate::error::TransportError;
 use crate::error::{ClientError, StoreError};
@@ -5623,4 +5623,60 @@ async fn test_loss_record_the_new_service_refuses_is_never_published() {
             .file(lost.w.alice.public(), &path)
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn test_feed_wait_across_a_move_followed_outside_a_read() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    for _ in 0..10 {
+        w.note(me, "hello");
+    }
+    app.receive(None).await.unwrap();
+    let read_to = app.cursor();
+    let n_key = next_key();
+    let freeze = freeze_for(&w, &n_key, 2);
+    w.switch.freeze(&freeze).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    assert_eq!(
+        app.check_for_move().await.unwrap(),
+        ProviderStatus::AwaitingMove { next_generation: 2 }
+    );
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    // The document naming the next generation, taken outside a read: no wait at this
+    // service can tell anything, and none is sent.
+    app.refresh_identity().await.unwrap();
+    assert!(app.not_current_here().is_some());
+    assert_eq!(format!("{:?}", app.feed_wait(25)), "FeedWait(ReadLater)");
+    assert_eq!(app.feed_wait(25).wait().await, Woken::ReadLater);
+    // Followed outside a read: the wait goes from the cursor at the next service, not from
+    // the position the last read reached at the earlier one.
+    assert_eq!(
+        app.follow_provider().await.unwrap(),
+        ProviderStatus::Followed { generation: 2 }
+    );
+    let cursor = app.cursor();
+    assert_eq!(cursor.generation, 2);
+    let shown = format!("{:?}", app.feed_wait(25));
+    assert!(shown.contains(&format!("\"{cursor}\"")), "{shown}");
+    // Whatever `seq` the earlier service's position has.
+    assert_eq!(read_to.generation, 1);
+    app.next_wait = crate::app::wait::NextWait::From(crate::app::wait::WaitFrom {
+        position: pubky_switch_core::ops::Position {
+            seq: cursor.seq + 50,
+            ..read_to
+        },
+        again: false,
+    });
+    let shown = format!("{:?}", app.feed_wait(25));
+    assert!(shown.contains(&format!("\"{cursor}\"")), "{shown}");
 }

@@ -52,6 +52,24 @@ const FLAG_PREFIX: &str = "flag/";
 const CERT_PREFIX: &str = "ocert/";
 /// Set while the app owes a listing of its collections: at join, after a `missed` item.
 pub(crate) const LIST_DUE: &str = "list_due";
+/// How far an owed listing got ([`ListProgress`]), while it is owed.
+const LIST_AT: &str = "list_at";
+
+/// Owe a listing of the collections from their beginning, in `tx`: `list_due` set and
+/// `list_at` deleted. Every new obligation starts the listing over, so a collection a
+/// listing under way already listed to its end is listed again: it may read members it
+/// didn't, such as after a renewal that widens the certificate (Switch spec 8.2, 8.3).
+pub(crate) fn owe_listing(tx: &mut Tx) -> Result<(), AppError> {
+    tx.put(LIST_DUE, &true)?;
+    tx.delete(LIST_AT)?;
+    Ok(())
+}
+
+/// The most listing pages one read of the feed asks for while it makes an owed listing
+/// ([`App::receive`]): a listing that needs more goes on at the next read from the page
+/// it reached, and the read stops before any entry meanwhile (Switch spec 8.2, wire
+/// 7.4.4).
+pub const LISTING_PAGES_PER_READ: u32 = 4;
 
 /// The most records one listing page asks for (Switch wire 7.4.9).
 const LIST_PAGE: u32 = 1000;
@@ -73,6 +91,53 @@ fn writes_a_delete(op: &SignedDoc) -> bool {
     SignedOp::peek(op).is_ok_and(|op| {
         matches!(&op.body().kind, OpKind::RecordPut(put) if put.value_sealed.looks_like_delete())
     })
+}
+
+/// What became of an owed listing of the collections at a read
+/// ([`App::list_collections_if_due`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Listing {
+    /// None is owed.
+    NotDue,
+    /// Made to its end.
+    Listed,
+    /// Owed, and waiting for a scope key the certificate lacks.
+    WaitsForKey,
+    /// Begun or carried on, and stopped on the read's page budget: the next read goes on.
+    Unfinished,
+}
+
+/// How one collection's listing ended: listed to its end, or stopped on the page budget,
+/// with the records listed either way.
+enum Listed {
+    Done(u64),
+    Paused(u64),
+}
+
+/// `list_at`: how far an owed listing got, kept with each page it takes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct ListProgress {
+    /// The collections listed to their end, by collection ID in base64url.
+    done: Vec<String>,
+    /// The collection being listed, and the last key of its last page taken.
+    at: Option<(String, String)>,
+}
+
+impl ListProgress {
+    /// A page of the collection `id` was taken; `next` is where the listing goes on, `None`
+    /// at the collection's end.
+    fn reached(&mut self, id: &[u8; 32], next: Option<&[u8; 32]>) {
+        let id = b64(id);
+        match next {
+            Some(next) => self.at = Some((id, b64(next))),
+            None => {
+                self.at = None;
+                if !self.done.contains(&id) {
+                    self.done.push(id);
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn record_key_of(key: &[u8; 32]) -> String {
@@ -963,43 +1028,67 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
-            let id = collection.id(&self.state.meta.identity);
-            let mut after: Option<[u8; 32]> = None;
-            let mut listed = 0u64;
-            loop {
-                let result = self
-                    .client
-                    .records(&id, after.as_ref(), Some(LIST_PAGE))
-                    .await;
-                let page = self.take(result).await?;
-                let mut tx = self.tx()?;
-                for view in &page.records {
-                    // A page holds up to 1,000 views, each cached with its mark: the views
-                    // taken so far are committed first once one more might not fit.
-                    if tx.size().saturating_add(LISTED_RECORD_ROOM_BYTES)
-                        > crate::store::MAX_BATCH_BYTES
-                    {
-                        let full = std::mem::replace(&mut tx, self.tx()?);
-                        self.commit(full).await?;
-                    }
-                    self.take_view(view, Some((&view.key, collection)), &mut tx)
-                        .await?;
-                    listed = listed.saturating_add(1);
-                }
-                self.commit(tx).await?;
-                // Records are listed by the base64url text of their keys, compared as ASCII
-                // (Switch wire 7.4.9): a `next` that doesn't move past the key asked after ends
-                // the listing, so a service that names keys back and forth can't keep the app
-                // reading.
-                match page.next {
-                    Some(next) if after.is_none_or(|after| b64(&next) > b64(&after)) => {
-                        after = Some(next);
-                    }
-                    _ => return Ok(listed),
-                }
+            let mut pages = u32::MAX;
+            match self.list_from(collection, None, &mut pages, None).await? {
+                Listed::Done(listed) | Listed::Paused(listed) => Ok(listed),
             }
         })
         .await
+    }
+
+    /// List `collection` from after the key `after`, at most `pages` pages, each counted
+    /// off as it is asked for. With `progress`, each page's commit records how far the
+    /// listing got, so an owed listing goes on from there at the next read.
+    async fn list_from(
+        &mut self,
+        collection: &Collection,
+        mut after: Option<[u8; 32]>,
+        pages: &mut u32,
+        mut progress: Option<&mut ListProgress>,
+    ) -> Result<Listed, AppError> {
+        let id = collection.id(&self.state.meta.identity);
+        let mut listed = 0u64;
+        loop {
+            if *pages == 0 {
+                return Ok(Listed::Paused(listed));
+            }
+            *pages -= 1;
+            let result = self
+                .client
+                .records(&id, after.as_ref(), Some(LIST_PAGE))
+                .await;
+            let page = self.take(result).await?;
+            let mut tx = self.tx()?;
+            for view in &page.records {
+                // A page holds up to 1,000 views, each cached with its mark: the views taken
+                // so far are committed first once one more might not fit.
+                if tx.size().saturating_add(LISTED_RECORD_ROOM_BYTES)
+                    > crate::store::MAX_BATCH_BYTES
+                {
+                    let full = std::mem::replace(&mut tx, self.tx()?);
+                    self.commit(full).await?;
+                }
+                self.take_view(view, Some((&view.key, collection)), &mut tx)
+                    .await?;
+                listed = listed.saturating_add(1);
+            }
+            // Records are listed by the base64url text of their keys, compared as ASCII
+            // (Switch wire 7.4.9): a `next` that doesn't move past the key asked after ends
+            // the listing, so a service that names keys back and forth can't keep the app
+            // reading.
+            let next = page
+                .next
+                .filter(|next| after.is_none_or(|after| b64(next) > b64(&after)));
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.reached(&id, next.as_ref());
+                tx.put(LIST_AT, &*progress)?;
+            }
+            self.commit(tx).await?;
+            match next {
+                Some(next) => after = Some(next),
+                None => return Ok(Listed::Done(listed)),
+            }
+        }
     }
 
     /// Whether a listing of the collections is owed (`list_due`): from joining or a restore,
@@ -1035,6 +1124,7 @@ impl App {
             }
             let mut tx = self.tx()?;
             tx.delete(LIST_DUE)?;
+            tx.delete(LIST_AT)?;
             self.commit(tx).await
         })
         .await
@@ -1048,13 +1138,54 @@ impl App {
     /// a read scope of a collection it lists, such as after a renewal that adds one: listed
     /// before its key arrives, a record would be held `Unreadable` until the key opened it
     /// ([`App::reopen_unreadable`]). `list_due` stays, so the read after the key arrives
-    /// lists. Returns whether it listed.
-    pub(crate) async fn list_collections_if_due(&mut self) -> Result<bool, AppError> {
-        if !self.reader().exists(LIST_DUE).await? || self.listing_lacks_keys() {
-            return Ok(false);
+    /// lists.
+    ///
+    /// The listing asks for at most `pages` pages, counted off as they go. One that needs
+    /// more is [`Listing::Unfinished`]: each page's commit records how far it got, and the
+    /// next call goes on from there, the collections listed to their end skipped. Records
+    /// written meanwhile come on the feed past the item that owed the listing, which no
+    /// read processes before the listing ends (Switch spec 8.2).
+    pub(crate) async fn list_collections_if_due(
+        &mut self,
+        pages: &mut u32,
+    ) -> Result<Listing, AppError> {
+        if !self.reader().exists(LIST_DUE).await? {
+            return Ok(Listing::NotDue);
         }
-        self.list_collections().await?;
-        Ok(true)
+        if self.listing_lacks_keys() {
+            return Ok(Listing::WaitsForKey);
+        }
+        let mut progress: ListProgress = self.reader().get(LIST_AT).await?.unwrap_or_default();
+        let collections: Vec<Collection> = self
+            .protocol
+            .collections()
+            .into_iter()
+            .filter(|c| c.readable_by(&self.state.cert))
+            .collect();
+        for collection in &collections {
+            let id = b64(&collection.id(&self.state.meta.identity));
+            if progress.done.contains(&id) {
+                continue;
+            }
+            let after = match &progress.at {
+                Some((at, key)) if *at == id => Some(
+                    unb64_array::<32>(key)
+                        .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?,
+                ),
+                _ => None,
+            };
+            if let Listed::Paused(_) = self
+                .list_from(collection, after, pages, Some(&mut progress))
+                .await?
+            {
+                return Ok(Listing::Unfinished);
+            }
+        }
+        let mut tx = self.tx()?;
+        tx.delete(LIST_DUE)?;
+        tx.delete(LIST_AT)?;
+        self.commit(tx).await?;
+        Ok(Listing::Listed)
     }
 
     /// Whether the certificate lacks, at the current data epoch, the key of a scope it

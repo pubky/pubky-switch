@@ -20,11 +20,27 @@ use reqwest::header::{HeaderName, HeaderValue};
 use super::{BoxFuture, Header, Request, Response, Transport, TransportError};
 
 /// The settings of an [`HttpTransport`].
+///
+/// Each call has a timeout for the whole of it, from connecting to the last byte of the
+/// answer, sized by what it can carry (Switch wire 7.1 "Answer sizes"). A call whose
+/// request or answer can pass a mebibyte gets the long one, [`HttpConfig::long_timeout_ms`]:
+/// a feed read, whose long poll holds it up to 25 s and whose page may take 8 MiB (Switch
+/// wire 7.4.4), a records listing (7.4.9), the directory (7.4.10), the apps and an app's
+/// key bundle parts (7.4.11, 7.4.12), a claim's entries (7.4.8), the admission lists
+/// (7.4.6), a batch of operations (6.4), an append, whose `409 stale_key` carries the
+/// directory (7.6), a recovery upload (7.4.14), the handover (7.4.17), an enrollment
+/// (7.4.1), and a move's export and import (10.2 to 10.4). Every other call gets
+/// [`HttpConfig::request_timeout_ms`], the time sample a write takes first included: a feed
+/// read of one item with no wait. At the limits some long calls carry tens of megabytes: a
+/// host on a slow network raises the settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HttpConfig {
-    /// The whole call's timeout, from connecting to the last byte of the answer, in
-    /// milliseconds. A long-poll read (`wait` up to 25 s, Switch wire 7.4.4) needs more.
+    /// The timeout of every call but the long ones, in milliseconds: 10 s by default.
     pub request_timeout_ms: u64,
+    /// The timeout of a call that can carry megabytes, the feed's long poll among them, in
+    /// milliseconds: 40 s by default, above the longest wait of 25 s.
+    pub long_timeout_ms: u64,
     /// The connection timeout, in milliseconds.
     pub connect_timeout_ms: u64,
     /// The ports other than 443 a switch origin may use, as the client's operator allows
@@ -38,7 +54,8 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            request_timeout_ms: 40_000,
+            request_timeout_ms: 10_000,
+            long_timeout_ms: 40_000,
             connect_timeout_ms: 10_000,
             extra_ports: Vec::new(),
             max_response_bytes: 32 << 20,
@@ -84,6 +101,51 @@ pub struct HttpTransport {
     /// The origin policy; `None` only for the loopback test constructor.
     origin_use: Option<UrlUse>,
     max_response_bytes: u64,
+    request_timeout: Duration,
+    long_timeout: Duration,
+}
+
+/// Whether `request` is a call whose request or answer can pass a mebibyte, or the feed's
+/// long poll ([`HttpConfig`]): judged by its method, its path after `/v1/{id}/` and, for a
+/// feed read, its query.
+fn is_long_call(request: &Request) -> bool {
+    let (path, query) = request
+        .path_and_query
+        .split_once('?')
+        .unwrap_or((request.path_and_query.as_str(), ""));
+    // An enrollment may name thousands of purged App IDs (Switch wire 7.1 "Answer sizes").
+    if path == "/v1/enroll" {
+        return true;
+    }
+    let Some(rest) = path
+        .strip_prefix("/v1/")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(_, rest)| rest)
+    else {
+        return false;
+    };
+    match request.method.as_str() {
+        // A feed read of one item with no wait, the time sample a write takes first, is
+        // short: one item is under 1 MiB (Switch wire 7.1 "Answer sizes").
+        "GET" if rest == "feed" => {
+            let mut params = query.split('&');
+            params.clone().any(|param| param.starts_with("wait="))
+                || !params.any(|param| param == "limit=1")
+        }
+        "GET" => {
+            matches!(
+                rest,
+                "records" | "directory" | "apps" | "allow" | "handover" | "export"
+            ) || rest.starts_with("export/chunks/")
+                || rest.starts_with("claims/")
+                || (rest.starts_with("apps/") && rest.ends_with("/keys"))
+        }
+        // A batch's items take up to 5 MiB; an append's `409 stale_key` carries the
+        // directory, and an import's start its manifest.
+        "POST" => matches!(rest, "ops" | "inbox" | "recovery/upload" | "import"),
+        "PUT" => rest == "handover" || rest.starts_with("import/chunks/"),
+        _ => false,
+    }
 }
 
 impl std::fmt::Debug for HttpTransport {
@@ -99,7 +161,6 @@ fn builder(config: &HttpConfig) -> reqwest::ClientBuilder {
         .use_rustls_tls()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_millis(config.request_timeout_ms))
         .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
         .tcp_nodelay(true)
 }
@@ -128,9 +189,11 @@ impl HttpTransport {
         Ok(Self {
             client,
             origin_use: Some(UrlUse::SwitchOrigin {
-                extra_ports: config.extra_ports,
+                extra_ports: config.extra_ports.clone(),
             }),
             max_response_bytes: config.max_response_bytes,
+            request_timeout: Duration::from_millis(config.request_timeout_ms),
+            long_timeout: Duration::from_millis(config.long_timeout_ms),
         })
     }
 
@@ -148,6 +211,8 @@ impl HttpTransport {
             client: built(builder(&config))?,
             origin_use: None,
             max_response_bytes: config.max_response_bytes,
+            request_timeout: Duration::from_millis(config.request_timeout_ms),
+            long_timeout: Duration::from_millis(config.long_timeout_ms),
         })
     }
 
@@ -164,7 +229,12 @@ impl HttpTransport {
         };
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|_| TransportError::InvalidRequest("the method".into()))?;
-        let mut call = self.client.request(method, url);
+        let timeout = if is_long_call(&request) {
+            self.long_timeout
+        } else {
+            self.request_timeout
+        };
+        let mut call = self.client.request(method, url).timeout(timeout);
         for Header { name, value } in &request.headers {
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| TransportError::InvalidRequest("a header name".into()))?;
@@ -399,6 +469,110 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!matches!(error, TransportError::Refused(_)), "{error:?}");
+    }
+
+    fn call(method: &str, path_and_query: &str) -> Request {
+        Request {
+            method: method.into(),
+            path_and_query: path_and_query.into(),
+            ..request("https://inbox.example")
+        }
+    }
+
+    #[test]
+    fn test_http_long_timeout_is_for_the_feed_and_the_large_calls() {
+        for (method, path) in [
+            ("GET", "/v1/x/feed?after=1:2&limit=100&wait=25"),
+            ("GET", "/v1/x/feed?after=1:2&limit=1&wait=25"),
+            ("GET", "/v1/x/feed?after=1:2&limit=100"),
+            ("GET", "/v1/x/feed?after=1:2&limit=10"),
+            ("GET", "/v1/x/feed"),
+            ("GET", "/v1/x/records?collection=c&after=k&limit=1000"),
+            ("GET", "/v1/x/directory"),
+            ("GET", "/v1/x/apps"),
+            ("GET", "/v1/x/apps/a/keys"),
+            ("GET", "/v1/x/claims/k"),
+            ("GET", "/v1/x/allow"),
+            ("GET", "/v1/x/handover"),
+            ("PUT", "/v1/x/handover"),
+            ("POST", "/v1/x/ops"),
+            ("POST", "/v1/x/inbox?apps_version=1"),
+            ("POST", "/v1/x/recovery/upload"),
+            ("POST", "/v1/enroll"),
+            ("GET", "/v1/x/export"),
+            ("GET", "/v1/x/export/chunks/c1"),
+            ("POST", "/v1/x/import"),
+            ("PUT", "/v1/x/import/chunks/c1"),
+        ] {
+            assert!(is_long_call(&call(method, path)), "{method} {path}");
+        }
+        // Every other call has the short one, the time sample a write takes first included.
+        for (method, path) in [
+            ("GET", "/v1/x/feed?after=1:2&limit=1"),
+            ("GET", "/v1/x/records/k"),
+            ("PUT", "/v1/x/identity"),
+            ("POST", "/v1/x/apps/a/keys"),
+            ("POST", "/v1/x/apps/a/leave"),
+            ("POST", "/v1/x/connect"),
+            ("POST", "/v1/x/import/activate"),
+            ("POST", "/v1/x/feed"),
+            ("GET", "/v1/x/feeds"),
+            ("GET", "/feed"),
+        ] {
+            assert!(!is_long_call(&call(method, path)), "{method} {path}");
+        }
+        // The time sample, as a write sends it.
+        let sample = crate::client::answers::FeedQuery {
+            after: Some(pubky_switch_core::ops::Position {
+                generation: 1,
+                seq: 2,
+            }),
+            limit: Some(1),
+            wait: None,
+        };
+        let path = format!("/v1/x/{}", sample.path());
+        assert!(!is_long_call(&call("GET", &path)), "{path}");
+    }
+
+    #[tokio::test]
+    async fn test_http_short_timeout_ends_a_call_the_long_poll_outlasts() {
+        // A server that takes every connection and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                open.push(socket);
+            }
+        });
+        let transport = HttpTransport::without_address_checks_for_loopback_tests(HttpConfig {
+            request_timeout_ms: 100,
+            long_timeout_ms: 1_500,
+            ..HttpConfig::default()
+        })
+        .unwrap();
+        // The time sample a write takes first: a feed read of one item with no wait.
+        let started = std::time::Instant::now();
+        let error = transport
+            .send(Request {
+                origin: origin.clone(),
+                ..call("GET", "/v1/x/feed?after=1:0&limit=1")
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TransportError::Timeout), "{error:?}");
+        assert!(started.elapsed() < Duration::from_millis(1_000));
+        let started = std::time::Instant::now();
+        let error = transport
+            .send(Request {
+                origin: origin.clone(),
+                ..call("GET", "/v1/x/feed?after=1:0&limit=1&wait=25")
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TransportError::Timeout), "{error:?}");
+        assert!(started.elapsed() >= Duration::from_millis(1_500));
+        server.abort();
     }
 
     #[tokio::test]

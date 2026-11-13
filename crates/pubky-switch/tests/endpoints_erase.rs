@@ -3558,3 +3558,33 @@ async fn test_erase_and_a_sweep_at_the_same_moment_run_one_after_the_other() {
         replay.db.drop_database().await.expect("drop");
     }
 }
+
+#[tokio::test]
+async fn test_erase_of_an_account_holding_an_older_item_that_doesnt_read() {
+    // An older chain item whose stored document doesn't read, left for the check of older
+    // documents (Switch wire 7.5): the signer can still erase the account, as step 4's check
+    // passes over the item.
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    sql_on(
+        &replay,
+        &alice_id(),
+        "UPDATE chain_items SET item_bytes = '\\x00'::BYTEA WHERE account_id = $1 AND seq = 3",
+    )
+    .await;
+    sql_on(
+        &replay,
+        &alice_id(),
+        "UPDATE accounts SET documents_checked_seq = 0, documents_check_end = last_seq \
+         WHERE id = $1",
+    )
+    .await;
+    let answer = erase(&replay, &alice_service_key(), &revoke_time()).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
