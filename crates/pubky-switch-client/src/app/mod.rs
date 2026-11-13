@@ -410,6 +410,10 @@ pub struct AppBackup {
     /// The messages of the outbox left out past the budget, and whether each is a re-send.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     outbox_left_out: Vec<(String, bool)>,
+    /// The counterparties whose messages the app holds ([`App::hold_queued`]), in base64:
+    /// a restore holds them too, so it delivers none of their messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    held_counterparties: Vec<String>,
     /// The protocol's layer, if it added one; absent from the bytes otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     protocol: Option<LayerOut>,
@@ -1236,6 +1240,7 @@ impl App {
             taken_service_ms: None,
             outbox: Vec::new(),
             outbox_left_out: Vec::new(),
+            held_counterparties: Vec::new(),
             protocol: None,
         })
     }
@@ -1258,6 +1263,11 @@ impl App {
                 item.replay_until(baseline);
             }
             send::put_outbox_item(tx, &item)?;
+        }
+        for rest in &backup.held_counterparties {
+            let pubky = pubky_switch_core::enc::unb64_array::<32>(rest)
+                .map_err(|_| AppError::InvalidData("a backup's held counterparty".into()))?;
+            send::put_hold(tx, &pubky)?;
         }
         let now = self.now();
         for (msg_id, resend) in &backup.outbox_left_out {
@@ -1282,6 +1292,12 @@ impl App {
         let carried = send::carried_outbox(reader).await?;
         backup.outbox = carried.items;
         backup.outbox_left_out = carried.left_out;
+        backup.held_counterparties = reader
+            .scan_raw(send::HOLD_PREFIX)
+            .await?
+            .into_iter()
+            .map(|(rest, _)| rest)
+            .collect();
         Ok(())
     }
 
@@ -1723,6 +1739,14 @@ impl App {
                 store: env.store.clone(),
             };
             let carried = Self::kept_for_protocol(&old).await?.unwrap_or_default();
+            // A restore in place keeps the store's holds beside the backup's: a hold the host
+            // set after the backup still holds (`App::hold_queued`).
+            let old_holds: Vec<String> = old
+                .scan_raw(send::HOLD_PREFIX)
+                .await?
+                .into_iter()
+                .map(|(rest, _)| rest)
+                .collect();
             // No local ID is given out twice: past the backup's counter, the counter of the
             // store restored in place, every ID a carried duty event names, and every entry
             // the backup brings back.
@@ -1782,6 +1806,11 @@ impl App {
                 // the restore commits (Switch spec 12.4).
                 parked::Retell::start(&app.state, &mut tx)?;
                 app.reinstall_outbox(backup, &mut tx)?;
+                for rest in &old_holds {
+                    if let Ok(pubky) = pubky_switch_core::enc::unb64_array::<32>(rest) {
+                        send::put_hold(&mut tx, &pubky)?;
+                    }
+                }
                 tx.local(&layer_writes)?;
                 tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;

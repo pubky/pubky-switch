@@ -35,6 +35,10 @@ fn futures_are_send(
     assert_send(&app.listing_owed());
     assert_send(&app.send(OutgoingMessage::new([0; 32], "sample.note", Map::new())));
     assert_send(&app.queue_stored(plaintext));
+    assert_send(&app.hold_queued(&[0; 32]));
+    assert_send(&app.release_queued(&[0; 32]));
+    assert_send(&app.held_counterparties());
+    assert_send(&app.withdraw_queued(&[0; 32]));
     assert_send(&app.leave(LeaveMode::TwoStep));
     assert_send(&App::load(
         env.clone(),
