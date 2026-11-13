@@ -487,6 +487,15 @@ pub(crate) struct ParkedEntry {
     /// has none; its reason [`ParkReason::Released`] says so ([`ParkedEntry::was_released`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) released: bool,
+    /// For an entry that waits for a scope key ([`ParkReason::AwaitingKey`]): how many
+    /// scope keys the app held when its step last ran. Keys are only ever added while the
+    /// app runs, so another count is a changed key set, and only that makes the entry due
+    /// again (`feed.rs`, `due_again`); `None` before its step ran so, for an entry an
+    /// earlier build stored, or for one whose step ran while a reopening was owed
+    /// (`records::REOPEN_DUE`): such an entry is due once its epoch's keys are held and
+    /// no reopening is owed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) keys_at: Option<u64>,
 }
 
 impl ParkedEntry {
@@ -1198,6 +1207,7 @@ mod tests {
             reason: ParkReason::Quota,
             round: 0,
             released: false,
+            keys_at: None,
         };
         let text = format!("{parked:?}");
         assert!(!text.contains("secret"), "{text}");

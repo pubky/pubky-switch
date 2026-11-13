@@ -44,7 +44,7 @@ use crate::store::KeyValue;
 
 /// What a newer write of a record builds on, as the reading app sees it
 /// ([`Protocol::record_regression_on`], Switch spec 8.2, 10.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WriteBase {
     /// The version the write builds on: the `expected_version` its operation signed,
@@ -59,6 +59,11 @@ pub struct WriteBase {
     /// record view's word, and whether its value opened doesn't count: a write held not
     /// open ([`super::RecordContent::Unreadable`]) is held at its version.
     pub held: bool,
+    /// The conditions the write's operation signed (Switch wire 6.3), in its order, such as
+    /// a `claim_step` on a claim its change depends on. The service checked them when it
+    /// applied the write; a protocol's reader rule may require one, such as a condition on
+    /// the claim of what the write drops, and flag a write without it (Switch spec 8.2).
+    pub conditions: Vec<Condition>,
 }
 
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
@@ -397,8 +402,10 @@ impl std::fmt::Display for StoreFailure {
     }
 }
 
-/// The protocol's answer for a received message.
+/// The protocol's answer for a received message. Later versions may add answers: a host
+/// that matches on it keeps a catch-all arm.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Outcome {
     /// Apply the effect.
     Apply(Effect),
@@ -463,6 +470,29 @@ pub enum Outcome {
     /// effect's batch ([`ReceivedMessage::conflict`]) nothing of it was applied, so a `Pass`
     /// then passes the entry.
     Pass,
+    /// The step needs a scope key of `data_epoch` that the app doesn't hold yet (Switch
+    /// spec 3.5, 8.2), such as to read a record held sealed at that epoch
+    /// ([`super::Unopened::KeyNotHeld`]) or to write while the app lacks the current data
+    /// epoch's key ([`ReceiveContext::holds_scope_key`], [`ReceiveContext::data_epoch`]).
+    /// What the context added is discarded. When a key the app's certificate is given is
+    /// missing at an epoch up to the current one, and no full bundle is asked for yet, the
+    /// app fetches its key bundle once, asking for a full bundle if a key is still missing,
+    /// and runs the step again if the epoch's keys came; otherwise the entry is stored
+    /// locally and the cursor passes it at once ([`super::ParkReason::AwaitingKey`]), with
+    /// no bounded wait and no [`super::AppEvent::StoreFailing`]. It is tried again once the
+    /// app holds every key of `data_epoch` its certificate is given and a key came since
+    /// the step last ran, so a key the certificate is never given runs it again only when
+    /// another key comes; in the read whose
+    /// fetch brought them, after the listing a read owes first, or at a later read; it is
+    /// bounded with the entries whose sender couldn't be checked and dropped past the
+    /// bounds ([`super::AppEvent::StoredEntryDropped`]). Each read's report names the
+    /// epochs waited for ([`super::AppEvent::AwaitingKeys`]). An effect applied with a
+    /// write the context refused for want of the key ([`ReceiveContext::put_record`]) ends
+    /// the same way, waiting for the current data epoch.
+    AwaitKey {
+        /// The data epoch whose key the step waits for.
+        data_epoch: u64,
+    },
 }
 
 /// Entries the app can't read and whose senders it asks to send again (Switch spec 8.2):
@@ -609,7 +639,7 @@ pub trait Protocol: Send + Sync {
     /// the writes the app holds and the claims it keeps, and adds record writes and claim
     /// entries to the effect's batch, which carries the cursor move. What `cx` added goes
     /// only with [`Outcome::Apply`]; a [`Outcome::Drop`], an [`Outcome::Need`], an
-    /// [`Outcome::Retry`] or an [`Outcome::Pass`] discards it. After an [`Outcome::Need`] the app reads what it
+    /// [`Outcome::Retry`], an [`Outcome::Pass`] or an [`Outcome::AwaitKey`] discards it. After an [`Outcome::Need`] the app reads what it
     /// names and calls this again, the answers in [`ReceiveContext::switch_claim`]. A read
     /// of the context, or of the protocol's own store, that fails with a store error is an
     /// [`Outcome::Retry`] ([`StoreFailure::try_from`]): the entry is held for a later read,
@@ -768,9 +798,11 @@ pub trait Protocol: Send + Sync {
     }
 
     /// [`Protocol::record_regression`], told what the newer write builds on
-    /// ([`WriteBase`]): its `expected_version`, and whether the app holds that version. A
-    /// protocol whose rules hold only for a writer that built on the value the app holds,
-    /// such as one that may drop only what it held itself, applies them when `base.held`.
+    /// ([`WriteBase`]): its `expected_version`, whether the app holds that version, and the
+    /// conditions its operation signed. A protocol whose rules hold only for a writer that
+    /// built on the value the app holds, such as one that may drop only what it held itself,
+    /// applies them when `base.held`; one whose rule fences a change on a condition, such as
+    /// a `claim_step` on the claim of what the write drops, finds it in `base.conditions`.
     /// The app calls this one; by default it calls [`Protocol::record_regression`], so a
     /// protocol that implements only that keeps its rules as they are.
     ///
