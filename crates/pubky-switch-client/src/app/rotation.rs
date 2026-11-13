@@ -510,6 +510,7 @@ impl App {
         if let Some(state) = self.state.restore.as_mut() {
             state.key_checked = true;
             state.own_key_n = Some(register.unwrap_or(restore.n_floor.saturating_add(1)));
+            state.key_current = Some(register.is_none());
             tx.put(key::RESTORE, state)?;
         }
         self.commit(tx).await?;

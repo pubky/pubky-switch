@@ -369,6 +369,19 @@ pub enum AppEvent {
         /// owed then, and asked by a later read.
         resend_asked: bool,
     },
+    /// A feed page reported the cursor the service holds ahead of the furthest position
+    /// the app committed or sent, for an app whose devices don't share its cursor (Switch
+    /// spec 8.3): an instance of the app passed entries its state doesn't hold. Its state
+    /// went back underneath it, or a copy of the app holding its keys reads before it, or
+    /// the service misreports the cursor. The host asks its user whether the app's state was
+    /// restored; it is the service's word only, so the app leaves on it only if the user
+    /// decides so. Told once for each higher report while the app runs.
+    HeldCursorAhead {
+        /// The `seq` the service reports.
+        held: u64,
+        /// The `seq` of the furthest position the app committed or sent.
+        position: u64,
+    },
     /// Entries the service deleted while the app was lagging (Switch spec 8.2).
     Missed {
         /// The item's `seq`.

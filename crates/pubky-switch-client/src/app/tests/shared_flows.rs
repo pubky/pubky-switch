@@ -9723,3 +9723,40 @@ async fn test_records_failing_directory_is_asked_once_a_minute() {
     phone.read_record(&target).await.unwrap();
     assert_eq!(directory_reads(&s) - before, 2);
 }
+
+/// The wallet's honest write under its renewed certificate, served with the earlier one, a
+/// proof that gives its version, and a view whose version the service raised, read by a
+/// phone that holds only the earlier certificate while the directory fails: the write
+/// names nobody, and the phone follows the version the proof gives, not the view's.
+#[tokio::test]
+async fn test_records_unnamed_write_follows_the_version_its_proof_gives() {
+    let s = Setup::new();
+    let mut phone = s.join("phone").await;
+    let (mut wallet, target, key, earlier) = own_write_under_a_closed_renewal(&s).await;
+    phone.refresh_identity().await.unwrap();
+    phone.read_record(&target).await.unwrap();
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    let proven = {
+        let mut switch = s.w.switch.lock();
+        let held = switch.shared.records.get_mut(&key).unwrap();
+        held.cert = Some(earlier.signed().clone());
+        let proven = held.state.version;
+        held.state.version = RecordVersion::new(proven.generation, proven.version + 3);
+        proven
+    };
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "/directory".into(),
+        after: 0,
+    });
+    phone.read_record(&target).await.unwrap();
+    assert!(phone.flagged_writes().await.unwrap().is_empty());
+    let held = phone.held_record(&key).await.unwrap().unwrap();
+    assert_eq!(held.base_version(), proven);
+    let shared = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(shared.content.value()), vec!["a"]);
+    assert!(!shared.flagged);
+}

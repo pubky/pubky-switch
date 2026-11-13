@@ -253,6 +253,9 @@ pub struct FeedPage {
     pub scanned_through: u64,
     /// Whether items follow `scanned_through`.
     pub more: bool,
+    /// The `seq` of the caller's cursor the service holds, 0 before its first move (Switch
+    /// spec 8.3). Required: a page without it is malformed.
+    pub cursor: u64,
     /// The newest head, verified with the pinned key.
     pub head: SignedHead,
     /// The service's latest checkpoint, verified with the pinned key.
@@ -279,6 +282,7 @@ impl FeedPage {
             next,
             scanned_through: o.u64("scanned_through")?,
             more: o.bool("more")?,
+            cursor: o.u64("cursor")?,
             head: o.head("head")?,
             checkpoint: o.opt_head("checkpoint")?,
             freeze,
@@ -1368,11 +1372,25 @@ mod tests {
     fn test_feed_page_requires_items() {
         let page = json!({
             "items": [{ "type": "missed", "seq": 4, "entries": 2 }], "next": "1:9",
-            "scanned_through": 9, "more": false, "head": head_value()
+            "scanned_through": 9, "more": false, "cursor": 0, "head": head_value()
         });
         requires(&page, "/items", |value| {
             let page = FeedPage::read(Obj::of(value, "feed")?, &account())?;
             assert_eq!(page.items.len(), 1);
+            Ok(())
+        });
+    }
+
+    /// Switch wire 7.4.4: `cursor` is required; a page without it is refused.
+    #[test]
+    fn test_feed_page_requires_cursor() {
+        let page = json!({
+            "items": [], "next": "1:9", "scanned_through": 9, "more": false, "cursor": 3,
+            "head": head_value()
+        });
+        requires(&page, "/cursor", |value| {
+            let page = FeedPage::read(Obj::of(value, "feed")?, &account())?;
+            assert_eq!(page.cursor, 3);
             Ok(())
         });
     }
