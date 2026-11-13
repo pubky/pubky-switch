@@ -125,10 +125,11 @@ async fn test_not_registered_repeated_headless_refusals_cost_one_request_a_read(
     assert!(!report.stopped);
 }
 
-/// Revoked while offline, then purged from `removed`: a service that frees the purged app's
-/// record answers its calls without the head (Switch wire 7.2 "Where an own app gets `403
-/// not_current`", 9.1). The newest identity.json lists the app in neither list, so it ends
-/// as removed, and reads on as a stopped app.
+/// Revoked while offline, then purged from `removed`: the switch purges the app's record at
+/// that delivery and answers its calls without the head (Switch wire 7.2 "Where an own app
+/// gets `403 not_current`", 9.1), and keeps its kids, so none is registered again (spec
+/// 3.6). The newest identity.json lists the app in neither list, so it ends as removed, and
+/// reads on as a stopped app.
 #[tokio::test]
 async fn test_not_registered_purged_app_ends_as_removed() {
     use pubky_switch_core::records::RemovedApp;
@@ -136,6 +137,16 @@ async fn test_not_registered_purged_app_ends_as_removed() {
     let mut app = w.join("wallet").await;
     let me = app.app_id();
     app.receive(None).await.unwrap();
+    let kids = |w: &World| -> usize {
+        w.switch
+            .lock()
+            .kids
+            .values()
+            .filter(|holder| **holder == me)
+            .count()
+    };
+    let registered = kids(&w);
+    assert!(registered > 0);
     w.switch.revoke(me).unwrap();
     w.next_doc(|body| {
         body.apps.retain(|listed| listed.app_id != me);
@@ -146,7 +157,8 @@ async fn test_not_registered_purged_app_ends_as_removed() {
     });
     w.clock.advance_ms(1_000);
     w.next_doc(|body| body.removed.retain(|removed| removed.app_id != me));
-    w.switch.purge(me);
+    assert!(w.switch.app(&me).purged);
+    assert_eq!(kids(&w), registered);
     let report = app.receive(None).await.unwrap();
     assert!(report.stopped);
     assert!(has(&report.events, |e| matches!(e, AppEvent::Removed)));

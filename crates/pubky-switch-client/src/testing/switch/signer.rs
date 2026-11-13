@@ -420,6 +420,8 @@ impl Inner {
         // After its chain item: an app it no longer makes current departs at it (Switch wire
         // 7.4.4).
         self.after_departure(was);
+        // The removed apps it leaves in neither list go, as at the service (Switch wire 9.1).
+        self.purge_removed(None);
         Ok(proof)
     }
 
