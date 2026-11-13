@@ -1351,6 +1351,63 @@ async fn test_store_upgrade_keeps_owed_keys_as_erasures() {
     db.drop_database().await.expect("drop");
 }
 
+#[tokio::test]
+async fn test_store_upgrade_applies_0021_after_later_migrations() {
+    // A database made by a service that already ran 0022 and 0025, but not 0021: the
+    // upgrade applies 0021 then, with its column and both indexes.
+    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
+    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
+        Ok(db) => db,
+        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
+        Err(error) => panic!("test database: {error}"),
+    };
+    let mut conn = PgConnection::connect_with(db.options())
+        .await
+        .expect("conn");
+    let without_0021 = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATIONS
+                .iter()
+                .filter(|m| m.version != 21)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    without_0021
+        .run(&mut conn)
+        .await
+        .expect("every migration but 0021");
+    let applied = |version: i64| {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = $1 AND success)",
+        )
+        .bind(version)
+    };
+    assert!(applied(25).fetch_one(&mut conn).await.expect("0025"));
+    assert!(!applied(21).fetch_one(&mut conn).await.expect("0021"));
+    let announced =
+        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
+    db.store().migrate(&announced).await.expect("upgrade");
+    assert!(applied(21).fetch_one(&mut conn).await.expect("0021"));
+    let indexes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes \
+         WHERE indexname IN ('shared_records_deleted', 'batches_with_proofs')",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("indexes");
+    assert_eq!(indexes, 2);
+    sqlx::query("SELECT swept_at_ms FROM accounts LIMIT 0")
+        .execute(&mut conn)
+        .await
+        .expect("the column");
+    conn.close().await.expect("close");
+    db.drop_database().await.expect("drop");
+}
+
 /// A record taken from a recovery upload after a provider loss, at `version` of generation 1,
 /// listed by the `upload` transition at `seq`.
 fn uploaded_record(key: [u8; 32], version: u64, seq: u64) -> pubky_switch::store::StoredRecord {
