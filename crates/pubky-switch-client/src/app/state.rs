@@ -630,13 +630,13 @@ pub(crate) struct RestoreState {
     pub(crate) reconcile: bool,
 }
 
-/// `leave`: a leave in progress or done (Switch spec 12.3).
+/// `leave`: a leave in progress or done (Switch spec 12.3). Each call's mode decides how
+/// it goes, so the mode isn't kept; a `two_step` member that stores written before carry
+/// is ignored when read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LeaveState {
     /// When `leave` succeeded, app clock; `None` while it is owed.
     pub(crate) left_at_ms: Option<u64>,
-    /// The app deletes its keys only once its removal is published.
-    pub(crate) two_step: bool,
     /// When the app first saw its `identity.json` list it in `removed`.
     pub(crate) removed_seen_ms: Option<u64>,
     /// When it deleted its keys.

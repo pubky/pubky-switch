@@ -6842,3 +6842,245 @@ async fn test_records_key_on_the_same_page_as_the_unreadable_write_opens_it() {
         held.content
     );
 }
+
+/// A record change whose delivery failed goes to the switch at the next read, before the
+/// feed, also in a read whose owed listing waits for a scope key: senders reading the
+/// directory see the new record without waiting for the key.
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_still_delivers_a_kept_record() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    app.receive(None).await.unwrap();
+    assert!(app.listing_owed().await.unwrap());
+    s.w.clock.advance_ms(1_000);
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap_err();
+    let kept = app.record().clone();
+    assert_ne!(s.w.switch.app(&me).record.as_ref(), Some(&kept));
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ListingWaitsForKey)),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(s.w.switch.app(&me).record.as_ref(), Some(&kept));
+}
+
+/// An owed publication goes at the next read, also one whose owed listing waits for a scope
+/// key, for an app whose devices don't share its keys: nothing a feed shows bears on it.
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_still_publishes_what_is_owed() {
+    let s = Setup::new();
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let config = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let mut app = App::join(s.env(), s.protocol.clone(), config, request)
+        .await
+        .unwrap();
+    let me = app.app_id();
+    let path = pubky_switch_core::records::app_record_path(&me);
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    app.receive(None).await.unwrap();
+    assert!(app.listing_owed().await.unwrap());
+    s.w.clock.advance_ms(1_000);
+    s.w.homeserver.fail_writes(1, false);
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap();
+    let accepted = app.record().clone();
+    assert_eq!(s.w.switch.app(&me).record.as_ref(), Some(&accepted));
+    for _ in 0..2 {
+        app.receive(None).await.unwrap();
+        s.w.clock.advance_ms(crate::app::PUBLISHED_CHECK_MS);
+    }
+    assert!(
+        s.w.homeserver.file(s.w.alice.public(), &path)
+            == Some(serde_json::to_vec(&accepted).unwrap()),
+        "the switch holds the new record, the Homeserver still the old one"
+    );
+}
+
+/// A read that delivers a kept record publishes it too, also when its owed listing then
+/// waits for a scope key: the switch accepted the record in that read, so the app is
+/// current, and the Homeserver needn't keep the older record meanwhile.
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_publishes_the_record_it_delivers() {
+    let s = Setup::new();
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let config = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let mut app = App::join(s.env(), s.protocol.clone(), config, request)
+        .await
+        .unwrap();
+    let me = app.app_id();
+    let path = pubky_switch_core::records::app_record_path(&me);
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    app.receive(None).await.unwrap();
+    s.w.clock.advance_ms(1_000);
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap_err();
+    let kept = app.record().clone();
+    app.receive(None).await.unwrap();
+    assert_eq!(s.w.switch.app(&me).record.as_ref(), Some(&kept));
+    assert!(
+        s.w.homeserver.file(s.w.alice.public(), &path) == Some(serde_json::to_vec(&kept).unwrap()),
+        "delivered in the read, not published"
+    );
+}
+
+/// A read whose owed listing waits for a scope key reads no feed, so an app whose devices
+/// share its keys writes no missing Homeserver copy back in it: another device may have
+/// deleted the copy to leave, and only a feed would show the departure (Switch spec 4.2).
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_writes_no_missing_copy_back() {
+    let s = Setup::new();
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let config = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let mut app = App::join(s.env(), s.protocol.clone(), config, request)
+        .await
+        .unwrap();
+    let me = app.app_id();
+    let path = pubky_switch_core::records::app_record_path(&me);
+    app.set_multi_device(true).await.unwrap();
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    app.receive(None).await.unwrap();
+    assert!(app.listing_owed().await.unwrap());
+    s.w.homeserver.remove(s.w.alice.public(), &path);
+    s.w.clock.advance_ms(crate::app::PUBLISHED_CHECK_MS);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ListingWaitsForKey)),
+        "{:?}",
+        report.events
+    );
+    assert!(s.w.homeserver.file(s.w.alice.public(), &path).is_none());
+}
+
+/// A publishing app whose owed listing waits for a scope key: joined, its scope keys
+/// dropped, and a `missed` item read so that the listing is owed.
+async fn publishing_app_waiting_for_a_key(s: &Setup) -> App {
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let config = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let mut app = App::join(s.env(), s.protocol.clone(), config, request)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    app.receive(None).await.unwrap();
+    assert!(app.listing_owed().await.unwrap());
+    app
+}
+
+/// A single-device app revoked while offline, whose publication is owed and
+/// whose copy the signer's clean-up deleted, writes nothing back in a read that waits for
+/// a key: the key bundle read is refused first.
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_revoked_app_writes_nothing_back() {
+    let s = Setup::new();
+    let mut app = publishing_app_waiting_for_a_key(&s).await;
+    let me = app.app_id();
+    let path = pubky_switch_core::records::app_record_path(&me);
+    s.w.clock.advance_ms(1_000);
+    s.w.homeserver.fail_writes(1, false);
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap();
+    assert!(app.state.pending_publish.is_some());
+    s.w.switch.revoke(me).unwrap();
+    s.w.homeserver.remove(s.w.alice.public(), &path);
+    let outcome = app.receive(None).await;
+    assert!(
+        s.w.homeserver.file(s.w.alice.public(), &path).is_none(),
+        "{outcome:?}"
+    );
+}
+
+/// A read that delivers a kept record and then waits for a key, with the
+/// Homeserver down, reports the failed publication once.
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_reports_a_failed_publication_once() {
+    let s = Setup::new();
+    let mut app = publishing_app_waiting_for_a_key(&s).await;
+    s.w.clock.advance_ms(1_000);
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap_err();
+    app.take_events();
+    s.w.homeserver.set_down(true);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ListingWaitsForKey)),
+        "{:?}",
+        report.events
+    );
+    let failed = report
+        .events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::RecordPublishFailed { .. }))
+        .count();
+    assert_eq!(failed, 1, "{:?}", report.events);
+}

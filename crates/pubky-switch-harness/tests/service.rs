@@ -14,6 +14,8 @@ use pubky_switch_client::testing::START_MS;
 use pubky_switch_client::transport::{Request, Response, Transport};
 use pubky_switch_core::http::header;
 use pubky_switch_harness::service::RealSwitch;
+use pubky_switch_harness::service_log::ServiceLog;
+use pubky_switch_harness::{Backend, HarnessError, run};
 
 const ORIGIN: &str = "https://switch.example";
 
@@ -96,6 +98,96 @@ async fn test_service_transport_takes_the_services_own_path() {
     let name = switch.database_name().to_owned();
     switch.close().await.expect("closed");
     assert!(!database_exists(&name).await, "{name} was left behind");
+}
+
+/// A request the service's storage fails: the service answers `503 unavailable` under the
+/// operator key, and its log, which a run keeps, says that it was the database.
+#[tokio::test]
+async fn test_service_storage_failure_is_a_503_whose_cause_the_log_names() {
+    let Some(switch) = switch(Arc::new(TestClock::new(START_MS))).await else {
+        return;
+    };
+    let identity = pubky_switch_core::keys::IdentityKey::from_secret([7; 32]);
+    let id = pubky_switch_core::enc::zbase32_encode(&identity.public());
+    let read = request("GET", ORIGIN, &format!("/v1/{id}/identity"), Vec::new());
+    let log = ServiceLog::default();
+    let keeping = log.keep();
+
+    // With its database: no such account, and nothing logged.
+    let answer = switch
+        .transport()
+        .send(read.clone())
+        .await
+        .expect("an answer");
+    assert_eq!((answer.status, code(&answer).as_str()), (404, "not_found"));
+    assert!(log.lines().is_empty(), "{:?}", log.lines());
+
+    // Without a connection to it.
+    switch.close_connections().await;
+    let answer = switch.transport().send(read).await.expect("an answer");
+    drop(keeping);
+    assert_eq!(
+        (answer.status, code(&answer).as_str()),
+        (503, "unavailable")
+    );
+    assert!(answer.header(header::SERVICE_SIGNATURE).is_some());
+    let failures = log.database_failures();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].starts_with("WARN pubky_switch::service: storage error=database: "),
+        "{failures:?}"
+    );
+
+    switch.close().await.expect("closed");
+}
+
+/// A run against the service whose database takes no connection ends as the database's
+/// failure, with the service's line for it, whether the flow fails on the `503` or passes
+/// it by.
+#[tokio::test]
+async fn test_run_at_the_service_fails_as_the_database_when_it_takes_no_connection() {
+    for flow_fails in [true, false] {
+        let ended = run(Backend::Service, async |world| {
+            let alice = world.identity("alice")?;
+            world.add_switch(ORIGIN, &[&alice]).await?;
+            let read = format!("/v1/{}/identity", alice.key().id());
+            let answer = world.request("GET", ORIGIN, &read).await?;
+            if answer.status != 404 {
+                return Err(
+                    format!("with its database the read was answered {}", answer.status).into(),
+                );
+            }
+            world.close_database_connections(ORIGIN).await;
+            let answer = world.request("GET", ORIGIN, &read).await?;
+            if flow_fails {
+                return Err(format!("the read was answered {}", answer.status).into());
+            }
+            Ok(())
+        })
+        .await;
+        let (logged, flow) = match ended {
+            // No test database: skipped.
+            Ok(None) => return,
+            Err(HarnessError::Database {
+                backend: Backend::Service,
+                logged,
+                ended,
+                ..
+            }) => (logged, ended),
+            other => panic!("the run ended {other:?}"),
+        };
+        assert_eq!(
+            logged,
+            "  WARN pubky_switch::service: storage error=database: attempted to acquire a \
+             connection on a closed pool"
+        );
+        let expected = if flow_fails {
+            "the read was answered 503"
+        } else {
+            "with no error"
+        };
+        assert_eq!(flow, expected);
+    }
 }
 
 /// Whether the test server holds a database named `name`.

@@ -81,9 +81,9 @@ The flows send every call the service serves, each at both switches. What they l
 
 - **Calls the service doesn't serve yet**, eight of the thirty-three of Switch wire 7.4:
   `PUT /push`, `POST /freeze` and `/unfreeze`, `GET /export` and its chunks, and `POST
-  /import` with its chunks and activation. So no flow moves an account or changes its key in place, and no upload is
-  sent in a cooperative move. `flows::flow_of` lists them, and the test fails once one is
-  served without a flow.
+  /import` with its chunks and activation. So no flow moves an account or changes its key
+  in place, and no upload is sent in a cooperative move. `flows::flow_of` lists them, and
+  the test fails once one is served without a flow.
 - **More of a recovery upload** (Switch wire 7.4.14). The upload flows bring records, a
   claim and the lists to the new service, and send the refusals in their order. They leave
   to the service's own tests: an operation of a removed app (`distrusted`), items that
@@ -113,12 +113,12 @@ The flows send every call the service serves, each at both switches. What they l
   that still finds entries to read are left to the service's own tests.
 - **More of the lists:** an invite code withdrawn or used several times, and a
   conversation entry pruned.
-- **More of connect requests.** The `connect request` flows ask, allow, decline and
-  deny, fill the list, turn the policy off with a request pending, and ask across a
-  provider loss, at another service and in place. Not sent: a request past `connect_per_min` or `stranger_per_min`, which
-  takes more requests in a minute than a flow sends; the push a request queues; a request
-  an invite code's first admitted append answers; one to a frozen account; and a `POST
-  /connect` from an own app or from the signer.
+- **More of connect requests.** The `connect request` flows ask, allow, decline and deny,
+  fill the list, turn the policy off with a request pending, and ask across a provider
+  loss, at another service and in place. Not sent: a request past `connect_per_min` or
+  `stranger_per_min`, which takes more requests in a minute than a flow sends; the push a
+  request queues; a request an invite code's first admitted append answers; one to a
+  frozen account; and a `POST /connect` from an own app or from the signer.
 - **Longer lives:** a renewal that adds a scope, and a claim that runs out by time.
 - **The Homeserver's side of a grant.** The `approval` flows hold the capabilities the
   signer grants when the user declines a protocol's paths, and that the switch is sent
@@ -179,3 +179,23 @@ of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flo
 that ran the flows had less left. Seventy-six flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.
+
+The test server is shared with whatever else uses it, and the service answers every failure
+of its storage `503 unavailable` with the reason only in its log. So a run keeps the
+service's warnings and errors (`src/service_log.rs`, at most fifty lines), and tells them
+apart:
+
+- **The server failed a request**: it refused or broke a connection, or the wait for a
+  pooled connection (5 seconds) or for an account's lock (10 seconds) ran out. The run ends
+  as a failure that names the test database and quotes those lines, whatever the flow made
+  of the `503`. Nothing is sent again, and a flow is never run a second time. When a run
+  fails that way, look for another suite on the same server: several at once can pass its
+  limit on connections.
+- **A request failed inside the service for another reason**, such as a statement the
+  database refused or a stored value that doesn't fit: the service's own. The run fails as
+  its flow, with the log, also when the flow made nothing of the answer.
+- **A line about no request**, such as the store trying its first connection again, fails
+  no run. It is shown beside a failed flow's error.
+
+The test that asks the service for every call runs the same way, so a request the server
+failed there isn't read as a call that isn't served.
