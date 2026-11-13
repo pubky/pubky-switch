@@ -4,8 +4,10 @@
 //!
 //! - **One attempt** claims a due row, leased so no other instance sends it meanwhile, and
 //!   holds its registration while the webhook is signed: the registration must still name the
-//!   row's push key and handle, and the key must not be owed deleting. Otherwise the row goes
-//!   unsent. The body is made at each attempt: `ts` is the service time when sent, and the
+//!   row's push key and handle, the key must not be owed deleting, and the account must still
+//!   serve at this service (its newest `identity.json` names it). Otherwise the row goes
+//!   unsent, and the registration stays as it is. A service with `push.enabled` off claims
+//!   nothing. The body is made at each attempt: `ts` is the service time when sent, and the
 //!   nonce is fresh, since a relay refuses a `ts` more than 5 minutes off and a nonce it saw
 //!   in the last 10 (8.3), so an attempt sent again after a timeout the relay did take must
 //!   not repeat one. It is signed with the registration's push key, never the service key.
@@ -34,10 +36,12 @@ use pubky_switch_core::{
     net::{UrlUse, check_addresses, check_url},
 };
 
-use super::Service;
+use pubky_switch_core::records::IdentityDoc;
+
+use super::{Service, rules::names_this_service};
 use crate::{
     keys::ServiceSigner,
-    store::{QueuedPush, StoreError},
+    store::{HeldRegistration, QueuedPush, StoreError},
 };
 
 /// How long one attempt may take, resolution included (Switch wire 8.2: 5 s).
@@ -156,6 +160,11 @@ impl Service {
     /// are claimed and attempted at once (Switch wire 8.2).
     pub async fn deliver_pushes(&self) -> PushRound {
         let mut round = PushRound::default();
+        // A service that sends no pushes claims and sends nothing: the rows wait, and go
+        // unsent once their minute has passed, at the first round of a service that does.
+        if !self.push_enabled {
+            return round;
+        }
         let reading = self.time.read();
         if !reading.trusted {
             return round;
@@ -231,21 +240,47 @@ impl Service {
         round
     }
 
-    /// One attempt of `push`: `Ok(true)` delivered, `Ok(false)` not to be sent, as its
-    /// registration no longer names its key or handle, or its key is owed deleting.
-    async fn attempt(&self, push: &QueuedPush) -> Result<bool, Failure> {
-        let internal = |error: StoreError| {
-            tracing::warn!(%error, "push deliveries: reading a registration");
-            Failure::Internal
-        };
-        // Signed while the registration is held, so the key can't be owed deleting, and so
-        // deleted, until the signature is made (`store::push_queue`).
+    /// `push`'s registration, held while its webhook is signed, if it may be sent: the
+    /// registration still names its push key and handle, the key isn't owed deleting, and
+    /// the account still serves at this service, its newest `identity.json` naming this
+    /// service's origin and the account's service key (Switch wire 3.7). `None` otherwise:
+    /// nothing is sent, and the registration stays as it is.
+    async fn sendable(&self, push: &QueuedPush) -> Result<Option<HeldRegistration>, Failure> {
+        // Held, so the key can't be owed deleting, and so deleted, until the signature is
+        // made (`store::push_queue`).
         let held = self
             .store
             .hold_push_registration(push)
             .await
-            .map_err(internal)?;
+            .map_err(|error: StoreError| {
+                tracing::warn!(%error, "push deliveries: reading a registration");
+                Failure::Internal
+            })?;
         let Some(held) = held else {
+            return Ok(None);
+        };
+        let identity = held
+            .identity
+            .as_ref()
+            .and_then(|doc| IdentityDoc::verify(doc, &held.identity_key).ok());
+        let service_key = self
+            .keys
+            .public_key(&held.service_key)
+            .await
+            .map_err(|failure| {
+                tracing::error!(%failure, "push deliveries: the account's service key");
+                Failure::Internal
+            })?;
+        if !names_this_service(identity.as_ref(), &self.origin, &service_key) {
+            return Ok(None);
+        }
+        Ok(Some(held))
+    }
+
+    /// One attempt of `push`: `Ok(true)` delivered, `Ok(false)` not to be sent
+    /// ([`Service::sendable`]).
+    async fn attempt(&self, push: &QueuedPush) -> Result<bool, Failure> {
+        let Some(held) = self.sendable(push).await? else {
             return Ok(false);
         };
         let signer = self.keys.signer(&push.push_key).await.map_err(|failure| {

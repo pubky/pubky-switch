@@ -307,3 +307,29 @@ impl AccountTxn {
         &self.owed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_push_registration_debug_shows_no_relay_or_handle() {
+        let registration = PushRegistration {
+            app_id: [1; 16],
+            relay_url: "https://push.example/v1/hook".into(),
+            push_key: KeyId::random().expect("key id"),
+            push_public: [2; 32],
+            handles: vec!["handle-Kt8fSp".into()],
+            set_at_ms: 5,
+        };
+        let shown = format!("{registration:?}");
+        for hidden in [
+            "push.example",
+            "/v1/hook",
+            "handle-Kt8fSp",
+            registration.push_key.as_str(),
+        ] {
+            assert!(!shown.contains(hidden), "{shown}");
+        }
+    }
+}

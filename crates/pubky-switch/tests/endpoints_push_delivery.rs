@@ -325,6 +325,11 @@ async fn append(replay: &Replay, byte: u8, notify: bool) {
 
 /// [`append`], at `service`.
 async fn append_to(replay: &Replay, service: &Service, byte: u8, notify: bool) {
+    append_envelope(replay, service, to_wallet(byte, notify)).await;
+}
+
+/// An append of `envelope` from bob's shop to the wallet at `service`, accepted.
+async fn append_envelope(replay: &Replay, service: &Service, envelope: Vec<u8>) {
     let mut conn = conn(replay).await;
     let version: i64 = sqlx::query_scalar("SELECT apps_version FROM accounts WHERE id = $1")
         .bind(alice_id())
@@ -338,7 +343,7 @@ async fn append_to(replay: &Replay, service: &Service, byte: u8, notify: bool) {
         ORIGIN,
         "POST",
         &path,
-        to_wallet(byte, notify),
+        envelope,
         None,
         ms(&at()),
     );
@@ -445,6 +450,32 @@ fn relay_checks(seen: &Seen, push_key: &[u8; 32], handles: &[&str], now_ms: u64)
     handle.to_string()
 }
 
+/// alice's service key.
+async fn service_key(replay: &Replay) -> [u8; 32] {
+    let mut conn = conn(replay).await;
+    let id: String = sqlx::query_scalar("SELECT service_key FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("service key");
+    conn.close().await.expect("close");
+    replay
+        .keys
+        .public_key(&KeyId::parse(&id).expect("key id"))
+        .await
+        .expect("public")
+}
+
+async fn registrations(replay: &Replay) -> i64 {
+    let mut conn = conn(replay).await;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM push_registrations")
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    conn.close().await.expect("close");
+    count
+}
+
 fn nonce(seen: &Seen) -> String {
     let webhook: Value = serde_json::from_slice(&seen.body).expect("json");
     webhook["nonce"].as_str().expect("nonce").to_string()
@@ -471,10 +502,16 @@ async fn test_push_delivery_notify_append_queues_one_per_handle() {
     assert_eq!(handles, [H1, H2]);
     assert!(rows.iter().all(|row| row.1 == 0 && row.2 == row.3));
     assert!(setup.relay.seen().is_empty());
+    // An append sent again, a retry by its content, queues nothing again.
+    let envelope = to_wallet(5, true);
+    append_envelope(replay, &replay.service, envelope.clone()).await;
+    assert_eq!(queued(replay).await.len(), 4);
+    append_envelope(replay, &replay.service, envelope).await;
+    assert_eq!(queued(replay).await.len(), 4);
     // A service with `push.enabled` off queues nothing, the registration kept.
     let off = setup.instance().with_push(false);
     append_to(replay, &off, 4, true).await;
-    assert_eq!(queued(replay).await.len(), 2);
+    assert_eq!(queued(replay).await.len(), 4);
     setup.replay.db.drop_database().await.expect("drop");
 }
 
@@ -519,6 +556,8 @@ async fn test_push_delivery_sends_signed_webhooks_and_drops_the_rows() {
         .is_err()
     );
     assert!(verify_webhook(&[7; 32], RELAY, &seen[0].body, &signature).is_err());
+    // Never signed with the account's service key.
+    assert!(verify_webhook(&service_key(replay).await, RELAY, &seen[0].body, &signature).is_err());
     // Nothing more is due.
     assert_eq!(replay.service.deliver_pushes().await, PushRound::default());
     setup.replay.db.drop_database().await.expect("drop");
@@ -703,6 +742,131 @@ async fn test_push_delivery_not_sent_unless_the_registration_names_it() {
         assert!(queued(replay).await.is_empty(), "{change}");
         setup.replay.db.drop_database().await.expect("drop");
     }
+}
+
+#[tokio::test]
+async fn test_push_delivery_of_a_crashed_attempt_retried_when_its_lease_ends() {
+    // An instance that dies mid-attempt leaves its row leased: no other instance sends it
+    // until the lease ends, 20 s after the claim, and then it is retried. The lost attempt
+    // counts among the 3: each claim is one.
+    let Some((setup, key)) = registered(&[H1]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    setup.relay.set(Mode::Hang);
+    append(replay, 1, true).await;
+    clock_at_entry(replay, 0).await;
+    let crashed = Arc::new(setup.instance());
+    let running = tokio::spawn({
+        let crashed = crashed.clone();
+        async move { crashed.deliver_pushes().await }
+    });
+    while setup.relay.seen().is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    running.abort();
+    assert!(running.await.is_err(), "the round died");
+    setup.relay.set(Mode::Ok);
+    let other = setup.instance();
+    clock_at_entry(replay, 19_999).await;
+    assert_eq!(other.deliver_pushes().await, PushRound::default());
+    let rows = queued(replay).await;
+    assert_eq!((rows[0].1, rows[0].3), (1, rows[0].2 + 20_000));
+    clock_at_entry(replay, 20_000).await;
+    assert_eq!(
+        other.deliver_pushes().await,
+        PushRound {
+            delivered: 1,
+            ..PushRound::default()
+        }
+    );
+    let seen = setup.relay.seen();
+    assert_eq!(seen.len(), 2);
+    relay_checks(&seen[1], &key, &[H1], replay.time.read().base_ms);
+    assert!(queued(replay).await.is_empty());
+    setup.replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_push_delivery_with_push_off_sends_nothing() {
+    // A service with `push.enabled` off claims and sends nothing: the row waits, and goes
+    // unsent once its minute has passed, at the first round of a service that sends pushes.
+    let Some((setup, _)) = registered(&[H1]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    append(replay, 1, true).await;
+    let off = setup.instance().with_push(false);
+    for after_ms in [0, 60_000] {
+        clock_at_entry(replay, after_ms).await;
+        assert_eq!(off.deliver_pushes().await, PushRound::default());
+        assert_eq!(queued(replay).await[0].1, 0, "not claimed");
+    }
+    assert_eq!(
+        replay.service.deliver_pushes().await,
+        PushRound {
+            dropped: 1,
+            ..PushRound::default()
+        }
+    );
+    assert!(setup.relay.seen().is_empty());
+    assert!(queued(replay).await.is_empty());
+    setup.replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_push_delivery_of_an_account_moved_away_sends_nothing() {
+    // An `identity.json` naming another switch: the account no longer serves here, so its
+    // queued webhook goes unsent, and its registration stays.
+    let Some((setup, _)) = registered(&[H1]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    append(replay, 1, true).await;
+    let keys = vectors("keys.json");
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let v3: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .expect("version 3");
+    let mut moved: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&v3.body_bytes().expect("body")).expect("identity body");
+    moved.version = 4;
+    moved.inbox.url = "https://other.example".into();
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: pubky_switch_core::records::IdentityDoc::sign(&key, moved)
+            .expect("sign")
+            .signed()
+            .clone(),
+        prev: Some(v3.doc_hash().expect("hash")),
+    };
+    let path = format!("/v1/{}/identity", alice_id());
+    let answer = replay
+        .service
+        .handle(signer_request("PUT", &path, delivery.to_json(), ms(&at())))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    clock_at_entry(replay, 0).await;
+    assert_eq!(
+        replay.service.deliver_pushes().await,
+        PushRound {
+            dropped: 1,
+            ..PushRound::default()
+        }
+    );
+    assert!(setup.relay.seen().is_empty());
+    assert!(queued(replay).await.is_empty());
+    assert_eq!(registrations(replay).await, 1);
+    setup.replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]
