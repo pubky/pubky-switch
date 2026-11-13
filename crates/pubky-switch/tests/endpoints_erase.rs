@@ -3580,6 +3580,40 @@ async fn test_erase_and_a_sweep_at_the_same_moment_run_one_after_the_other() {
 }
 
 #[tokio::test]
+async fn test_erase_after_a_purge() {
+    // The wallet revoked and purged (Switch wire 9.1): the erasure deletes every row as
+    // before, the purged App ID's included.
+    let Some(replay) = replay().await else { return };
+    let (_, at) = purge_wallet(&replay).await;
+    let answer = erase(
+        &replay,
+        &alice_service_key(),
+        &pubky_switch_core::time::rfc3339(at),
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    for (table, count) in rows(&replay, &alice_id()).await {
+        assert_eq!(count, 0, "{table}");
+    }
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            at,
+        ))
+        .await;
+    assert_eq!(answer.status, 404);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_erase_of_an_account_holding_an_older_item_that_doesnt_read() {
     // An older chain item whose stored document doesn't read, left for the check of older
     // documents (Switch wire 7.5): the signer can still erase the account, as step 4's check

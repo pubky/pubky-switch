@@ -279,6 +279,12 @@ impl Service {
             .departed(txn, &current)
             .await
             .map_err(|e| store_error(&e))?;
+        // A revoked app the newest document lists in neither `apps` nor `removed`, owning no
+        // open or `unknown` attempt, is purged at once (Switch wire 9.1); a listed one waits
+        // for the delivery that leaves it out.
+        super::purge::purge_removed_apps(txn, held, Some(&[app]))
+            .await
+            .map_err(|e| store_error(&e))?;
         let object = transition.proof_object().ok_or_else(temporary)?;
         let proof = TransitionProof::sign(
             signer,

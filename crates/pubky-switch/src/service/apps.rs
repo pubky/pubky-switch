@@ -167,6 +167,9 @@ pub(crate) fn statuses(
         let record_cert = held
             .and_then(|app| app.record.as_ref())
             .map(|record| b64(&AppRecord::cert(record).hash()));
+        // A purged app has no row, so no cursor: none of the entries naming it counts as
+        // unread for it (Switch wire 9.1).
+        let unread = row.and_then(|_| view.unread.get(&id).copied());
         let ranges: Vec<[u64; 2]> = parts
             .iter()
             .map(|part| [part.first_epoch, part.last_epoch])
@@ -187,11 +190,11 @@ pub(crate) fn statuses(
             ("open_attempts", array(&open_attempts)),
             (
                 "unread_entries",
-                json_of(&view.unread.get(&id).map_or(0, |(unread, _)| *unread))?,
+                json_of(&unread.map_or(0, |(unread, _)| unread))?,
             ),
             (
                 "sole_target_unread",
-                json_of(&view.unread.get(&id).map_or(0, |(_, sole)| *sole))?,
+                json_of(&unread.map_or(0, |(_, sole)| sole))?,
             ),
             ("record_cert", json_of(&record_cert)?),
             (

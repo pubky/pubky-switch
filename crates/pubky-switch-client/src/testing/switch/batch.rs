@@ -283,6 +283,7 @@ impl Inner {
         }
         // Step 11: the chain items and their proofs, then the state, all at once.
         let first_seq = self.seq + 1;
+        let claims_before = self.shared.claims.clone();
         let mut proofs = Vec::with_capacity(ops.len());
         for (op, state) in ops.iter().zip(states) {
             let body = op.body();
@@ -320,6 +321,8 @@ impl Inner {
             proofs.push(proof);
         }
         self.commit(draft);
+        // A removed app whose last open attempt the batch resolved goes (Switch wire 9.1).
+        self.purge_released(&claims_before);
         // An entry every reader it waits for has passed goes (Switch wire 9.1).
         if cursor_moved {
             self.after_cursor_move();

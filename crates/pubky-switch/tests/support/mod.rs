@@ -716,6 +716,220 @@ pub async fn listen(
     (stop, task)
 }
 
+/// The App ID of the vectors' app `name`.
+pub fn app_id_of(name: &str) -> [u8; 16] {
+    let keys = vectors("keys.json");
+    pubky_switch_core::enc::app_id_decode(app(&keys, name)["app_id"].as_str().expect("id"))
+        .expect("app id")
+}
+
+/// The wallet's attempt that `chain.json` opens at seq 7: its claim key and attempt ID. Its
+/// claim is at step 1.
+pub fn wallet_attempt() -> ([u8; 32], [u8; 16]) {
+    let chain = vectors("chain.json");
+    let op = SignedOp::peek(
+        &serde_json::from_value::<SignedDoc>(chain_item(&chain, 7)["item"].clone()).expect("op"),
+    )
+    .expect("op");
+    let body: Value =
+        serde_json::from_slice(&op.signed().body_bytes().expect("body")).expect("json");
+    let claim_key = unb64(body["claim_key"].as_str().expect("claim key")).expect("b64");
+    let attempt_id = unb64(body["attempt_id"].as_str().expect("attempt id")).expect("b64");
+    (
+        claim_key.try_into().expect("32"),
+        attempt_id.try_into().expect("16"),
+    )
+}
+
+/// A claim entry on the wallet's attempt (`chain.json` seq 7), at `step`.
+pub fn on_wallet_attempt(
+    kind: pubky_switch_core::claims::ClaimType,
+    step: u64,
+    basis: Option<pubky_switch_core::claims::Basis>,
+) -> pubky_switch_core::ops::OpKind {
+    let (claim_key, attempt_id) = wallet_attempt();
+    pubky_switch_core::ops::OpKind::Claim(pubky_switch_core::claims::ClaimFields {
+        claim_key: claim_key.to_vec(),
+        kind,
+        expected_step: step,
+        attempt_id: attempt_id.to_vec(),
+        orphan_after: None,
+        deadline: None,
+        evidence_ref: basis
+            .filter(|basis| *basis == pubky_switch_core::claims::Basis::Evidence)
+            .map(|_| vec![5; 32]),
+        basis,
+    })
+}
+
+/// The vectors' app `name` sends a batch of `ops` with ID `[batch; 16]` at `at_ms`.
+pub async fn app_batch(
+    replay: &Replay,
+    name: &str,
+    batch: u8,
+    ops: Vec<pubky_switch_core::ops::OpKind>,
+    at_ms: u64,
+) -> SwitchResponse {
+    let keys = vectors("keys.json");
+    let writer = app(&keys, name);
+    let signed = pubky_switch_core::ops::sign_batch(
+        &pubky_switch_core::keys::AppKeys::from_secrets(
+            hex32(&writer["signing_secret_hex"]),
+            hex32(&writer["bundle_secret_hex"]),
+        ),
+        &hex32(&alice(&keys)["public_hex"]),
+        Some(app_id_of(name)),
+        1,
+        [batch; 16],
+        ops.into_iter().map(|op| (Vec::new(), op)).collect(),
+    )
+    .expect("batch");
+    let path = format!("/v1/{}/ops", alice(&keys)["pubky_id"].as_str().expect("id"));
+    replay
+        .service
+        .handle(app_request(
+            writer,
+            "POST",
+            &path,
+            OpsRequest::new(&signed, None).to_json(),
+            at_ms,
+        ))
+        .await
+}
+
+/// alice's version after `prev`, by `change`, delivered by her signer at `at_ms`: the new
+/// document, once the service took it.
+pub async fn deliver_next(
+    replay: &Replay,
+    prev: &SignedDoc,
+    at_ms: u64,
+    change: impl FnOnce(&mut pubky_switch_core::records::IdentityBody),
+) -> SignedDoc {
+    let keys = vectors("keys.json");
+    let mut next: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&prev.body_bytes().expect("body")).expect("identity body");
+    next.version += 1;
+    change(&mut next);
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let doc = pubky_switch_core::records::IdentityDoc::sign(&key, next)
+        .expect("sign")
+        .signed()
+        .clone();
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: doc.clone(),
+        prev: Some(prev.doc_hash().expect("hash")),
+    }
+    .to_json();
+    let path = format!(
+        "/v1/{}/identity",
+        alice(&keys)["pubky_id"].as_str().expect("id")
+    );
+    let answer = replay
+        .service
+        .handle(signer_request("PUT", &path, delivery, at_ms))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    doc
+}
+
+/// alice's version 3, the newest `chain.json` delivers.
+pub fn alice_version_3() -> SignedDoc {
+    serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .expect("document")
+}
+
+/// The vectors' chain through the phone's revocation, then the wallet's attempt failed by
+/// the wallet, the wallet revoked, moved to `removed` at a higher data epoch, and purged
+/// from it (Switch wire 9.1): the newest document, which lists it in neither list, and the
+/// time of it all.
+pub async fn purge_wallet(replay: &Replay) -> (SignedDoc, u64) {
+    let at = revoke_wallet(replay).await;
+    let wallet = app_id_of("wallet");
+    let removing = deliver_next(replay, &alice_version_3(), at, |body| {
+        body.apps.retain(|listed| listed.app_id != wallet);
+        body.removed.push(pubky_switch_core::records::RemovedApp {
+            app_id: wallet,
+            distrust_from: at,
+        });
+        body.data_epoch += 1;
+    })
+    .await;
+    let purging = deliver_next(replay, &removing, at, |body| {
+        body.removed.retain(|removed| removed.app_id != wallet);
+    })
+    .await;
+    (purging, at)
+}
+
+/// The vectors' chain through the phone's revocation, then the wallet's attempt failed by
+/// the wallet and the wallet revoked, still listed in `apps`: the time of it all.
+pub async fn revoke_wallet(replay: &Replay) -> u64 {
+    use pubky_switch_core::claims::ClaimType;
+    replay_chain_through_revoke(replay).await;
+    let at = ms(&item_time(chain_item(&vectors("chain.json"), 9)));
+    let failed = app_batch(
+        replay,
+        "wallet",
+        90,
+        vec![on_wallet_attempt(ClaimType::Failed, 1, None)],
+        at,
+    )
+    .await;
+    assert_eq!(
+        failed.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&failed.body)
+    );
+    let keys = vectors("keys.json");
+    let path = format!(
+        "/v1/{}/apps/{}/revoke",
+        alice(&keys)["pubky_id"].as_str().expect("id"),
+        app(&keys, "wallet")["app_id"].as_str().expect("id"),
+    );
+    let revoked = replay
+        .service
+        .handle(signer_request("POST", &path, Vec::new(), at))
+        .await;
+    assert_eq!(
+        revoked.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&revoked.body)
+    );
+    at
+}
+
+/// How many rows `table` holds for alice's account whose `column` is `app`.
+pub async fn rows_naming(replay: &Replay, table: &str, column: &str, app: &[u8; 16]) -> i64 {
+    use sqlx::Connection;
+    let keys = vectors("keys.json");
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} WHERE account_id = $1 AND {column} = $2"
+    ))
+    .bind(alice(&keys)["pubky_id"].as_str().expect("id"))
+    .bind(app.as_slice())
+    .fetch_one(&mut conn)
+    .await
+    .expect("count");
+    conn.close().await.expect("close");
+    count
+}
+
 /// Log, in a table of the test database outside every account, each invite code the
 /// minute's sweep deletes (its statement, not an erasure's cascade or a recovery's clear),
 /// so a test can tell that a sweep ran.
@@ -752,6 +966,64 @@ pub async fn swept_invite_codes(replay: &Replay) -> i64 {
         .expect("count");
     conn.close().await.expect("close");
     count
+}
+
+/// What the service holds of `app` that a purge of a removed app deletes (Switch wire 9.1):
+/// its record, receive key records, key bundle parts and listing. Its kids stay
+/// ([`rows_naming`] on `receive_keys`).
+pub async fn holdings(replay: &Replay, app: &[u8; 16]) -> [i64; 4] {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let records: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM receive_keys WHERE account_id = $1 AND app_id = $2 \
+         AND record IS NOT NULL",
+    )
+    .bind(
+        alice(&vectors("keys.json"))["pubky_id"]
+            .as_str()
+            .expect("id"),
+    )
+    .bind(app.as_slice())
+    .fetch_one(&mut conn)
+    .await
+    .expect("count");
+    conn.close().await.expect("close");
+    [
+        rows_naming(replay, "apps", "app_id", app).await,
+        records,
+        rows_naming(replay, "key_bundle_parts", "target_app_id", app).await,
+        rows_naming(replay, "app_listings", "app_id", app).await,
+    ]
+}
+
+/// The signer's `GET /apps` status of the vectors' app `name`.
+pub async fn app_status(replay: &Replay, name: &str, at_ms: u64) -> Value {
+    let keys = vectors("keys.json");
+    let path = format!(
+        "/v1/{}/apps",
+        alice(&keys)["pubky_id"].as_str().expect("id")
+    );
+    let answer = replay
+        .service
+        .handle(signer_request("GET", &path, Vec::new(), at_ms))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let id = pubky_switch_core::enc::zbase32_encode(&app_id_of(name));
+    let body: Value = serde_json::from_slice(&answer.body).expect("json");
+    body["apps"]
+        .as_array()
+        .expect("apps")
+        .iter()
+        .find(|status| status["app_id"] == id.as_str())
+        .unwrap_or_else(|| panic!("no status for {name}"))
+        .clone()
 }
 
 /// Whether account `account`'s chain item at `seq` keeps its document, and its proof

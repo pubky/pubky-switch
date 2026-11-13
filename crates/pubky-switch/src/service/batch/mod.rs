@@ -127,8 +127,9 @@ impl VerifiedApp {
 ///
 /// # Errors
 ///
-/// A [`Stop`]: `401 bad_signature` before the app is known to be its key's, then `403
-/// cert_expired` or `403 not_current`.
+/// A [`Stop`]: `401 bad_signature` before the app is known to be its key's, or `403
+/// not_current` without the head when it holds no record and the call isn't its first;
+/// then `403 cert_expired` or `403 not_current`.
 pub(super) fn check_own_app(
     identity: &[u8; 32],
     held: Option<&IdentityDoc>,
@@ -161,12 +162,20 @@ pub(super) fn check_own_app(
             (record.cert().clone(), None)
         }
         None => {
+            // No record held: the headless `403 not_current` the request gets before the
+            // lock without one, also when it read a record there and the app was purged or
+            // recovered in place before the lock (Switch wire 7.2 "An own app's first call",
+            // 9.1).
             let held_app = stored
                 .map(|stored| held_app(stored, identity))
                 .transpose()
                 .map_err(|e| storage(&e))?
                 .filter(|a| a.record.is_some())
-                .ok_or_else(changed_key)?;
+                .ok_or_else(|| {
+                    Stop::Unauthenticated(not_current(
+                        "7.2: an own app's first call carries its app.put",
+                    ))
+                })?;
             let mut state = OpsState::new(*identity, 0, 0, time_ms);
             state.doc = held.cloned();
             state.apps.insert(*app, held_app.clone());
@@ -911,6 +920,14 @@ impl Service {
         save(txn, &before, &mut after, &ops, &proofs, release)
             .await
             .map_err(|e| storage(&e))?;
+        // A removed app whose last open or `unknown` attempt this batch resolved may be
+        // purged now (Switch wire 9.1).
+        let released = super::purge::released_owners(before.claims.values(), after.claims.values());
+        if !released.is_empty() {
+            super::purge::purge_removed_apps(txn, held, Some(&released))
+                .await
+                .map_err(|e| storage(&e))?;
+        }
         if let (Some(first), Some(ops_hash)) = (ops.first(), hash) {
             txn.put_batch(
                 &first.body().batch.id,

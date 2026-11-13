@@ -1,6 +1,6 @@
 //! What `GET /apps` reads of an account (Switch wire 7.4.12): its apps' rows, the App IDs it
 //! keeps for good, when each app was first listed, the key bundle parts, the open attempts
-//! and the generations its kept proofs name.
+//! and the generations its kept proofs name; and the purge of removed apps (9.1).
 
 use std::collections::BTreeMap;
 
@@ -211,13 +211,11 @@ impl AccountTxn {
         Ok(())
     }
 
-    /// What `GET /apps` reports (Switch wire 7.4.12), read under the account's lock.
-    pub async fn apps_view(&mut self) -> Result<AppsView, StoreError> {
+    /// Every App ID the account keeps for good, with why, when and its rotation (Switch
+    /// wire 9.1, 7.4.12), by App ID.
+    pub async fn kept_entries(&mut self) -> Result<Vec<KeptAppId>, StoreError> {
         let id = self.head().id.clone();
-        let mut view = AppsView {
-            apps: self.apps().await?,
-            ..AppsView::default()
-        };
+        let mut kept = Vec::new();
         for row in sqlx::query(
             "SELECT app_id, reason, at_ms, data_epoch, rotated FROM kept_app_ids \
              WHERE account_id = $1 ORDER BY app_id",
@@ -230,7 +228,7 @@ impl AccountTxn {
             let app: Vec<u8> = row.try_get("app_id")?;
             let reason_text: String = row.try_get("reason")?;
             let data_epoch: Option<i64> = row.try_get("data_epoch")?;
-            view.kept.push(KeptAppId {
+            kept.push(KeptAppId {
                 app_id: app_id(&app)?,
                 reason: reason(&reason_text)?,
                 at_ms: from_db(row.try_get("at_ms")?, "at_ms")?,
@@ -238,6 +236,118 @@ impl AccountTxn {
                 rotated: row.try_get("rotated")?,
             });
         }
+        Ok(kept)
+    }
+
+    /// Purge each of `apps`, App IDs kept for good that the newest `identity.json` lists in
+    /// neither `apps` nor `removed` and whose rotation is done, once it owns no attempt open
+    /// or `unknown` (Switch wire 9.1 "Departure, revoked app"): its app record, renewed
+    /// certificate, cursor, last-seen time and lagging mark (its `apps` row), its receive
+    /// key records, its key bundle parts and its listing go. Its `kept_app_ids` row stays
+    /// for good, so it is never current again, and so do its kids, each with its App ID and
+    /// no record, so none is registered again (Switch spec 3.6) and an envelope wrapped to
+    /// one is told the app isn't current (wire 7.6 `not_current`). Everything other rules
+    /// depend on stays: the claims and attempts it wrote, the shared records it wrote with
+    /// their `writer` and certificate, the list entries it wrote, the inbox entries naming
+    /// it as a target, whose release judges current apps only, and the chain items, its key
+    /// bundle parts' included; the documents of its `app.put` and `cert.put` items and of
+    /// its deleted parts' `key_bundle.put` items go before the commit, as no app may read
+    /// them in full any more (wire 7.5). Returns the App IDs purged; one that holds nothing
+    /// any more is passed by.
+    pub async fn purge_apps(&mut self, apps: &[[u8; 16]]) -> Result<Vec<[u8; 16]>, StoreError> {
+        let id = self.head().id.clone();
+        let apps: Vec<Vec<u8>> = apps.iter().map(|app| app.to_vec()).collect();
+        // Only an App ID kept for good, and only one that still holds something: one purged
+        // before is passed by without reading the claims.
+        let holding: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT k.app_id FROM kept_app_ids k WHERE k.account_id = $1 \
+             AND k.app_id = ANY($2) AND ( \
+                 EXISTS (SELECT 1 FROM apps a \
+                         WHERE a.account_id = $1 AND a.app_id = k.app_id) \
+                 OR EXISTS (SELECT 1 FROM receive_keys r \
+                            WHERE r.account_id = $1 AND r.app_id = k.app_id \
+                            AND r.record IS NOT NULL) \
+                 OR EXISTS (SELECT 1 FROM key_bundle_parts p \
+                            WHERE p.account_id = $1 AND p.target_app_id = k.app_id) \
+                 OR EXISTS (SELECT 1 FROM app_listings l \
+                            WHERE l.account_id = $1 AND l.app_id = k.app_id)) \
+             ORDER BY k.app_id",
+        )
+        .bind(&id)
+        .bind(&apps)
+        .fetch_all(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        if holding.is_empty() {
+            return Ok(Vec::new());
+        }
+        // An app owning an attempt open or unknown keeps everything until it is resolved:
+        // open_owners names the owner of each such attempt.
+        let owning: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT DISTINCT o.app_id FROM claims c, unnest(c.open_owners) AS o(app_id) \
+             WHERE c.account_id = $1 AND cardinality(c.open_owners) > 0 \
+             AND o.app_id = ANY($2)",
+        )
+        .bind(&id)
+        .bind(&holding)
+        .fetch_all(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        let gone: Vec<Vec<u8>> = holding
+            .into_iter()
+            .filter(|app| !owning.contains(app))
+            .collect();
+        if gone.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Its kids stay, each row with its record cleared: the rows are the account's kid
+        // index, which keeps a kid from being registered twice and names the app an
+        // envelope wrapped to it (Switch spec 3.6).
+        for statement in [
+            "DELETE FROM apps WHERE account_id = $1 AND app_id = ANY($2)",
+            "UPDATE receive_keys SET record = NULL WHERE account_id = $1 AND app_id = ANY($2)",
+            "DELETE FROM app_listings WHERE account_id = $1 AND app_id = ANY($2)",
+        ] {
+            sqlx::query(statement)
+                .bind(&id)
+                .bind(&gone)
+                .execute(self.conn())
+                .await
+                .map_err(StoreError::from_db)?;
+        }
+        // A part no longer stored shows as its stub, as at `set_bundle_parts`.
+        let parts: Vec<i64> = sqlx::query_scalar(
+            "DELETE FROM key_bundle_parts WHERE account_id = $1 AND target_app_id = ANY($2) \
+             RETURNING seq",
+        )
+        .bind(&id)
+        .bind(&gone)
+        .fetch_all(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        let parts: Vec<u64> = parts
+            .into_iter()
+            .map(|seq| from_db(seq, "seq"))
+            .collect::<Result<_, _>>()?;
+        self.note_superseded(parts);
+        let gone: Vec<[u8; 16]> = gone
+            .iter()
+            .map(|app| app_id(app))
+            .collect::<Result<_, _>>()?;
+        for app in &gone {
+            self.note_app_documents(*app);
+        }
+        Ok(gone)
+    }
+
+    /// What `GET /apps` reports (Switch wire 7.4.12), read under the account's lock.
+    pub async fn apps_view(&mut self) -> Result<AppsView, StoreError> {
+        let id = self.head().id.clone();
+        let mut view = AppsView {
+            apps: self.apps().await?,
+            ..AppsView::default()
+        };
+        view.kept = self.kept_entries().await?;
         view.lagging = self.lagging_apps().await?.into_iter().collect();
         for row in sqlx::query(
             "SELECT app_id, last_seen_ms FROM apps WHERE account_id = $1 \
