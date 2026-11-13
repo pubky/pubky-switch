@@ -160,8 +160,32 @@ impl std::fmt::Debug for AccountTxn {
     }
 }
 
-/// Insert an account unless one exists.
-pub(super) async fn create(pool: &PgPool, account: &NewAccount) -> Result<bool, StoreError> {
+/// An account inserted and not committed yet: its creation time is raised past every erasure
+/// of its identity before it commits ([`Creation::commit`]), so a new account is never taken
+/// for one a restored database brought back (Switch spec 6.5).
+pub struct Creation {
+    tx: Transaction<'static, Postgres>,
+    account: NewAccount,
+    erased_at_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for Creation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Creation")
+            .field("id", &self.account.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Insert an account unless one exists: `None` if one does. The insert waits for an erasure
+/// of the identity still committing; once it returns, the erasure the database still owes
+/// keys for is read, in the same transaction. The key store's ledger is read after it, by
+/// the caller: an erasure's owed rows go only once its ledger entry is recorded, so one of
+/// the two holds every erasure committed before the insert.
+pub(super) async fn begin_create(
+    pool: &PgPool,
+    account: &NewAccount,
+) -> Result<Option<Creation>, StoreError> {
     let identity_doc = account
         .identity_doc
         .as_ref()
@@ -188,42 +212,81 @@ pub(super) async fn create(pool: &PgPool, account: &NewAccount) -> Result<bool, 
     .map_err(StoreError::from_db)?
     .rows_affected();
     if created != 1 {
-        return Ok(false);
+        return Ok(None);
     }
-    for app_id in &account.revoked_apps {
-        sqlx::query(
-            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
-             VALUES ($1, $2, 'enrolled', $3) ON CONFLICT DO NOTHING",
-        )
-        .bind(&account.id)
-        .bind(app_id.as_slice())
-        .bind(to_db(account.created_at_ms, "created_at_ms")?)
-        .execute(&mut *tx)
-        .await
-        .map_err(StoreError::from_db)?;
-    }
-    // The apps the enrollment's identity.json lists are listed for the first time here
-    // (Switch wire 7.4.12 keys_through).
-    if let Some(doc) = &account.identity_doc {
-        let doc = pubky_switch_core::records::IdentityDoc::verify(doc, &account.identity_key)
-            .map_err(|_| StoreError::Corrupt("the enrollment's identity.json"))?;
-        let listed = super::apps::newly_listed(None, &doc);
-        super::apps::note_listings(&mut tx, &account.id, &listed, doc.data_epoch()).await?;
-    }
-    // The first enrollment's answer: an account keeps far fewer than any limit allows.
-    super::enrollments::keep(
-        &mut tx,
-        &account.id,
-        &account.enrollment_hash,
-        &account.service_key,
-        account.created_at_ms,
-        u64::MAX >> 1,
-        true,
-        false,
+    let erased_at: Option<i64> = sqlx::query_scalar(
+        "SELECT max(erased_at_ms) FROM erased_keys \
+         WHERE account_id = $1 AND reason = 'erasure'",
     )
-    .await?;
-    tx.commit().await.map_err(StoreError::from_db)?;
-    Ok(true)
+    .bind(&account.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(StoreError::from_db)?;
+    Ok(Some(Creation {
+        tx,
+        account: account.clone(),
+        erased_at_ms: erased_at
+            .map(|at| from_db(at, "erased_at_ms"))
+            .transpose()?,
+    }))
+}
+
+impl Creation {
+    /// Commit the account, created after `ledger_ms`, its identity's latest erasure in the
+    /// key store's ledger, and after any erasure the database still owes keys for: at the
+    /// time asked for, or 1 ms after the latest of those. The time it was created at.
+    pub async fn commit(mut self, ledger_ms: Option<u64>) -> Result<u64, StoreError> {
+        let account = &self.account;
+        let floor = ledger_ms.max(self.erased_at_ms);
+        let created_at_ms = floor.map_or(account.created_at_ms, |at| {
+            account.created_at_ms.max(at.saturating_add(1))
+        });
+        if created_at_ms != account.created_at_ms {
+            sqlx::query(
+                "UPDATE accounts SET created_at_ms = $2, stamped_time_ms = $2 WHERE id = $1",
+            )
+            .bind(&account.id)
+            .bind(to_db(created_at_ms, "created_at_ms")?)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        }
+        for app_id in &account.revoked_apps {
+            sqlx::query(
+                "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
+                 VALUES ($1, $2, 'enrolled', $3) ON CONFLICT DO NOTHING",
+            )
+            .bind(&account.id)
+            .bind(app_id.as_slice())
+            .bind(to_db(created_at_ms, "created_at_ms")?)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        }
+        // The apps the enrollment's identity.json lists are listed for the first time here
+        // (Switch wire 7.4.12 keys_through).
+        if let Some(doc) = &account.identity_doc {
+            let doc = pubky_switch_core::records::IdentityDoc::verify(doc, &account.identity_key)
+                .map_err(|_| StoreError::Corrupt("the enrollment's identity.json"))?;
+            let listed = super::apps::newly_listed(None, &doc);
+            super::apps::note_listings(&mut self.tx, &account.id, &listed, doc.data_epoch())
+                .await?;
+        }
+        // The first enrollment's answer: an account keeps far fewer than any limit allows.
+        super::enrollments::keep(
+            &mut self.tx,
+            &account.id,
+            &account.enrollment_hash,
+            &account.service_key,
+            created_at_ms,
+            u64::MAX >> 1,
+            true,
+            false,
+        )
+        .await?;
+        self.tx.commit().await.map_err(StoreError::from_db)?;
+        Ok(created_at_ms)
+    }
 }
 
 impl AccountTxn {
