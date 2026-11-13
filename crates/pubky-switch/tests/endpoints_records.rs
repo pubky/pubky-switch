@@ -3,8 +3,8 @@
 //! record by its `read_scope`, the list's order, paging by `limit` and by the byte budget,
 //! and a page as the state under the lock, read after it.
 //!
-//! The wallet holds `pay`, `contacts` and `manage_contacts`; the phone `pay` and
-//! `allowance`. Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run them; see `store::testing`.
+//! The wallet holds `tasks`, `tasks_people` and `tasks_people_admin`; the phone `tasks` and
+//! `tasks_share`. Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run them; see `store::testing`.
 
 // Test helpers fail the test on any error.
 #![allow(clippy::expect_used, clippy::panic)]
@@ -29,7 +29,7 @@ use support::*;
 /// The time of the tests' writes and reads, after the registration.
 const AT: &str = "2026-01-01T00:01:00.000Z";
 
-const PAYMENTS: &str = "payments";
+const TASK_ITEMS: &str = "task_items";
 
 /// alice's current data epoch, at which the service takes sealed values (wire 6.2).
 const DATA_EPOCH: u64 = 2;
@@ -132,7 +132,7 @@ async fn registered(limits: Limits) -> Option<Replay> {
 }
 
 /// A record of `collection` at the natural key `natural`, read under `read_scope` and
-/// written under `pay`, created with the value `value` (an empty one deletes).
+/// written under `tasks`, created with the value `value` (an empty one deletes).
 fn record_put(
     collection: &str,
     natural: &[u8],
@@ -142,7 +142,7 @@ fn record_put(
 ) -> RecordPut {
     let alice = alice_key();
     let naming = NamingKey::from_root(&alice.switch_root());
-    let policy = Policy::new(read_scope, &["pay"]);
+    let policy = Policy::new(read_scope, &["tasks"]);
     let blinded = naming.blind(natural);
     let key = record_key_from_blinded(collection, &blinded, &policy.hash().expect("policy"));
     let value_sealed = SealedValue::seal(
@@ -168,7 +168,7 @@ fn record_put(
     }
 }
 
-/// The wallet creates a record of [`PAYMENTS`] at `natural` read under `read_scope`, in
+/// The wallet creates a record of [`TASK_ITEMS`] at `natural` read under `read_scope`, in
 /// batch `id`: its key, the signed op and its proof.
 async fn create(
     replay: &Replay,
@@ -177,7 +177,7 @@ async fn create(
     read_scope: &str,
 ) -> ([u8; 32], SignedOp, SignedDoc) {
     let put = record_put(
-        PAYMENTS,
+        TASK_ITEMS,
         natural,
         read_scope,
         RecordVersion::NONE,
@@ -208,8 +208,8 @@ fn list_path(collection: &[u8; 32], extra: &str) -> String {
     format!("records?collection={}{extra}", b64(collection))
 }
 
-fn payments() -> [u8; 32] {
-    collection_id(PAYMENTS, &alice_key().public())
+fn task_items() -> [u8; 32] {
+    collection_id(TASK_ITEMS, &alice_key().public())
 }
 
 /// The keys of a page's records, as text.
@@ -241,12 +241,12 @@ async fn test_records_get_shows_the_view_to_a_reader_of_its_scope() {
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
-    let (contacts, op, proof) = create(&replay, 1, b"contacts", "contacts").await;
-    let (pay_sub, ..) = create(&replay, 2, b"sub", "pay:x").await;
+    let (people, op, proof) = create(&replay, 1, b"people", "tasks_people").await;
+    let (tasks_sub, ..) = create(&replay, 2, b"sub", "tasks:x").await;
     let keys = vectors("keys.json");
     let wallet = app(&keys, "wallet");
-    // The wallet holds contacts: the whole view, with the head.
-    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&contacts))).await;
+    // The wallet holds tasks_people: the whole view, with the head.
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&people))).await;
     assert_eq!(
         answer.status,
         200,
@@ -260,10 +260,10 @@ async fn test_records_get_shows_the_view_to_a_reader_of_its_scope() {
     assert_eq!(
         view,
         json!({
-            "key": b64(&contacts),
-            "collection": b64(&payments()),
-            "read_scope": "contacts",
-            "write_scopes": ["pay"],
+            "key": b64(&people),
+            "collection": b64(&task_items()),
+            "read_scope": "tasks_people",
+            "write_scopes": ["tasks"],
             "generation": 1,
             "version": seq,
             "seq": seq,
@@ -275,14 +275,14 @@ async fn test_records_get_shows_the_view_to_a_reader_of_its_scope() {
             "cert": serde_json::to_value(document("wallet certificate")).expect("cert"),
         })
     );
-    // The phone doesn't hold contacts: refused, with the head.
-    let answer = get_as(&replay, "phone", &format!("records/{}", b64(&contacts))).await;
+    // The phone doesn't hold tasks_people: refused, with the head.
+    let answer = get_as(&replay, "phone", &format!("records/{}", b64(&people))).await;
     assert_eq!(code_of(&answer), (403, json!("permission_missing")));
     assert!(header_text(&answer, "switch-head").is_some(), "the head");
-    // It holds pay, which covers pay:x.
-    let answer = get_as(&replay, "phone", &format!("records/{}", b64(&pay_sub))).await;
+    // It holds tasks, which covers tasks:x.
+    let answer = get_as(&replay, "phone", &format!("records/{}", b64(&tasks_sub))).await;
     assert_eq!(answer.status, 200);
-    assert_eq!(body(&answer)["read_scope"], "pay:x");
+    assert_eq!(body(&answer)["read_scope"], "tasks:x");
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -291,15 +291,15 @@ async fn test_records_get_refusals_and_deleted_records() {
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
-    let (gone, ..) = create(&replay, 1, b"gone", "pay").await;
+    let (gone, ..) = create(&replay, 1, b"gone", "tasks").await;
     let version =
         body(&get_as(&replay, "wallet", &format!("records/{}", b64(&gone))).await)["version"]
             .as_u64()
             .expect("version");
     let delete = record_put(
-        PAYMENTS,
+        TASK_ITEMS,
         b"gone",
-        "pay",
+        "tasks",
         RecordVersion::new(1, version),
         b"",
     );
@@ -327,7 +327,7 @@ async fn test_records_get_refusals_and_deleted_records() {
         .handle(signer_request("GET", &path, Vec::new(), ms(AT)))
         .await;
     assert_eq!(code_of(&answer), (403, json!("permission_missing")));
-    let list = format!("/v1/{}/{}", alice_id(), list_path(&payments(), ""));
+    let list = format!("/v1/{}/{}", alice_id(), list_path(&task_items(), ""));
     let answer = replay
         .service
         .handle(signer_request("GET", &list, Vec::new(), ms(AT)))
@@ -354,31 +354,38 @@ async fn test_records_list_shows_what_the_reader_may_read_by_key_text() {
     };
     let mut readable_by_phone = Vec::new();
     let mut all = Vec::new();
-    for (i, scope) in ["pay", "contacts", "pay:x", "pay", "contacts:y", "pay"]
-        .iter()
-        .enumerate()
+    for (i, scope) in [
+        "tasks",
+        "tasks_people",
+        "tasks:x",
+        "tasks",
+        "tasks_people:y",
+        "tasks",
+    ]
+    .iter()
+    .enumerate()
     {
         let id = u8::try_from(i).expect("small") + 1;
         let (key, ..) = create(&replay, id, &[id], scope).await;
         all.push(b64(&key));
-        if scope.starts_with("pay") {
+        if *scope == "tasks" || scope.starts_with("tasks:") {
             readable_by_phone.push(b64(&key));
         }
     }
     // A deleted record and another collection's are never listed.
-    let (gone, ..) = create(&replay, 20, b"gone", "pay").await;
+    let (gone, ..) = create(&replay, 20, b"gone", "tasks").await;
     let version =
         body(&get_as(&replay, "wallet", &format!("records/{}", b64(&gone))).await)["version"]
             .as_u64()
             .expect("version");
     let delete = record_put(
-        PAYMENTS,
+        TASK_ITEMS,
         b"gone",
-        "pay",
+        "tasks",
         RecordVersion::new(1, version),
         b"",
     );
-    let other = record_put("other", b"x", "pay", RecordVersion::NONE, b"{}");
+    let other = record_put("other", b"x", "tasks", RecordVersion::NONE, b"{}");
     post(
         &replay,
         "wallet",
@@ -393,7 +400,7 @@ async fn test_records_list_shows_what_the_reader_may_read_by_key_text() {
     all.sort();
     readable_by_phone.sort();
     let seq = last_seq(&replay).await;
-    let answer = get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+    let answer = get_as(&replay, "wallet", &list_path(&task_items(), "")).await;
     assert_eq!(
         answer.status,
         200,
@@ -406,19 +413,19 @@ async fn test_records_list_shows_what_the_reader_may_read_by_key_text() {
     assert_eq!(page["seq"], seq);
     assert_eq!(page["next"], Value::Null);
     assert!(page["records"][0]["proof"].is_object(), "a view's proof");
-    let page = body(&get_as(&replay, "phone", &list_path(&payments(), "")).await);
+    let page = body(&get_as(&replay, "phone", &list_path(&task_items(), "")).await);
     assert_eq!(keys_of(&page), readable_by_phone);
     // `after` is exclusive.
     let after = format!("&after={}", readable_by_phone[0]);
-    let page = body(&get_as(&replay, "phone", &list_path(&payments(), &after)).await);
+    let page = body(&get_as(&replay, "phone", &list_path(&task_items(), &after)).await);
     assert_eq!(keys_of(&page), readable_by_phone[1..].to_vec());
     // The query's refusals.
     for path in [
         "records".to_string(),
         "records?after=x".to_string(),
-        list_path(&payments(), "&limit=0"),
-        list_path(&payments(), "&limit=1001"),
-        list_path(&payments(), "&after=abc"),
+        list_path(&task_items(), "&limit=0"),
+        list_path(&task_items(), "&limit=1001"),
+        list_path(&task_items(), "&after=abc"),
     ] {
         let answer = get_as(&replay, "phone", &path).await;
         assert_eq!(code_of(&answer), (400, json!("bad_request")), "{path}");
@@ -427,7 +434,7 @@ async fn test_records_list_shows_what_the_reader_may_read_by_key_text() {
     replay.db.drop_database().await.expect("drop");
 }
 
-/// Every key a reader gets listing [`payments`] with `extra`, following `next`, and the
+/// Every key a reader gets listing [`task_items`] with `extra`, following `next`, and the
 /// number of pages.
 async fn follow(replay: &Replay, name: &str, extra: &str) -> (Vec<String>, usize) {
     let mut keys = Vec::new();
@@ -437,7 +444,7 @@ async fn follow(replay: &Replay, name: &str, extra: &str) -> (Vec<String>, usize
             &get_as(
                 replay,
                 name,
-                &list_path(&payments(), &format!("{extra}{after}")),
+                &list_path(&task_items(), &format!("{extra}{after}")),
             )
             .await,
         );
@@ -464,7 +471,7 @@ async fn test_records_list_pages_by_limit() {
     };
     let mut all = Vec::new();
     for id in 1..=5u8 {
-        all.push(b64(&create(&replay, id, &[id], "pay").await.0));
+        all.push(b64(&create(&replay, id, &[id], "tasks").await.0));
     }
     all.sort();
     assert_eq!(follow(&replay, "phone", "&limit=2").await, (all.clone(), 3));
@@ -486,7 +493,7 @@ async fn test_records_list_pages_by_budget_with_its_first_view_whole() {
     };
     let mut all = Vec::new();
     for id in 1..=3u8 {
-        all.push(b64(&create(&replay, id, &[id], "pay").await.0));
+        all.push(b64(&create(&replay, id, &[id], "tasks").await.0));
     }
     all.sort();
     assert_eq!(follow(&replay, "phone", "").await, (all, 3));
@@ -498,9 +505,9 @@ async fn test_records_list_reads_the_state_under_the_lock_not_after() {
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
-    let (first, ..) = create(&replay, 1, b"first", "pay").await;
+    let (first, ..) = create(&replay, 1, b"first", "tasks").await;
     let seq = last_seq(&replay).await;
-    let list = list_path(&payments(), "");
+    let list = list_path(&task_items(), "");
     let pause = replay.db.pause_next_snapshot_read();
     let (answer, ()) = tokio::join!(get_as(&replay, "phone", &list), async {
         tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
@@ -510,7 +517,7 @@ async fn test_records_list_reads_the_state_under_the_lock_not_after() {
         // in its page.
         let write = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            create(&replay, 2, b"second", "pay"),
+            create(&replay, 2, b"second", "tasks"),
         )
         .await
         .expect("a write while the read waits");
@@ -527,7 +534,7 @@ async fn test_records_list_reads_the_state_under_the_lock_not_after() {
     assert_eq!(keys_of(&page), vec![b64(&first)]);
     assert_eq!(page["seq"], seq);
     // A read after it sees the write.
-    let page = body(&get_as(&replay, "phone", &list_path(&payments(), "")).await);
+    let page = body(&get_as(&replay, "phone", &list_path(&task_items(), "")).await);
     assert_eq!(keys_of(&page).len(), 2);
     assert!(page["seq"].as_u64().expect("seq") > seq);
     replay.db.drop_database().await.expect("drop");
@@ -538,8 +545,8 @@ async fn test_records_lists_of_an_account_wait_their_turn() {
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
-    let (key, ..) = create(&replay, 1, b"first", "pay").await;
-    let list = list_path(&payments(), "");
+    let (key, ..) = create(&replay, 1, b"first", "tasks").await;
+    let list = list_path(&task_items(), "");
     let pause = replay.db.pause_next_snapshot_read();
     let exchange = async {
         tokio::join!(
@@ -598,7 +605,7 @@ async fn test_records_list_reads_past_one_read_of_the_snapshot() {
     for id in 1..=5u8 {
         let puts: Vec<OpKind> = (0..8u8)
             .map(|i| {
-                let put = record_put(PAYMENTS, &[id, i], "pay", RecordVersion::NONE, b"{}");
+                let put = record_put(TASK_ITEMS, &[id, i], "tasks", RecordVersion::NONE, b"{}");
                 all.push(b64(&put.key));
                 OpKind::RecordPut(put)
             })
@@ -608,7 +615,7 @@ async fn test_records_list_reads_past_one_read_of_the_snapshot() {
     all.sort();
     assert_eq!(follow(&replay, "phone", "").await, (all.clone(), 1));
     // A limit past one read ends the page there, with the next.
-    let page = body(&get_as(&replay, "phone", &list_path(&payments(), "&limit=35")).await);
+    let page = body(&get_as(&replay, "phone", &list_path(&task_items(), "&limit=35")).await);
     assert_eq!(keys_of(&page), all[..35].to_vec());
     assert_eq!(page["next"], json!(all[34]));
     replay.db.drop_database().await.expect("drop");
@@ -651,8 +658,8 @@ async fn test_records_view_of_a_record_taken_from_an_upload() {
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
-    let (key, ..) = create(&replay, 1, b"uploaded", "pay").await;
-    let (plain, ..) = create(&replay, 2, b"plain", "pay").await;
+    let (key, ..) = create(&replay, 1, b"uploaded", "tasks").await;
+    let (plain, ..) = create(&replay, 2, b"plain", "tasks").await;
     as_uploaded(&replay, &key, 40, true).await;
     // No proof, the upload transition's seq, and divergent (Switch wire 7.4.9).
     let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
@@ -661,7 +668,7 @@ async fn test_records_view_of_a_record_taken_from_an_upload() {
     assert_eq!(view["divergent"], true);
     assert_ne!(view["version"], 40);
     // A list page shows the same.
-    let page = body(&get_as(&replay, "wallet", &list_path(&payments(), "")).await);
+    let page = body(&get_as(&replay, "wallet", &list_path(&task_items(), "")).await);
     let views = page["records"].as_array().expect("records");
     let listed = views
         .iter()
@@ -683,7 +690,7 @@ async fn test_records_write_here_on_an_uploaded_record_keeps_its_base() {
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
-    let (key, ..) = create(&replay, 1, b"uploaded", "pay").await;
+    let (key, ..) = create(&replay, 1, b"uploaded", "tasks").await;
     as_uploaded(&replay, &key, 40, true).await;
     let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
     let uploaded = RecordVersion::new(
@@ -714,7 +721,13 @@ async fn test_records_write_here_on_an_uploaded_record_keeps_its_base() {
     // Two writes here: the first builds on the uploaded version, the second on the first.
     let mut expected_version = uploaded;
     for id in [2u8, 3] {
-        let mut put = record_put(PAYMENTS, b"uploaded", "pay", expected_version, b"{\"n\":2}");
+        let mut put = record_put(
+            TASK_ITEMS,
+            b"uploaded",
+            "tasks",
+            expected_version,
+            b"{\"n\":2}",
+        );
         put.id_inputs = None;
         let ops = batch("wallet", id, vec![OpKind::RecordPut(put)]);
         post(&replay, "wallet", &ops, AT).await;
@@ -785,7 +798,7 @@ async fn test_records_conflict_on_an_uploaded_record_shows_its_view() {
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
-    let (key, ..) = create(&replay, 1, b"uploaded", "pay").await;
+    let (key, ..) = create(&replay, 1, b"uploaded", "tasks").await;
     as_uploaded(&replay, &key, 40, true).await;
     let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
     let held = RecordVersion::new(
@@ -793,7 +806,7 @@ async fn test_records_conflict_on_an_uploaded_record_shows_its_view() {
         view["version"].as_u64().expect("version"),
     );
     let stale = RecordVersion::new(held.generation, held.version + 1);
-    let mut put = record_put(PAYMENTS, b"uploaded", "pay", stale, b"{\"n\":2}");
+    let mut put = record_put(TASK_ITEMS, b"uploaded", "tasks", stale, b"{\"n\":2}");
     put.id_inputs = None;
     let ops = batch("wallet", 2, vec![OpKind::RecordPut(put)]);
     let answer = post_answer(&replay, "wallet", &ops, AT).await;
@@ -817,13 +830,13 @@ async fn test_records_create_over_an_uploaded_delete_keeps_its_base() {
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
-    let (key, ..) = create(&replay, 1, b"gone", "pay").await;
+    let (key, ..) = create(&replay, 1, b"gone", "tasks").await;
     let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
     let v1 = RecordVersion::new(
         view["generation"].as_u64().expect("generation"),
         view["version"].as_u64().expect("version"),
     );
-    let mut del = record_put(PAYMENTS, b"gone", "pay", v1, b"");
+    let mut del = record_put(TASK_ITEMS, b"gone", "tasks", v1, b"");
     del.id_inputs = None;
     post(
         &replay,
@@ -839,7 +852,13 @@ async fn test_records_create_over_an_uploaded_delete_keeps_its_base() {
         view["generation"].as_u64().expect("generation"),
         view["version"].as_u64().expect("version"),
     );
-    let again = record_put(PAYMENTS, b"gone", "pay", RecordVersion::NONE, b"{\"n\":3}");
+    let again = record_put(
+        TASK_ITEMS,
+        b"gone",
+        "tasks",
+        RecordVersion::NONE,
+        b"{\"n\":3}",
+    );
     post(
         &replay,
         "wallet",
@@ -927,15 +946,15 @@ async fn all_past(replay: &Replay, seq: u64) {
 
 /// A record the wallet creates at `natural`, then deletes: its key and the delete's `seq`.
 async fn created_and_deleted(replay: &Replay, id: u8, natural: &[u8]) -> ([u8; 32], u64) {
-    let (key, ..) = create(replay, id, natural, "pay").await;
+    let (key, ..) = create(replay, id, natural, "tasks").await;
     let version =
         body(&get_as(replay, "wallet", &format!("records/{}", b64(&key))).await)["version"]
             .as_u64()
             .expect("version");
     let delete = record_put(
-        PAYMENTS,
+        TASK_ITEMS,
         natural,
-        "pay",
+        "tasks",
         RecordVersion::new(1, version),
         b"",
     );
@@ -983,7 +1002,7 @@ async fn test_records_deleted_key_every_reader_passed_is_forgotten() {
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
-    let (live, ..) = create(&replay, 7, b"live", "pay").await;
+    let (live, ..) = create(&replay, 7, b"live", "tasks").await;
     let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
     move_cursor(&replay, "wallet", deleted_at, AT).await;
     move_cursor(&replay, "phone", deleted_at, AT).await;
@@ -1025,9 +1044,9 @@ async fn test_records_deleted_key_every_reader_passed_is_forgotten() {
     // A write naming the forgotten delete's own version is refused for good; a writer that
     // held or followed the delete names `{0, 0}` instead (Switch spec 8.2, 10.3).
     let on_the_delete = record_put(
-        PAYMENTS,
+        TASK_ITEMS,
         b"gone",
-        "pay",
+        "tasks",
         RecordVersion::new(1, deleted_at),
         b"{\"n\":2}",
     );
@@ -1039,7 +1058,7 @@ async fn test_records_deleted_key_every_reader_passed_is_forgotten() {
     )
     .await;
     assert_eq!(code_of(&refused), (409, json!("conflict")));
-    let (again, ..) = create(&replay, 3, b"gone", "pay").await;
+    let (again, ..) = create(&replay, 3, b"gone", "tasks").await;
     assert_eq!(again, key);
     let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
     assert!(
@@ -1243,7 +1262,13 @@ fn conditioned(id: u8, key: [u8; 32], version: RecordVersion, natural: &[u8]) ->
     let signing = ed25519_dalek::SigningKey::from_bytes(&hex32(&wallet["signing_secret_hex"]));
     let app_id = pubky_switch_core::enc::app_id_decode(wallet["app_id"].as_str().expect("id"))
         .expect("app id");
-    let put = record_put(PAYMENTS, natural, "pay", RecordVersion::NONE, b"{\"n\":1}");
+    let put = record_put(
+        TASK_ITEMS,
+        natural,
+        "tasks",
+        RecordVersion::NONE,
+        b"{\"n\":1}",
+    );
     sign_batch(
         &signing,
         &alice_key().public(),
@@ -1268,7 +1293,7 @@ async fn test_records_condition_zero_matches_a_held_delete_and_a_forgotten_key()
         return;
     };
     register_executor(&replay).await;
-    let (live, ..) = create(&replay, 1, b"live", "pay").await;
+    let (live, ..) = create(&replay, 1, b"live", "tasks").await;
     let keys = vectors("keys.json");
     let refused = replay
         .service
@@ -1321,16 +1346,16 @@ async fn test_records_superseded_write_loses_its_document() {
         return;
     };
     let before = last_seq(&replay).await;
-    let (key, ..) = create(&replay, 1, b"n1", "pay").await;
+    let (key, ..) = create(&replay, 1, b"n1", "tasks").await;
     let created = last_seq(&replay).await;
     assert_eq!(
         chain_document_kept(&replay, &alice_id(), created).await,
         (true, true)
     );
     let update = record_put(
-        PAYMENTS,
+        TASK_ITEMS,
         b"n1",
-        "pay",
+        "tasks",
         RecordVersion::new(1, created),
         b"{\"n\":2}",
     );
@@ -1362,7 +1387,13 @@ async fn test_records_superseded_write_loses_its_document() {
     };
     assert_eq!(shown(created), json!("stub"));
     assert_eq!(shown(updated), json!("chain"));
-    let delete = record_put(PAYMENTS, b"n1", "pay", RecordVersion::new(1, updated), b"");
+    let delete = record_put(
+        TASK_ITEMS,
+        b"n1",
+        "tasks",
+        RecordVersion::new(1, updated),
+        b"",
+    );
     post(
         &replay,
         "wallet",
@@ -1392,12 +1423,12 @@ async fn test_records_documents_chained_before_the_rule_are_checked_a_bounded_nu
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
-    create(&replay, 1, b"n1", "pay").await;
+    create(&replay, 1, b"n1", "tasks").await;
     let created = last_seq(&replay).await;
     let update = record_put(
-        PAYMENTS,
+        TASK_ITEMS,
         b"n1",
-        "pay",
+        "tasks",
         RecordVersion::new(1, created),
         b"{\"n\":2}",
     );
@@ -1410,7 +1441,7 @@ async fn test_records_documents_chained_before_the_rule_are_checked_a_bounded_nu
     .await;
     let updated = last_seq(&replay).await;
     for n in 0..70u8 {
-        create(&replay, n.wrapping_add(10), &[b'k', n], "pay").await;
+        create(&replay, n.wrapping_add(10), &[b'k', n], "tasks").await;
     }
     let end = last_seq(&replay).await;
     assert!(end > 64 + updated, "more than one request's bound");
@@ -1436,7 +1467,7 @@ async fn test_records_documents_chained_before_the_rule_are_checked_a_bounded_nu
         chain_document_kept(&replay, &alice_id(), created).await,
         (true, true)
     );
-    get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+    get_as(&replay, "wallet", &list_path(&task_items(), "")).await;
     assert_eq!(checked(&replay).await, 64);
     assert_eq!(
         chain_document_kept(&replay, &alice_id(), created).await,
@@ -1446,9 +1477,9 @@ async fn test_records_documents_chained_before_the_rule_are_checked_a_bounded_nu
         chain_document_kept(&replay, &alice_id(), updated).await,
         (true, true)
     );
-    get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+    get_as(&replay, "wallet", &list_path(&task_items(), "")).await;
     assert_eq!(checked(&replay).await, i64::try_from(end).expect("end"));
-    get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+    get_as(&replay, "wallet", &list_path(&task_items(), "")).await;
     assert_eq!(
         checked(&replay).await,
         i64::try_from(end).expect("end"),
@@ -1494,7 +1525,7 @@ async fn update(
     value: &[u8],
 ) -> u64 {
     let put = record_put(
-        PAYMENTS,
+        TASK_ITEMS,
         natural,
         read_scope,
         RecordVersion::new(1, version),
@@ -1522,19 +1553,19 @@ async fn test_records_feed_is_the_same_with_deleted_documents_put_back() {
     let id = alice_id();
     capture_documents(&replay, &id, &mut docs).await;
     let before = last_seq(&replay).await;
-    create(&replay, 1, b"a1", "pay").await;
+    create(&replay, 1, b"a1", "tasks").await;
     let v1 = last_seq(&replay).await;
     capture_documents(&replay, &id, &mut docs).await;
-    let v2 = update(&replay, 2, b"a1", "pay", v1, b"{\"n\":2}").await;
+    let v2 = update(&replay, 2, b"a1", "tasks", v1, b"{\"n\":2}").await;
     capture_documents(&replay, &id, &mut docs).await;
-    let v3 = update(&replay, 3, b"a1", "pay", v2, b"{\"n\":3}").await;
+    let v3 = update(&replay, 3, b"a1", "tasks", v2, b"{\"n\":3}").await;
     capture_documents(&replay, &id, &mut docs).await;
-    create(&replay, 4, b"c1", "contacts").await;
+    create(&replay, 4, b"c1", "tasks_people").await;
     let c1 = last_seq(&replay).await;
     capture_documents(&replay, &id, &mut docs).await;
-    let c2 = update(&replay, 5, b"c1", "contacts", c1, b"{\"n\":2}").await;
+    let c2 = update(&replay, 5, b"c1", "tasks_people", c1, b"{\"n\":2}").await;
     capture_documents(&replay, &id, &mut docs).await;
-    let deleted = update(&replay, 6, b"a1", "pay", v3, b"").await;
+    let deleted = update(&replay, 6, b"a1", "tasks", v3, b"").await;
     capture_documents(&replay, &id, &mut docs).await;
     for seq in [v1, v2, v3, c1] {
         assert_eq!(
@@ -1589,7 +1620,7 @@ async fn test_records_old_documents_check_takes_every_stale_one_over_several_req
     };
     let id = alice_id();
     let mut docs = std::collections::BTreeMap::new();
-    create(&replay, 99, b"n1", "pay").await;
+    create(&replay, 99, b"n1", "tasks").await;
     let mut version = last_seq(&replay).await;
     let mut stale = vec![version];
     capture_documents(&replay, &id, &mut docs).await;
@@ -1598,7 +1629,7 @@ async fn test_records_old_documents_check_takes_every_stale_one_over_several_req
             &replay,
             100 + n,
             b"n1",
-            "pay",
+            "tasks",
             version,
             format!("{{\"n\":{n}}}").as_bytes(),
         )
@@ -1637,7 +1668,7 @@ async fn test_records_old_documents_check_takes_every_stale_one_over_several_req
         if checked == end {
             break;
         }
-        get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+        get_as(&replay, "wallet", &list_path(&task_items(), "")).await;
         requests += 1;
     }
     assert_eq!(requests, (end + 63) / 64);
@@ -1694,10 +1725,10 @@ async fn test_records_migration_marks_older_documents_and_holds_feed_reads() {
     };
     let id = alice_id();
     let mut docs = std::collections::BTreeMap::new();
-    create(&replay, 1, b"n1", "pay").await;
+    create(&replay, 1, b"n1", "tasks").await;
     let created = last_seq(&replay).await;
     capture_documents(&replay, &id, &mut docs).await;
-    update(&replay, 2, b"n1", "pay", created, b"{\"n\":2}").await;
+    update(&replay, 2, b"n1", "tasks", created, b"{\"n\":2}").await;
     assert_eq!(restore_documents(&replay, &id, &docs).await, 1);
     let mut admin = sqlx::PgConnection::connect_with(replay.db.options())
         .await
@@ -1765,7 +1796,7 @@ async fn test_records_migration_marks_older_documents_and_holds_feed_reads() {
         chain_document_kept(&replay, &id, created).await,
         (true, true)
     );
-    get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+    get_as(&replay, "wallet", &list_path(&task_items(), "")).await;
     assert_eq!(documents_check(&replay, &id).await, (end, end));
     assert_eq!(
         chain_document_kept(&replay, &id, created).await,
@@ -1783,7 +1814,7 @@ async fn test_records_old_documents_check_past_an_item_that_doesnt_read() {
         return;
     };
     let id = alice_id();
-    create(&replay, 1, b"n1", "pay").await;
+    create(&replay, 1, b"n1", "tasks").await;
     let created = last_seq(&replay).await;
     sql_on(
         &replay,
@@ -1805,7 +1836,7 @@ async fn test_records_old_documents_check_past_an_item_that_doesnt_read() {
     )
     .await;
     for _ in 0..2 {
-        let answer = get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+        let answer = get_as(&replay, "wallet", &list_path(&task_items(), "")).await;
         assert_eq!(
             answer.status,
             200,
@@ -1847,9 +1878,9 @@ async fn test_records_write_superseding_an_item_that_doesnt_read_still_commits()
         return;
     };
     let id = alice_id();
-    create(&replay, 1, b"n1", "pay").await;
+    create(&replay, 1, b"n1", "tasks").await;
     let created = last_seq(&replay).await;
-    create(&replay, 2, b"n2", "pay").await;
+    create(&replay, 2, b"n2", "tasks").await;
     let other = last_seq(&replay).await;
     sql_on(
         &replay,
@@ -1860,14 +1891,14 @@ async fn test_records_write_superseding_an_item_that_doesnt_read_still_commits()
         ),
     )
     .await;
-    let updated = update(&replay, 3, b"n1", "pay", created, b"{\"n\":2}").await;
+    let updated = update(&replay, 3, b"n1", "tasks", created, b"{\"n\":2}").await;
     assert!(updated > created, "the update committed");
     assert_eq!(
         chain_document_kept(&replay, &id, created).await,
         (true, true),
         "kept"
     );
-    let replaced = update(&replay, 4, b"n2", "pay", other, b"{\"n\":2}").await;
+    let replaced = update(&replay, 4, b"n2", "tasks", other, b"{\"n\":2}").await;
     assert!(replaced > updated);
     assert_eq!(
         chain_document_kept(&replay, &id, other).await,

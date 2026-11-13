@@ -568,7 +568,7 @@ async fn test_vectors_http_answers_read_by_the_typed_calls() {
     };
 
     // The feed page with an entry and chain items, read by alice's wallet: its opaque
-    // contexts read, its head verifies.
+    // contexts read, its head verifies, and the superseded create at seq 6 reads as a stub.
     let page = response_named(&v, "own app: feed page with an entry");
     let client = SwitchClient::new(
         "https://inbox.example",
@@ -582,6 +582,11 @@ async fn test_vectors_http_answers_read_by_the_typed_calls() {
     let read = client.feed(FeedQuery::default()).await.unwrap();
     assert!(matches!(read.items.first(), Some(FeedItem::Entry(_))));
     assert!(read.items.iter().any(|i| matches!(i, FeedItem::Chain(_))));
+    assert!(
+        read.items
+            .iter()
+            .any(|i| matches!(i, FeedItem::Stub { .. }) && i.seq() == 6)
+    );
     assert!(read.items.windows(2).all(|w| w[0].seq() < w[1].seq()));
 
     // The directory, read by bob's shop: the documents verify for alice.

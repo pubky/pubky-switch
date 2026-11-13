@@ -62,6 +62,9 @@ mod revocation;
 mod takeover;
 #[cfg(test)]
 mod vector_cases;
+#[cfg(test)]
+#[path = "../tests/common/vector_protocol.rs"]
+mod vector_protocol;
 
 pub use approval::{AppReview, ApprovedRequest};
 use clients::{RequestClient, SigningClient, Target};
