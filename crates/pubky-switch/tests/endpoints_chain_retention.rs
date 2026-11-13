@@ -477,9 +477,13 @@ async fn test_retention_reads_and_drops_a_bounded_number_at_one_request() {
     chain(&replay, 10, 20, AT).await;
     let before = kept(&replay).await;
     cursors(&replay, ALL, head_seq(&replay).await).await;
-    for round in 1..=2 {
+    for request_number in 1..=2 {
         request(&replay, AT).await;
-        assert_eq!(kept(&replay).await, before[8 * round..], "round {round}");
+        assert_eq!(
+            kept(&replay).await,
+            before[8 * request_number..],
+            "request {request_number}"
+        );
     }
     request(&replay, AT).await;
     assert_eq!(kept(&replay).await, before[before.len() - 1..], "the head");
@@ -725,5 +729,250 @@ async fn test_retention_a_read_that_ends_inside_a_batch_still_moves_on() {
     );
     request(&replay, AT).await;
     assert_eq!(kept(&replay).await, before[base + 8..]);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_retention_an_app_of_another_identity_sweeps_the_chain() {
+    // An app of another identity calls alice's account: its step 4 runs, chain stub
+    // retention with it, as at an own app's request.
+    let Some(replay) = registered(small(), false).await else {
+        return;
+    };
+    chain(&replay, 10, 6, AT).await;
+    let before = kept(&replay).await;
+    cursors(&replay, ALL, head_seq(&replay).await).await;
+    set_time(&replay.clock, AT);
+    let path = format!("/v1/{}/connect", alice_id());
+    let answer = replay
+        .service
+        .handle(other_request(
+            "shop",
+            ORIGIN,
+            "POST",
+            &path,
+            Vec::new(),
+            None,
+            ms(AT),
+        ))
+        .await;
+    assert_eq!(
+        kept(&replay).await,
+        before[8..],
+        "{}: {}",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_retention_behind_the_mark_keeps_the_stubs_behind_an_earlier_checkpoint() {
+    // With `checkpoint_at_head`, a checkpoint at the head leaves stubs behind it that the
+    // cursors held. Then the state falls behind the key's mark and every cursor passes
+    // them: a request signs nothing and drops nothing behind the earlier checkpoint.
+    let Some(replay) = registered(
+        Limits {
+            checkpoint_at_head: true,
+            ..small()
+        },
+        false,
+    )
+    .await
+    else {
+        return;
+    };
+    unmoved(&replay, &["phone", "executor"]).await;
+    chain(&replay, 10, 1, AT).await;
+    chain(&replay, 11, 2, AT).await;
+    let (checkpoint, dropped) = retained(&replay).await;
+    let checkpoint = checkpoint.expect("a checkpoint at the head");
+    assert!(
+        dropped.expect("dropped") < checkpoint,
+        "stubs kept behind it"
+    );
+    let before = kept(&replay).await;
+    let mark = Mark {
+        generation: 1,
+        seq: 500,
+        chain_hash: [0xcd; 32],
+    };
+    replay
+        .keys
+        .advance_mark(&service_key(&replay).await, mark)
+        .await
+        .expect("mark");
+    cursors(&replay, ALL, head_seq(&replay).await).await;
+    assert_eq!(request(&replay, AT).await, 503);
+    assert_eq!(
+        kept(&replay).await,
+        before,
+        "nothing dropped behind the mark"
+    );
+    assert_eq!(retained(&replay).await, (Some(checkpoint), dropped));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[test]
+fn test_retention_a_raised_checkpoint_behind_alone_is_refused() {
+    // A configuration that raised `checkpoint_behind` above 1,000 and sets no
+    // `retention_per_request` is refused once retention exists.
+    let limits = Limits {
+        checkpoint_behind: 5_000,
+        ..Limits::default()
+    };
+    assert!(limits.validate().is_err());
+    let limits = Limits {
+        checkpoint_behind: 5_000,
+        retention_per_request: 5_000,
+        ..Limits::default()
+    };
+    assert!(limits.validate().is_ok());
+}
+
+#[tokio::test]
+async fn test_retention_a_batch_ending_before_its_missed_item_still_goes() {
+    // The executor is registered and marked lagging, and an entry targets it and the
+    // wallet. The wallet's batch of seven moves its cursor past the entry: the entry goes,
+    // and the executor's `missed` item takes the `seq` after the batch's seventh chain item,
+    // inside the batch record's `first_seq..=last_seq`. Every cursor then stands at that
+    // seventh item: it ends the batch, so the batch may go, as the scripted switch, which
+    // ends batches by their envelopes' count, lets it.
+    let Some(replay) = registered(small(), false).await else {
+        return;
+    };
+    let keys = vectors("keys.json");
+    let executor = app(&keys, "executor");
+    let id_of = |name: &str| -> [u8; 16] {
+        hex::decode(app(&keys, name)["app_id_bytes_hex"].as_str().expect("hex"))
+            .expect("hex")
+            .try_into()
+            .expect("16 bytes")
+    };
+    let (executor_id, wallet_id) = (id_of("executor"), id_of("wallet"));
+    let record: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "executor app record",
+        )["signed"]
+            .clone(),
+    )
+    .expect("record");
+    let ops = sign_batch(
+        &ed25519_dalek::SigningKey::from_bytes(&hex32(&executor["signing_secret_hex"])),
+        &alice_key(),
+        Some(executor_id),
+        1,
+        [76; 16],
+        vec![(Vec::new(), OpKind::AppPut { record })],
+    )
+    .expect("batch");
+    let path = format!("/v1/{}/ops", alice_id());
+    let answer = replay
+        .service
+        .handle(app_request(
+            executor,
+            "POST",
+            &path,
+            OpsRequest::new(&ops, None).to_json(),
+            ms(AT),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let mut db = conn(&replay).await;
+    let last: i64 = sqlx::query_scalar("SELECT last_seq FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut db)
+        .await
+        .expect("last");
+    let entry = last + 1;
+    sqlx::query("UPDATE accounts SET last_seq = $2 WHERE id = $1")
+        .bind(alice_id())
+        .bind(entry)
+        .execute(&mut db)
+        .await
+        .expect("seq");
+    sqlx::query(
+        "INSERT INTO inbox_entries (account_id, generation, seq, entry_id, sender, sender_app, \
+         cert, accepted_at_ms, envelope, envelope_hash, targets, answer, quota_bytes) \
+         VALUES ($1, 1, $2, $3, $4, $5, '\\x00', $6, '\\x00', $7, $8, '\\x00', 257)",
+    )
+    .bind(alice_id())
+    .bind(entry)
+    .bind([1u8; 16].as_slice())
+    .bind([2u8; 32].as_slice())
+    .bind([3u8; 16].as_slice())
+    .bind(i64::try_from(ms(AT)).expect("ms"))
+    .bind([4u8; 32].as_slice())
+    .bind(vec![wallet_id.to_vec(), executor_id.to_vec()])
+    .execute(&mut db)
+    .await
+    .expect("entry");
+    sqlx::query("UPDATE apps SET lagging = true WHERE account_id = $1 AND app_id = $2")
+        .bind(alice_id())
+        .bind(executor_id.as_slice())
+        .execute(&mut db)
+        .await
+        .expect("lagging");
+    let cursor = pubky_switch_core::ops::Position {
+        generation: 1,
+        seq: u64::try_from(entry).expect("seq"),
+    };
+    let ops = batch(20, &[20, 21, 22, 23, 24, 25, 26]);
+    let answer = replay
+        .service
+        .handle(app_request(
+            app(&keys, "wallet"),
+            "POST",
+            &path,
+            OpsRequest::new(&ops, Some(cursor)).to_json(),
+            ms(AT),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let (first, last): (i64, i64) = sqlx::query_as(
+        "SELECT first_seq, last_seq FROM batches WHERE account_id = $1 AND batch_id = $2",
+    )
+    .bind(alice_id())
+    .bind([20u8; 16].as_slice())
+    .fetch_one(&mut db)
+    .await
+    .expect("batch");
+    let missed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM inbox_entries WHERE account_id = $1 AND kind = 'missed' AND seq = $2",
+    )
+    .bind(alice_id())
+    .bind(last)
+    .fetch_one(&mut db)
+    .await
+    .expect("missed");
+    db.close().await.expect("close");
+    assert_eq!(
+        (last - first, missed),
+        (7, 1),
+        "the missed item ends the batch's range"
+    );
+    let ends = u64::try_from(last - 1).expect("seq");
+    chain(&replay, 30, 3, AT).await;
+    cursors(&replay, ALL, ends).await;
+    for _ in 0..3 {
+        request(&replay, AT).await;
+    }
+    let kept = kept(&replay).await;
+    assert!(
+        kept[0] > ends,
+        "the batch {first}..={ends} is still kept: {kept:?}, {:?}",
+        retained(&replay).await
+    );
     replay.db.drop_database().await.expect("drop");
 }

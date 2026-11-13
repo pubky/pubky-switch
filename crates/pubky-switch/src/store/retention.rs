@@ -104,14 +104,20 @@ impl AccountTxn {
             .collect()
     }
 
-    /// The first `seq` of the batch that `seq` lies inside of, before its last item, in the
-    /// generation served: one row of `batches_by_last_seq`, since batches don't overlap.
-    /// `None` when `seq` ends a batch or belongs to none.
+    /// The first `seq` of the batch that `seq` lies inside of, before its last chain item,
+    /// in the generation served; `None` when `seq` ends a batch or belongs to none. One row
+    /// of `batches_by_last_seq`, since batches don't overlap, and one lookup in the chain: a
+    /// batch's record may run past its last chain item, to the `missed` item its cursor
+    /// move wrote, so only a chain item after `seq` puts `seq` inside the batch.
     pub async fn batch_across(&mut self, seq: u64) -> Result<Option<u64>, StoreError> {
         let head = self.head().clone();
         let row = sqlx::query(
-            "SELECT first_seq FROM batches WHERE account_id = $1 AND generation = $2 \
-             AND last_seq > $3 ORDER BY last_seq LIMIT 1",
+            "SELECT b.first_seq FROM ( \
+                 SELECT first_seq, last_seq FROM batches WHERE account_id = $1 \
+                 AND generation = $2 AND last_seq > $3 ORDER BY last_seq LIMIT 1) AS b \
+             WHERE b.first_seq <= $3 AND EXISTS (SELECT 1 FROM chain_items c \
+                 WHERE c.account_id = $1 AND c.generation = $2 AND c.seq > $3 \
+                 AND c.seq <= b.last_seq)",
         )
         .bind(&head.id)
         .bind(to_db(head.generation, "generation")?)
@@ -119,11 +125,8 @@ impl AccountTxn {
         .fetch_optional(self.conn())
         .await
         .map_err(StoreError::from_db)?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let first = from_db(row.try_get("first_seq")?, "first_seq")?;
-        Ok((first <= seq).then_some(first))
+        row.map(|row| from_db(row.try_get("first_seq")?, "first_seq"))
+            .transpose()
     }
 
     /// How many chain items there are after `after` in the generation served, counting no

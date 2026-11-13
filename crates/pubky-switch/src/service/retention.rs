@@ -16,11 +16,15 @@
 //!    their `seq` and chain hash noted as the newest dropped, and with them the batch
 //!    records whose proofs are gone and none of whose stubs is kept (wire 6.4 step 5).
 //!
-//! Nothing is signed or dropped with `chain_retention` off, for a staged account, which doesn't serve the chain, or one
-//! whose state is behind its key's mark, which signs no checkpoint (spec 6.5), or when the
-//! mark can't be read: keeping a stub is always safe. Freezes aren't served, so there is no
+//! Nothing is signed or dropped with `chain_retention` off, for a staged account, which
+//! doesn't serve the chain, or one whose state is behind its key's mark, which signs no
+//! checkpoint (spec 6.5), or when the mark can't be read: keeping a stub is always safe. Freezes aren't served, so there is no
 //! frozen account to stop at; the check comes with the cooperative move (spec 12.5). Each
 //! write is in the request's transaction, so a failure rolls the whole step back.
+//!
+//! Each run reads the oldest kept stub first and stops there when it can't go, so a request
+//! with nothing to drop reads one stub, not `retention_per_request`; it still reads the held
+//! `identity.json`, the apps' cursors and the key's mark for that.
 //!
 //! Current state never depends on a dropped row: records, claim entries and key bundle parts
 //! keep their own signed operations and proofs, and the feed reads current documents through
@@ -150,13 +154,24 @@ impl Service {
         let retained = txn.chain_retention().await?;
         let after = retained.dropped.map_or(0, |(seq, _)| seq);
         let limits = &self.limits;
-        let window = txn.kept_stubs(after, limits.retention_per_request).await?;
         let passed = current.passed(head.generation);
         let old = base.checked_sub(limits.cursor_hold_ms);
         let may_go = |stub: &KeptStub| {
             stub.seq < head_mark.seq
                 && (stub.seq <= passed || old.is_some_and(|old| stub.server_time_ms <= old))
         };
+        // The oldest kept stub first: while it may not go, nothing behind a checkpoint at the
+        // cut can, so most requests read one stub, not the whole window. Only a checkpoint
+        // at the head may still be due.
+        let oldest = txn.kept_stubs(after, 1).await?;
+        if !limits.checkpoint_at_head && !oldest.first().is_some_and(may_go) {
+            if let Some((through, _)) = retained.dropped {
+                txn.drop_spent_batches(through, limits.retention_per_request)
+                    .await?;
+            }
+            return Ok(());
+        }
+        let window = txn.kept_stubs(after, limits.retention_per_request).await?;
         let mut cut = window.iter().take_while(|stub| may_go(stub)).count();
         // Counted before the batch edge: the stubs that may go are what a checkpoint waits
         // for, and the edge only says where it can be signed. Counted after it, a window

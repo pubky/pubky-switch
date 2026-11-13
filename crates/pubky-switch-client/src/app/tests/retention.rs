@@ -300,3 +300,103 @@ async fn test_retention_stops_while_the_account_is_frozen() {
     let _ = wallet.receive(None).await;
     assert_eq!(w.switch.retained(), kept);
 }
+
+#[tokio::test]
+async fn test_retention_a_page_without_the_checkpoint_is_a_rollback() {
+    // The phone stops reading; 31 days on, the stubs after it are dropped behind a
+    // checkpoint. A switch whose pages drop the stubs and leave the checkpoint out, as
+    // an instance on code from before the checkpoint member, shows the phone a broken
+    // chain: it raises a rollback, where with the checkpoint it reconciles.
+    let w = World::new();
+    w.switch.set_retention(retention(3));
+    let mut wallet = writer(&w, "wallet").await;
+    let mut phone = writer(&w, "phone").await;
+    read_a_note(&w, &mut [&mut wallet, &mut phone]).await;
+    let phone_at = w.switch.lock().apps[&phone.app_id()].cursor;
+    write(&mut wallet, 5).await;
+    read_a_note(&w, &mut [&mut wallet]).await;
+    write(&mut wallet, 1).await;
+    w.clock.advance_ms(31 * DAY);
+    write(&mut wallet, 1).await;
+    assert!(w.switch.retained().1 > phone_at, "dropped once 30 days old");
+    w.switch.set_retention(None);
+    w.switch.lock().checkpoint = None;
+    let read = phone.receive(None).await;
+    assert!(read.is_err(), "the read fails");
+    assert!(
+        matches!(phone.alarm(), Some(crate::app::Alarm::Rollback { .. })),
+        "{:?}",
+        phone.alarm()
+    );
+}
+
+/// The `seq`s of the switch's chain items, oldest first.
+fn chain_seqs(w: &World) -> Vec<u64> {
+    w.switch
+        .lock()
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            crate::testing::Item::Chain { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_retention_never_drops_the_head() {
+    // The wallet's cursor stands at the head, every stub passed: the checkpoint and the
+    // drop stop short of the head, as at the service.
+    let w = World::new();
+    w.switch.set_retention(retention(1));
+    let mut wallet = writer(&w, "wallet").await;
+    write(&mut wallet, 3).await;
+    wallet.receive(None).await.unwrap();
+    wallet.flush_cursor().await.unwrap();
+    let head = w.switch.lock().tip.seq;
+    assert_eq!(w.switch.lock().apps[&wallet.app_id()].cursor, head);
+    wallet.receive(None).await.unwrap();
+    let (checkpoint, dropped) = w.switch.retained();
+    let at = checkpoint.expect("a checkpoint").seq;
+    assert!(
+        at < head && dropped < head,
+        "the head {head} stays: {at}, {dropped}"
+    );
+}
+
+#[tokio::test]
+async fn test_retention_a_look_that_ends_inside_a_batch_still_signs() {
+    // The sweep looks at as many stubs as a checkpoint waits for, and the last it looks at
+    // is inside a batch of three: the stubs that may go are counted before the batch edge,
+    // so the checkpoint goes at the item before the batch, as at the service. Counted only
+    // at batch ends, they would stay short at every request.
+    let w = World::new();
+    let mut wallet = writer(&w, "wallet").await;
+    write(&mut wallet, 1).await;
+    wallet
+        .submit_batch(
+            OpBatch::new()
+                .op(OpKind::DenyPut { pubky: [7; 32] })
+                .op(OpKind::DenyPut { pubky: [8; 32] })
+                .op(OpKind::DenyPut { pubky: [9; 32] }),
+        )
+        .await
+        .unwrap();
+    write(&mut wallet, 2).await;
+    wallet.receive(None).await.unwrap();
+    wallet.flush_cursor().await.unwrap();
+    let seqs = chain_seqs(&w);
+    let batch = batch_of_three(&w);
+    let first = seqs.iter().position(|seq| *seq == batch[0]).unwrap();
+    // The look ends at the batch's second item.
+    let look = first + 2;
+    w.switch.set_retention(Some(Retention {
+        checkpoint_behind: u64::try_from(look).unwrap(),
+        per_request: look,
+        ..Retention::default()
+    }));
+    wallet.receive(None).await.unwrap();
+    let (checkpoint, dropped) = w.switch.retained();
+    assert_eq!(checkpoint.map(|c| c.seq), Some(seqs[first - 1]));
+    assert_eq!(dropped, seqs[first - 1]);
+}
