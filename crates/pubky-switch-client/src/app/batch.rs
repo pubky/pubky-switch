@@ -122,22 +122,27 @@ pub const KEPT_RESENDS_PER_WRITE: usize = 1;
 /// The next creation number of a kept batch ([`PendingBatch::queued_n`]).
 const KEPT_NEXT: &str = "keptn";
 
-/// `opq/<batch_id>`: a kept batch, under the batch ID it was first kept under, whatever ID
-/// its bytes carry once signed again (`kept.rs`).
-/// The order kept batches go in (Switch wire 6.4 step 5): those sent before by their first
-/// send's service time, then those never sent by their creation number, each with the ID
-/// last, so no write overtakes an earlier one.
+/// The order kept batches go in, so no write overtakes an earlier one: the order the calls
+/// kept them in, by their creation number ([`PendingBatch::queued_n`]), whether or not they
+/// were sent before. A batch's creation number never changes, so its place holds through a
+/// first send, a signing again and a provider change. Batches an earlier build kept carry
+/// none, and go first: before any numbered batch, which was kept after them, and among
+/// themselves those sent before by their first send's time, then those never sent, each
+/// group by ID.
 fn kept_order(
     (id, pending): &([u8; 16], PendingBatch),
-) -> (bool, Option<u64>, Option<u64>, [u8; 16]) {
+) -> (bool, Option<u64>, bool, Option<u64>, [u8; 16]) {
     (
+        pending.queued_n.is_some(),
+        pending.queued_n,
         pending.kept_ms.is_none(),
         pending.kept_ms,
-        pending.queued_n,
         *id,
     )
 }
 
+/// `opq/<batch_id>`: a kept batch, under the batch ID it was first kept under, whatever ID
+/// its bytes carry once signed again (`kept.rs`).
 pub(crate) fn pending_key(batch_id: &[u8; 16]) -> String {
     format!("{PENDING_PREFIX}{}", b64(batch_id))
 }
@@ -288,7 +293,8 @@ pub(crate) struct PendingBatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kept_ms: Option<u64>,
     /// Its creation number among the app's kept batches, in the commit that keeps it: the
-    /// order of those never sent. `None` for one an earlier build kept, which goes first.
+    /// order kept batches go in (`kept_order`). `None` for one an earlier build kept, which
+    /// goes first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) queued_n: Option<u64>,
 }
@@ -743,12 +749,11 @@ impl App {
         Ok(())
     }
 
-    /// Send the batches kept from earlier calls, oldest first, and commit their answers:
-    /// those sent before by the time their first send left ([`PendingBatch::kept_ms`]),
-    /// then those never sent, each group in ID order. One refused for good is dropped and
-    /// reported ([`AppEvent::BatchRefused`]);
-    /// any other failure stops here, the batch still kept, and is the caller's error, so
-    /// later writes don't overtake it. Nothing is sent while the evidence of a provider loss
+    /// Send the batches kept from earlier calls, oldest first, and commit their answers: in
+    /// the order the calls kept them, whether sent before or not (`kept_order`). One
+    /// refused for good is dropped and reported ([`AppEvent::BatchRefused`]); any other
+    /// failure stops here, the batch still kept, and is the caller's error, so later writes
+    /// don't overtake it. Nothing is sent while the evidence of a provider loss
     /// isn't uploaded yet. A batch never sent that holds an `attempt` is a new attempt, so
     /// it goes only while the app may attempt ([`App::may_attempt`]), as the call that kept
     /// it checked; otherwise, in reconcile mode begun since (Switch spec 8.3, 12.4), it is
@@ -1397,6 +1402,54 @@ mod tests {
     fn test_op_batch_condition_without_an_operation_is_dropped() {
         let batch = OpBatch::new().when(server_time_in(None, Some(2)));
         assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_kept_order_follows_creation_whatever_was_sent_first() {
+        let kept = |id: u8, queued_n: Option<u64>, kept_ms: Option<u64>| {
+            (
+                [id; 16],
+                PendingBatch {
+                    queued_n,
+                    kept_ms,
+                    ..PendingBatch::default()
+                },
+            )
+        };
+        let mut batches = vec![
+            // Kept by this build: the later one sent first, and at an earlier time.
+            kept(1, Some(8), Some(1_000)),
+            kept(2, Some(7), None),
+            kept(3, Some(9), Some(500)),
+            // Kept by an earlier build, with no creation number.
+            kept(4, None, None),
+            kept(5, None, Some(3_000)),
+            kept(6, None, Some(2_000)),
+            kept(0, None, None),
+        ];
+        batches.sort_by_key(kept_order);
+        let ids: Vec<u8> = batches.iter().map(|(id, _)| id[0]).collect();
+        assert_eq!(ids, [6, 5, 0, 4, 2, 1, 3]);
+    }
+
+    #[test]
+    fn test_pending_batch_without_a_creation_number_reads_as_one_kept_before() {
+        let kept = PendingBatch {
+            body: b"body".to_vec(),
+            kept_ms: Some(5),
+            ..PendingBatch::default()
+        };
+        let mut value = serde_json::to_value(&kept).unwrap();
+        assert!(value.get("queued_n").is_none(), "{value}");
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("queued_n".into(), serde_json::json!(3));
+        let numbered: PendingBatch = serde_json::from_value(value).unwrap();
+        assert_eq!(numbered.queued_n, Some(3));
+        let read: PendingBatch =
+            serde_json::from_value(serde_json::to_value(&kept).unwrap()).unwrap();
+        assert_eq!((read.queued_n, read.kept_ms), (None, Some(5)));
     }
 
     #[test]
