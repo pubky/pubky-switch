@@ -1481,7 +1481,8 @@ async fn test_records_regression_check_sees_the_write_base() {
         *s.protocol.bases.lock().unwrap(),
         vec![WriteBase {
             expected_version: first,
-            held: true
+            held: true,
+            conditions: Vec::new(),
         }]
     );
     // Two writes later, the phone reads only the record's current view: it builds on the
@@ -1501,7 +1502,8 @@ async fn test_records_regression_check_sees_the_write_base() {
         s.protocol.bases.lock().unwrap().last(),
         Some(&WriteBase {
             expected_version: third,
-            held: false
+            held: false,
+            conditions: Vec::new(),
         })
     );
 }
@@ -1525,12 +1527,13 @@ async fn test_records_regression_base_of_a_create_over_a_held_delete_is_held() {
         .await
         .unwrap();
     phone.receive(None).await.unwrap();
-    let last = *s.protocol.bases.lock().unwrap().last().unwrap();
+    let last = s.protocol.bases.lock().unwrap().last().unwrap().clone();
     assert_eq!(
         last,
         WriteBase {
             expected_version: RecordVersion::NONE,
-            held: true
+            held: true,
+            conditions: Vec::new(),
         }
     );
 }
@@ -1561,14 +1564,50 @@ async fn test_records_regression_base_of_a_write_on_a_flagged_one_isnt_held() {
         .await
         .unwrap();
     phone.receive(None).await.unwrap();
-    let last = *s.protocol.bases.lock().unwrap().last().unwrap();
+    let last = s.protocol.bases.lock().unwrap().last().unwrap().clone();
     assert_eq!(
         last,
         WriteBase {
             expected_version: flagged,
-            held: false
+            held: false,
+            conditions: Vec::new(),
         }
     );
+}
+
+/// The later-write check is told the conditions the write's operation signed, in order, so
+/// a protocol's reader rule can require one, such as a `claim_step` on the claim of what the
+/// write drops (Switch spec 8.2).
+#[tokio::test]
+async fn test_records_regression_check_sees_the_write_conditions() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    let now = s.w.clock.now_ms();
+    let conditions = vec![
+        Condition::ClaimStep {
+            claim_key: [9; 32],
+            step: 0,
+        },
+        Condition::ServerTimeIn {
+            start: None,
+            end: Some(now + HOUR),
+        },
+    ];
+    wallet
+        .put_record(&target, &value(&["a", "b"]), conditions.clone())
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    let last = s.protocol.bases.lock().unwrap().last().unwrap().clone();
+    assert_eq!(last.conditions, conditions);
+    assert!(last.held);
 }
 
 async fn version_of(app: &App, key: &[u8; 32]) -> RecordVersion {
@@ -5264,6 +5303,102 @@ async fn test_records_held_unreadable_opens_once_its_key_arrives() {
     );
 }
 
+/// A store whose commits that end an owed reopening fail, as many times as `failing` says.
+struct FailingReopen {
+    inner: MemoryStore,
+    failing: std::sync::Mutex<u32>,
+}
+
+impl StateStore for FailingReopen {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, crate::error::StoreError> {
+        self.inner.get(ns, key)
+    }
+
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::KeyValue>, crate::error::StoreError> {
+        self.inner.scan(ns, prefix, after, limit)
+    }
+
+    fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), crate::error::StoreError> {
+        let ends_reopen = batch.writes.iter().any(|write| {
+            matches!(write, crate::store::Write::Delete { key, .. } if key.as_slice() == b"reopen")
+        });
+        let fails = ends_reopen && {
+            let mut left = self.failing.lock().unwrap();
+            let fails = *left > 0;
+            *left = left.saturating_sub(1);
+            fails
+        };
+        if fails {
+            return Err(crate::error::StoreError::Unavailable);
+        }
+        self.inner.commit(batch)
+    }
+}
+
+/// The reopening a key owes is kept with the key: when its own commit fails after the key
+/// was taken, the read goes on and reports it, and the next read reopens the record held
+/// `Unreadable`, though no fetch takes a key again.
+#[tokio::test]
+async fn test_records_reopening_that_fails_is_made_at_the_next_read() {
+    let s = Setup::new();
+    let store = Arc::new(FailingReopen {
+        inner: MemoryStore::new(),
+        failing: std::sync::Mutex::new(0),
+    });
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let mut wallet = App::join(
+        s.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        s.protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    let mut phone = s.join("phone").await;
+    let key = record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    wallet.receive(None).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        held.content,
+        RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 }),
+    );
+    // The key arrives, and the reopening's commit fails at each try of that read: after
+    // the page, and at the read's end.
+    *store.failing.lock().unwrap() = 2;
+    store_parts_for(&s, &wallet.cert().clone());
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(*store.failing.lock().unwrap(), 0);
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ReopeningOwed { .. })),
+        "{:?}",
+        report.events
+    );
+    assert!(
+        wallet.scope_key(2, "scope-a").is_some(),
+        "the key was taken"
+    );
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert!(held.content.value().is_none(), "not reopened yet");
+    // The next read reopens it.
+    wallet.receive(None).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+    let ns = crate::store::client_namespace(&wallet.app_id());
+    assert!(
+        store.get(&ns, b"reopen").unwrap().is_none(),
+        "nothing owed after"
+    );
+}
+
 /// An explicit listing of a record held `Unreadable` opens it once its key is held: the
 /// same write, by its item hash, is taken as opened.
 #[tokio::test]
@@ -6528,6 +6663,638 @@ async fn test_records_listing_at_a_missed_item_fetches_the_key_and_reads_on() {
     let report = app.receive(None).await.unwrap();
     assert_eq!(handed(&s, &note.msg_id), 1, "{:?}", report.events);
     assert!(!app.listing_owed().await.unwrap());
+}
+
+/// Records held `Unreadable` whose reopened writes together pass one commit's size: the
+/// reopening owed once their key arrives must not keep every later read from the feed.
+#[tokio::test]
+async fn test_records_reopening_too_large_for_one_commit_keeps_reads_going() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let pad = "x".repeat(200 * 1024);
+    let mut keys = Vec::new();
+    for n in 0..80 {
+        let target = s.target(&format!("big{n}"));
+        let big = json!({ "items": ["a"], "pad": pad })
+            .to_string()
+            .into_bytes();
+        phone.put_record(&target, &big, vec![]).await.unwrap();
+        keys.push(phone.record_key(&target).unwrap());
+    }
+    wallet.receive(None).await.unwrap();
+    for key in &keys {
+        let held = wallet.shared_record(key).await.unwrap().unwrap();
+        assert!(held.content.value().is_none(), "held unreadable for now");
+    }
+    store_parts_for(&s, &wallet.cert().clone());
+    let first = wallet.receive(None).await;
+    // A note sent after the key: a read that gets to the feed takes it.
+    let (seq, _) = s.w.note(wallet.app_id(), "after the key");
+    let mut results = Vec::new();
+    for _ in 0..3 {
+        results.push(wallet.receive(None).await.map(|_| ()));
+    }
+    assert!(
+        results.iter().all(Result::is_ok),
+        "the first read after the key: {first:?}; later reads: {results:?}"
+    );
+    assert!(wallet.cursor().seq >= seq, "the feed is read on");
+    for key in &keys {
+        let held = wallet.shared_record(key).await.unwrap().unwrap();
+        assert_eq!(ids(held.content.value()), vec!["a"]);
+    }
+}
+
+/// A store whose commits that put a held record fail once, after `pass` of them went
+/// through, while armed.
+struct FailingRecordCommit {
+    inner: MemoryStore,
+    armed: std::sync::Mutex<Option<u32>>,
+}
+
+impl StateStore for FailingRecordCommit {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, crate::error::StoreError> {
+        self.inner.get(ns, key)
+    }
+
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::KeyValue>, crate::error::StoreError> {
+        self.inner.scan(ns, prefix, after, limit)
+    }
+
+    fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), crate::error::StoreError> {
+        let puts_record = batch.writes.iter().any(|write| {
+            matches!(write, crate::store::Write::Put { key, .. } if key.starts_with(b"rec/"))
+        });
+        if puts_record {
+            let mut armed = self.armed.lock().unwrap();
+            match *armed {
+                Some(0) => {
+                    *armed = None;
+                    return Err(crate::error::StoreError::Unavailable);
+                }
+                Some(pass) => *armed = Some(pass - 1),
+                None => {}
+            }
+        }
+        self.inner.commit(batch)
+    }
+}
+
+/// A reopening of more records than one commit takes that fails after its first commit:
+/// the mark stays, since only the last commit clears it, and the rest open at the next
+/// try.
+#[tokio::test]
+async fn test_records_reopening_cut_short_keeps_the_rest_owed() {
+    let s = Setup::new();
+    let store = Arc::new(FailingRecordCommit {
+        inner: MemoryStore::new(),
+        armed: std::sync::Mutex::new(None),
+    });
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let mut wallet = App::join(
+        s.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        s.protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let pad = "x".repeat(200 * 1024);
+    let mut keys = Vec::new();
+    for n in 0..80 {
+        let target = s.target(&format!("big{n}"));
+        let big = json!({ "items": ["a"], "pad": pad })
+            .to_string()
+            .into_bytes();
+        phone.put_record(&target, &big, vec![]).await.unwrap();
+        keys.push(phone.record_key(&target).unwrap());
+    }
+    wallet.receive(None).await.unwrap();
+    // The key arrives; the reopening's first commit goes through and its second fails.
+    *store.armed.lock().unwrap() = Some(1);
+    store_parts_for(&s, &wallet.cert().clone());
+    let report = wallet.receive(None).await.unwrap();
+    assert!(
+        store.armed.lock().unwrap().is_none(),
+        "the second commit failed"
+    );
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ReopeningOwed { .. })),
+        "{:?}",
+        report.events
+    );
+    wallet.receive(None).await.unwrap();
+    for key in &keys {
+        let held = wallet.shared_record(key).await.unwrap().unwrap();
+        assert_eq!(ids(held.content.value()), vec!["a"]);
+    }
+    let ns = crate::store::client_namespace(&wallet.app_id());
+    assert!(store.get(&ns, b"reopen").unwrap().is_none());
+}
+
+/// [`ItemsProtocol`], whose receive step reads the record `shared`: held not open for want
+/// of a key, it waits for that key; open, it writes the note's own record.
+struct SharedReader {
+    items: ItemsProtocol,
+    runs: std::sync::Mutex<usize>,
+}
+
+impl Protocol for SharedReader {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.items.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.items.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.items.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.items.accepts(cert)
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.items.check_body(message)
+    }
+
+    fn receive_with(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
+        *self.runs.lock().unwrap() += 1;
+        let shared = RecordTarget::new(items(), b"shared");
+        match cx
+            .record(&shared)
+            .ok()
+            .flatten()
+            .map(|record| record.content)
+        {
+            Some(RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch })) => {
+                Outcome::AwaitKey { data_epoch }
+            }
+            _ => {
+                let own = RecordTarget::new(items(), message.message.msg_id.as_bytes());
+                let _ = cx.put_record(&own, &value(&["seen"]), vec![]);
+                Outcome::Apply(Effect::default())
+            }
+        }
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.items.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.items.missed(missed)
+    }
+
+    fn collections(&self) -> Vec<Collection> {
+        vec![items()]
+    }
+}
+
+/// alice's wallet on a store whose reopening commits fail, with [`SharedReader`], and a note
+/// waiting for the epoch-2 key that opens the record `shared`: the wallet, its store, the
+/// protocol and the note's `seq`.
+async fn waiting_on_shared(s: &Setup) -> (App, Arc<FailingReopen>, Arc<SharedReader>, u64) {
+    let store = Arc::new(FailingReopen {
+        inner: MemoryStore::new(),
+        failing: std::sync::Mutex::new(0),
+    });
+    let protocol = Arc::new(SharedReader {
+        items: ItemsProtocol::default(),
+        runs: std::sync::Mutex::new(0),
+    });
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let mut wallet = App::join(
+        s.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    let mut phone = s.join("phone").await;
+    record_at_a_new_epoch(s, &mut wallet, &mut phone).await;
+    phone
+        .put_record(
+            &RecordTarget::new(items(), b"shared"),
+            &value(&["a"]),
+            vec![],
+        )
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (seq, _) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "reads shared" }),
+            &[wallet.app_id()],
+        )
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*protocol.runs.lock().unwrap(), 1);
+    assert!(wallet.stored_at(seq).is_some(), "waits for the key");
+    (wallet, store, protocol, seq)
+}
+
+/// An entry waiting for a key reads a record the key opens. The key arrives in a read whose
+/// reopening fails at both its tries: the entry isn't run on the record still held not
+/// open. The next read reopens at its start and takes the entry there, before the feed.
+#[tokio::test]
+async fn test_records_waiting_entry_waits_for_an_owed_reopening() {
+    let s = Setup::new();
+    let (mut wallet, store, protocol, seq) = waiting_on_shared(&s).await;
+    // The key comes; both tries of that read's reopening fail.
+    *store.failing.lock().unwrap() = 2;
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*store.failing.lock().unwrap(), 0);
+    assert_eq!(
+        *protocol.runs.lock().unwrap(),
+        1,
+        "not run on a record still not open"
+    );
+    // The next read reopens, then takes the entry before it reads the feed.
+    let from = s.log().len();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*protocol.runs.lock().unwrap(), 2);
+    assert!(wallet.stored_at(seq).is_none());
+    let log = s.log();
+    let read = &log[from..];
+    let effect = read.iter().position(|line| line.contains("/ops")).unwrap();
+    // The one-item read that verifies a service time before the effect is sent isn't the
+    // feed's (Switch spec 10.1).
+    let feed = read
+        .iter()
+        .position(|line| line.contains("/feed") && !line.ends_with("limit=1"))
+        .unwrap();
+    assert!(effect < feed, "{read:?}");
+}
+
+/// The same, with the next read's reopening at its start failing too: the retries there
+/// pass the entry over, and it is taken at the read's end, once the reopening after the
+/// page went through.
+#[tokio::test]
+async fn test_records_waiting_entry_passed_over_while_the_start_reopening_fails() {
+    let s = Setup::new();
+    let (mut wallet, store, protocol, seq) = waiting_on_shared(&s).await;
+    *store.failing.lock().unwrap() = 3;
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*protocol.runs.lock().unwrap(), 1);
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*store.failing.lock().unwrap(), 0);
+    assert!(
+        wallet.stored_at(seq).is_none(),
+        "taken once the records opened"
+    );
+    assert_eq!(*protocol.runs.lock().unwrap(), 2);
+}
+
+/// A new entry read after the key bundle part on the same page, whose step reads a record
+/// held `Unreadable` that the key opens: the reopening waits for the page's end, so the
+/// step still finds the record not open and waits for a key the app now holds. Once the
+/// record opens the entry is taken.
+#[tokio::test]
+async fn test_records_entry_after_the_key_on_its_page_is_taken_once_the_record_opens() {
+    let s = Setup::new();
+    let protocol = Arc::new(SharedReader {
+        items: ItemsProtocol::default(),
+        runs: std::sync::Mutex::new(0),
+    });
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let mut wallet = App::join(s.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let mut phone = s.join("phone").await;
+    record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    let shared = RecordTarget::new(items(), b"shared");
+    phone
+        .put_record(&shared, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    let key = wallet.record_key(&shared).unwrap();
+    assert!(
+        wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()
+            .is_none(),
+        "held unreadable for now"
+    );
+    // The key's part, then a note, both unread: one page.
+    store_parts_for(&s, &wallet.cert().clone());
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (seq, _) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "after the key" }),
+            &[wallet.app_id()],
+        )
+        .unwrap();
+    let mut events = Vec::new();
+    for _ in 0..4 {
+        s.w.clock.advance_ms(crate::app::MAX_CURSOR_DEFER_MS + 1);
+        events.extend(wallet.receive(None).await.unwrap().events);
+    }
+    assert_eq!(
+        ids(wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        vec!["a"],
+        "the record opened"
+    );
+    assert!(
+        wallet.stored_at(seq).is_none(),
+        "still stored as {:?} after {} runs; {:?}",
+        wallet.stored_at(seq).map(|stored| stored.reason),
+        *protocol.runs.lock().unwrap(),
+        events
+            .iter()
+            .filter(|e| matches!(e, AppEvent::Parked { .. } | AppEvent::AwaitingKeys { .. }))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The same with the key taken by the step's own fetch. The wallet read `shared`, sealed
+/// at a data epoch it doesn't know yet, from the switch: held `Unreadable`, and no key is
+/// missing for the epoch it knows, so no full bundle is asked for. The feed then shows the
+/// epoch rise, then a note whose step reads `shared` and fetches the key bundle, whose part
+/// the feed shows only after the note. The step runs again on the record still not open, as
+/// the reopening waits for the page's end; once the record opens the entry is taken in the
+/// same read.
+#[tokio::test]
+async fn test_records_entry_whose_own_fetch_takes_the_key_is_taken_once_the_record_opens() {
+    let s = Setup::new();
+    let protocol = Arc::new(SharedReader {
+        items: ItemsProtocol::default(),
+        runs: std::sync::Mutex::new(0),
+    });
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let mut wallet = App::join(s.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let shared = RecordTarget::new(items(), b"shared");
+    phone
+        .put_record(&shared, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let held = wallet.read_record(&shared).await.unwrap().unwrap();
+    assert!(held.content.value().is_none(), "{:?}", held.content);
+    let key = wallet.record_key(&shared).unwrap();
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (seq, _) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "reads shared" }),
+            &[wallet.app_id()],
+        )
+        .unwrap();
+    // The wallet's part is stored after the note: the feed shows it after the note, and
+    // a fetch made at the note reads it.
+    store_parts_for(&s, &wallet.cert().clone());
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(
+        ids(wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        vec!["a"],
+        "the record opened"
+    );
+    assert!(
+        wallet.stored_at(seq).is_none(),
+        "still stored as {:?} after {} runs; {:?}",
+        wallet.stored_at(seq).map(|stored| stored.reason),
+        *protocol.runs.lock().unwrap(),
+        report.events
+    );
+}
+
+/// An alarm raised in the reopening at a read's start ends the read: nothing is handed to
+/// the protocol after it, and no feed is read and nothing sent. Here a held record's proof
+/// is another write's, which the reopening judges a rollback (Switch wire 6.2 step 2).
+#[tokio::test]
+async fn test_records_alarm_in_the_reopening_ends_the_read() {
+    let s = Setup::new();
+    let (mut wallet, store, protocol, _) = waiting_on_shared(&s).await;
+    // The key comes; the reopening fails at both tries of that read, and stays owed.
+    *store.failing.lock().unwrap() = 2;
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap();
+    assert!(
+        wallet
+            .reader()
+            .exists(crate::app::records::REOPEN_DUE)
+            .await
+            .unwrap()
+    );
+    // `n1`, held `Unreadable`, now carries the proof of `shared`'s write.
+    let n1 = crate::app::records::record_key_of(&wallet.record_key(&s.target("n1")).unwrap());
+    let shared = crate::app::records::record_key_of(
+        &wallet
+            .record_key(&RecordTarget::new(items(), b"shared"))
+            .unwrap(),
+    );
+    let mut held: serde_json::Value = wallet.reader().get(&n1).await.unwrap().unwrap();
+    let other: serde_json::Value = wallet.reader().get(&shared).await.unwrap().unwrap();
+    assert!(
+        other["proof"].is_object() || other["proof"].is_string(),
+        "{other}"
+    );
+    held["proof"] = other["proof"].clone();
+    let mut tx = wallet.tx().unwrap();
+    tx.put(&n1, &held).unwrap();
+    wallet.commit(tx).await.unwrap();
+    // A new note in the feed, whose step would run once the read reached it.
+    let shop = s.peer.apps()[0].cert.app_id();
+    s.peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "after the alarm" }),
+            &[wallet.app_id()],
+        )
+        .unwrap();
+    let runs = *protocol.runs.lock().unwrap();
+    let from = s.log().len();
+    let (error, events) = match wallet.receive(None).await {
+        Ok(report) => (None, report.events),
+        Err(error) => (Some(error), wallet.take_events()),
+    };
+    let alarm = events
+        .iter()
+        .position(|e| matches!(e, AppEvent::Alarm(Alarm::Rollback { .. })));
+    assert!(alarm.is_some(), "{error:?} {events:?}");
+    assert!(
+        matches!(error, Some(AppError::Alarm(Alarm::Rollback { .. }))),
+        "{error:?} {events:?}"
+    );
+    assert_eq!(
+        *protocol.runs.lock().unwrap(),
+        runs,
+        "nothing handed over: {events:?}"
+    );
+    let after: Vec<&AppEvent> = events[alarm.unwrap()..]
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AppEvent::MessageReceived { .. }
+                    | AppEvent::Unparked { .. }
+                    | AppEvent::ReopeningOwed { .. }
+            )
+        })
+        .collect();
+    assert!(after.is_empty(), "{after:?}");
+    let log = s.log();
+    let read = &log[from..];
+    assert!(
+        !read
+            .iter()
+            .any(|line| line.contains("/ops") || line.contains("/feed")),
+        "{read:?}"
+    );
+}
+
+/// A reopening that keeps failing is tried at most twice a read, and once more at the
+/// next read: each failed try is reported once.
+#[tokio::test]
+async fn test_records_failing_reopening_is_tried_twice_a_read() {
+    let s = Setup::new();
+    let (mut wallet, store, _, _) = waiting_on_shared(&s).await;
+    *store.failing.lock().unwrap() = 100;
+    store_parts_for(&s, &wallet.cert().clone());
+    let owed = |events: &[AppEvent]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, AppEvent::ReopeningOwed { .. }))
+            .count()
+    };
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(owed(&report.events), 2, "{:?}", report.events);
+    // A note, so the next read reads a page past its start.
+    let shop = s.peer.apps()[0].cert.app_id();
+    s.peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "another" }),
+            &[wallet.app_id()],
+        )
+        .unwrap();
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(owed(&report.events), 2, "{:?}", report.events);
+    // Outside a read it is tried again.
+    wallet.fetch_key_bundle().await.unwrap();
+    assert_eq!(owed(&wallet.take_events()), 1);
+    // Once the store takes it, the record opens.
+    *store.failing.lock().unwrap() = 0;
+    wallet.receive(None).await.unwrap();
+    assert!(
+        !wallet
+            .reader()
+            .exists(crate::app::records::REOPEN_DUE)
+            .await
+            .unwrap()
+    );
+}
+
+/// A record write sealed at an epoch whose key a later item of the same page brings: the
+/// write is taken unreadable in the page's open writes, the key's fetch reopens what the
+/// store holds, and the record must still open once the key is held.
+#[tokio::test]
+async fn test_records_key_on_the_same_page_as_the_unreadable_write_opens_it() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&target).unwrap();
+    // The wallet's key comes after the write, and both are read in one page.
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap();
+    assert!(
+        wallet.scope_key(2, "scope-a").is_some(),
+        "the key was taken"
+    );
+    for _ in 0..2 {
+        wallet.receive(None).await.unwrap();
+    }
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        ids(held.content.value()),
+        vec!["a"],
+        "held {:?} with its key held",
+        held.content
+    );
 }
 
 #[tokio::test]

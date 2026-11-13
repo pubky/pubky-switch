@@ -150,7 +150,8 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     time.clone(),
                     config.limits.clone(),
                 )
-                .await,
+                .await
+                .with_push(config.push.enabled),
             );
             // Changes made by any instance wake the feed reads waiting here.
             let changes = ChangeListener::connect(&store).await?;

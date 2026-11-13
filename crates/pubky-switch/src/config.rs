@@ -28,6 +28,19 @@ pub struct Config {
     pub database: DatabaseConfig,
     /// The key store.
     pub keys: KeysConfig,
+    /// Push (Switch wire 8).
+    pub push: PushConfig,
+}
+
+/// Push (Switch spec 9, Switch wire 8). The service keeps registrations; it sends no
+/// webhook to a relay yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PushConfig {
+    /// Take push registrations (`PUT /v1/{id}/push`); off, every one is answered `400`, as
+    /// a service that sends no pushes answers (Switch wire 8.1). Off by default, since no
+    /// push is sent yet.
+    pub enabled: bool,
 }
 
 /// The operator listener, which serves health checks and metrics. Keep it off the public
@@ -150,6 +163,10 @@ mod tests {
         let config = Config::from_toml("").expect("empty config");
         assert_eq!(config, Config::default());
         assert!(config.trusted_time.required);
+        // No push is sent yet, so registrations are off unless the operator turns them on.
+        assert!(!config.push.enabled);
+        let on = Config::from_toml("[push]\nenabled = true\n").expect("push on");
+        assert!(on.push.enabled);
     }
 
     #[test]

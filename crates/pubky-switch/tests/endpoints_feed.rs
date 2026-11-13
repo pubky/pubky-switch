@@ -990,6 +990,12 @@ impl KeyStore for MarkStuck {
     fn generate(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceKey> {
         self.inner.generate()
     }
+    fn generate_as<'a>(
+        &'a self,
+        id: &'a KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceKey> {
+        self.inner.generate_as(id)
+    }
     fn public_key<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
         self.inner.public_key(id)
     }

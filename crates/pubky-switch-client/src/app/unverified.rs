@@ -1,9 +1,10 @@
 //! The bounds on entries stored because their sender's standing couldn't be checked
-//! (Switch spec 8.2, [`ParkReason::Unverifiable`]): at most [`MAX_UNVERIFIED_AGE_MS`] from
-//! acceptance, [`MAX_UNVERIFIED_PER_SENDER`] per sender identity and
-//! [`MAX_UNVERIFIED_TOTAL`] in all. Past them the app drops entries without processing
-//! them and tells its protocol ([`AppEvent::StoredEntryDropped`]), which may ask the sender
-//! to send them again (Switch spec 11).
+//! (Switch spec 8.2, [`ParkReason::Unverifiable`]), and on entries stored because they
+//! wait for a scope key ([`ParkReason::AwaitingKey`]), the two counted together: at most
+//! [`MAX_UNVERIFIED_AGE_MS`] from acceptance, [`MAX_UNVERIFIED_PER_SENDER`] per sender
+//! identity and [`MAX_UNVERIFIED_TOTAL`] in all. Past them the app drops entries without
+//! processing them and tells its protocol ([`AppEvent::StoredEntryDropped`]), which may ask
+//! the sender to send them again (Switch spec 11).
 //!
 //! The bounds apply at the start of every read, before entries stored locally are tried
 //! again, and before a layered backup is taken, to every such entry the store holds: those
@@ -33,18 +34,20 @@ use super::events::{DropReason, Duty, ParkReason};
 use super::state::ParkedEntry;
 use super::{App, AppError};
 
-/// How long an entry stored as [`ParkReason::Unverifiable`] is kept from its acceptance:
-/// 21 days, judged on the highest service time the app verified, so the sender, which
-/// answers re-sends for 30 days from a message's first acceptance (Switch spec 11), still
-/// can when the protocol asks.
+/// How long an entry stored as [`ParkReason::Unverifiable`] or [`ParkReason::AwaitingKey`]
+/// is kept from its acceptance: 21 days, judged on the highest service time the app
+/// verified, so the sender, which answers re-sends for 30 days from a message's first
+/// acceptance (Switch spec 11), still can when the protocol asks.
 pub const MAX_UNVERIFIED_AGE_MS: u64 = 21 * DAY_MS;
 
-/// The most entries stored as [`ParkReason::Unverifiable`] the app keeps for one sender
-/// identity, the identity the entry's certificate names: 64.
+/// The most entries stored as [`ParkReason::Unverifiable`] or [`ParkReason::AwaitingKey`],
+/// together, the app keeps for one sender identity, the identity the entry's certificate
+/// names: 64.
 pub const MAX_UNVERIFIED_PER_SENDER: usize = 64;
 
-/// The most entries stored as [`ParkReason::Unverifiable`] the app keeps in all: 128, at
-/// most about 16 MiB as stored of what a restore commits at once.
+/// The most entries stored as [`ParkReason::Unverifiable`] or [`ParkReason::AwaitingKey`],
+/// together, the app keeps in all: 128, at most about 16 MiB as stored of what a restore
+/// commits at once.
 pub const MAX_UNVERIFIED_TOTAL: usize = 128;
 
 /// The most entries one commit drops: each drop deletes the entry and its retry count and
@@ -69,7 +72,8 @@ impl Counted {
 }
 
 /// The entries past the bounds, in the order they are dropped, each with the bound it is
-/// past, given every entry stored as [`ParkReason::Unverifiable`] and the highest service
+/// past, given every entry the bounds count ([`ParkReason::Unverifiable`] and
+/// [`ParkReason::AwaitingKey`]) and the highest service
 /// time the app verified (`None` before any verified answer: then none is dropped for its
 /// age, since the device clock alone doesn't judge it).
 ///
@@ -126,10 +130,10 @@ pub(crate) fn over_bounds(entries: &[Counted], verified_ms: Option<u64>) -> Vec<
 }
 
 impl App {
-    /// Apply the bounds on entries stored as [`ParkReason::Unverifiable`] (Switch spec 8.2):
-    /// drop every entry past them, at most [`UNVERIFIED_DROPS_PER_COMMIT`] per commit, each
-    /// commit deleting the entries with their retry counts and keeping a
-    /// [`super::AppEvent::StoredEntryDropped`] for each.
+    /// Apply the bounds on entries stored as [`ParkReason::Unverifiable`] or
+    /// [`ParkReason::AwaitingKey`] (Switch spec 8.2): drop every entry past them, at most
+    /// [`UNVERIFIED_DROPS_PER_COMMIT`] per commit, each commit deleting the entries with
+    /// their retry counts and keeping a [`super::AppEvent::StoredEntryDropped`] for each.
     ///
     /// The entry a kept effect belongs to ([`super::state::PendingEffect::stored`]) is
     /// neither counted nor dropped, whoever calls this: its effect may have been applied,
@@ -145,7 +149,7 @@ impl App {
             .state
             .parked
             .iter()
-            .filter(|(id, stored)| stored.reason == ParkReason::Unverifiable && Some(**id) != kept)
+            .filter(|(id, stored)| ParkReason::bounded(stored.reason) && Some(**id) != kept)
             .map(|(id, stored)| Counted {
                 id: *id,
                 sender: stored.sender,
@@ -159,7 +163,8 @@ impl App {
                 let Some(stored) = self.state.parked.get(id).cloned() else {
                     continue;
                 };
-                self.keep_duty(&mut tx, dropped(*id, &stored, *reason))?;
+                let given_up = self.given_up(*id, &stored).await?;
+                self.keep_duty(&mut tx, dropped(*id, &stored, *reason, given_up))?;
                 self.unpark(Some(*id), &mut tx)?;
             }
             self.commit(tx).await?;
@@ -168,7 +173,39 @@ impl App {
     }
 }
 
-fn dropped(id: u64, stored: &ParkedEntry, reason: DropReason) -> Duty {
+impl App {
+    /// The `msg_id` of the message an entry dropped past the bounds gives up: only for an
+    /// entry that waited for a key, which passed the checks of its sender before it was
+    /// stored (Switch wire 5.1), so its `msg_id` is the signed one; and only when nothing
+    /// else may still apply the message: no other entry stored locally holds it, whatever
+    /// it waits for, no kept effect is its, and it isn't processed already. A copy dropped
+    /// while another waits names none; the last copy to go names it.
+    async fn given_up(&self, id: u64, stored: &ParkedEntry) -> Result<Option<String>, AppError> {
+        if stored.reason.awaited_epoch().is_none() {
+            return Ok(None);
+        }
+        let Some(msg_id) = super::parked::stored_msg_id(stored) else {
+            return Ok(None);
+        };
+        let held_elsewhere = self.state.parked.iter().any(|(other, entry)| {
+            *other != id
+                && entry.sender == stored.sender
+                && super::parked::stored_msg_id(entry).as_deref() == Some(msg_id.as_str())
+        });
+        let kept = self
+            .state
+            .pending_effect
+            .as_ref()
+            .is_some_and(|pending| pending.sender == stored.sender && pending.msg_id == msg_id);
+        let processed = self
+            .reader()
+            .exists(&super::state::key::processed(&stored.sender, &msg_id))
+            .await?;
+        Ok((!held_elsewhere && !kept && !processed).then_some(msg_id))
+    }
+}
+
+fn dropped(id: u64, stored: &ParkedEntry, reason: DropReason, msg_id: Option<String>) -> Duty {
     Duty::StoredEntryDropped {
         stored_id: id,
         seq: stored.seq,
@@ -176,6 +213,8 @@ fn dropped(id: u64, stored: &ParkedEntry, reason: DropReason) -> Duty {
         sender: stored.sender,
         accepted_at_ms: stored.accepted_at_ms,
         reason,
+        awaited_epoch: stored.reason.awaited_epoch(),
+        msg_id,
     }
 }
 

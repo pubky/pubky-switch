@@ -52,6 +52,15 @@ const FLAG_PREFIX: &str = "flag/";
 const CERT_PREFIX: &str = "ocert/";
 /// Set while the app owes a listing of its collections: at join, after a `missed` item.
 pub(crate) const LIST_DUE: &str = "list_due";
+/// Set in the commit that takes a scope key, while the records held `Unreadable` are owed
+/// a reopening ([`App::reopen_unreadable`]): cleared in the commit of a reopening that
+/// finished, so a store that fails between the two loses nothing.
+pub(crate) const REOPEN_DUE: &str = "reopen";
+/// The most times one read makes an owed reopening that fails ([`App::reopen_if_due`]):
+/// the first failure and one more try, such as after the page whose commit failed. The
+/// next read tries again.
+pub(crate) const REOPEN_TRIES_PER_READ: u32 = 2;
+
 /// How far an owed listing got ([`ListProgress`]), while it is owed.
 const LIST_AT: &str = "list_at";
 
@@ -1207,6 +1216,12 @@ impl App {
     /// still doesn't open with its key held is flagged and stays `Unreadable`; it is tried
     /// only at a fetch that takes a key, and when the write is read again, never at every
     /// read.
+    ///
+    /// The commit that takes the key keeps the reopening owed ([`REOPEN_DUE`]). The
+    /// reopened records are committed as `list_collection` commits a listing, a commit
+    /// whenever one more record might not fit, and only the last clears the mark: a failure
+    /// at any of them leaves it owed, the records committed before it opened, and the next
+    /// reading of the store goes on from there ([`App::reopen_if_due`]).
     pub(crate) async fn reopen_unreadable(&mut self) -> Result<(), AppError> {
         let held = self.reader().scan::<HeldRecord>(RECORD_PREFIX).await?;
         let mut tx = self.tx()?;
@@ -1229,6 +1244,10 @@ impl App {
             {
                 continue;
             }
+            if tx.size().saturating_add(LISTED_RECORD_ROOM_BYTES) > crate::store::MAX_BATCH_BYTES {
+                let full = std::mem::replace(&mut tx, self.tx()?);
+                self.commit(full).await?;
+            }
             let collection = Collection::new(&record.collection, record.policy.clone());
             let evidence = Evidence {
                 op: &record.op,
@@ -1240,8 +1259,42 @@ impl App {
             self.read_write(&evidence, Some((&put.key, &collection)), put.key, &mut tx)
                 .await?;
         }
+        if self.reader().exists(REOPEN_DUE).await? {
+            tx.delete(REOPEN_DUE)?;
+        }
         if !tx.is_empty() {
             self.commit(tx).await?;
+        }
+        Ok(())
+    }
+
+    /// The reopening a commit that took a scope key left owed, made now
+    /// ([`App::reopen_unreadable`]), never while a page's writes are open. It owes nothing
+    /// to the read: a reopening that fails keeps the mark, is reported
+    /// ([`AppEvent::ReopeningOwed`]) and is made again at the next read, and the read goes
+    /// on, from the store as committed when a commit failed. One read tries it at most
+    /// [`REOPEN_TRIES_PER_READ`] times once it fails.
+    ///
+    /// # Errors
+    ///
+    /// A store that can't be read, and an alarm the reopening raised, or any failure once
+    /// one is raised: the app is stopped, and the read ends there, so nothing is handed
+    /// over or sent after the alarm.
+    pub(crate) async fn reopen_if_due(&mut self) -> Result<(), AppError> {
+        if self.reopen_failures >= REOPEN_TRIES_PER_READ
+            || !self.reader().exists(REOPEN_DUE).await?
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.reopen_unreadable().await {
+            if matches!(error, AppError::Alarm(_)) || self.state.alarm.is_some() {
+                return Err(error);
+            }
+            self.reopen_failures = self.reopen_failures.saturating_add(1);
+            self.events.push(AppEvent::ReopeningOwed {
+                error: error.to_string(),
+            });
+            self.ready_local().await?;
         }
         Ok(())
     }
@@ -1918,6 +1971,11 @@ impl App {
         let new_value = accepted.content.value();
         // What the write builds on, and whether the app holds it (Switch spec 8.2, 10.3).
         let expected_version = accepted.version.expected_version;
+        // The write was verified before it got here, so its operation reads; its conditions
+        // are the ones it signed (Switch wire 6.3).
+        let conditions = SignedOp::peek(&accepted.op)
+            .map(|op| op.body().conditions.clone())
+            .unwrap_or_default();
         let base = WriteBase {
             expected_version,
             held: match &held {
@@ -1927,6 +1985,7 @@ impl App {
                 Some(held) => held.version == expected_version,
                 None => expected_version.is_none(),
             },
+            conditions,
         };
         if !own
             && let Some(mark) = &seen

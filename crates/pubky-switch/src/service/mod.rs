@@ -13,7 +13,8 @@
 //! `POST /v1/{id}/inbox`, `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`,
 //! `GET /v1/{id}/apps`, `POST /v1/{id}/apps/{app_id}/revoke`, `GET /v1/{id}/directory`,
 //! `GET` and `POST /v1/{id}/apps/{app_id}/keys`, `POST /v1/{id}/apps/{app_id}/leave`,
-//! `PUT` and `GET /v1/{id}/handover`, and `POST /v1/{id}/erase`. Every other call is answered
+//! `PUT` and `GET /v1/{id}/handover`, `POST /v1/{id}/erase`, and `PUT /v1/{id}/push`, whose
+//! registrations are kept while nothing is sent to a relay yet. Every other call is answered
 //! `503 unavailable`.
 
 mod admission;
@@ -33,12 +34,14 @@ mod inbox;
 mod keyed;
 mod peers;
 mod purge;
+mod push;
 mod records;
 mod recovery;
 pub mod rules;
 mod sweeps;
 mod upload;
 
+pub use push::Resolver;
 pub use recovery::AdmissionEnd;
 
 pub use enroll::announced_limits;
@@ -115,6 +118,11 @@ pub struct Service {
     changes: Arc<ChangeHub>,
     /// Where entry IDs come from: random, opaque to senders (Switch wire 1.7).
     entry_ids: EntryIds,
+    /// Whether the service takes push registrations (Switch wire 8.1); off, every one is
+    /// `400`, as a service that sends no pushes answers.
+    push_enabled: bool,
+    /// Resolves relay hosts for the address check (Switch wire 8.1, 8.2).
+    resolver: Resolver,
 }
 
 /// A source of entry IDs.
@@ -239,6 +247,8 @@ enum Prepared {
     /// A recovery upload's rate slot and its items, judged against the account as it stood
     /// before the lock (Switch wire 7.4.14).
     Upload(Box<upload::PreparedUpload>),
+    /// A push registration's body, checked, and the key minted for a start (Switch wire 8.1).
+    Push(Box<push::PreparedPush>),
 }
 
 fn store_error(error: &StoreError) -> ApiError {
@@ -295,7 +305,27 @@ impl Service {
             erasure_sweeps: KeyedWindows::default(),
             changes: ChangeHub::new(),
             entry_ids: Arc::new(random_entry_id),
+            push_enabled: false,
+            resolver: push::system_resolver(),
         }
+    }
+
+    /// The service with push registrations on or off (`push.enabled`, Switch wire 8.1): off,
+    /// the default while no push is sent, `PUT /push` is `400`, as at a service that sends
+    /// no pushes.
+    #[must_use]
+    pub fn with_push(mut self, enabled: bool) -> Self {
+        self.push_enabled = enabled;
+        self
+    }
+
+    /// The service resolving relay hosts with `resolver`, for tests whose relays have no
+    /// DNS names.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Resolver) -> Self {
+        self.resolver = resolver;
+        self
     }
 
     /// The service with entry IDs from `ids`, for tests that replay the vectors' fixed ones.
@@ -489,7 +519,8 @@ impl Service {
             | Call::GetAllow
             | Call::PostConnect
             | Call::GetConnect
-            | Call::DeleteConnect(_) => {
+            | Call::DeleteConnect(_)
+            | Call::PutPush => {
                 match self.authenticate_caller(&account, &request, base_ms, base_ms.max(stamped_ms))
                 {
                     Ok((claimed, cert)) => {
@@ -546,67 +577,92 @@ impl Service {
                 ))),
                 None => None,
             },
+            Call::PutPush => match verified.as_ref() {
+                Some(app) => Some(Prepared::Push(Box::new(
+                    self.prepare_push(
+                        &account,
+                        &app.app_id(),
+                        &request.body,
+                        base_ms.max(stamped_ms),
+                    )
+                    .await,
+                ))),
+                None => None,
+            },
             _ => None,
         };
-        // The reads that run after the lock on its snapshot take their account's turn and
-        // their reader first, so the lock is never held waiting for one. Only an own app's
-        // request whose signature verified takes them, one place per app: the signer's is
-        // refused under the lock without a read, and an app of another identity's was
-        // refused above. Whether the app is current and may read is judged under the lock.
-        let reading_app = verified
-            .as_ref()
-            .filter(|_| matches!(call, Call::GetAllow | Call::ListRecords))
-            .map(batch::VerifiedApp::app_id);
-        let begun = if let Some(app) = reading_app {
-            self.store.begin_reading(&account, app).await
-        } else {
-            self.store.begin(&account).await
+        // A key minted for a start goes once the request is over, unless its commit took it
+        // (Switch wire 8.1, `store::push`).
+        let reserved = match &prepared {
+            Some(Prepared::Push(push)) => push.reserved().cloned(),
+            _ => None,
         };
-        let txn = match begun {
-            Ok(Some(txn)) => txn,
-            // Erased between the lookup and the lock: as for an account the service doesn't
-            // host, the signer's answer held back while the erasure's keys are owed (7.4.16).
-            Ok(None) => {
-                let by_signer = caller.as_ref().is_some_and(|c| c.caller == Caller::Signer);
-                let error = self.no_such_account(&account, by_signer).await;
-                return self
-                    .operator_answer(request_signature.as_ref(), base_ms, &error)
-                    .await;
-            }
-            // The wait for the lock, or for a reader's turn, can outlast an erasure whose key
-            // stays owed: never signed with the key looked up before it (7.4.16).
-            Err(error) => {
-                let by_signer = caller.as_ref().is_some_and(|c| c.caller == Caller::Signer);
-                if let Some(error) = self
-                    .no_longer_keyed(&account, &looked_up_key, by_signer)
-                    .await
-                {
+        let response = async {
+            // The reads that run after the lock on its snapshot take their account's turn and
+            // their reader first, so the lock is never held waiting for one. Only an own app's
+            // request whose signature verified takes them, one place per app: the signer's is
+            // refused under the lock without a read, and an app of another identity's was
+            // refused above. Whether the app is current and may read is judged under the lock.
+            let reading_app = verified
+                .as_ref()
+                .filter(|_| matches!(call, Call::GetAllow | Call::ListRecords))
+                .map(batch::VerifiedApp::app_id);
+            let begun = if let Some(app) = reading_app {
+                self.store.begin_reading(&account, app).await
+            } else {
+                self.store.begin(&account).await
+            };
+            let txn = match begun {
+                Ok(Some(txn)) => txn,
+                // Erased between the lookup and the lock: as for an account the service doesn't
+                // host, the signer's answer held back while the erasure's keys are owed (7.4.16).
+                Ok(None) => {
+                    let by_signer = caller.as_ref().is_some_and(|c| c.caller == Caller::Signer);
+                    let error = self.no_such_account(&account, by_signer).await;
                     return self
                         .operator_answer(request_signature.as_ref(), base_ms, &error)
                         .await;
                 }
-                return refused_early(store_error(&error)).await;
-            }
-        };
-        let signature = if caller.is_some() {
-            request_signature
-        } else {
-            // The public read's answer signs the hash of the empty string as the request
-            // signature, so it is the same for every reader (Switch wire 7.4.15).
-            None
-        };
-        self.at_account(
-            txn,
-            &request,
-            base_ms,
-            due,
-            signature,
-            caller.as_ref(),
-            verified.as_ref(),
-            other.as_ref(),
-            prepared.as_ref(),
-        )
-        .await
+                // The wait for the lock, or for a reader's turn, can outlast an erasure whose key
+                // stays owed: never signed with the key looked up before it (7.4.16).
+                Err(error) => {
+                    let by_signer = caller.as_ref().is_some_and(|c| c.caller == Caller::Signer);
+                    if let Some(error) = self
+                        .no_longer_keyed(&account, &looked_up_key, by_signer)
+                        .await
+                    {
+                        return self
+                            .operator_answer(request_signature.as_ref(), base_ms, &error)
+                            .await;
+                    }
+                    return refused_early(store_error(&error)).await;
+                }
+            };
+            let signature = if caller.is_some() {
+                request_signature
+            } else {
+                // The public read's answer signs the hash of the empty string as the request
+                // signature, so it is the same for every reader (Switch wire 7.4.15).
+                None
+            };
+            self.at_account(
+                txn,
+                &request,
+                base_ms,
+                due,
+                signature,
+                caller.as_ref(),
+                verified.as_ref(),
+                other.as_ref(),
+                prepared.as_ref(),
+            )
+            .await
+        }
+        .await;
+        if let Some(key) = reserved {
+            self.delete_owed_keys(&[key]).await;
+        }
+        response
     }
 
     /// An answer before the account's lock: signed with its service key, at the service time
@@ -962,6 +1018,8 @@ impl Service {
         } else {
             None
         };
+        // The push keys the request let go (Switch wire 8.1), deleted once it commits.
+        let owed = txn.owed_keys().to_vec();
         // Durable, then answered (step 10). An answer is sent even when the request only
         // stamped the time, which must be durable before it is shown. A serving account's
         // commit moves the key's mark to the head the answer carries.
@@ -984,6 +1042,8 @@ impl Service {
         // The outgoing key, retired by the change, goes once the change is durable.
         if rekeyed.is_some() && committed.is_ok() {
             let _ = self.sweep_erased_keys().await;
+        } else if !owed.is_empty() && committed.is_ok() {
+            self.delete_owed_keys(&owed).await;
         }
         match committed {
             Ok(()) => {
@@ -1620,6 +1680,21 @@ impl Service {
                 };
                 return self
                     .get_handover(txn, signer, reader)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::PutPush => {
+                // An own app sets its own (Switch wire 8.1).
+                let Some(caller) = writer.as_ref() else {
+                    return Err(Refused::with_head(rules::other_app_refusal(call), serving));
+                };
+                let prepared = match prepared {
+                    Some(Prepared::Push(prepared)) => Some(&**prepared),
+                    _ => None,
+                };
+                return self
+                    .put_push(txn, signer, caller.app_id(), prepared, time_ms)
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
