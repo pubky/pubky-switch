@@ -56,7 +56,7 @@ use serde_json::{Map, Value};
 use super::admission::allow_key;
 use super::batch::OpBatch;
 use super::directory::Route;
-use super::error::Refusal;
+use super::error::{Refusal, WontDeliver};
 use super::events::{AppEvent, Duty};
 use super::records::{Collection, RecordTarget};
 use super::state::key;
@@ -93,6 +93,9 @@ const RESEALS: usize = 2;
 const OUT_PREFIX: &str = "out/";
 const SENT_PREFIX: &str = "sent/";
 const SENT_TIME_PREFIX: &str = "sentt/";
+/// A message whose delivery the app gave up, with the time until which
+/// [`App::queue_stored`] refuses it (`STATE.md`).
+const GIVEN_UP_PREFIX: &str = "outgone/";
 
 fn out_key(msg_id: &str) -> String {
     format!("{OUT_PREFIX}{msg_id}")
@@ -104,6 +107,25 @@ fn sent_key(msg_id: &str) -> String {
 
 fn sent_time_key(at: u64, msg_id: &str) -> String {
     format!("{SENT_TIME_PREFIX}{}/{msg_id}", key::num(at))
+}
+
+fn given_up_key(msg_id: &str) -> String {
+    format!("{GIVEN_UP_PREFIX}{msg_id}")
+}
+
+/// Note in `tx` that the delivery of `msg_id` was given up at `now`, in the commit that
+/// gives it up and tells the protocol: [`App::queue_stored`] refuses the message from then
+/// until [`SENT_RETENTION_MS`] later, past which its replay deadline refuses it anyway, so
+/// the protocol is told once.
+pub(crate) fn note_given_up(
+    tx: &mut super::state::Tx,
+    msg_id: &str,
+    now: u64,
+) -> Result<(), AppError> {
+    tx.put(
+        &given_up_key(msg_id),
+        &now.saturating_add(SENT_RETENTION_MS),
+    )
 }
 
 /// The shared record a sent message is written into (Switch spec 8.2), and the protocol's
@@ -425,9 +447,11 @@ pub(crate) struct OutboxItem {
     /// A re-send queued from `sent/`: the recipient accepted the message before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     resend_queued: bool,
-    /// The last time a delivery may go, for a message a restore put back: past it, the
-    /// recipient may have forgotten the processed pair of a copy the device the backup came
-    /// from delivered (Switch spec 11). Kept through later backups, never moved on.
+    /// The last time a delivery may go, for a message a restore put back or
+    /// [`App::queue_stored`] queued: past it, the recipient may have forgotten the processed
+    /// pair of a copy another device delivered (Switch spec 11). Kept through later backups,
+    /// never moved on, and carried into `sent/` at its acceptance, so a re-send of it keeps
+    /// the deadline too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replay_until_ms: Option<u64>,
     /// The batch a try of the record job left kept, the latest one, in base64: named when
@@ -531,6 +555,13 @@ impl OutboxItem {
         self.replay_until_ms
     }
 
+    /// Whether the delivery notifies the recipient, and whether it owes a conversation
+    /// entry.
+    #[cfg(test)]
+    pub(crate) fn notify_and_conversation(&self) -> (bool, bool) {
+        (self.notify, self.conversation)
+    }
+
     /// The bytes the item takes in the store.
     fn stored_bytes(&self) -> u64 {
         super::state::encode(self).map_or(u64::MAX, |bytes| {
@@ -600,6 +631,12 @@ struct SentStored {
     first_ms: u64,
     /// The acceptances of re-sends.
     resent: Vec<u64>,
+    /// The last time a re-send may go, carried from the outbox item a restore put back or
+    /// [`App::queue_stored`] queued ([`OutboxItem::replay_until`]): its first acceptance
+    /// here may be later than the message's first acceptance anywhere, so the retention of
+    /// this copy doesn't bound its re-sends (Switch spec 11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay_until_ms: Option<u64>,
 }
 
 impl SentStored {
@@ -761,19 +798,34 @@ impl App {
     ///
     /// The plaintext must be signed with this app's key, the one its certificate names,
     /// with the App ID and `from` of this app and identity; the recipient, the kind and the
-    /// `msg_id` are the message's. It is queued as [`App::queue_signed`] queues one: pushed,
-    /// with the conversation entry its kind needs, and no record job, since the record holds
-    /// it already. A message the outbox holds, or that was sent, is left as it is, so the
-    /// call queues it once however often it is made. A recipient that processed the
-    /// message drops a copy as a duplicate only while it keeps the pair, so the copy is
-    /// delivered only until [`SENT_RETENTION_MS`] from the message's `created_at`, less
-    /// the clock tolerance; past that, it is given up and
-    /// [`AppEvent::MessageUndelivered`] tells the protocol.
+    /// `msg_id` are the message's. It is queued as [`App::queue_signed`] queues one, with
+    /// the conversation entry its kind needs, and no record job, since the record holds it
+    /// already. The copy carries no invite code and notifies the recipient: a first message
+    /// that needed an invite code is for the host to send again with one.
+    ///
+    /// The call queues the message once however often it is made, while the outbox holds
+    /// it or the app keeps it as sent; it then returns the `msg_id` and changes nothing.
+    /// After that it is refused with [`Refusal::WontDeliver`], and queues nothing and raises
+    /// no event:
+    ///
+    /// - [`WontDeliver::PastReplayWindow`]: past [`SENT_RETENTION_MS`] from the message's
+    ///   `created_at`, less the clock tolerance, by the later of the device clock and a
+    ///   service time the app verified. A recipient that processed the message drops a copy
+    ///   as a duplicate only while it keeps the pair, so a copy, and any re-send of it, goes
+    ///   only until then; one queued in time and still undelivered then is given up, and
+    ///   [`AppEvent::MessageUndelivered`] tells the protocol, once.
+    /// - [`WontDeliver::GivenUp`]: the app gave its delivery up already, and told the
+    ///   protocol then.
+    /// - [`WontDeliver::TooLarge`]: its outbox record is over the store's sizes.
+    ///
+    /// So for one message the call never leads to a second [`AppEvent::MessageUndelivered`],
+    /// nor to one with `resend: false` once this app had a copy of it accepted.
     ///
     /// # Errors
     ///
-    /// [`Refusal::Stopped`] or [`Refusal::Left`]; [`Refusal::Usage`] for a plaintext that
-    /// doesn't read as a message, or that this app didn't sign; a store failure.
+    /// [`Refusal::Stopped`] or [`Refusal::Left`]; [`Refusal::WontDeliver`] as above;
+    /// [`Refusal::Usage`] for a plaintext that doesn't read as a message, or that this app
+    /// didn't sign; a store failure.
     pub async fn queue_stored(&mut self, plaintext: &MessagePlaintext) -> Result<String, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
@@ -782,10 +834,29 @@ impl App {
             if self.knows_message(&item.msg_id).await? {
                 return Ok(item.msg_id);
             }
-            let mut tx = self.tx()?;
-            put_outbox_item(&mut tx, &item)?;
-            self.commit(tx).await?;
-            Ok(item.msg_id)
+            let refused = |why| Err(AppError::Refused(Refusal::WontDeliver(why)));
+            let given_up: Option<u64> = self.reader().get(&given_up_key(&item.msg_id)).await?;
+            if given_up.is_some_and(|until| self.now() <= until) {
+                return refused(WontDeliver::GivenUp);
+            }
+            if let Some(until_ms) = item.replay_until_ms
+                && self.kept_window_now() > until_ms
+            {
+                return refused(WontDeliver::PastReplayWindow { until_ms });
+            }
+            let written = async {
+                let mut tx = self.tx()?;
+                put_outbox_item(&mut tx, &item)?;
+                self.commit(tx).await
+            }
+            .await;
+            match written {
+                Err(AppError::Store(StoreError::TooLarge { .. })) => {
+                    self.reload_now().await?;
+                    refused(WontDeliver::TooLarge)
+                }
+                committed => committed.map(|()| item.msg_id),
+            }
         })
         .await
     }
@@ -972,7 +1043,7 @@ impl App {
             undeliverable_last_ms: None,
             undeliverable_tries: 0,
             resend_queued: true,
-            replay_until_ms: None,
+            replay_until_ms: sent.replay_until_ms,
             record_batch: None,
         };
         let mut tx = self.tx()?;
@@ -1185,6 +1256,7 @@ impl App {
             let mut tx = self.tx()?;
             if gone {
                 tx.delete(&out_key(msg_id))?;
+                note_given_up(&mut tx, msg_id, self.now())?;
             } else {
                 tx.put(&out_key(msg_id), &item)?;
             }
@@ -1213,8 +1285,9 @@ impl App {
         if item.failed.is_some() {
             return Ok(false);
         }
-        // A delivery a restore put back goes only by its replay deadline, judged at the later
-        // of the device clock and a service time verified in this call (Switch spec 11).
+        // A delivery with a replay deadline, one a restore put back, one `queue_stored`
+        // queued, or a re-send of either, goes only by it, judged at the later of the device
+        // clock and a service time verified in this call (Switch spec 11).
         if item.delivery_owed()
             && let Some(deadline) = item.replay_until_ms
         {
@@ -1229,7 +1302,10 @@ impl App {
                 let mut tx = self.tx()?;
                 match &kept {
                     Some(kept) => tx.put(&out_key(msg_id), kept)?,
-                    None => tx.delete(&out_key(msg_id))?,
+                    None => {
+                        tx.delete(&out_key(msg_id))?;
+                        note_given_up(&mut tx, msg_id, self.now())?;
+                    }
                 }
                 self.keep_duty(&mut tx, duty)?;
                 self.commit(tx).await?;
@@ -1329,6 +1405,7 @@ impl App {
         let mut tx = self.tx()?;
         if gone {
             tx.delete(&out_key(&item.msg_id))?;
+            note_given_up(&mut tx, &item.msg_id, self.now())?;
         } else {
             tx.put(&out_key(&item.msg_id), &*item)?;
         }
@@ -1375,6 +1452,10 @@ impl App {
                 if at != sent.first_ms && !sent.resent.contains(&at) {
                     sent.resent.push(at);
                 }
+                sent.replay_until_ms = [sent.replay_until_ms, item.replay_until_ms]
+                    .into_iter()
+                    .flatten()
+                    .min();
                 sent
             }
             None => {
@@ -1386,6 +1467,7 @@ impl App {
                     plaintext: item.plaintext.clone(),
                     first_ms: first,
                     resent: if at == first { Vec::new() } else { vec![at] },
+                    replay_until_ms: item.replay_until_ms,
                 }
             }
         };
@@ -1453,6 +1535,12 @@ impl App {
             }
             tx.delete(&sent_key(msg_id))?;
             tx.delete(&sent_time_key(at, msg_id))?;
+        }
+        let now = self.now();
+        for (msg_id, until) in self.reader().scan::<u64>(GIVEN_UP_PREFIX).await? {
+            if until < now {
+                tx.delete(&given_up_key(&msg_id))?;
+            }
         }
         if !tx.is_empty() {
             self.commit(tx).await?;

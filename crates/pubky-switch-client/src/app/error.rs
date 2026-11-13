@@ -116,6 +116,28 @@ pub enum Refusal {
         /// The owed protocol calls it would carry.
         owed_calls: u64,
     },
+    /// [`super::App::queue_stored`] queued nothing: the message can no longer be delivered
+    /// safely, or no longer fits. Nothing was written and no event raised.
+    WontDeliver(WontDeliver),
+}
+
+/// Why [`super::App::queue_stored`] queued nothing ([`Refusal::WontDeliver`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WontDeliver {
+    /// Past the message's replay deadline, [`super::SENT_RETENTION_MS`] from its
+    /// `created_at` less the clock tolerance, by the later of the device clock and a service
+    /// time the app verified: a recipient that processed it may have forgotten the pair, and
+    /// would process a copy as new (Switch spec 11).
+    PastReplayWindow {
+        /// The deadline, Unix milliseconds.
+        until_ms: u64,
+    },
+    /// This app gave the message's delivery up already, and told the protocol so then
+    /// ([`super::AppEvent::MessageUndelivered`]).
+    GivenUp,
+    /// Its outbox record is over the store's sizes.
+    TooLarge,
 }
 
 impl std::fmt::Display for Refusal {
@@ -131,6 +153,18 @@ impl std::fmt::Display for Refusal {
             }
             Refusal::NotNow(why) => write!(f, "not now: {why}"),
             Refusal::Usage(why) => write!(f, "usage: {why}"),
+            Refusal::WontDeliver(WontDeliver::PastReplayWindow { until_ms }) => {
+                write!(
+                    f,
+                    "not queued: past the message's replay deadline, {until_ms}"
+                )
+            }
+            Refusal::WontDeliver(WontDeliver::GivenUp) => {
+                f.write_str("not queued: the message's delivery was given up")
+            }
+            Refusal::WontDeliver(WontDeliver::TooLarge) => {
+                f.write_str("not queued: the message's outbox record is over the store's sizes")
+            }
             Refusal::CarriedTooLarge {
                 duty_events,
                 owed_calls,

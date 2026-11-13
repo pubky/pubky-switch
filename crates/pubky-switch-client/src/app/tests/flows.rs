@@ -783,6 +783,8 @@ async fn test_missed_entries_last_time_unparsable_asks_for_nothing() {
     assert!(w.protocol.missed.lock().unwrap().is_empty());
     assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
     assert!(app.cursor().seq >= behind && behind > seq);
+    // The listing it owes was made: none is owed any more, and the item behind was read.
+    assert!(!app.listing_owed().await.unwrap());
 }
 
 /// A missed-entries call kept owed in the form written before, without the item's last

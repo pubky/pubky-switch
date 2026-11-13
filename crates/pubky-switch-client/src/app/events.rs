@@ -678,13 +678,19 @@ pub enum AppEvent {
     /// make: it was deleted from the outbox at once. Also a message a restore didn't
     /// deliver again because its backup was older than [`super::SENT_RETENTION_MS`]: the
     /// device the backup came from may have delivered it since ([`super::App::backup`]).
-    /// A duty event.
+    /// Also a delivery with a replay deadline not made by it: one a restore put back, a copy
+    /// [`super::App::queue_stored`] queued, or a re-send of either (Switch spec 11). Once a
+    /// delivery is given up, `queue_stored` refuses the message
+    /// ([`super::WontDeliver::GivenUp`]), so a protocol hears of it once. A duty event.
     MessageUndelivered {
         /// The duty event's ID.
         id: EventId,
         /// The message ID.
         msg_id: String,
-        /// Whether it was a re-send of a message accepted before.
+        /// Whether this app had the message accepted before, and only a re-send of it was
+        /// given up. `false` says that this app's store never saw it accepted: a message a
+        /// restore put back, or one queued again with `queue_stored`, may still have been
+        /// delivered by the device the backup came from.
         resend: bool,
     },
     /// The shared record write a sent message named ([`super::RecordJob`]) was given up:
