@@ -28,6 +28,29 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  protocol-names:
+    name: No protocol named in the Switch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The Switch holds no rule, name or definition of a protocol built on it. The README
+      # names the first such protocol in one sentence; no other tracked file names it.
+      # CLAUDE.md holds the contributors' rule about this and is left out. The pattern is
+      # written so that this file doesn't match it.
+      - name: Only the README's one sentence names the first protocol
+        run: |
+          pattern='p[a]ykit'
+          if git grep -I -i -n -E "$pattern" -- . ':!README.md' ':!CLAUDE.md'; then
+            echo "these files name a protocol built on the Switch"
+            exit 1
+          fi
+          lines=$(git grep -I -i -c -E "$pattern" -- README.md | cut -d: -f2)
+          if [ "${lines:-0}" -gt 1 ]; then
+            echo "README.md names it on $lines lines, not one"
+            exit 1
+          fi
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
