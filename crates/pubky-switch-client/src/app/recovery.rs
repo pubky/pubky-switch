@@ -560,6 +560,7 @@ impl App {
             key_checked: true,
             own_key_n: Some(n),
             reconcile: true,
+            key_current: None,
         });
         restore.reconcile = true;
         tx.put(key::RESTORE, restore)?;

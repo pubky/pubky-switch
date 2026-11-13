@@ -529,6 +529,7 @@ mod tests {
             },
             scanned_through: last,
             more,
+            cursor: None,
             head,
             checkpoint: None,
             freeze: None,

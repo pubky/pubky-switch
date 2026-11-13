@@ -40,6 +40,7 @@ mod error;
 mod events;
 mod feed;
 mod forget;
+mod held_cursor;
 mod identity;
 mod kept;
 mod keys;
@@ -76,6 +77,7 @@ pub use events::{
     ParkReason, RefusedCall,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
+pub use held_cursor::HeldCursor;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use kept::{KeptBatch, KeptBatchDrop, KeptBatchStatus};
 pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
@@ -595,6 +597,8 @@ pub(crate) struct AppState {
     pub(crate) accepted: Option<SignedDoc>,
     pub(crate) alarm: Option<Alarm>,
     pub(crate) restore: Option<RestoreState>,
+    /// The last restore's check of the cursor the service holds (`hcur`).
+    pub(crate) restore_cursor: Option<held_cursor::RestoreCursor>,
     pub(crate) leave: Option<LeaveState>,
     pub(crate) service_time: Option<ServiceTime>,
     /// The app isn't current any more, or its account is gone: every read stops.
@@ -649,6 +653,12 @@ pub struct App {
     peer_rereads: HashMap<[u8; 32], u64>,
     /// How many reads ([`App::receive`]) this app began since it was loaded.
     reads_begun: u64,
+    /// The worst held-cursor verdict of the read under way's pages ([`HeldCursor::worse`]),
+    /// taken into its report. In memory only.
+    held_cursor_read: Option<HeldCursor>,
+    /// The highest held cursor reported ahead with [`AppEvent::HeldCursorAhead`], so a report
+    /// isn't told again at every page. In memory only.
+    held_ahead_told: Option<u64>,
     /// How many times an owed reopening failed in the read under way ([`App::receive`]):
     /// after [`records::REOPEN_TRIES_PER_READ`], it is left for the next read. In memory
     /// only.
@@ -874,6 +884,7 @@ impl App {
                 accepted: None,
                 alarm: None,
                 restore: None,
+                restore_cursor: None,
                 leave: None,
                 service_time: None,
                 gone: None,
@@ -905,6 +916,8 @@ impl App {
                 read_done_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
+                held_cursor_read: None,
+                held_ahead_told: None,
                 reopen_failures: 0,
             };
             app.update_keys_through();
@@ -1044,6 +1057,8 @@ impl App {
                 read_done_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
+                held_cursor_read: None,
+                held_ahead_told: None,
                 reopen_failures: 0,
             };
             // A store an earlier build wrote keeps the epoch read now.
@@ -1129,6 +1144,7 @@ impl App {
             accepted: reader.get(key::ACCEPTED_RECORD).await?,
             alarm: reader.get(key::ALARM).await?,
             restore: reader.get(key::RESTORE).await?,
+            restore_cursor: reader.get(key::RESTORE_CURSOR).await?,
             leave,
             service_time: reader.get(key::SERVICE_TIME).await?,
             gone: reader.get(provider::keys::GONE).await?,
@@ -1728,6 +1744,14 @@ impl App {
                     key_checked: false,
                     own_key_n: None,
                     reconcile: true,
+                    key_current: None,
+                }),
+                // Checked at the first page after the restore, against the backup's
+                // committed position (Switch spec 12.4 "The held cursor").
+                restore_cursor: Some(held_cursor::RestoreCursor {
+                    generation: backup.cursor.generation,
+                    seq: backup.cursor.seq,
+                    verdict: None,
                 }),
                 leave: None,
                 service_time: None,
@@ -1796,6 +1820,8 @@ impl App {
                 read_done_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
+                held_cursor_read: None,
+                held_ahead_told: None,
                 reopen_failures: 0,
             };
             // Every write of the one commit; what fails here is mostly a write the store
@@ -1919,6 +1945,9 @@ impl App {
         }
         tx.put(key::STORED_NEXT, &s.next_stored_id)?;
         tx.put(key::JOIN, &s.join)?;
+        if let Some(check) = &s.restore_cursor {
+            tx.put(key::RESTORE_CURSOR, check)?;
+        }
         if let Some(restore) = &s.restore {
             tx.put(key::RESTORE, restore)?;
         }
@@ -2785,6 +2814,7 @@ impl App {
     /// that generation's key (Switch wire 6.4 step 6).
     pub(crate) async fn submit(&mut self, batch: &Batch) -> Result<Submitted, AppError> {
         self.refuse_before_upload_of(Some(batch)).await?;
+        self.note_cursor_sent(batch).await?;
         let generation = batch_generation(batch);
         let result = match generation.filter(|g| *g < self.state.meta.generation) {
             Some(earlier) => match self.service_key_of(earlier).await? {

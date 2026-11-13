@@ -253,6 +253,9 @@ pub struct FeedPage {
     pub scanned_through: u64,
     /// Whether items follow `scanned_through`.
     pub more: bool,
+    /// The `seq` of the caller's cursor the service holds, 0 before its first move (Switch
+    /// spec 8.3); `None` from a service of an earlier version, which is no report.
+    pub cursor: Option<u64>,
     /// The newest head, verified with the pinned key.
     pub head: SignedHead,
     /// The service's latest checkpoint, verified with the pinned key.
@@ -279,6 +282,7 @@ impl FeedPage {
             next,
             scanned_through: o.u64("scanned_through")?,
             more: o.bool("more")?,
+            cursor: o.opt_u64("cursor")?,
             head: o.head("head")?,
             checkpoint: o.opt_head("checkpoint")?,
             freeze,

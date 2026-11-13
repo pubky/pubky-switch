@@ -139,6 +139,10 @@ pub struct ReceiveReport {
     /// locally that a read didn't retry don't set it: they are retried at the next read
     /// whenever it comes. The host calls [`App::receive`] again without waiting.
     pub more: bool,
+    /// What the cursor the service holds said beside the furthest position the app
+    /// committed or sent, the worst of the read's pages (Switch spec 8.3); `None` when the
+    /// read read no page.
+    pub held_cursor: Option<super::HeldCursor>,
 }
 
 /// How far an item lets the cursor go.
@@ -490,6 +494,7 @@ impl App {
         budget: &super::CallBudget,
     ) -> Result<ReceiveReport, AppError> {
         self.reads_begun = self.reads_begun.wrapping_add(1);
+        self.held_cursor_read = None;
         // Where a wait for the feed starts once this read is done ([`App::feed_wait`]): set
         // again by a read that gets that far.
         self.next_wait = super::wait::NextWait::Cursor;
@@ -788,6 +793,7 @@ impl App {
                 })
         };
         report.cursor = self.cursor();
+        report.held_cursor = self.held_cursor_read.take();
         Ok(report)
     }
 
@@ -867,6 +873,9 @@ impl App {
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
         }
+        // The cursor the service holds, before anything of the page is processed (Switch
+        // spec 8.3).
+        self.compare_held_cursor(page.cursor, &mut read.tx).await?;
         if let Some(freeze) = &page.freeze {
             // Nothing on a frozen service's page is processed: its items come again from
             // the next service (`provider.rs`).
