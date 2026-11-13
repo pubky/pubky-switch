@@ -382,9 +382,12 @@ impl App {
     /// two items, never inside a batch's items; the next read goes on from where it got
     /// (`feed_at`). The time budget ([`super::AppConfig::call_budget_ms`], 20 s by default)
     /// bounds the steps that loop: the kept batches, the listing, the stored entries, the
-    /// feed and the rereads. Once it is spent each of them starts no further request after
-    /// its first, which it makes whatever the time, so no step waits for ever behind a slow
-    /// one. It doesn't bound the whole read:
+    /// feed and the rereads. Once it is spent each of them starts no further unit after its
+    /// first, a kept batch, a listing page, a stored entry, a page or a reread, which it
+    /// makes whatever the time with the requests that unit needs (a kept batch's time
+    /// sample and its send again after `409 stale_generation`, a stored entry's own
+    /// requests, as a feed item's), so no step waits for ever behind a slow one. It doesn't
+    /// bound the whole read:
     /// - an item processed after it still makes its own requests, its sender's
     ///   `identity.json` and its effect's batch;
     /// - the read's other steps take no budget and make their requests whatever the time,
@@ -395,13 +398,14 @@ impl App {
     /// - a move or provider change met during the read is followed, which the budget doesn't
     ///   bound either, and the read then goes on once more under the same budget.
     ///
-    /// So a read ends after its budget, one request of each looping step and the requests
-    /// of the item it stopped on and of those other steps, each request within its timeout.
-    /// Once the budget is spent, the rest of a page already downloaded is dropped, past the
-    /// one item or batch processed, and the next read downloads that page again.
+    /// So a read ends after its budget, the first unit of each looping step and the
+    /// requests of the item it stopped on and of those other steps, each request within its
+    /// timeout. Once the budget is spent, the rest of a page already downloaded is dropped,
+    /// past the items processed, and the next read downloads that page again.
     ///
-    /// **Order.** The kept batches go before the feed, oldest first, and no later write of
-    /// the host overtakes them ([`App::submit_batch`]). The read's own writes aren't kept
+    /// **Order.** The kept batches go before the feed, oldest first, and no later write
+    /// through [`App::submit_batch`], [`App::write_claim`], the record writes or the
+    /// admission writes overtakes them. The read's own writes aren't kept
     /// batches: the effects of the messages it processes, its cursor moves and a rotation
     /// go as the read makes them, also when it left kept batches unsent, on its budget or
     /// because their resend failed. So a read's own write may reach the switch before a

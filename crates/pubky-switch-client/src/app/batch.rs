@@ -323,8 +323,12 @@ impl App {
     /// builds the batch again ([`App::record_op`] seals at the epoch the app holds then).
     ///
     /// **Kept batches ahead, and the worst case.** A batch kept from an earlier call goes
-    /// before any later write, in the order the calls kept them, and no later write of the
-    /// host overtakes it; this is the client's rule, the switch orders only what reaches it.
+    /// before any later write, in the order the calls kept them, and no later write through
+    /// this call, [`App::write_claim`], the record writes or the admission writes overtakes
+    /// it; this is the client's rule, the switch orders only what reaches it. The one
+    /// exception is the best-effort `failed` write of an own attempt whose proof shows
+    /// another state ([`App::check_attempt`]): it goes at once, and its claim entry carries
+    /// a step condition, so it can't land on a state it doesn't fit.
     /// A write sends at most one of them again ([`KEPT_RESENDS_PER_WRITE`]) before its own.
     /// With more kept, its own batch is kept unsent behind them and the call fails with
     /// [`AppError::Kept`] around [`Refusal::KeptBatchesAhead`], which names the oldest and

@@ -33,7 +33,14 @@ use super::{BoxFuture, Header, Request, Response, Transport, TransportError};
 /// of at most a mebibyte gets [`HttpConfig::request_timeout_ms`] and a share of what the
 /// long timeout adds to it, in proportion to its body: about the short timeout for a batch
 /// of a few KiB, the long one for a batch of a mebibyte. So a slow uplink that sends a
-/// mebibyte within the long timeout's extra time sends every smaller batch too. Every
+/// mebibyte within the long timeout's extra time sends every smaller batch too. The share
+/// grows with the request body only, not with the answer: a small batch whose answer is a
+/// `409 conflict` carrying a large record's view, up to about 950 KB (7.1 "Answer sizes"),
+/// gets the short timeout all the same. On a downlink below about 1 Mbit/s such an answer
+/// doesn't arrive in time, so the batch stays kept, each resend meets the same conflict
+/// and times out the same way, and the writes behind it wait until its answer window ends
+/// (`KEPT_BATCH_ANSWER_MS`): a host on such a link raises [`HttpConfig::request_timeout_ms`].
+/// Every
 /// other call gets [`HttpConfig::request_timeout_ms`], the time sample a write takes first
 /// among them: a feed read of one item with no wait. At the limits some long calls carry
 /// tens of megabytes: a host on a slow network raises the settings.
