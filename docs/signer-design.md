@@ -110,7 +110,7 @@ pub trait Protocol: Send + Sync {
 }
 ```
 
-- **Several protocols:** the signer holds a `Protocols` set. Building it refuses an empty set, a malformed or repeated protocol name, a protocol that owns no scope, a scope name that breaks the scope rule or has a sub-scope, and one name declared twice. An app may hold scopes of several protocols: each protocol sees only its own, the permissions are the union, written in the Switch's fixed order (wire 3.1), and the keyed scopes are those whose owner marks them.
+- **Several protocols:** the signer holds a `Protocols` set. Building it refuses an empty set, a malformed or repeated protocol name, a protocol that owns no scope, a scope name that breaks the scope rule or has a sub-scope, a scope whose root isn't the protocol's own (wire 3.1 Scope roots), and one name declared twice. An app may hold scopes of several protocols: each protocol sees only its own, the permissions are the union, written in the Switch's fixed order (wire 3.1), and the keyed scopes are those whose owner marks them.
 - **What the set gives:** `terms(scopes)` checks a request and returns its permissions and keyed scopes; `knows_scope` and `has_keys` are the predicates the core's app request check and key bundle functions take; `grant_paths` gives the paths for the core's caps check, and `check_grant_paths` each protocol's rule on the paths a grant would cover; `unowned` lists the scopes no registered protocol owns.
 - **The Switch's own rules stay in the signer and the core:**
   - the scope rule and the 32-scope bound, and no name beside its own sub-scope;
