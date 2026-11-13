@@ -1355,16 +1355,23 @@ impl App {
         self.note_known_version(pubky, version).await
     }
 
+    /// Whether a pass of the deliveries of [`App::deliver_to_recent_peers`] is under way.
+    pub(crate) async fn peers_pass_open(&self) -> Result<bool, AppError> {
+        let judged: PeersDoc = self.reader().get(PEERS_DOC).await?.unwrap_or_default();
+        Ok(judged.untried > 0)
+    }
+
     /// After an own `identity.json` that removes an app or closes a renewal, deliver it to
     /// the switches the app wrote to in the last 30 days whose copy is older, by the
     /// `known_version` they last answered (Switch spec 12.2 step 5, 3.2). The ones that fail
     /// stay owed, each on its own, and are tried again by a later call.
     ///
     /// The deliveries go in passes, each trying every owed switch once. Past the call's
-    /// `budget`, once one was tried, the rest of the pass is left to the next call, and it
-    /// returns `true`; the next call tries only those. A switch whose delivery failed goes
-    /// behind them, so one slow failing switch holds up no other. The call that ends a pass
-    /// returns `false`, failed switches still owed, and the call after starts a new pass.
+    /// `budget`, once a unit of the call went (`units`, counted with the call's other
+    /// units), the rest of the pass is left to the next call, and it returns `true`; the next
+    /// call tries only those. A switch whose delivery failed goes behind them, so one slow
+    /// failing switch holds up no other. The call that ends a pass returns `false`, failed
+    /// switches still owed, and the call after starts a new pass.
     ///
     /// # Errors
     ///
@@ -1372,6 +1379,7 @@ impl App {
     pub(crate) async fn deliver_to_recent_peers(
         &mut self,
         budget: &super::CallBudget,
+        units: &mut usize,
     ) -> Result<bool, AppError> {
         let own = self.state.own_doc.clone();
         let mut judged: PeersDoc = self.reader().get(PEERS_DOC).await?.unwrap_or_default();
@@ -1429,10 +1437,10 @@ impl App {
         let tried_before = owed.split_off(pass);
         let mut skipped = Vec::new();
         let mut failed = Vec::new();
-        let mut sent = 0usize;
         for rest in owed {
-            // Past the call's time budget, once one went, the rest are owed to a later call.
-            if sent > 0 && self.spent(budget) {
+            // Past the call's time budget, once a unit of the call went, the rest are owed to
+            // a later call.
+            if *units > 0 && self.spent(budget) {
                 skipped.push(rest);
                 continue;
             }
@@ -1443,7 +1451,7 @@ impl App {
             if !recent(&peer) {
                 continue;
             }
-            sent += 1;
+            *units += 1;
             match self.deliver_own_identity(&pubky, None, false).await {
                 Ok(()) => {}
                 Err(error @ (AppError::Alarm(_) | AppError::Store(_))) => return Err(error),

@@ -201,13 +201,20 @@ pub struct AppConfig {
     /// needs public data does (Switch spec 4.2); such an app leaves in two steps (Switch spec
     /// 12.3). It needs [`AppEnv::homeserver_writer`].
     pub publishes_record: bool,
-    /// The time budget of [`App::receive`] and [`App::update_record`], in milliseconds by
-    /// the app's clock: 20 s by default. Once it has passed since the call began, a read's
-    /// looping steps start no further request, each after its first, and the read says
-    /// [`ReceiveReport::more`], what is left kept for the next read; `update_record` tries
-    /// no further write. It bounds when those steps stop, not the call's whole time: each
-    /// call's docs state what it may still send after the budget ran out. A write
-    /// ([`App::submit_batch`]) doesn't take it: its bound is the requests it sends.
+    /// The time budget of each bounded call, in milliseconds by the app's clock: 20 s by
+    /// default. Once it has passed since the call began:
+    /// - [`App::receive`]'s looping steps start no further request, each after its first,
+    ///   and the read says [`ReceiveReport::more`], what is left kept for the next read;
+    /// - [`App::update_record`] tries no further write;
+    /// - [`App::flush_outbox`] starts no further unit after its first, and says
+    ///   [`OutboxReport::more`];
+    /// - [`App::list_collection`] and [`App::list_collections`] ask for no further page
+    ///   after their first, and [`App::peek`] reads no further page.
+    ///
+    /// It bounds when those steps stop, not the call's whole time: each call's docs state
+    /// what it may still send after the budget ran out. A write ([`App::submit_batch`]) and
+    /// one message's try ([`App::send`], [`App::resend`], [`App::flush_message`]) don't take
+    /// it: their bound is the requests they send.
     pub call_budget_ms: u64,
 }
 
