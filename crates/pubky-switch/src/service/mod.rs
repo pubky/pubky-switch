@@ -315,7 +315,7 @@ impl Service {
             erasure_sweeps: KeyedWindows::default(),
             changes: ChangeHub::new(),
             entry_ids: Arc::new(random_entry_id),
-            push_enabled: true,
+            push_enabled: false,
             resolver: push::system_resolver(),
             push_concurrency: crate::config::PushConfig::default().concurrency,
             #[cfg(any(test, feature = "test-util"))]

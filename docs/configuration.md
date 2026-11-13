@@ -57,7 +57,7 @@ The API listener.
 
 A request's network source, which the failed-authentication and public-read limits count by, is an IPv4 address or an IPv6 /64 (Switch wire 7.2). Behind a trusted proxy it is the nearest address in the header that isn't a trusted proxy; otherwise it is the connection's peer.
 
-Served so far: `POST /v1/enroll`; `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`; `POST /v1/{id}/ops`; `GET /v1/{id}/feed`; `GET /v1/{id}/claims/{key}`; `GET /v1/{id}/apps` and `POST /v1/{id}/apps/{app_id}/revoke`; `PUT /v1/{id}/peers`; `POST /v1/{id}/inbox`; `GET /v1/{id}/directory`; `GET` and `POST /v1/{id}/apps/{app_id}/keys`; `POST /v1/{id}/apps/{app_id}/leave`; `GET /v1/{id}/allow`; `GET /v1/{id}/records/{key}` and `GET /v1/{id}/records`; `PUT` and `GET /v1/{id}/handover`; `POST /v1/{id}/erase`; `PUT /v1/{id}/push`, whose registrations get a webhook per handle for each `notify` entry (push for connect requests isn't sent yet). Every other call is answered `503 unavailable` until its endpoint lands. `GET /v1/{id}/apps` answers `recovery: null` until recovery is served. The sweeps of Switch wire 9.1 run once a minute at a request to the account, with two parts not yet: forgetting a deleted key doesn't check that the account isn't frozen, since freezes aren't served (it comes with the cooperative move); and no batch record is deleted whole, only its proofs, since no chain stub is dropped yet (it comes with chain stub retention).
+Served so far: `POST /v1/enroll`; `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`; `POST /v1/{id}/ops`; `GET /v1/{id}/feed`; `GET /v1/{id}/claims/{key}`; `GET /v1/{id}/apps` and `POST /v1/{id}/apps/{app_id}/revoke`; `PUT /v1/{id}/peers`; `POST /v1/{id}/inbox`; `GET /v1/{id}/directory`; `GET` and `POST /v1/{id}/apps/{app_id}/keys`; `POST /v1/{id}/apps/{app_id}/leave`; `GET /v1/{id}/allow`; `GET /v1/{id}/records/{key}` and `GET /v1/{id}/records`; `PUT` and `GET /v1/{id}/handover`; `POST /v1/{id}/erase`; `PUT /v1/{id}/push`, whose registrations get a webhook per handle for each `notify` entry while `push.enabled` is on (off by default) (push for connect requests isn't sent yet). Every other call is answered `503 unavailable` until its endpoint lands. `GET /v1/{id}/apps` answers `recovery: null` until recovery is served. The sweeps of Switch wire 9.1 run once a minute at a request to the account, with two parts not yet: forgetting a deleted key doesn't check that the account isn't frozen, since freezes aren't served (it comes with the cooperative move); and no batch record is deleted whole, only its proofs, since no chain stub is dropped yet (it comes with chain stub retention).
 
 ### `[log]`
 
@@ -166,7 +166,7 @@ Push (Switch wire 8).
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` | take push registrations (`PUT /v1/{id}/push`) and send webhooks; off, every registration is answered `400`, as a service that sends no pushes answers (Switch wire 8.1), and nothing is queued or sent; rows queued while it was on wait, and go unsent once their minute has passed |
+| `enabled` | `false` | take push registrations (`PUT /v1/{id}/push`) and send webhooks; off, every registration is answered `400`, as a service that sends no pushes answers (Switch wire 8.1), and nothing is queued or sent; rows queued while it was on wait, and go unsent once their minute has passed. Off by default: one account can still hold up delivery for the others on an instance, which a later version fixes before turning it on |
 | `concurrency` | `16` | the most webhooks one instance sends at once; 0 is taken as 1 |
 
 The service keeps each own app's registration: its relay URL, at most 8 handles and a push key the service mints for it. The relay URL must be `https://` on port 443 without user info, and its host must resolve only to public addresses, which the service checks with its system resolver at each registration, within 5 seconds.
@@ -175,7 +175,7 @@ The service keeps each own app's registration: its relay URL, at most 8 handles 
 
 Neither relay URLs, handles nor keys are logged: delivery logs counts and failure kinds (`unresolved`, `refused`, `timeout`, `connect`, `redirect`, `status`, `internal`) only, and `pubky_switch_push_webhooks_total` counts attempts by `result` (`delivered` or a failure kind). The HTTP client's own debug logs name the hosts it connects to: keep `reqwest` and `hyper_util` at `info` or above in `log.filter`.
 
-**Rolling upgrades.** Turn push on only once every instance runs a version that has it: an older instance's sweep would read a `push` row as an erasure and delete the key without the row lock, its erasure would drop registrations without owing their keys, and its revocations and recoveries in place would leave registrations of apps no longer current. Since `enabled` defaults to on, set it to `false` while an upgrade from a version without push rolls out, and back once every instance runs this one.
+**Rolling upgrades.** Turn push on only once every instance runs a version that has it: an older instance's sweep would read a `push` row as an erasure and delete the key without the row lock, its erasure would drop registrations without owing their keys, and its revocations and recoveries in place would leave registrations of apps no longer current.
 
 ### `[keys]`
 

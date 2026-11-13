@@ -201,6 +201,7 @@ impl Setup {
     fn instance(&self) -> Service {
         self.replay
             .restarted_with(Limits::default())
+            .with_push(true)
             .with_resolver(resolver(self.private.clone()))
             .with_relay_route(route(self.relay.addr))
     }
@@ -499,6 +500,10 @@ async fn test_push_delivery_notify_append_queues_one_per_handle() {
     append_envelope(replay, &replay.service, envelope.clone()).await;
     assert_eq!(queued(replay).await.len(), 4);
     append_envelope(replay, &replay.service, envelope).await;
+    assert_eq!(queued(replay).await.len(), 4);
+    // Without trusted time, nothing is queued: no webhook could go before its minute ends.
+    let untrusted = replay.without_trusted_time().with_push(true);
+    append_to(replay, &untrusted, 6, true).await;
     assert_eq!(queued(replay).await.len(), 4);
     // A service with `push.enabled` off queues nothing, the registration kept.
     let off = setup.instance().with_push(false);
@@ -955,6 +960,7 @@ async fn test_push_delivery_removal_waits_for_the_signature() {
             setup.replay.time.clone(),
             Limits::default(),
         )
+        .with_push(true)
         .with_resolver(resolver(setup.private.clone()))
         .with_relay_route(route(setup.relay.addr)),
     );
