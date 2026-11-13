@@ -212,9 +212,11 @@ pub struct AppConfig {
     ///   after their first, and [`App::peek`] reads no further page.
     ///
     /// It bounds when those steps stop, not the call's whole time: each call's docs state
-    /// what it may still send after the budget ran out. A write ([`App::submit_batch`]) and
-    /// one message's try ([`App::send`], [`App::resend`], [`App::flush_message`]) don't take
-    /// it: their bound is the requests they send.
+    /// what it may still send after the budget ran out. A write ([`App::submit_batch`])
+    /// doesn't take it: its bound is the requests it sends. One message's try
+    /// ([`App::send`], [`App::resend`], [`App::flush_message`]) starts no retry of its
+    /// delivery once the budget has passed since the delivery began, and its record job is
+    /// an [`App::update_record`], with a budget of its own.
     pub call_budget_ms: u64,
 }
 
