@@ -990,7 +990,7 @@ fn shared_record(
         state: RecordState {
             key,
             collection,
-            policy: Policy::new(read_scope, &["pay"]),
+            policy: Policy::new(read_scope, &["tasks"]),
             version: RecordVersion::new(1, version),
             deleted,
         },
@@ -1054,12 +1054,12 @@ async fn test_store_records_by_key_text_and_read_scope() {
     // Keys whose text sorts otherwise than their bytes: 0xF8 begins with '-', 0xD0 with
     // '0', 0x00 with 'A', 0x68 with 'a', 0xFC with '_'.
     let scopes = [
-        "pay",
-        "pay:x",
-        "contacts",
-        "contacts:x",
-        "request:shop1",
-        "request",
+        "tasks",
+        "tasks:x",
+        "tasks_people",
+        "tasks_people:x",
+        "tasks_assign:team1",
+        "tasks_assign",
     ];
     let mut written = Vec::new();
     {
@@ -1079,23 +1079,23 @@ async fn test_store_records_by_key_text_and_read_scope() {
             }
         }
         // A deleted record, and one of another collection, never listed.
-        let deleted = shared_record([0x40; 32], collection, "pay", true, 3);
+        let deleted = shared_record([0x40; 32], collection, "tasks", true, 3);
         txn.put_record(&deleted).await.expect("put");
-        let other = shared_record([0x41; 32], [2; 32], "pay", false, 4);
+        let other = shared_record([0x41; 32], [2; 32], "tasks", false, 4);
         txn.put_record(&other).await.expect("put");
         txn.commit().await.expect("commit");
     }
     written.sort_by_key(|(key, _)| b64(key));
     for held in [
-        &["pay"][..],
-        &["pay:x"],
-        &["contacts", "request:shop1"],
-        &["request"],
-        &["contacts:y"],
+        &["tasks"][..],
+        &["tasks:x"],
+        &["tasks_people", "tasks_assign:team1"],
+        &["tasks_assign"],
+        &["tasks_people:y"],
         // A prefix of a name is no parent of it.
-        &["pa"],
-        &["contact"],
-        &["pa_"],
+        &["task"],
+        &["tasks_peopl"],
+        &["task_"],
         &[],
     ] {
         let held_owned: Vec<String> = held.iter().map(|s| (*s).to_string()).collect();
@@ -1164,7 +1164,7 @@ async fn test_store_upgrade_gives_records_their_key_text() {
         sqlx::query(
             "INSERT INTO shared_records (account_id, key, collection, read_scope, \
              write_scopes, generation, version, deleted, value_bytes, writer, cert, op, proof) \
-             VALUES ('old', $1, $2, 'pay', '{pay}', 1, 1, false, 0, $3, '\\x7b7d', '\\x7b7d', \
+             VALUES ('old', $1, $2, 'tasks', '{tasks}', 1, 1, false, 0, $3, '\\x7b7d', '\\x7b7d', \
              '\\x7b7d')",
         )
         .bind(key.as_slice())
@@ -1228,15 +1228,15 @@ async fn test_store_records_page_rows_stay_in_their_account() {
     // name, the blinded natural key and the policy, not the identity.
     let key = [0x11; 32];
     for (id, record) in [
-        (ID_A, shared_record(key, [1; 32], "pay", false, 5)),
-        (ID_B, shared_record(key, [2; 32], "contacts", false, 9)),
+        (ID_A, shared_record(key, [1; 32], "tasks", false, 5)),
+        (ID_B, shared_record(key, [2; 32], "tasks_people", false, 9)),
     ] {
         let mut txn = fx.store().begin(id).await.expect("begin").expect("account");
         txn.put_record(&record).await.expect("put");
         txn.commit().await.expect("commit");
     }
     // A's page shows A's row only, once.
-    let page = read_once(&fx, &[1; 32], &["pay"], 33).await;
+    let page = read_once(&fx, &[1; 32], &["tasks"], 33).await;
     assert_eq!(page.len(), 1, "one row, A's");
     assert_eq!(page[0].state.version.version, 5);
     assert_eq!(page[0].state.collection, [1; 32]);
@@ -1261,7 +1261,7 @@ async fn test_store_records_page_keeps_key_text_order_under_any_join() {
             for j in 0..6u8 {
                 let mut key = [first; 32];
                 key[31] = j;
-                let record = shared_record(key, [1; 32], "pay", false, 1);
+                let record = shared_record(key, [1; 32], "tasks", false, 1);
                 txn.put_record(&record).await.expect("put");
             }
         }
@@ -1270,7 +1270,7 @@ async fn test_store_records_page_keeps_key_text_order_under_any_join() {
         for n in 0..3_000u32 {
             let mut key = [0x55; 32];
             key[..4].copy_from_slice(&n.to_be_bytes());
-            let record = shared_record(key, [2; 32], "pay", false, 1);
+            let record = shared_record(key, [2; 32], "tasks", false, 1);
             txn.put_record(&record).await.expect("put");
         }
         txn.commit().await.expect("commit");
@@ -1294,7 +1294,7 @@ async fn test_store_records_page_keeps_key_text_order_under_any_join() {
         .await
         .expect("analyze");
     drop(conn);
-    let page = read_once(&fx, &[1; 32], &["pay"], 33).await;
+    let page = read_once(&fx, &[1; 32], &["tasks"], 33).await;
     let texts: Vec<String> = page.iter().map(|record| b64(&record.state.key)).collect();
     let mut sorted = texts.clone();
     sorted.sort();
@@ -1411,7 +1411,7 @@ async fn test_store_upgrade_applies_0021_after_later_migrations() {
 /// A record taken from a recovery upload after a provider loss, at `version` of generation 1,
 /// listed by the `upload` transition at `seq`.
 fn uploaded_record(key: [u8; 32], version: u64, seq: u64) -> pubky_switch::store::StoredRecord {
-    let mut record = shared_record(key, [1; 32], "pay", false, version);
+    let mut record = shared_record(key, [1; 32], "tasks", false, version);
     record.origin = pubky_switch::store::RecordOrigin::Uploaded { seq, exact: false };
     record
 }
@@ -1465,7 +1465,7 @@ async fn test_store_record_written_here_keeps_its_upload_base() {
     let Some(fx) = fixture().await else { return };
     fx.account(ID_A).await;
     let key = [0x52; 32];
-    let mut record = shared_record(key, [1; 32], "pay", false, 12);
+    let mut record = shared_record(key, [1; 32], "tasks", false, 12);
     let RecordOrigin::Written { proof, .. } = record.origin.clone() else {
         unreachable!("shared_record writes here");
     };
@@ -1561,7 +1561,7 @@ async fn test_store_divergent_uploads_keep_their_order_until_a_write_here() {
             .await
             .expect("begin")
             .expect("account");
-        txn.put_record(&shared_record(key, [1; 32], "pay", false, 20))
+        txn.put_record(&shared_record(key, [1; 32], "tasks", false, 20))
             .await
             .expect("write here");
         assert!(txn.divergent_uploads(&key).await.expect("kept").is_empty());
@@ -1581,7 +1581,7 @@ async fn test_store_record_origin_checks_refuse_mixed_rows() {
         format!(
             "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
              generation, version, deleted, value_bytes, writer, cert, op{columns}) VALUES \
-             ($1, $2, $2, 'pay', '{{pay}}', 1, 1, false, 0, $3, '\\x7b7d', '\\x7b7d'{values})"
+             ($1, $2, $2, 'tasks', '{{tasks}}', 1, 1, false, 0, $3, '\\x7b7d', '\\x7b7d'{values})"
         )
     };
     let cases = [
@@ -1654,7 +1654,7 @@ async fn test_store_kept_proof_generations_leave_out_uploaded_records() {
         txn.kept_proof_generations().await.expect("generations").0,
         Vec::<u64>::new()
     );
-    txn.put_record(&shared_record([0x55; 32], [1; 32], "pay", false, 3))
+    txn.put_record(&shared_record([0x55; 32], [1; 32], "tasks", false, 3))
         .await
         .expect("put");
     assert_eq!(
@@ -1678,7 +1678,7 @@ async fn test_store_sweeps_take_at_most_their_bound_and_the_rest_later() {
         sqlx::query(
             "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
              generation, version, deleted, value_bytes, writer, cert, op, proof) \
-             VALUES ($1, $2, $3, 'pay', '{pay}', 1, $4, true, 0, $5, '\\x', '\\x', '\\x')",
+             VALUES ($1, $2, $3, 'tasks', '{tasks}', 1, $4, true, 0, $5, '\\x', '\\x', '\\x')",
         )
         .bind(ID_A)
         .bind([i; 32].as_slice())
@@ -1796,7 +1796,7 @@ async fn test_store_forget_compares_whole_positions() {
         sqlx::query(
             "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
              generation, version, deleted, value_bytes, writer, cert, op, proof) \
-             VALUES ($1, $2, $3, 'pay', '{pay}', $4, $5, true, 0, $6, '\\x', '\\x', '\\x')",
+             VALUES ($1, $2, $3, 'tasks', '{tasks}', $4, $5, true, 0, $6, '\\x', '\\x', '\\x')",
         )
         .bind(ID_A)
         .bind([key; 32].as_slice())
