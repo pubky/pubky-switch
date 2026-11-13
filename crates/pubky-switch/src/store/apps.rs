@@ -248,7 +248,10 @@ impl AccountTxn {
     /// claims and attempts it wrote, the shared records it wrote with their `writer` and
     /// certificate, the list entries it wrote, the inbox entries naming it as a target,
     /// whose release judges current apps only, and the chain items, its key bundle parts'
-    /// included. Returns the App IDs purged; one that holds nothing any more is passed by.
+    /// included; the documents of its `app.put` and `cert.put` items and of its deleted
+    /// parts' `key_bundle.put` items go before the commit, as no app may read them in full
+    /// any more (Switch wire 7.5). Returns the App IDs purged; one that holds nothing any
+    /// more is passed by.
     pub async fn purge_apps(&mut self, apps: &[[u8; 16]]) -> Result<Vec<[u8; 16]>, StoreError> {
         let id = self.head().id.clone();
         let apps: Vec<Vec<u8>> = apps.iter().map(|app| app.to_vec()).collect();
@@ -297,7 +300,6 @@ impl AccountTxn {
         for statement in [
             "DELETE FROM apps WHERE account_id = $1 AND app_id = ANY($2)",
             "DELETE FROM receive_keys WHERE account_id = $1 AND app_id = ANY($2)",
-            "DELETE FROM key_bundle_parts WHERE account_id = $1 AND target_app_id = ANY($2)",
             "DELETE FROM app_listings WHERE account_id = $1 AND app_id = ANY($2)",
         ] {
             sqlx::query(statement)
@@ -307,7 +309,29 @@ impl AccountTxn {
                 .await
                 .map_err(StoreError::from_db)?;
         }
-        gone.iter().map(|app| app_id(app)).collect()
+        // A part no longer stored shows as its stub, as at `set_bundle_parts`.
+        let parts: Vec<i64> = sqlx::query_scalar(
+            "DELETE FROM key_bundle_parts WHERE account_id = $1 AND target_app_id = ANY($2) \
+             RETURNING seq",
+        )
+        .bind(&id)
+        .bind(&gone)
+        .fetch_all(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        let parts: Vec<u64> = parts
+            .into_iter()
+            .map(|seq| from_db(seq, "seq"))
+            .collect::<Result<_, _>>()?;
+        self.note_superseded(parts);
+        let gone: Vec<[u8; 16]> = gone
+            .iter()
+            .map(|app| app_id(app))
+            .collect::<Result<_, _>>()?;
+        for app in &gone {
+            self.note_app_documents(*app);
+        }
+        Ok(gone)
     }
 
     /// What `GET /apps` reports (Switch wire 7.4.12), read under the account's lock.

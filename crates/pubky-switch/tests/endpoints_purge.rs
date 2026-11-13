@@ -456,3 +456,70 @@ async fn test_purge_at_the_revocation_of_an_app_in_neither_list() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_purge_deletes_the_documents_of_its_record_and_parts() {
+    // Before the purge the wallet's `app.put` and its stored part's `key_bundle.put` keep
+    // their documents; the purge's transaction deletes them, as no app may read them in
+    // full any more (Switch wire 7.5), and keeps their stubs.
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let wallet = app_id_of("wallet");
+    store_wallet_part(&replay, at).await;
+    let failed = app_batch(
+        &replay,
+        "wallet",
+        90,
+        vec![on_wallet_attempt(ClaimType::Failed, 1, None)],
+        at,
+    )
+    .await;
+    assert_eq!(failed.status, 200);
+    assert_eq!(revoke(&replay, "wallet", at).await.status, 200);
+    let removing = wallet_removed(&replay, at).await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let mut seqs: Vec<i64> = sqlx::query_scalar(
+        "SELECT seq FROM chain_items WHERE account_id = $1 AND doc_app = $2 \
+         AND item_bytes IS NOT NULL",
+    )
+    .bind(alice_id())
+    .bind(wallet.as_slice())
+    .fetch_all(&mut conn)
+    .await
+    .expect("its app.put");
+    assert!(!seqs.is_empty(), "its app.put keeps its document");
+    let part: i64 = sqlx::query_scalar(
+        "SELECT seq FROM key_bundle_parts WHERE account_id = $1 AND target_app_id = $2",
+    )
+    .bind(alice_id())
+    .bind(wallet.as_slice())
+    .fetch_one(&mut conn)
+    .await
+    .expect("its part");
+    seqs.push(part);
+    for seq in &seqs {
+        let seq = u64::try_from(*seq).expect("seq");
+        assert_eq!(
+            chain_document_kept(&replay, &alice_id(), seq).await,
+            (true, true),
+            "seq {seq} before the purge"
+        );
+    }
+    deliver_next(&replay, &removing, at, |body| {
+        body.removed.retain(|removed| removed.app_id != wallet);
+    })
+    .await;
+    assert_eq!(holdings(&replay, &wallet).await, [0, 0, 0, 0]);
+    for seq in &seqs {
+        let seq = u64::try_from(*seq).expect("seq");
+        assert_eq!(
+            chain_document_kept(&replay, &alice_id(), seq).await,
+            (false, false),
+            "seq {seq} after the purge"
+        );
+    }
+    replay.db.drop_database().await.expect("drop");
+}
