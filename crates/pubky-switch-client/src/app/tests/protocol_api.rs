@@ -4164,3 +4164,39 @@ async fn test_scripted_invite_codes_sweep_with_the_clock_behind_its_mark() {
     shop.receive(None).await.unwrap();
     assert_eq!(p.bob.switch().invite_uses_left(&code.code), None);
 }
+
+/// Run `body` on a thread with a stack of `bytes`, in a runtime of that thread alone, as a
+/// host on small threads does.
+fn on_a_small_stack<F>(bytes: usize, body: impl FnOnce() -> F + Send + 'static)
+where
+    F: std::future::Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(bytes)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(body());
+        })
+        .unwrap()
+        .join()
+        .expect("the read runs within the stack");
+}
+
+#[test]
+fn test_receive_runs_its_deepest_paths_on_a_one_mebibyte_stack() {
+    // A read whose entry's effect writes a record through the context, and one whose effect
+    // makes an attempt: the deepest paths of a read, on a 1 MiB stack.
+    for mode in [Mode::Record, Mode::Attempt] {
+        on_a_small_stack(1 << 20, move || async move {
+            let w = World::new();
+            let protocol = ApiProtocol::new(mode);
+            let mut app = join(&w, &protocol, "wallet").await;
+            w.note(app.app_id(), "hello");
+            app.receive(None).await.unwrap();
+            assert!(!protocol.seen().is_empty());
+        });
+    }
+}

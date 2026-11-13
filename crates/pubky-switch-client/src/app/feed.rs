@@ -468,7 +468,17 @@ impl App {
         result
     }
 
-    async fn receive_inner(
+    fn receive_inner<'a>(
+        &'a mut self,
+        wait: Option<u32>,
+        budget: &'a super::CallBudget,
+    ) -> crate::transport::BoxFuture<'a, Result<ReceiveReport, AppError>> {
+        // A read's large steps are boxed one by one, so that no poll frame holds the state
+        // of the step under it and a read runs on a host's small stack (a 1 MiB thread).
+        Box::pin(self.receive_inner_body(wait, budget))
+    }
+
+    async fn receive_inner_body(
         &mut self,
         wait: Option<u32>,
         budget: &super::CallBudget,
@@ -800,7 +810,18 @@ impl App {
 
     /// One page, read after `after`, with the lowest `seq` held so far in this read: how it
     /// ended, or `None` when the read stops on it.
-    async fn process_page(
+    fn process_page<'a>(
+        &'a mut self,
+        page: FeedPage,
+        after: u64,
+        blocked: &'a mut Option<u64>,
+        budget: Option<&'a super::CallBudget>,
+    ) -> crate::transport::BoxFuture<'a, Result<Option<PageEnd>, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.process_page_body(page, after, blocked, budget))
+    }
+
+    async fn process_page_body(
         &mut self,
         page: FeedPage,
         after: u64,
@@ -1032,7 +1053,20 @@ impl App {
     // ---------------------------------------------------------------------------------
     // Entries
 
-    async fn handle_entry(&mut self, item: &EntryItem, read: &mut Read) -> Result<Step, AppError> {
+    fn handle_entry<'a>(
+        &'a mut self,
+        item: &'a EntryItem,
+        read: &'a mut Read,
+    ) -> crate::transport::BoxFuture<'a, Result<Step, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.handle_entry_body(item, read))
+    }
+
+    async fn handle_entry_body(
+        &mut self,
+        item: &EntryItem,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
         let entry = Entry {
             seq: item.seq,
             generation: self.state.cursor.generation,
@@ -1070,7 +1104,18 @@ impl App {
     }
 
     /// Checks 2 to 9, then the protocol's check 10 and effect.
-    async fn check_and_apply(
+    fn check_and_apply<'a>(
+        &'a mut self,
+        entry: &'a Entry,
+        plaintext: MessagePlaintext,
+        parked: bool,
+        read: &'a mut Read,
+    ) -> crate::transport::BoxFuture<'a, Result<Step, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.check_and_apply_body(entry, plaintext, parked, read))
+    }
+
+    async fn check_and_apply_body(
         &mut self,
         entry: &Entry,
         plaintext: MessagePlaintext,
@@ -1243,7 +1288,18 @@ impl App {
     /// The protocol's check 10, then its effect, at most twice after a conflict: the records
     /// and claims the effect wrote are read again before the second try (Switch spec 8.2,
     /// 10.3).
-    async fn apply(
+    fn apply<'a>(
+        &'a mut self,
+        entry: &'a Entry,
+        received: Received,
+        parked: bool,
+        read: &'a mut Read,
+    ) -> crate::transport::BoxFuture<'a, Result<Step, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.apply_body(entry, received, parked, read))
+    }
+
+    async fn apply_body(
         &mut self,
         entry: &Entry,
         received: Received,
@@ -1600,7 +1656,20 @@ impl App {
 
     /// Sign the effect's batch with the cursor move, keep it with what the answer commits,
     /// then send it (Switch spec 8.2: the effect and the cursor in one batch).
-    async fn send_effect(
+    fn send_effect<'a>(
+        &'a mut self,
+        entry: &'a Entry,
+        received: &'a Received,
+        effect: Effect,
+        written: Written<'a>,
+        parked: bool,
+        read: &'a mut Read,
+    ) -> crate::transport::BoxFuture<'a, Result<Sent, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.send_effect_body(entry, received, effect, written, parked, read))
+    }
+
+    async fn send_effect_body(
         &mut self,
         entry: &Entry,
         received: &Received,
@@ -1688,7 +1757,17 @@ impl App {
     /// the same answer to any request; past the window in which a resend tells, its entry is
     /// stored as uncertain instead. One about these bytes will come again: the entry is
     /// stored as uncertain at once ([`App::effect_uncertain`]), and the read goes on.
-    async fn run_effect(
+    fn run_effect<'a>(
+        &'a mut self,
+        pending: PendingEffect,
+        batch: &'a Batch,
+        resent: bool,
+    ) -> crate::transport::BoxFuture<'a, Result<Sent, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.run_effect_body(pending, batch, resent))
+    }
+
+    async fn run_effect_body(
         &mut self,
         pending: PendingEffect,
         batch: &Batch,
