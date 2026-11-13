@@ -1165,3 +1165,93 @@ async fn test_upload_divergence_is_told_to_each_app_that_holds_the_record() {
         at_phone
     );
 }
+
+#[tokio::test]
+async fn test_upload_divergence_is_told_again_after_a_restore_in_place() {
+    // A restore in place carries the unacknowledged duty event, and replaces the namespace,
+    // the mark included: the listing it owes reads the record again, still divergent, and
+    // keeps a second event, under a new ID of the same store, for the same divergence.
+    let store = Arc::new(MemoryStore::new());
+    let w = World::new();
+    let router = super::moves::Router::of(&w);
+    let protocol = Arc::new(super::moves::LossProtocol::default());
+    let (mut app, key) = holding_a_record(&w, &router, &store, &protocol).await;
+    w.switch
+        .make_divergent(app_keys("phone").app_id_bytes(), key, [1; 32])
+        .unwrap();
+    let report = app.receive(None).await.unwrap();
+    let first = divergent_ids(&report.events, key);
+    assert_eq!(first.len(), 1, "{:?}", report.events);
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    let mut restored = App::restore(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&protocol) as Arc<dyn crate::app::Protocol>,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let mut told = divergent_ids(&restored.take_events(), key);
+    for _ in 0..4 {
+        let report = restored.receive(None).await.unwrap();
+        told.extend(divergent_ids(&report.events, key));
+        if !restored.listing_owed().await.unwrap() {
+            break;
+        }
+    }
+    assert_eq!(told.len(), 2, "{told:?}");
+    assert_eq!(told[0], first[0]);
+    assert!(told[1].same_store(&first[0]) && told[1] != first[0]);
+    let kept = divergent_ids(&restored.unacknowledged_events().await.unwrap(), key);
+    assert_eq!(kept, told);
+}
+
+#[tokio::test]
+async fn test_upload_divergence_event_stays_through_a_provider_loss() {
+    // The commit that starts a provider loss removes the marks and leaves the duty event.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, true).await;
+    let key = upload_fork(&lost, [99; 16]);
+    let report = app.receive(None).await.unwrap();
+    let first = divergent_ids(&report.events, key);
+    assert_eq!(first.len(), 1, "{:?}", report.events);
+    drop(app);
+    lost.router.remove(NEXT);
+    let third = third_recovering(&lost.w, &lost.router, 3, 2);
+    third.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::Unavailable,
+        current: Value::Null,
+    });
+    let (mut app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(app.cursor().generation, 3);
+    assert_eq!(marks(&store, "rcdiv/"), 0);
+    let kept = divergent_ids(&app.unacknowledged_events().await.unwrap(), key);
+    assert_eq!(kept, first);
+}
+
+#[tokio::test]
+async fn test_upload_make_divergent_refuses_a_key_the_switch_lacks() {
+    // A key the switch holds no record at can't be divergent: a recovery upload fills it,
+    // and a service keeps no divergent uploads for a key it lacks (Switch wire 7.4.14). The
+    // hook refuses it, so a later upload that fills the key leaves its views as they are.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, false).await;
+    let target = RecordTarget::new(items(), b"uploaded");
+    let key = app.record_key(&target).unwrap();
+    assert!(!lost.next.lock().shared.records.contains_key(&key));
+    let made = lost.next.make_divergent(PHONE, key, [1; 32]);
+    assert!(
+        matches!(made, Err(crate::testing::ScriptError::Missing(_))),
+        "{made:?}"
+    );
+    app.receive(None).await.unwrap();
+    assert_eq!(upload_unheld_record(&lost, &mut app).await, key);
+    let report = app.receive(None).await.unwrap();
+    let held = app.shared_record(&key).await.unwrap().unwrap();
+    assert!(!held.divergent);
+    assert_eq!(divergent(&report.events, key), 0);
+}

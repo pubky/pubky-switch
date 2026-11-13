@@ -1510,8 +1510,9 @@ impl ScriptedSwitch {
         self.lock().uploads_per_app_per_hour = uploads;
     }
 
-    /// Make record `key` divergent, as a recovery upload with a conflicting write of it does
-    /// (Switch spec 12.6, wire 7.4.14), without the provider loss and the signed upload: the
+    /// Make record `key`, one the switch holds, divergent, as a recovery upload with a
+    /// conflicting write of it does (Switch spec 12.6, wire 7.4.14), without the provider
+    /// loss and the signed upload: the
     /// switch keeps `doc_hash` among the record's divergent uploads, so every view of the
     /// record shows it `divergent` until a newer write, and chains an `upload` transition by
     /// `by` that lists the key as divergent and merges nothing, so an app that holds the
@@ -1521,7 +1522,9 @@ impl ScriptedSwitch {
     ///
     /// # Errors
     ///
-    /// As [`ScriptedSwitch::signer_op`].
+    /// [`ScriptError::Missing`] for a key the switch holds no record at: a service keeps no
+    /// divergent uploads for a key it lacks, and fills it instead. Otherwise as
+    /// [`ScriptedSwitch::signer_op`].
     pub fn make_divergent(
         &self,
         by: [u8; 16],
@@ -1529,6 +1532,9 @@ impl ScriptedSwitch {
         doc_hash: [u8; 32],
     ) -> Result<(), ScriptError> {
         let mut inner = self.lock();
+        if !inner.shared.records.contains_key(&key) {
+            return Err(ScriptError::Missing("no record at the key".into()));
+        }
         let kept = inner.shared.divergent.entry(key).or_default();
         if !kept.contains(&doc_hash) {
             kept.push(doc_hash);

@@ -143,7 +143,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `policy.connect_requests.push` asks for yet: push isn't served.
 - **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
   by a write here, as at the service (Recovery uploads, below). `make_divergent`, public,
-  sets it for one record without a loss or an upload: the upload's `doc_hash` is kept among
+  sets it for one record the switch holds, without a loss or an upload (a key it holds no
+  record at is refused, as a service fills such a key): the upload's `doc_hash` is kept among
   the record's divergent uploads, and an `upload` transition listing the key as divergent,
   merging nothing, is chained, so an app reading its feed reads the record again; for a
   protocol's tests of a divergent record.
