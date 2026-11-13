@@ -2015,7 +2015,8 @@ impl App {
         // A write by this app is its own, also when the feed or a view shows it before its
         // answer, or another device of the app made it: one app is one principal (Switch
         // spec 3.1), so it is never checked against what this device saw, and it is marked
-        // from the value written, as at its answer. A flag would name the app itself.
+        // from the value written, as at its answer, once this device can read that value. A
+        // flag would name the app itself.
         let own = own || accepted.writer == self.state.meta.app_id;
         if !own
             && let Some(mark) = &seen
@@ -2034,9 +2035,13 @@ impl App {
         }
         // What the app saw of a record stays seen after its own delete (Switch spec 8.2):
         // the mark it holds stays, so a write that brings the record back without it is
-        // checked against it. Any other own write marks from the value it wrote.
-        let own_delete = own && accepted.content == RecordContent::Deleted;
-        let marked = if own_delete {
+        // checked against it. So does an own write this device can't read yet, such as
+        // another device's at a data epoch whose key it hasn't fetched: the mark is set from
+        // its value when the key comes and the record reopens (`reopen_unreadable`), which
+        // takes it here again. Any other own write marks from the value it wrote.
+        let keeps_mark =
+            own && (accepted.content == RecordContent::Deleted || accepted.content.waits_for_key());
+        let marked = if keeps_mark {
             None
         } else {
             self.protocol.record_seen(
@@ -2070,7 +2075,7 @@ impl App {
                 )?;
             }
             Some(mark) => tx.put(&seen_key(&key), &SeenMark { mark })?,
-            None if own && !own_delete => tx.delete(&seen_key(&key))?,
+            None if own && !keeps_mark => tx.delete(&seen_key(&key))?,
             None => {}
         }
         let record = HeldRecord {
