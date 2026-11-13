@@ -66,7 +66,10 @@ pub use ops::{
 };
 pub use peers::{HeldPeer, PeerFloor};
 pub use push::{OwedKey, PushRegistration};
-pub use push_queue::{HeldRegistration, QueuedPush};
+pub use push_queue::{
+    HOLD_LOCK_TIMEOUT_MS, HeldRegistration, PUSH_LEASE_MS, PUSH_PER_ACCOUNT, PUSH_PER_HOST,
+    PUSH_RETRY_MS, PUSH_WINDOW_MS, QueuedPush,
+};
 pub use recovery::{RECOVERY_KEEPS, Recovery, recovery_clears};
 pub use snapshot::SnapshotRead;
 
@@ -551,6 +554,11 @@ impl Store {
     /// The connection pool, for the store's own modules.
     pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// The most connections the request pool holds (`database.max_connections`).
+    pub fn max_connections(&self) -> u32 {
+        self.pool.options().get_max_connections()
     }
 
     /// Close every connection.

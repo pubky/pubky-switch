@@ -39,8 +39,7 @@ pub struct Config {
 pub struct PushConfig {
     /// Take push registrations (`PUT /v1/{id}/push`) and send webhooks; off, every
     /// registration is answered `400`, as a service that sends no pushes answers (Switch
-    /// wire 8.1), and nothing is queued or sent. Off by default until delivery is fair across
-    /// accounts.
+    /// wire 8.1), and nothing is queued or sent. On by default.
     pub enabled: bool,
     /// The most webhooks one instance sends at once; 0 is taken as 1.
     pub concurrency: usize,
@@ -49,7 +48,7 @@ pub struct PushConfig {
 impl Default for PushConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             concurrency: 16,
         }
     }
@@ -175,10 +174,10 @@ mod tests {
         let config = Config::from_toml("").expect("empty config");
         assert_eq!(config, Config::default());
         assert!(config.trusted_time.required);
-        // Push is off unless the operator turns it on.
-        assert!(!config.push.enabled);
-        let on = Config::from_toml("[push]\nenabled = true\n").expect("push on");
-        assert!(on.push.enabled);
+        // Push is on unless the operator turns it off.
+        assert!(config.push.enabled);
+        let off = Config::from_toml("[push]\nenabled = false\n").expect("push off");
+        assert!(!off.push.enabled);
     }
 
     #[test]
