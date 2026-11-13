@@ -17,11 +17,13 @@
 //!   version, the collection's fixed policy and the key's derivation, the writer's standing
 //!   at the write's time, its write scope, and the sealed value opening. Signed evidence of
 //!   misbehaviour is a rollback (Switch spec 10.1). A failure that is only the service's
-//!   word (a write served for another record, a signature that doesn't verify, the
-//!   certificate it shows, a missing date or version), and any failure of the app's own
-//!   write but a value that doesn't open, leaves the write ignored, naming no app, and
-//!   nothing follows its version. Any other failure leaves it ignored and shown with the app it names (Switch
-//!   spec 8.2), once for each write, at most eight for a record.
+//!   word, and any failure of the app's own write but a value that doesn't open, leaves the
+//!   write ignored, naming no app. Of those, a write refused for the certificate the service
+//!   shows or a missing date, at a plausible version, is followed, so the next write builds
+//!   on it; the others (a write served for another record, a signature that doesn't verify,
+//!   a version missing or not plausible, an own write) aren't. Any other failure leaves the
+//!   write ignored and shown with the app it names (Switch spec 8.2), once for each write,
+//!   at most eight for a record, and followed.
 //! - **A write replaces the one held** only if it is newer by the core's rule
 //!   ([`WriteVersion::replaces`]), and only if the protocol finds it doesn't go back on what
 //!   the app has seen there ([`super::Protocol::record_regression_on`]). A write refused that
@@ -630,6 +632,15 @@ pub(crate) struct HeldRecord {
     /// on a delete the app holds (Switch wire 6.2), since the service may forget the key.
     #[serde(default)]
     follow_deleted: bool,
+    /// Whether the refused write followed names the app that signed it (Switch spec 8.2):
+    /// `false` for one refused only on the service's word, which names nobody and reads as
+    /// not flagged. A record an earlier build kept followed only named writes.
+    #[serde(default = "named_by_default")]
+    follow_named: bool,
+}
+
+fn named_by_default() -> bool {
+    true
 }
 
 impl std::fmt::Debug for HeldRecord {
@@ -687,7 +698,7 @@ impl HeldRecord {
                 ref content => content.clone(),
             },
             doubtful: self.doubtful,
-            flagged: self.follow.is_some(),
+            flagged: self.follow.is_some() && self.follow_named,
             divergent,
         }
     }
@@ -785,6 +796,11 @@ enum Refused {
     },
     /// Not a write the app takes: another collection, or a writer it can't find.
     Ignored,
+    /// A write at the key read, its version plausible, that the app doesn't take on the
+    /// service's word only: a missing date, or the certificate the service chose. It names
+    /// nobody, but its version is followed, so the app's next write builds on it and puts
+    /// back what it trusts, as over a flagged write (Switch spec 8.2).
+    Unnamed,
     /// A write without a record view, that no certificate the app holds authorizes, while
     /// the newest own `identity.json` names a certificate of the writer in force at its
     /// time that the app doesn't hold: the record's view decides (Switch wire 6.2
@@ -1610,6 +1626,11 @@ impl App {
                 };
                 self.flag_write(shown, writer, reason, deleted, tx).await?;
             }
+            Err(Refused::Unnamed) => {
+                let deleted = writes_a_delete(evidence.op);
+                self.follow_write(&shown_key, version, deleted, false, tx)
+                    .await?;
+            }
             Err(Refused::Ignored | Refused::Unheld(_)) => {}
         }
         Ok(WriteRead::Refused)
@@ -1673,18 +1694,34 @@ impl App {
             }
         }
         tx.put(&entry, &flagged)?;
-        if let Some(mut held) = self.held_record(key).await?
-            && version > held.base_version()
-        {
-            held.follow = Some(version);
-            held.follow_deleted = deleted;
-            tx.put(&record_key_of(key), &held)?;
-        }
+        self.follow_write(key, version, deleted, true, tx).await?;
         self.events.push(AppEvent::WriteFlagged {
             key: *key,
             writer,
             reason,
         });
+        Ok(())
+    }
+
+    /// Follow a refused write's version when it is the switch's current one for a record the
+    /// app holds, so the next write builds on it (Switch spec 8.2); `named` when the refusal
+    /// names the app that signed it.
+    async fn follow_write(
+        &mut self,
+        key: &[u8; 32],
+        version: RecordVersion,
+        deleted: bool,
+        named: bool,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        if let Some(mut held) = self.held_record(key).await?
+            && version > held.base_version()
+        {
+            held.follow = Some(version);
+            held.follow_deleted = deleted;
+            held.follow_named = named;
+            tx.put(&record_key_of(key), &held)?;
+        }
         Ok(())
     }
 
@@ -1785,6 +1822,32 @@ impl App {
             Ok(dated) => dated,
             Err(reason) => return Ok(Err(Refused::Misbehaviour(reason))),
         };
+        // The version step 6 checks, `None` when nothing gives one.
+        let shown = match (proven, evidence.view_version) {
+            (Some(version), _) => Some(WriteVersion {
+                version,
+                authenticated: true,
+                expected_version: put.expected_version,
+            }),
+            (None, Some(version)) => Some(WriteVersion {
+                version,
+                authenticated: false,
+                expected_version: put.expected_version,
+            }),
+            (None, None) => None,
+        };
+        let plausible = shown.is_some_and(|version| version.plausible(body.generation));
+        // A write refused on the service's word only, at the key read: followed, naming
+        // nobody, when its version is plausible, so an honest service's record stays
+        // writable, as one taken from a recovery upload under a renewal closed since; else
+        // ignored.
+        let unnamed = || -> Result<Result<Accepted, Refused>, AppError> {
+            Ok(Err(if plausible {
+                Refused::Unnamed
+            } else {
+                Refused::Ignored
+            }))
+        };
         // Step 4: standing at the write's time, of a certificate of the writer that counts
         // for it (`write_cert`).
         let mut doubtful = false;
@@ -1852,7 +1915,7 @@ impl App {
         }
         let invalid = |reason: &str| -> Result<Result<Accepted, Refused>, AppError> {
             if unheld {
-                return Ok(Err(Refused::Ignored));
+                return unnamed();
             }
             invalid(reason)
         };
@@ -1871,9 +1934,9 @@ impl App {
                 }
                 Some(_) => {}
                 // Nothing dates it: the service keeps the proof of every current write (Switch
-                // wire 7.4.9), so a missing one is the service's word. The write is ignored,
-                // naming no app.
-                None => return Ok(Err(Refused::Ignored)),
+                // wire 7.4.9), so a missing one is the service's word. The write isn't taken
+                // and names no app; its version is followed.
+                None => return unnamed(),
             },
             Standing::Removed { distrust_from } => match time {
                 Some(t) if t > distrust_from => {
@@ -1895,26 +1958,13 @@ impl App {
         if !own && !holds_write_scope(&cert) {
             return invalid("Switch wire 6.2 step 5: the writer holds none of the write scopes");
         }
-        // Step 6: the version.
-        let version = match (proven, evidence.view_version) {
-            (Some(version), _) => WriteVersion {
-                version,
-                authenticated: true,
-                expected_version: put.expected_version,
-            },
-            (None, Some(version)) => WriteVersion {
-                version,
-                authenticated: false,
-                expected_version: put.expected_version,
-            },
-            // The version is the service's word, not the writer's: a write whose version is
-            // missing or not plausible is ignored, naming no app. A client loses nothing by it
-            // that a service withholding the write couldn't take.
-            (None, None) => return Ok(Err(Refused::Ignored)),
-        };
-        if !version.plausible(body.generation) {
+        // Step 6: the version. It is the service's word, not the writer's: a write whose
+        // version is missing or not plausible is ignored, naming no app and followed by
+        // nothing. A client loses nothing by it that a service withholding the write couldn't
+        // take.
+        let Some(version) = shown.filter(|_| plausible) else {
             return Ok(Err(Refused::Ignored));
-        }
+        };
         // Step 7: the content.
         let content = match put
             .value_sealed
@@ -2365,6 +2415,7 @@ impl App {
                 .and_then(|held| held.follow)
                 .filter(|_| reopened),
             follow_deleted: held.as_ref().is_some_and(|held| held.follow_deleted) && reopened,
+            follow_named: held.as_ref().is_none_or(|held| held.follow_named) || !reopened,
         };
         tx.put(&record_key_of(&key), &record)?;
         self.events.push(AppEvent::RecordChanged { key });

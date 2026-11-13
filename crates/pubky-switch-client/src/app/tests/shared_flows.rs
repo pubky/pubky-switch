@@ -9592,3 +9592,134 @@ async fn test_records_flagged_writes_are_bounded_per_record() {
     assert_eq!(kept, versions[2..].to_vec());
     assert!(flagged.iter().all(|f| f.writer == phone.app_id()));
 }
+
+/// The wallet's write under its earlier certificate, before a reduction dropped the
+/// record's write scope and closed, without a proof, as a recovery upload leaves it: the
+/// phone doesn't take it and names no app, but follows its version, so it writes the record
+/// over it.
+#[tokio::test]
+async fn test_records_upload_under_a_reduced_renewal_is_written_over() {
+    let s = Setup::new();
+    let mut phone = s.join("phone").await;
+    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+    phone.receive(None).await.unwrap();
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    s.w.clock.advance_ms(DAY_MS);
+    let earlier = wallet.cert().clone();
+    let renewed = renewal_of(&s, "wallet", &["scope-c"]);
+    let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
+    let opened =
+        s.w.signer
+            .sign_next(|body| list_renewal(body, &earlier, &renewed, None))
+            .unwrap();
+    let closed =
+        s.w.signer
+            .sign_next(|body| list_renewal(body, &earlier, &renewed, Some(until)))
+            .unwrap();
+    s.w.switch
+        .signer_op(OpKind::CertPut {
+            target_app_id: wallet.app_id(),
+            cert: renewed.signed().clone(),
+        })
+        .unwrap();
+    s.w.switch.deliver_identity(&opened).unwrap();
+    s.w.switch.deliver_identity(&closed).unwrap();
+    s.w.clock.advance_ms(2 * CLOCK_TOLERANCE_MS);
+    {
+        let mut switch = s.w.switch.lock();
+        let held = switch.shared.records.get_mut(&key).unwrap();
+        held.proof = None;
+        held.uploaded = Some(false);
+    }
+    phone.refresh_identity().await.unwrap();
+    phone.refresh_own_apps().await.unwrap();
+    // Read, the write isn't taken, names no app, and the record doesn't read as flagged.
+    phone.read_record(&target).await.unwrap();
+    let held = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+    assert!(!held.flagged);
+    assert!(phone.flagged_writes().await.unwrap().is_empty());
+    let written = phone
+        .update_record(&target, vec![], |_| Some(value(&["a", "c"])))
+        .await;
+    assert!(written.is_ok(), "{written:?}");
+}
+
+/// A view of the key read whose write, signed by the phone, names another collection: the
+/// phone signed that collection, so the write is flagged naming the phone.
+#[tokio::test]
+async fn test_records_write_of_another_collection_at_the_key_read_is_flagged() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&target).unwrap();
+    let genuine = s.w.switch.lock().shared.records[&key].op.clone();
+    let mut body = SignedOp::peek(&genuine).unwrap().body().clone();
+    if let OpKind::RecordPut(put) = &mut body.kind {
+        put.collection = [7; 32];
+    }
+    let resigned = SignedOp::sign(&app_keys("phone"), body).unwrap();
+    s.w.switch.lock().shared.records.get_mut(&key).unwrap().op = resigned.signed().clone();
+    wallet.read_record(&target).await.unwrap();
+    let events = wallet.take_events();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AppEvent::WriteFlagged { writer, .. } if *writer == phone.app_id()
+        )),
+        "{events:?}"
+    );
+}
+
+/// A directory that keeps failing, read for a writer's listed certificate: three reads of
+/// the record within a minute send one directory request, and the write isn't taken.
+#[tokio::test]
+async fn test_records_failing_directory_is_asked_once_a_minute() {
+    let s = Setup::new();
+    let mut phone = s.join("phone").await;
+    let (mut wallet, _, _, earlier) = own_write_under_a_closed_renewal(&s).await;
+    let target = s.target("n2");
+    wallet
+        .put_record(&target, &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+    s.w.switch.lock().shared.records.get_mut(&key).unwrap().cert = Some(earlier.signed().clone());
+    phone.refresh_identity().await.unwrap();
+    for _ in 0..4 {
+        s.w.switch.fail_next(Fault::Unreachable {
+            path: "/directory".into(),
+            after: 0,
+        });
+    }
+    let directory_reads = |s: &Setup| {
+        s.log()
+            .iter()
+            .filter(|line| line.contains("/directory"))
+            .count()
+    };
+    let before = directory_reads(&s);
+    for _ in 0..3 {
+        phone.read_record(&target).await.unwrap();
+    }
+    assert_eq!(directory_reads(&s) - before, 1);
+    assert!(phone.shared_record(&key).await.unwrap().is_none());
+    s.w.clock.advance_ms(crate::app::SENDER_REREAD_MS);
+    phone.read_record(&target).await.unwrap();
+    assert_eq!(directory_reads(&s) - before, 2);
+}
