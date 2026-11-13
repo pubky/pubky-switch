@@ -61,8 +61,6 @@ The files use a sample protocol, `tasks`, described in the spec's Section 1, who
 ## How the files were generated
 A reference prototype, shared separately, generated every file but the cases `pubky-switch-core` adds (below). In this repository, `pubky-switch-core`'s vector tests read every file, rebuild each deterministic value byte for byte from the fixed keys, and check that each rejection case is refused by the rule it names. The signer's, the client's and the service's tests check their own parts against the same files.
 
-The seed prefix `pubky-switch/v1/test-vectors/` is new with the sample protocol, so every key, Pubky ID, App ID, hash and signature differs from earlier sets of these files: a set that pins earlier values takes them from these files again.
-
 `pubky-switch-core`, the Switch's core crate in this repository, added these cases, each built from the fixed keys and the files' own values, with the seeds of this README where it seals:
 - `export.json` `claim_rejections`: the `failed` entry signed by the executor under its own certificate, naming the wallet as its writer, and the claim marked `rebuilt` on an account without a provider loss;
 - `documents.json` `approval.rejections` (the part through data epoch 3) and `identity_rejections` (the two `connect_requests` cases);
