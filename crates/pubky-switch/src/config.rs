@@ -129,6 +129,12 @@ pub enum ConfigError {
     /// The log filter doesn't parse.
     #[error("log.filter: {0}")]
     LogFilter(String),
+    /// `keys.backup_retention_days` is 0, which would forget every erasure at once.
+    #[error(
+        "keys.backup_retention_days: 0 would forget every erasure at once; set the age of the \
+         oldest database backup kept, or leave it unset to keep every erasure"
+    )]
+    BackupRetention,
 }
 
 impl Config {
@@ -154,6 +160,11 @@ impl Config {
         self.trusted_time.validate()?;
         self.database.validate()?;
         self.server.validate()?;
+        // A restore from any backup would then serve an erased account again (Switch spec
+        // 6.5).
+        if self.keys.backup_retention_days == Some(0) {
+            return Err(ConfigError::BackupRetention);
+        }
         tracing_subscriber::EnvFilter::try_new(&self.log.filter)
             .map_err(|error| ConfigError::LogFilter(error.to_string()))?;
         Ok(())
@@ -216,6 +227,14 @@ mod tests {
             Config::from_toml("[nonsense]\n"),
             Err(ConfigError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn test_config_refuses_zero_backup_retention_days() {
+        // 0 would forget every erasure at the next erasure or start, so a restore from any
+        // backup serves an erased account again (Switch spec 6.5).
+        assert!(Config::from_toml("[keys]\nbackup_retention_days = 0\n").is_err());
+        assert!(Config::from_toml("[keys]\nbackup_retention_days = 35\n").is_ok());
     }
 
     #[test]

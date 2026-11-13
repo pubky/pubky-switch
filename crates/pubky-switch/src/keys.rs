@@ -250,7 +250,9 @@ pub trait KeyStore: Send + Sync {
     fn record_erasure<'a>(&'a self, identity: &'a str, erased_at_ms: u64) -> KeyFuture<'a, ()>;
 
     /// When `identity`'s account was last erased, if ever; never for an identity the ledger
-    /// can't hold, which [`KeyStore::record_erasure`] refuses.
+    /// can't hold, which [`KeyStore::record_erasure`] refuses. Every call to an account
+    /// asks, so it must be cheap: a store that caches the ledger holds at least what the
+    /// ledger holds.
     fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>>;
 
     /// Every erasure the ledger holds: each identity, with the time of its latest erasure.
@@ -364,8 +366,9 @@ struct Inner {
     root: PathBuf,
     keys: Mutex<HashMap<KeyId, Arc<SigningKey>>>,
     marks: Mutex<HashMap<KeyId, Option<Mark>>>,
-    /// The erasure ledger as its files hold it, read whole at open and changed only once a
-    /// file's write or removal is durable, so a request's check needs no file read.
+    /// The erasure ledger, read whole from its files at open, so a request's check needs no
+    /// file read. It holds at least what the files hold: an erasure goes in before its file
+    /// is written, and leaves only once its file's removal is durable.
     ledger: Mutex<HashMap<String, u64>>,
     /// Held around every read-check-write of a mark, a deletion and an erasure record,
     /// inside the blocking task that does it. A caller that stops waiting can't release it
@@ -572,14 +575,19 @@ impl Inner {
     fn record_erasure_sync(&self, identity: &str, erased_at_ms: u64) -> Result<(), KeyStoreError> {
         let path = self.erasure_path(identity)?;
         let _writes = self.writes.lock();
-        if Self::read_erasure(&path)?.is_some_and(|recorded| recorded >= erased_at_ms) {
+        let recorded = Self::read_erasure(&path)?;
+        // The ledger in memory takes the erasure first, so it holds at least what the files
+        // hold, also when a write lands its file and then fails: on that side it only erases.
+        let latest = recorded.map_or(erased_at_ms, |recorded| recorded.max(erased_at_ms));
+        {
+            let mut ledger = self.ledger.lock();
+            let held = ledger.entry(identity.to_string()).or_insert(latest);
+            *held = (*held).max(latest);
+        }
+        if recorded.is_some_and(|recorded| recorded >= erased_at_ms) {
             return Ok(());
         }
-        write_atomic(&path, erased_at_ms.to_string().as_bytes(), false)?;
-        self.ledger
-            .lock()
-            .insert(identity.to_string(), erased_at_ms);
-        Ok(())
+        write_atomic(&path, erased_at_ms.to_string().as_bytes(), false)
     }
 
     /// Remove the ledger's files of erasures before `before_ms`, each removal durable before
@@ -1307,6 +1315,17 @@ mod tests {
             vec![("bbb".to_string(), 2_000), ("ccc".to_string(), 3_000)]
         );
         assert_eq!(store.forget_erasures_before(0).await.expect("forget"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_key_store_erasure_ledger_holds_an_erasure_its_file_already_records() {
+        // A write whose rename landed but whose directory sync failed leaves the file in
+        // place and the record refused; the retry finds the file and must still put the
+        // erasure in the ledger the checks read (Switch spec 6.5).
+        let (dir, store) = open();
+        fs::write(dir.path().join("erasures").join("aaa"), "1000").expect("landed");
+        store.record_erasure("aaa", 1_000).await.expect("record");
+        assert_eq!(store.erasure("aaa").await.expect("read"), Some(1_000));
     }
 
     #[tokio::test]

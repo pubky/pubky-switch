@@ -280,9 +280,9 @@ fn store_error(error: &StoreError) -> ApiError {
 }
 
 impl Service {
-    /// A service at `origin`, the switch origin `identity.json` names, started: the keys an
-    /// erasure left owed, by a key store failure or a crash, are deleted first (Switch wire
-    /// 7.4.16). The service's binary starts it so.
+    /// A service at `origin`, the switch origin `identity.json` names, with the default
+    /// settings, [`Service::started`]. The binary sets its settings first, then runs
+    /// [`Service::started`] itself.
     pub async fn start(
         origin: String,
         store: Store,

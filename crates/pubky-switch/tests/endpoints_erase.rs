@@ -4164,3 +4164,182 @@ async fn test_erase_ledger_forgets_an_erasure_once_its_backups_aged_out() {
     assert_eq!(held().await, ["bbb"], "the erasure older than a day goes");
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_erase_account_enrolled_while_its_erasure_is_unrecorded_is_kept() {
+    // An erasure whose ledger record fails commits and stays owed; an enrollment of the
+    // identity meanwhile, at an earlier service time than the erasure's (the erased account's
+    // time ran ahead), makes a new account. Once a start records the owed erasure, neither
+    // the start nor a call may take that new account for a restored one (Switch spec 6.5).
+    use std::sync::atomic::Ordering;
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let gate = gated(&mut replay, false);
+    serve_alice(&replay).await;
+    let ahead = "2026-01-01T00:04:00.000Z";
+    set_time(&replay.clock, ahead);
+    gate.fail_ledger.store(true, Ordering::SeqCst);
+    assert_eq!(
+        code_of(&erase(&replay, &alice_service_key(), ahead).await),
+        (503, json!("unavailable"))
+    );
+    gate.fail_ledger.store(false, Ordering::SeqCst);
+    assert_eq!(
+        replay.keys.erasure(&alice_id()).await.expect("ledger"),
+        None,
+        "not recorded yet"
+    );
+    let http = vectors("http.json");
+    let enrolled = named(
+        &http["responses"],
+        "signer: enrollment answer, signed with the new account's key",
+    );
+    let at = enrolled["headers"]["switch-server-time"]
+        .as_str()
+        .expect("time")
+        .to_string();
+    assert!(ms(&at) < ms(ahead), "enrolled at an earlier time");
+    set_time(&replay.clock, &at);
+    let enrollment = vector_request(named(&http["requests"], "signer: enrollment"));
+    assert_eq!(replay.service.handle(enrollment).await.status, 200);
+    let created = created_at(&replay).await.expect("the new account");
+    let service = started(&replay, gate.clone(), None).await;
+    assert!(
+        replay
+            .keys
+            .erasure(&alice_id())
+            .await
+            .expect("ledger")
+            .is_some(),
+        "the start recorded the owed erasure"
+    );
+    assert_eq!(
+        created_at(&replay).await,
+        Some(created),
+        "the new account is kept through a start"
+    );
+    let apps = service
+        .handle(signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            ms(&at),
+        ))
+        .await;
+    assert_eq!(code_of(&apps), (503, json!("staged")));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_restored_account_whose_key_is_still_held_signs_nothing() {
+    // A database restored from before an erasure while the key store still holds the
+    // account's service key and its mark (a deletion that failed, or a key store brought back
+    // from its own backup): only the ledger tells. The first call erases the account again,
+    // the operator answers it, and the key goes (Switch spec 6.5).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let key = service_key_id(&replay, &alice_id()).await;
+    let created = created_at(&replay).await.expect("the account");
+    replay
+        .keys
+        .record_erasure(&alice_id(), created + 60_000)
+        .await
+        .expect("ledger");
+    assert!(replay.keys.public_key(&key).await.is_ok(), "still held");
+    let answer = replay
+        .service
+        .handle(request(
+            "GET",
+            &format!("/v1/{}/identity", alice_id()),
+            &[],
+            Vec::new(),
+        ))
+        .await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, None));
+    assert!(all_gone(&replay).await, "erased again");
+    assert!(
+        replay.keys.public_key(&key).await.is_err(),
+        "the key is deleted"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_account_enrolled_while_its_erasure_commits_is_kept() {
+    // An enrollment whose lookup still finds the account while an erasure of it commits, at
+    // a later service time than the enrollment's: its insert waits for the deletion, and the
+    // new account is created after the erasure, which the database holds before the ledger
+    // does. A start that then records the erasure keeps the new account (Switch spec 6.5).
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let key = service_key_id(&replay, &alice_id()).await;
+    let http = vectors("http.json");
+    let enrolled = named(
+        &http["responses"],
+        "signer: enrollment answer, signed with the new account's key",
+    );
+    let at = enrolled["headers"]["switch-server-time"]
+        .as_str()
+        .expect("time")
+        .to_string();
+    set_time(&replay.clock, &at);
+    let erased_at = ms(&at) + 60_000;
+    // The erasure's transaction, as `AccountTxn::erase` writes it, held open.
+    let mut erasing = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("BEGIN")
+        .execute(&mut erasing)
+        .await
+        .expect("begin");
+    sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .execute(&mut erasing)
+        .await
+        .expect("delete");
+    sqlx::query("INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, $3)")
+        .bind(key.as_str())
+        .bind(alice_id())
+        .bind(i64::try_from(erased_at).expect("time"))
+        .execute(&mut erasing)
+        .await
+        .expect("owed");
+    let enrollment = vector_request(named(&http["requests"], "signer: enrollment"));
+    let (answer, ()) = tokio::join!(replay.service.handle(enrollment), async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        sqlx::query("COMMIT")
+            .execute(&mut erasing)
+            .await
+            .expect("commit");
+    });
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_ne!(
+        service_key_id(&replay, &alice_id()).await,
+        key,
+        "a new account"
+    );
+    let created = created_at(&replay).await.expect("the new account");
+    assert_eq!(created, erased_at + 1, "created after the erasure");
+    assert_eq!(
+        replay.keys.erasure(&alice_id()).await.expect("ledger"),
+        None,
+        "not recorded yet"
+    );
+    let _ = started(&replay, replay.keys.clone(), None).await;
+    assert_eq!(
+        replay.keys.erasure(&alice_id()).await.expect("ledger"),
+        Some(erased_at),
+        "the start recorded it"
+    );
+    assert_eq!(created_at(&replay).await, Some(created), "kept");
+    erasing.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+}

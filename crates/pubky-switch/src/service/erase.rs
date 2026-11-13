@@ -223,53 +223,53 @@ impl Service {
                 return Err(unavailable());
             }
         };
-        if self.erase_restored(account, erased_at_ms).await {
-            Ok(true)
-        } else {
-            Err(unavailable())
+        match self.erase_restored(account, erased_at_ms).await {
+            Some(Restored::Gone | Restored::Erased) => Ok(true),
+            // A new account made since the lookup: served as it is.
+            Some(Restored::New) => Ok(false),
+            None => Err(unavailable()),
         }
     }
 
     /// Erase again account `account`, which a restored database brought back after its
     /// erasure at `erased_at_ms`: as an erasure does, its state deleted and its keys owed in
     /// one commit, then the owed keys deleted, its ledger entry kept, with no answer to sign.
-    /// Whether the account is gone: erased here, or already, or not a restored one any more
-    /// (a new account made meanwhile is left as it is).
-    async fn erase_restored(&self, account: &str, erased_at_ms: u64) -> bool {
+    /// What became of the account: gone, erased here or already, or a new account made since
+    /// the caller looked, left as it is; `None` when the erasure didn't commit.
+    async fn erase_restored(&self, account: &str, erased_at_ms: u64) -> Option<Restored> {
         let (store, keys, id) = (self.store.clone(), self.keys.clone(), account.to_string());
         // Run to the end in a task of its own, as an erasure is: a request dropped meanwhile
         // can't stop it between the commit and the keys' deletion.
         let erased = to_the_end(async move {
             let Some(mut txn) = store.begin(&id).await? else {
-                return Ok(false);
+                return Ok(Restored::Gone);
             };
             if txn.head().created_at_ms > erased_at_ms {
-                return Ok(false);
+                return Ok(Restored::New);
             }
             // A request that looked the account up before this signs nothing for it: its key is
             // gone already, and the keyed sections wait for this commit (store/keying.rs).
             txn.exclude_signers().await?;
             txn.erase(erased_at_ms).await?;
             let _ = sweep_owed(store, keys).await;
-            Ok::<_, crate::store::StoreError>(true)
+            Ok::<_, crate::store::StoreError>(Restored::Erased)
         })
         .await;
         match erased {
-            Some(Ok(erased)) => {
-                if erased {
-                    // No account ID in the log (Switch wire 9.4).
-                    tracing::warn!(
-                        "erased again an account a restored database brought back after its erasure"
-                    );
-                    self.forget_account(account);
-                }
-                true
+            Some(Ok(Restored::Erased)) => {
+                // No account ID in the log (Switch wire 9.4).
+                tracing::warn!(
+                    "erased again an account a restored database brought back after its erasure"
+                );
+                self.forget_account(account);
+                Some(Restored::Gone)
             }
+            Some(Ok(outcome)) => Some(outcome),
             Some(Err(failure)) => {
                 tracing::error!(%failure, "erasing again a restored account");
-                false
+                None
             }
-            None => false,
+            None => None,
         }
     }
 
@@ -297,7 +297,7 @@ impl Service {
         };
         let mut erased = 0;
         for (account, erased_at_ms) in &restored {
-            if self.erase_restored(account, *erased_at_ms).await {
+            if self.erase_restored(account, *erased_at_ms).await == Some(Restored::Gone) {
                 erased += 1;
             }
         }
@@ -337,6 +337,17 @@ impl Service {
         self.upload_rate.forget(|(at, _)| at == account);
         self.notify_rate.forget(|(at, _)| at == account);
     }
+}
+
+/// What [`Service::erase_restored`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Restored {
+    /// Erased just now; reported as [`Restored::Gone`].
+    Erased,
+    /// The account is gone.
+    Gone,
+    /// A new account, created after the erasure: not a restored one.
+    New,
 }
 
 /// Run `work` to its end in a task of its own: a request dropped meanwhile (a client that

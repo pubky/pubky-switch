@@ -51,7 +51,9 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
-pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount, Savepoint};
+pub use account::{
+    AccountHead, AccountTxn, CommitError, Committed, Creation, NewAccount, Savepoint,
+};
 pub use allow::{AllowEntry, AllowInvite};
 pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
 pub use chain::NewChainItem;
@@ -420,10 +422,21 @@ impl Store {
         Ok(())
     }
 
-    /// Create an account. Returns `false`, changing nothing, when one exists for the
-    /// identity already.
+    /// Insert an account, to commit with [`Creation::commit`] once its identity's
+    /// ledger entry is read: `None`, changing nothing, when one exists for the identity
+    /// already.
+    pub async fn begin_create(&self, account: &NewAccount) -> Result<Option<Creation>, StoreError> {
+        account::begin_create(&self.pool, account).await
+    }
+
+    /// For tests: create an account with no erasure ledger to read; `false`, changing
+    /// nothing, when one exists. The service creates through [`Store::begin_create`].
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn create_account(&self, account: &NewAccount) -> Result<bool, StoreError> {
-        account::create(&self.pool, account).await
+        match self.begin_create(account).await? {
+            Some(creation) => creation.commit(None).await.map(|_| true),
+            None => Ok(false),
+        }
     }
 
     /// The key store entries erasures still owe deleting, oldest first (Switch wire 7.4.16).

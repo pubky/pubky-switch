@@ -2047,3 +2047,33 @@ async fn test_push_delivery_attempt_runs_while_the_worker_waits_on_a_claim() {
         "the webhook waited {waited:?} for the claim"
     );
 }
+
+#[tokio::test]
+async fn test_push_delivery_of_a_restored_erased_account_holding_its_keys_is_never_sent() {
+    // A database restored from before alice's erasure, the key store still holding her
+    // service key and the registration's push key (a deletion that failed): only the ledger
+    // tells. The webhook isn't sent, and the account is erased again (Switch spec 6.5).
+    let Some((setup, _key)) = registered(&[H1]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    append(replay, 1, true).await;
+    assert_eq!(queued(replay).await.len(), 1);
+    let mut db = conn(replay).await;
+    let created: i64 = sqlx::query_scalar("SELECT created_at_ms FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut db)
+        .await
+        .expect("account");
+    db.close().await.expect("close");
+    replay
+        .keys
+        .record_erasure(&alice_id(), u64::try_from(created).expect("time") + 60_000)
+        .await
+        .expect("ledger");
+    let _ = replay.service.deliver_pushes().await;
+    assert!(setup.relay.seen().is_empty(), "no webhook");
+    assert!(queued(replay).await.is_empty(), "erased with the account");
+    assert_eq!(registrations(replay).await, 0);
+    setup.replay.db.drop_database().await.expect("drop");
+}
