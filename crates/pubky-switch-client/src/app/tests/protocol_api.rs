@@ -4164,3 +4164,210 @@ async fn test_scripted_invite_codes_sweep_with_the_clock_behind_its_mark() {
     shop.receive(None).await.unwrap();
     assert_eq!(p.bob.switch().invite_uses_left(&code.code), None);
 }
+
+// -------------------------------------------------------------------------------------
+// Holding and withdrawing the messages queued to a counterparty
+
+#[tokio::test]
+async fn test_hold_queued_holds_a_message_until_released() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let alice = p.alice.identity().public();
+    let bob = p.bob.identity().public();
+    shop.invite(&alice).await.unwrap();
+    wallet.hold_queued(&bob).await.unwrap();
+    assert_eq!(wallet.held_counterparties().await.unwrap(), vec![bob]);
+    let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.queued, vec![msg_id.clone()]);
+    assert_eq!(p.bob.switch().entries_from(&alice), 0, "held");
+    wallet.release_queued(&bob).await.unwrap();
+    assert!(wallet.held_counterparties().await.unwrap().is_empty());
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![msg_id]);
+    assert_eq!(
+        p.bob.switch().entries_from(&alice),
+        1,
+        "released, delivered once"
+    );
+}
+
+/// A batch that queues a message to a held counterparty, its answer lost: once it settles
+/// the message is in the outbox, held, while the batch's other operation is applied.
+#[tokio::test]
+async fn test_hold_queued_holds_what_a_kept_batch_queues() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let alice = p.alice.identity().public();
+    let bob = p.bob.identity().public();
+    shop.invite(&alice).await.unwrap();
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    p.alice
+        .switch()
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let batch = OpBatch::new()
+        .op(OpKind::AllowPut {
+            pubky: [9; 32],
+            kind: pubky_switch_core::ops::AllowKind::Conversation,
+        })
+        .queue(signed.clone());
+    assert!(
+        wallet
+            .submit_batch(batch)
+            .await
+            .unwrap_err()
+            .kept_batch()
+            .is_some()
+    );
+    wallet.hold_queued(&bob).await.unwrap();
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.kept_batches().await.unwrap().is_empty(), "settled");
+    assert!(matches!(
+        wallet.delivery(signed.msg_id()).await.unwrap(),
+        Some(Delivery::Queued { .. })
+    ));
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 0, "held");
+    wallet.release_queued(&bob).await.unwrap();
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 1);
+}
+
+/// Withdrawing gives up the messages queued to the counterparty and those a kept batch
+/// would queue, each told once; none is delivered or queued again.
+#[tokio::test]
+async fn test_withdraw_queued_gives_up_queued_and_kept_batch_messages() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let alice = p.alice.identity().public();
+    let bob = p.bob.identity().public();
+    wallet.hold_queued(&bob).await.unwrap();
+    let first = wallet.sign_message(Pair::note(&p.bob, "first")).unwrap();
+    wallet.queue_signed(first.clone()).await.unwrap();
+    let second = wallet.sign_message(Pair::note(&p.bob, "second")).unwrap();
+    p.alice
+        .switch()
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let batch = OpBatch::new()
+        .op(OpKind::AllowPut {
+            pubky: [9; 32],
+            kind: pubky_switch_core::ops::AllowKind::Conversation,
+        })
+        .queue(second.clone());
+    assert!(
+        wallet
+            .submit_batch(batch)
+            .await
+            .unwrap_err()
+            .kept_batch()
+            .is_some()
+    );
+    wallet.take_events();
+    let withdrawn = wallet.withdraw_queued(&bob).await.unwrap();
+    assert_eq!(
+        withdrawn,
+        vec![first.msg_id().to_owned(), second.msg_id().to_owned()]
+    );
+    let events = wallet.take_events();
+    assert_eq!(undelivered(&events, first.msg_id()), vec![false]);
+    assert_eq!(undelivered(&events, second.msg_id()), vec![false]);
+    // The kept batch settles; neither message goes, even released and admitted.
+    shop.invite(&alice).await.unwrap();
+    wallet.release_queued(&bob).await.unwrap();
+    wallet.receive(None).await.unwrap();
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 0);
+    assert!(
+        wallet
+            .take_events()
+            .iter()
+            .all(|e| !matches!(e, AppEvent::MessageUndelivered { .. })),
+        "told once"
+    );
+    let error = wallet.queue_stored(first.plaintext()).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Refused(Refusal::WontDeliver(WontDeliver::GivenUp))
+        ),
+        "{error:?}"
+    );
+}
+
+/// A backup carries the hold: the restored app holds the counterparty and delivers none of
+/// its messages. A restore in place also keeps a hold the host set after the backup.
+#[tokio::test]
+async fn test_hold_queued_survives_a_restore() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    let bob = p.bob.identity().public();
+    wallet.hold_queued(&bob).await.unwrap();
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    shop.invite(&alice).await.unwrap();
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    assert_eq!(restored.held_counterparties().await.unwrap(), vec![bob]);
+    restored.flush_outbox().await.unwrap();
+    assert_eq!(
+        p.bob.switch().entries_from(&alice),
+        0,
+        "held after the restore"
+    );
+    assert!(matches!(
+        restored.delivery(signed.msg_id()).await.unwrap(),
+        Some(Delivery::Queued { .. })
+    ));
+    // In place: a backup taken before the hold, restored over a store that holds it.
+    restored.release_queued(&bob).await.unwrap();
+    let before = restored.backup().await.unwrap();
+    restored.hold_queued(&bob).await.unwrap();
+    let store = Arc::new(MemoryStore::new());
+    drop(restored);
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let before = AppBackup::from_bytes(&before.to_bytes().unwrap()).unwrap();
+    let mut first = App::restore(env, protocol.clone(), config(), &before)
+        .await
+        .unwrap();
+    first.hold_queued(&bob).await.unwrap();
+    drop(first);
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let in_place = App::restore(env, protocol.clone(), config(), &before)
+        .await
+        .unwrap();
+    assert_eq!(in_place.held_counterparties().await.unwrap(), vec![bob]);
+}
+
+/// A held copy's replay deadline still runs: past it the copy is given up, once, though
+/// held.
+#[tokio::test]
+async fn test_hold_queued_copy_past_its_deadline_is_given_up_once() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let alice = p.alice.identity().public();
+    let bob = p.bob.identity().public();
+    shop.invite(&alice).await.unwrap();
+    let signed = wallet.sign_message(Pair::note(&p.bob, "old")).unwrap();
+    p.clock.advance_ms(25 * DAY_MS);
+    let msg_id = wallet.queue_stored(signed.plaintext()).await.unwrap();
+    wallet.hold_queued(&bob).await.unwrap();
+    wallet.flush_outbox().await.unwrap();
+    p.clock.advance_ms(6 * DAY_MS);
+    wallet.take_events();
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![msg_id.clone()]);
+    assert_eq!(undelivered(&wallet.take_events(), &msg_id), vec![false]);
+    wallet.release_queued(&bob).await.unwrap();
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 0);
+}

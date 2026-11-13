@@ -2476,6 +2476,7 @@ pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
         "sent/",
         "sentt/",
         "outgone/",
+        "outhold/",
         "invite/",
         "opq/",
         "kb/",
