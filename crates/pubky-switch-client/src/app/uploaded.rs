@@ -170,10 +170,21 @@ impl App {
     /// change, such as `403 cert_expired` before a renewal, stops the reads here, its record
     /// and the rest still marked, and the feed's read still succeeds; an alarm or a store
     /// failure fails it.
-    pub(crate) async fn reread_records(&mut self) -> Result<(), AppError> {
+    ///
+    /// Returns whether marks are left that this read didn't reach, past its budget of
+    /// [`RECORD_REREADS_PER_READ`] or its time ([`super::AppConfig::call_budget_ms`]): the
+    /// next read goes on with them ([`super::ReceiveReport::more`]).
+    pub(crate) async fn reread_records(
+        &mut self,
+        budget: Option<&super::CallBudget>,
+    ) -> Result<bool, AppError> {
         let mut marks = self.reader().scan::<u64>(RECORD_REREAD_PREFIX).await?;
         marks.sort_by(|(a_key, a_at), (b_key, b_at)| a_at.cmp(b_at).then(a_key.cmp(b_key)));
-        for (rest, _) in marks.into_iter().take(RECORD_REREADS_PER_READ) {
+        let left = marks.len() > RECORD_REREADS_PER_READ;
+        for (index, (rest, _)) in marks.into_iter().take(RECORD_REREADS_PER_READ).enumerate() {
+            if index > 0 && budget.is_some_and(|budget| self.spent(budget)) {
+                return Ok(true);
+            }
             let key = unb64_array::<32>(&rest).map_err(|_| AppError::Store(StoreError::Corrupt))?;
             let view = match self.record_view(&key).await {
                 Ok(view) => view.filter(|view| view.key == key),
@@ -181,7 +192,7 @@ impl App {
                     code: ErrorCode::PermissionMissing,
                     ..
                 })) => None,
-                Err(AppError::Transport(_) | AppError::Switch(_)) => break,
+                Err(AppError::Transport(_) | AppError::Switch(_)) => return Ok(false),
                 Err(error) => return Err(error),
             };
             // A record the app holds is read as its collection, the protocol's or not, as
@@ -195,7 +206,7 @@ impl App {
             tx.delete(&record_reread_key(&key))?;
             self.commit(tx).await?;
         }
-        Ok(())
+        Ok(left)
     }
 
     /// Hold what a view of record `key` says of divergent uploads, once its write is judged

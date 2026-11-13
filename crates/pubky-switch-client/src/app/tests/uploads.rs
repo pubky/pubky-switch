@@ -1255,3 +1255,25 @@ async fn test_upload_make_divergent_refuses_a_key_the_switch_lacks() {
     assert!(!held.divergent);
     assert_eq!(divergent(&report.events, key), 0);
 }
+
+#[tokio::test]
+async fn test_upload_records_left_by_the_read_budget_say_more() {
+    // The records past one read's budget stay marked, and the read says so: the next read
+    // goes on with them at once.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, false).await;
+    let keys: BTreeSet<[u8; 32]> = (0..=RECORD_REREADS_PER_READ)
+        .map(|i| [u8::try_from(i).unwrap() + 100; 32])
+        .collect();
+    let changes = UploadChanges {
+        divergent: keys,
+        ..UploadChanges::default()
+    };
+    lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(marks(&store, "rcread/"), 1);
+    assert!(report.more, "{:?}", report.events);
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(marks(&store, "rcread/"), 0);
+    assert!(!report.more, "{:?}", report.events);
+}

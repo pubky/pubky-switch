@@ -777,6 +777,13 @@ impl App {
     /// sending nothing. Returns its `msg_id`. A message already in the outbox, or sent, is
     /// left as it is.
     ///
+    /// It is for a message just signed. It checks neither a give-up nor the message's age,
+    /// so a host doesn't queue a kept [`SignedMessage`] again once its delivery was given up
+    /// ([`AppEvent::MessageUndelivered`]), or 30 days after it was signed: past that a
+    /// recipient that processed it may have forgotten the pair, and would process it as new
+    /// (Switch spec 11). A message signed before is queued again with [`App::queue_stored`],
+    /// which refuses those.
+    ///
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`]; [`Refusal::Usage`] for a message another
@@ -834,7 +841,9 @@ impl App {
     /// [`AppEvent::MessageUndelivered`], nor to one with `resend: false` once this app had a
     /// copy of it accepted. A backup carries neither the sent messages nor the give-up
     /// marks, so a restored app may queue again a message given up or accepted before the
-    /// backup: within its window it goes again, and the recipient drops it as a duplicate.
+    /// backup: within its window it goes again. A recipient that processed a copy accepted
+    /// before the backup drops it as a duplicate; a message given up before the backup goes
+    /// as a first delivery.
     ///
     /// # Errors
     ///
@@ -1589,6 +1598,9 @@ impl App {
 
     /// The conversation entry for `pubky`, unless the app knows it holds one, or a contact
     /// (Switch spec 7). An app whose certificate lacks `conversation.add` can't write one.
+    /// One a batch kept from an earlier call carries isn't written again: the call fails
+    /// with [`Refusal::NotNow`] until that batch is answered, so the item is tried again,
+    /// and no copy of the entry is kept behind another.
     async fn conversation_entry(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         let reader = self.reader();
         if reader
@@ -1599,11 +1611,21 @@ impl App {
         {
             return Ok(());
         }
-        self.submit_batch(OpBatch::new().op(OpKind::AllowPut {
+        let entry = OpKind::AllowPut {
             pubky: *pubky,
             kind: AllowKind::Conversation,
-        }))
-        .await?;
+        };
+        for (_, pending) in self.kept_batches().await? {
+            let kept = crate::client::Batch::from_body(pending.body)?;
+            if kept.ops().iter().any(|op| op.body().kind == entry) {
+                return Err(Refusal::NotNow(
+                    "the conversation entry is kept, to be sent after the batches ahead of it"
+                        .into(),
+                )
+                .into());
+            }
+        }
+        self.submit_batch(OpBatch::new().op(entry)).await?;
         Ok(())
     }
 

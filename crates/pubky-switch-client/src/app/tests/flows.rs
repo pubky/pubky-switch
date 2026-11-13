@@ -1812,13 +1812,21 @@ async fn test_submit_batch_behind_an_unsent_kept_batch_keeps_nothing_of_its_own(
     let kept = app.kept_batches().await.unwrap();
     assert_eq!(first.kept_batch(), Some(kept[0].0));
     // The kept batch still can't be sent: the next call fails before its own batch is
-    // signed, with the bare error, and keeps nothing of its own.
+    // signed, naming the kept batch ahead, with the bare error inside, and keeps nothing of
+    // its own.
     w.switch.fail_next(Fault::Unreachable {
         path: "ops".into(),
         after: 0,
     });
     let second = app.submit_batch(conversation([7; 32])).await.unwrap_err();
-    assert!(matches!(second, AppError::Transport(_)), "{second:?}");
+    assert!(
+        matches!(&second, AppError::Ahead { ahead, .. } if ahead.batch_id == kept[0].0),
+        "{second:?}"
+    );
+    assert!(
+        matches!(second.unkept(), AppError::Transport(_)),
+        "{second:?}"
+    );
     assert_eq!(second.kept_batch(), None);
     let ids = |kept: &[([u8; 16], crate::app::batch::PendingBatch)]| {
         kept.iter().map(|(id, _)| *id).collect::<Vec<_>>()

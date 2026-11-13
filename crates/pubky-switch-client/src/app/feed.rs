@@ -91,14 +91,30 @@ use super::provider::TakeOver;
 use super::records::{Collection, LISTING_PAGES_PER_READ, Listing, pending_name_key};
 use super::rotation::RegistrationStep;
 use super::state::{
-    CachedDoc, HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, PendingEffect, Processed,
-    RetryEntry, Tx, encode, key,
+    CachedDoc, HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, ParkedRound, PendingEffect,
+    Processed, RetryEntry, Tx, encode, key,
 };
 use super::{App, AppError, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
 use crate::client::answers::{ChainItem, EntryItem, FeedItem, FeedPage, FeedQuery};
 use crate::error::ClientError;
 use crate::store::{MAX_BATCH_BYTES, MAX_VALUE_BYTES};
+
+/// The most feed pages one read asks for ([`App::receive`]): a read that needs more stops
+/// between pages, says so ([`ReceiveReport::more`]), and the next read goes on from where it
+/// got.
+pub const FEED_PAGES_PER_READ: u32 = 4;
+
+/// Where a read that stopped with more to do went on to, kept so the next read goes on from
+/// there rather than from the cursor, past the entries held behind it (`feed_at`, `STATE.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FeedAt {
+    generation: u64,
+    after: u64,
+    blocked: Option<u64>,
+}
+
+const FEED_AT: &str = "feed_at";
 
 /// What one read did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -115,9 +131,13 @@ pub struct ReceiveReport {
     /// The read stopped on one of its per-call budgets with more to do now, all of it
     /// left for the next read, nothing lost or reordered: kept batches beyond
     /// [`KEPT_RESENDS_PER_READ`](super::KEPT_RESENDS_PER_READ), an owed listing of the
-    /// collections beyond [`LISTING_PAGES_PER_READ`] pages, or a second `missed` item,
-    /// whose listing the next read makes. The host calls [`App::receive`] again without
-    /// waiting.
+    /// collections beyond [`LISTING_PAGES_PER_READ`] pages, a second `missed` item, whose
+    /// listing the next read makes, feed pages beyond [`FEED_PAGES_PER_READ`], claims or
+    /// records to read again beyond [`CLAIM_REREADS_PER_READ`](super::CLAIM_REREADS_PER_READ)
+    /// or [`RECORD_REREADS_PER_READ`](super::RECORD_REREADS_PER_READ), or any of these left
+    /// once the time budget was spent ([`super::AppConfig::call_budget_ms`]). Entries stored
+    /// locally that a read didn't retry don't set it: they are retried at the next read
+    /// whenever it comes. The host calls [`App::receive`] again without waiting.
     pub more: bool,
 }
 
@@ -292,6 +312,9 @@ enum PageEnd {
     /// Processed through the `missed` item at this `seq`, which owes a listing of the
     /// collections, made before any later item is processed (Switch wire 7.4.4).
     ListFirst(u64),
+    /// Processed through the item at this `seq`, and stopped there on the call's time
+    /// budget: the next read goes on after it.
+    Budget(u64),
 }
 
 impl Read {
@@ -355,6 +378,35 @@ impl App {
     /// ([`AppEvent::KeptBatchesWaiting`]), and the read goes on. A read that stops on a
     /// budget says so ([`ReceiveReport::more`]).
     ///
+    /// **Worst case.** A read reads at most [`FEED_PAGES_PER_READ`] pages, and stops between
+    /// two items, never inside a batch's items; the next read goes on from where it got
+    /// (`feed_at`). The time budget ([`super::AppConfig::call_budget_ms`], 20 s by default)
+    /// bounds the steps that loop: the kept batches, the listing, the stored entries, the
+    /// feed and the rereads. Once it is spent each of them starts no further request after
+    /// its first, which it makes whatever the time, so no step waits for ever behind a slow
+    /// one. It doesn't bound the whole read:
+    /// - an item processed after it still makes its own requests, its sender's
+    ///   `identity.json` and its effect's batch;
+    /// - the read's other steps take no budget and make their requests whatever the time,
+    ///   among them the admission lists' refresh, the kept effect, the owed record
+    ///   delivery, the owed calls, the scope keys and key bundle parts, the records'
+    ///   reopening, the entries' writers, the own record's publication, the receive key
+    ///   rotation and the cursor move;
+    /// - a move or provider change met during the read is followed, which the budget doesn't
+    ///   bound either, and the read then goes on once more under the same budget.
+    ///
+    /// So a read ends after its budget, one request of each looping step and the requests
+    /// of the item it stopped on and of those other steps, each request within its timeout.
+    /// Once the budget is spent, the rest of a page already downloaded is dropped, past the
+    /// one item or batch processed, and the next read downloads that page again.
+    ///
+    /// **Order.** The kept batches go before the feed, oldest first, and no later write of
+    /// the host overtakes them ([`App::submit_batch`]). The read's own writes aren't kept
+    /// batches: the effects of the messages it processes, its cursor moves and a rotation
+    /// go as the read makes them, also when it left kept batches unsent, on its budget or
+    /// because their resend failed. So a read's own write may reach the switch before a
+    /// host's write kept from an earlier call.
+    ///
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app; an alarm the
@@ -367,12 +419,13 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.reopen_failures = 0;
-            let result = self.receive_once(wait).await;
+            let budget = self.begin_budget();
+            let result = self.receive_once(wait, &budget).await;
             // A move, a provider change, a revocation or an erasure met during the read is
             // followed (`provider.rs`), and the read goes on once at the service followed.
             let result = match self.take_over(result).await {
                 TakeOver::Done(result) => result,
-                TakeOver::ReadAgain => self.receive_once(None).await,
+                TakeOver::ReadAgain => self.receive_once(None, &budget).await,
             };
             // A reopening outside a read is tried whenever it is asked for.
             self.reopen_failures = 0;
@@ -398,9 +451,13 @@ impl App {
     /// One read. [`AppEvent::KeptBatchesWaiting`] goes only in the report of the read that
     /// met it: a read that fails drops it, its error being the outcome, so no later report
     /// carries a stale one.
-    async fn receive_once(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
+    async fn receive_once(
+        &mut self,
+        wait: Option<u32>,
+        budget: &super::CallBudget,
+    ) -> Result<ReceiveReport, AppError> {
         let raised = self.events.len();
-        let result = self.receive_inner(wait).await;
+        let result = self.receive_inner(wait, budget).await;
         if result.is_err() {
             let mut index = 0;
             self.events.retain(|event| {
@@ -411,7 +468,11 @@ impl App {
         result
     }
 
-    async fn receive_inner(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
+    async fn receive_inner(
+        &mut self,
+        wait: Option<u32>,
+        budget: &super::CallBudget,
+    ) -> Result<ReceiveReport, AppError> {
         self.reads_begun = self.reads_begun.wrapping_add(1);
         // Where a wait for the feed starts once this read is done ([`App::feed_wait`]): set
         // again by a read that gets that far.
@@ -489,7 +550,7 @@ impl App {
         // The batches kept from earlier calls go before the feed, and before anything the
         // read writes itself, so a lost answer is settled by this read (Switch wire 6.4
         // step 5).
-        let (waiting, kept_left) = self.resume_batches_before_feed().await?;
+        let (waiting, kept_left) = self.resume_batches_before_feed(Some(budget)).await?;
         if let Some(waiting) = waiting {
             self.events.push(waiting);
         }
@@ -516,12 +577,16 @@ impl App {
         // list again and again: a later item that owes one ends the read, and the next read
         // lists first.
         let mut pages = LISTING_PAGES_PER_READ;
-        let mut listing = self.list_collections_if_due(&mut pages).await?;
+        let mut listing = self
+            .list_collections_if_due(&mut pages, Some(budget))
+            .await?;
         if listing == Listing::WaitsForKey {
             // The key a listing waits for comes in a key bundle part, which the feed would
             // show only past this point: fetched here, then the listing tried once more.
             self.fetch_key_parts().await?;
-            listing = self.list_collections_if_due(&mut pages).await?;
+            listing = self
+                .list_collections_if_due(&mut pages, Some(budget))
+                .await?;
         }
         let waits_for_key = listing == Listing::WaitsForKey;
         let unfinished = listing == Listing::Unfinished;
@@ -555,14 +620,34 @@ impl App {
             if !self.reader().exists(super::records::REOPEN_DUE).await? {
                 due_at_start = self.awaiting_due();
             }
-            self.retry_parked().await?;
+            self.retry_parked(Some(budget)).await?;
             self.retry_owed().await?;
             let mut wait = wait.map(|seconds| self.long_poll_seconds(seconds).0);
             // The read position moves on page by page, past a held entry, while the cursor
             // stays before it (Switch spec 8.2); the held `seq` carries over to later pages.
+            // A read that a budget stopped left where it got: the next one goes on from
+            // there, the held `seq` with it, so the entries held behind the cursor don't take
+            // each read's budget again.
             let mut after = self.state.cursor.seq;
             let mut blocked = None;
+            let resumed: Option<FeedAt> = self.reader().get(FEED_AT).await?;
+            if let Some(at) = resumed
+                && at.generation == self.state.cursor.generation
+                && at.after >= after
+            {
+                after = at.after;
+                blocked = at.blocked;
+            }
+            let mut feed_pages = 0u32;
             loop {
+                // At most FEED_PAGES_PER_READ pages, and none past the call's time budget
+                // once one is read: the next read goes on from here.
+                if feed_pages >= FEED_PAGES_PER_READ || (feed_pages > 0 && self.spent(budget)) {
+                    self.feed_goes_on(after, blocked).await?;
+                    report.more = true;
+                    break;
+                }
+                feed_pages += 1;
                 let generation = self.state.cursor.generation;
                 let query = FeedQuery {
                     after: Some(Position {
@@ -575,15 +660,26 @@ impl App {
                 let result = self.client.feed(query).await;
                 let page = self.take(result).await?;
                 let scanned = page.scanned_through;
-                match self.process_page(page, after, &mut blocked).await? {
+                match self
+                    .process_page(page, after, &mut blocked, Some(budget))
+                    .await?
+                {
                     Some(PageEnd::Read { more: true }) => {
                         after = after.max(scanned).max(self.state.cursor.seq);
                     }
                     Some(PageEnd::Read { more: false }) => {
                         // Read to the end: a wait goes on past everything shown, the entries
-                        // held behind the cursor included.
+                        // held behind the cursor included. The next read starts at the
+                        // cursor again, and meets them.
                         let seq = after.max(scanned);
                         reached = Some(Position { generation, seq });
+                        self.feed_read_to_end().await?;
+                        break;
+                    }
+                    Some(PageEnd::Budget(through)) => {
+                        after = after.max(through).max(self.state.cursor.seq);
+                        self.feed_goes_on(after, blocked).await?;
+                        report.more = true;
                         break;
                     }
                     // The listing a `missed` item owes, before any later item: ending the page's
@@ -594,18 +690,26 @@ impl App {
                     // lists first, and so does one past the read's one listing or its page
                     // budget, which the report says.
                     Some(PageEnd::ListFirst(through)) => {
+                        // The page is committed through the `missed` item: a read that stops
+                        // here for the listing keeps where it got, as a budget's stop does.
                         if listed {
+                            self.feed_goes_on(after.max(through), blocked).await?;
                             report.more = true;
                             break;
                         }
-                        let mut listing = self.list_collections_if_due(&mut pages).await?;
+                        let mut listing = self
+                            .list_collections_if_due(&mut pages, Some(budget))
+                            .await?;
                         if listing == Listing::WaitsForKey {
                             self.fetch_key_parts().await?;
-                            listing = self.list_collections_if_due(&mut pages).await?;
+                            listing = self
+                                .list_collections_if_due(&mut pages, Some(budget))
+                                .await?;
                         }
                         match listing {
                             Listing::Listed => listed = true,
                             Listing::Unfinished => {
+                                self.feed_goes_on(after.max(through), blocked).await?;
                                 report.more = true;
                                 break;
                             }
@@ -640,10 +744,11 @@ impl App {
             } else if !report.stopped {
                 // Nothing is handed over while a listing is owed (Switch spec 8.2).
                 if !self.reader().exists(super::records::LIST_DUE).await? {
-                    self.retry_awaited(&due_at_start).await?;
+                    self.retry_awaited(&due_at_start, Some(budget)).await?;
                 }
-                self.reread_claims().await?;
-                self.reread_records().await?;
+                let claims_left = self.reread_claims(Some(budget)).await?;
+                let records_left = self.reread_records(Some(budget)).await?;
+                report.more |= claims_left || records_left;
                 self.fetch_entry_writers().await?;
                 if !published {
                     self.publish_owed(false, true).await?;
@@ -670,6 +775,29 @@ impl App {
         Ok(report)
     }
 
+    /// Keep where a read that stopped with more to do got to (`feed_at`): the next read goes
+    /// on from `after`, with the lowest `seq` held so far.
+    async fn feed_goes_on(&mut self, after: u64, blocked: Option<u64>) -> Result<(), AppError> {
+        let at = FeedAt {
+            generation: self.state.cursor.generation,
+            after,
+            blocked,
+        };
+        let mut tx = self.tx()?;
+        tx.put(FEED_AT, &at)?;
+        self.commit(tx).await
+    }
+
+    /// A read reached the feed's end: the next one starts at the cursor again.
+    async fn feed_read_to_end(&mut self) -> Result<(), AppError> {
+        if self.reader().exists(FEED_AT).await? {
+            let mut tx = self.tx()?;
+            tx.delete(FEED_AT)?;
+            self.commit(tx).await?;
+        }
+        Ok(())
+    }
+
     /// One page, read after `after`, with the lowest `seq` held so far in this read: how it
     /// ended, or `None` when the read stops on it.
     async fn process_page(
@@ -677,6 +805,7 @@ impl App {
         page: FeedPage,
         after: u64,
         blocked: &mut Option<u64>,
+        budget: Option<&super::CallBudget>,
     ) -> Result<Option<PageEnd>, AppError> {
         let now = self.now();
         let multi = self.state.device.multi_device;
@@ -720,6 +849,16 @@ impl App {
         }
         let mut stopped = None;
         let mut list_through = None;
+        // The last item processed, and where the call's time budget stopped the page.
+        let mut processed: Option<u64> = None;
+        let mut budget_through = None;
+        let batch_of = |seq: u64| {
+            checked
+                .envelopes
+                .get(&seq)
+                .and_then(|e| e.batch)
+                .map(|b| b.id)
+        };
         // A stub names no object: once the page shows the stub of an operation, the claims
         // the app follows are read again at the end of the read (Switch wire 7.5), noted in
         // the commit that passes it.
@@ -730,6 +869,16 @@ impl App {
                 continue;
             }
             if list_through.is_some() && !matches!(item, FeedItem::Missed { .. }) {
+                break;
+            }
+            // Past the call's time budget the read stops between two items, once it has
+            // processed one, and never inside a batch's items, which a page always carries
+            // whole (Switch wire 7.4.4).
+            if let (Some(budget), Some(last)) = (budget, processed)
+                && (batch_of(last).is_none() || batch_of(last) != batch_of(seq))
+                && self.spent(budget)
+            {
+                budget_through = Some(last);
                 break;
             }
             // Room for one more item, whatever it writes: the read's writes so far are
@@ -793,6 +942,7 @@ impl App {
                     break;
                 }
             }
+            processed = Some(seq);
             if self.state.alarm.is_some() {
                 stopped = Some(seq);
                 break;
@@ -804,7 +954,9 @@ impl App {
                 list_through = Some(seq);
             }
         }
-        let through = list_through.unwrap_or(page.scanned_through);
+        let through = list_through
+            .or(budget_through)
+            .unwrap_or(page.scanned_through);
         let end = match (stopped, read.blocked) {
             (Some(stop), _) => stop
                 .saturating_sub(1)
@@ -829,6 +981,9 @@ impl App {
         }
         if let Some(through) = list_through {
             return Ok(Some(PageEnd::ListFirst(through)));
+        }
+        if let Some(through) = budget_through {
+            return Ok(Some(PageEnd::Budget(through)));
         }
         Ok(Some(PageEnd::Read { more: page.more }))
     }
@@ -2123,7 +2278,14 @@ impl App {
     ///
     /// At most [`PARKED_RETRIES_PER_READ`] each read, starting where the last read stopped
     /// and going round, so none waits for ever behind others the store keeps failing.
-    async fn retry_parked(&mut self) -> Result<(), AppError> {
+    ///
+    /// Past the call's time budget it stops once it has tried one, and the round moves on
+    /// only past the entries it reached: the next read starts at the first one it left. So
+    /// with the budget spent at every read, each read still tries one entry, and every
+    /// entry due is tried within two rounds of one read per entry. No `more` is said for
+    /// them: an entry the store keeps failing comes again at every read, so the host's next
+    /// read, not one at once, tries it.
+    async fn retry_parked(&mut self, budget: Option<&super::CallBudget>) -> Result<(), AppError> {
         let gaps = self.key_gaps();
         let keys_held = self.keys_held();
         // An entry that waits for a key may read the records a reopening still owes: it
@@ -2142,14 +2304,31 @@ impl App {
         if due.is_empty() {
             return Ok(());
         }
-        let (ids, round) = self.state.parked_round.turn(&due, PARKED_RETRIES_PER_READ);
+        let before = self.state.parked_round;
+        let (ids, round) = before.turn(&due, PARKED_RETRIES_PER_READ);
+        // Committed before the retries, so an entry whose retry fails the read doesn't
+        // hold the round at it.
+        self.commit_parked_round(round).await?;
+        let given = ids.len();
+        let reached = self.retry_stored(ids, budget).await?;
+        if reached < given {
+            // A smaller turn takes the same first entries: the round stands past those
+            // reached, and the next read starts at the first one left.
+            self.commit_parked_round(before.turn(&due, reached).1)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Keep where the retries of entries stored locally stand (`parkn`), when it changed.
+    async fn commit_parked_round(&mut self, round: ParkedRound) -> Result<(), AppError> {
         if round != self.state.parked_round {
             self.state.parked_round = round;
             let mut tx = self.tx()?;
             tx.put(key::PARKED_NEXT, &round)?;
             self.commit(tx).await?;
         }
-        self.retry_stored(ids).await
+        Ok(())
     }
 
     /// The entries waiting for a scope key that a fetch in the read brought the keys of,
@@ -2157,7 +2336,11 @@ impl App {
     /// retries began (`due_at_start`), at most [`PARKED_RETRIES_PER_READ`] in local ID order;
     /// the rest are due at the next read's retries. The caller makes sure no listing is
     /// owed, so nothing is handed to the protocol before one (Switch spec 8.2).
-    async fn retry_awaited(&mut self, due_at_start: &[u64]) -> Result<(), AppError> {
+    async fn retry_awaited(
+        &mut self,
+        due_at_start: &[u64],
+        budget: Option<&super::CallBudget>,
+    ) -> Result<(), AppError> {
         // Not while a reopening is owed, which their steps may read (`retry_parked`).
         if self.reader().exists(super::records::REOPEN_DUE).await? {
             return Ok(());
@@ -2168,7 +2351,7 @@ impl App {
             .filter(|id| !due_at_start.contains(id))
             .take(PARKED_RETRIES_PER_READ)
             .collect();
-        self.retry_stored(ids).await
+        self.retry_stored(ids, budget).await.map(|_| ())
     }
 
     /// The local IDs of the entries waiting for a scope key that are due now, in order.
@@ -2204,9 +2387,19 @@ impl App {
     }
 
     /// The entries stored locally at `ids`, each checked and applied again in a commit of
-    /// its own.
-    async fn retry_stored(&mut self, ids: Vec<u64>) -> Result<(), AppError> {
-        for id in ids {
+    /// its own. Past the call's time budget, once one is tried, it stops: the rest go at a
+    /// later read. Returns how many of `ids` it reached, in order, those it passed over
+    /// included.
+    async fn retry_stored(
+        &mut self,
+        ids: Vec<u64>,
+        budget: Option<&super::CallBudget>,
+    ) -> Result<usize, AppError> {
+        let given = ids.len();
+        for (index, id) in ids.into_iter().enumerate() {
+            if index > 0 && budget.is_some_and(|budget| self.spent(budget)) {
+                return Ok(index);
+            }
             let Some(stored) = self.state.parked.get(&id).cloned() else {
                 continue;
             };
@@ -2239,7 +2432,7 @@ impl App {
                 });
             }
         }
-        Ok(())
+        Ok(given)
     }
 
     /// The sender's newest `identity.json` for check 7: the own one, or a copy at most 10

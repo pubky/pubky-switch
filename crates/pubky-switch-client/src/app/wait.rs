@@ -107,7 +107,9 @@ pub(crate) struct WaitFrom {
 ///
 /// The host's loop, paced with [`WaitPace`] so that no state makes it spin: a removed app,
 /// a read that stops, a listing waiting for a key and a switch or proxy that ends every
-/// wait at once each give it a pause, doubling to [`MAX_PAUSE_MS`].
+/// wait at once each give it a pause, doubling to [`MAX_PAUSE_MS`]. A read that says
+/// [`super::ReceiveReport::more`] is followed by the next at once, with no pause, by design:
+/// each such read made progress its budget allowed, and what is left is finite.
 ///
 /// ```text
 /// let mut pace = WaitPace::new();
@@ -278,7 +280,10 @@ impl App {
         if self.reload {
             return Err(Woken::ReadNow);
         }
-        if self.refuse_when_stopped().is_err() || self.not_current_here().is_some() {
+        if self.refuse_when_stopped().is_err()
+            || self.not_current_here().is_some()
+            || self.next_wait == NextWait::Later
+        {
             return Err(Woken::ReadLater);
         }
         if self.state.chain.is_none() {

@@ -6687,7 +6687,12 @@ async fn test_records_reopening_too_large_for_one_commit_keeps_reads_going() {
         phone.put_record(&target, &big, vec![]).await.unwrap();
         keys.push(phone.record_key(&target).unwrap());
     }
-    wallet.receive(None).await.unwrap();
+    // The records take more pages than one read's budget: reads go on while it says so.
+    for _ in 0..8 {
+        if !wallet.receive(None).await.unwrap().more {
+            break;
+        }
+    }
     for key in &keys {
         let held = wallet.shared_record(key).await.unwrap().unwrap();
         assert!(held.content.value().is_none(), "held unreadable for now");

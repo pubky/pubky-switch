@@ -226,16 +226,16 @@ pub(crate) enum Carry {
 /// retry gets `409 conflict`, which then can't be told from a condition that failed, and an
 /// ID forgotten takes the same bytes as new. The window ends [`KEPT_BATCH_MARGIN_MS`]
 /// before those 30 days from when the app kept the batch, before its first send.
-pub(crate) const KEPT_BATCH_ANSWER_MS: u64 =
+pub const KEPT_BATCH_ANSWER_MS: u64 =
     pubky_switch_core::ops::BATCH_PROOFS_MS - KEPT_BATCH_MARGIN_MS;
 
 /// How much sooner than the service's 30 days a kept batch's window ends. A resend sent just
-/// inside the window, measured at [`App::kept_window_now`], reaches the service within the
-/// device clock's tolerance of the service's (5 minutes, the clock tolerance), plus the
-/// 5 minutes a request's signed time is accepted for (Switch wire 7.1), after the app kept
-/// it, and the service applied it no sooner than the app kept it: some 20 minutes in the
-/// worst case. An hour leaves room past that.
-pub(crate) const KEPT_BATCH_MARGIN_MS: u64 = 60 * 60 * 1000;
+/// inside the window, measured at the later of the device clock and a verified service
+/// time, reaches the service within the device clock's tolerance of the service's (5
+/// minutes, the clock tolerance), plus the 5 minutes a request's signed time is accepted for
+/// (Switch wire 7.1), after the app kept it, and the service applied it no sooner than the
+/// app kept it: some 20 minutes in the worst case. An hour leaves room past that.
+pub const KEPT_BATCH_MARGIN_MS: u64 = 60 * 60 * 1000;
 
 /// Whether a resend of a batch kept at `kept_ms` still tells whether it was applied, at
 /// `now`: kept less than [`KEPT_BATCH_ANSWER_MS`] ago. A batch without a time, kept by an

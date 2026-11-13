@@ -460,7 +460,7 @@ impl App {
             let batch = OpBatch::new()
                 .op_if(op.kind(), conditions)
                 .obligation_deadline(op.entry.claim_key, deadline);
-            let (submitted, views) = match self.submit_checked(batch).await {
+            let (submitted, views) = match self.submit_checked(batch, false).await {
                 Ok(answered) => answered,
                 Err(error) => {
                     return match self.repeated_entry(&op.entry, &error).await? {
@@ -714,9 +714,15 @@ impl App {
     /// an alarm or a store failure fails it. Reading a claim writes no chain item, so it
     /// shows no stub and can't mark again by itself. An app without `claims.read` can't
     /// read claims, and marks none.
-    pub(crate) async fn reread_claims(&mut self) -> Result<(), AppError> {
+    ///
+    /// Returns whether marks are left that this read didn't reach, past its budget of
+    /// [`CLAIM_REREADS_PER_READ`] or its time: the next read goes on with them.
+    pub(crate) async fn reread_claims(
+        &mut self,
+        budget: Option<&super::CallBudget>,
+    ) -> Result<bool, AppError> {
         if !self.state.cert.has_permission(Permission::ClaimsRead) {
-            return Ok(());
+            return Ok(false);
         }
         if self.reader().exists(STUB_SEEN).await? {
             let now = self.service_now();
@@ -739,7 +745,11 @@ impl App {
         }
         let mut marks = self.reader().scan::<u64>(REREAD_PREFIX).await?;
         marks.sort_by(|(a_key, a_at), (b_key, b_at)| a_at.cmp(b_at).then(a_key.cmp(b_key)));
-        for (rest, _) in marks.into_iter().take(CLAIM_REREADS_PER_READ) {
+        let left = marks.len() > CLAIM_REREADS_PER_READ;
+        for (index, (rest, _)) in marks.into_iter().take(CLAIM_REREADS_PER_READ).enumerate() {
+            if index > 0 && budget.is_some_and(|budget| self.spent(budget)) {
+                return Ok(true);
+            }
             let claim_key = unb64_array::<32>(&rest)
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let held = |kept: Option<KeptClaim>| kept.map(|kept| (kept.view, kept.settled_proof));
@@ -753,14 +763,14 @@ impl App {
             }
             match self.read_claim_inner(&claim_key).await {
                 Ok(_) => {}
-                Err(AppError::Transport(_) | AppError::Switch(_)) => break,
+                Err(AppError::Transport(_) | AppError::Switch(_)) => return Ok(false),
                 Err(error) => return Err(error),
             }
             if held(self.kept_claim(&claim_key).await?) != before {
                 self.events.push(AppEvent::ClaimChanged { claim_key });
             }
         }
-        Ok(())
+        Ok(left)
     }
 
     /// The checks of a claim answer; `Err` names the contradiction (Switch wire 7.4.8).
