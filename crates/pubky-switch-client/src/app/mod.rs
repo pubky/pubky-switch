@@ -656,9 +656,10 @@ pub struct App {
     /// The worst held-cursor verdict of the read under way's pages ([`HeldCursor::worse`]),
     /// taken into its report. In memory only.
     held_cursor_read: Option<HeldCursor>,
-    /// The highest held cursor reported ahead with [`AppEvent::HeldCursorAhead`], so a report
-    /// isn't told again at every page. In memory only.
-    held_ahead_told: Option<u64>,
+    /// The generation and highest held cursor reported ahead with
+    /// [`AppEvent::HeldCursorAhead`], so a report isn't told again at every page; cleared by
+    /// a page that isn't ahead. In memory only.
+    held_ahead_told: Option<(u64, u64)>,
     /// How many times an owed reopening failed in the read under way ([`App::receive`]):
     /// after [`records::REOPEN_TRIES_PER_READ`], it is left for the next read. In memory
     /// only.
@@ -1751,6 +1752,7 @@ impl App {
                 restore_cursor: Some(held_cursor::RestoreCursor {
                     generation: backup.cursor.generation,
                     seq: backup.cursor.seq,
+                    restored_at_ms: env.clock.now_ms(),
                     verdict: None,
                 }),
                 leave: None,
@@ -2119,6 +2121,7 @@ impl App {
             let over = self.state.restore.as_ref().is_some_and(|r| r.key_checked);
             if over {
                 tx.delete(key::RESTORE)?;
+                tx.delete(key::RESTORE_CURSOR)?;
             } else if let Some(restore) = self.state.restore.as_mut() {
                 restore.reconcile = false;
                 tx.put(key::RESTORE, restore)?;
@@ -2130,6 +2133,7 @@ impl App {
             self.commit(tx).await?;
             if over {
                 self.state.restore = None;
+                self.state.restore_cursor = None;
             }
             Ok(())
         })

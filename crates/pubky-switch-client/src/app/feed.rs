@@ -307,6 +307,9 @@ struct Read {
     /// A `missed` item owed a listing of the collections: no later item of the read is
     /// processed before it (Switch wire 7.4.4).
     list_first: bool,
+    /// The restore's check of the held cursor as this page settled it, taken once the
+    /// page's commit is done.
+    restore_cursor: Option<super::held_cursor::RestoreCursor>,
 }
 
 /// How a page of the feed ended, when the read didn't stop on it.
@@ -330,6 +333,7 @@ impl Read {
             epoch_rose: false,
             pairs: HashMap::new(),
             list_first: false,
+            restore_cursor: None,
         }
     }
 
@@ -873,9 +877,6 @@ impl App {
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
         }
-        // The cursor the service holds, before anything of the page is processed (Switch
-        // spec 8.3).
-        self.compare_held_cursor(page.cursor, &mut read.tx).await?;
         if let Some(freeze) = &page.freeze {
             // Nothing on a frozen service's page is processed: its items come again from
             // the next service (`provider.rs`).
@@ -883,8 +884,22 @@ impl App {
             self.note_freeze(freeze).await?;
             return Ok(None);
         }
+        // The cursor the service holds, before anything of the page is processed, and not
+        // a frozen service's (Switch spec 8.3, 12.4).
+        let compared = self.compare_held_cursor(page.cursor).await?;
         let mut stopped = None;
         let mut list_through = None;
+        if let Some(check) = compared.restore {
+            read.tx.put(key::RESTORE_CURSOR, &check)?;
+            read.restore_cursor = Some(check);
+        }
+        if let Some((held, _)) = compared.gap {
+            // The gap ahead is handled as a `missed` item at the page's start: the
+            // protocol is handed it and a listing is owed, made before any item of the
+            // page (Switch spec 8.3 "Ahead", 12.4 condition 4).
+            self.hand_held_gap(held, &mut read)?;
+            list_through = Some(start);
+        }
         // The last item processed, and where the call's time budget stopped the page.
         let mut processed: Option<u64> = None;
         let mut budget_through = None;
@@ -1045,7 +1060,11 @@ impl App {
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
         }
-        self.commit(read.tx).await
+        self.commit(read.tx).await?;
+        if let Some(check) = read.restore_cursor {
+            self.state.restore_cursor = Some(check);
+        }
+        Ok(())
     }
 
     /// An item the cursor passes: its acceptance time becomes the cursor's.
@@ -2591,6 +2610,37 @@ impl App {
 
     /// The earliest acceptance time the app asks a re-send for: its cursor's, less the
     /// clock tolerance (Switch spec 8.2).
+    /// A gap the cursor the service holds shows ahead of the app's position, handled as a
+    /// `missed` item is (Switch spec 8.3 "Ahead"): entries after `position` that an instance
+    /// of the app passed, which the service may have deleted. The protocol is handed the
+    /// range accepted from the cursor's time, less the clock tolerance, with no end and no
+    /// count (`entries` 0), and a listing is owed; once for each higher report (`hgap`).
+    fn hand_held_gap(&mut self, held: u64, read: &mut Read) -> Result<(), AppError> {
+        let missed = MissedEntries {
+            seq: held,
+            entries: 0,
+            accepted_from_ms: self.resend_floor(),
+            accepted_until_ms: u64::MAX,
+        };
+        let call = OwedCall::Missed {
+            seq: held,
+            entries: 0,
+            accepted_from_ms: missed.accepted_from_ms,
+            accepted_until_ms: missed.accepted_until_ms,
+        };
+        match self.protocol.missed(&missed) {
+            Ok(writes) if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES => {
+                self.local_writes_refused(held, call, read)?;
+            }
+            Ok(writes) => read.tx.local(&writes)?,
+            Err(_) => self.owe(held, call, read)?,
+        }
+        self.gap_handed(held, &mut read.tx)?;
+        super::records::owe_listing(&mut read.tx)?;
+        read.list_first = true;
+        Ok(())
+    }
+
     fn resend_floor(&self) -> u64 {
         self.state.cursor.time_ms.saturating_sub(CLOCK_TOLERANCE_MS)
     }

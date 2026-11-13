@@ -1494,6 +1494,18 @@ impl ScriptedSwitch {
         self.lock().keep_passed = true;
     }
 
+    /// Serve feed pages without `cursor`, as a service of an earlier version does (Switch
+    /// wire 7.4.4), or with it again.
+    pub fn serve_feed_without_cursor(&self, without: bool) {
+        self.lock().omit_cursor = without;
+    }
+
+    /// Set the cursor the switch holds for `app`, as another instance of the app moving it
+    /// would (Switch spec 8.3).
+    pub fn set_held_cursor(&self, app: &[u8; 16], seq: u64) {
+        self.lock().apps.entry(*app).or_default().cursor = seq;
+    }
+
     /// Set the inbox quota (Switch wire 9.2 `quota_bytes`), which an enrollment announces
     /// and the current apps share: an app whose unread entries pass its share is marked
     /// lagging (Switch wire 7.4.4). The switch refuses no append for it.
