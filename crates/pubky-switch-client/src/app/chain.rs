@@ -237,7 +237,9 @@ impl ChainView {
                 self.verifier = trial;
             }
             Some(cp) => {
-                if self.stubs_kept(now_ms)
+                // Neither evidence holds for an app whose devices share its cursor: another
+                // device may have moved it past the stubs, which then went honestly.
+                if (!multi_device && self.stubs_kept(now_ms))
                     || self.holds_fresh_mark(position, cp.seq, now_ms, multi_device)
                 {
                     return Err(rollback(ChainError::Checkpoint { seq: cp.seq }));
@@ -268,7 +270,8 @@ impl ChainView {
 
     /// Whether the service rule keeps the stubs from the app's position: the chain item
     /// there is less than 30 days old, less the tolerance, and the app wasn't restored
-    /// since (Switch wire 7.4.4).
+    /// since (Switch wire 7.4.4). The caller doesn't ask for an app whose devices share its
+    /// cursor, which another device may have moved past them.
     fn stubs_kept(&self, now_ms: u64) -> bool {
         self.restore.is_none()
             && self

@@ -29,6 +29,7 @@ const GENERATION_STATE: &[&str] = &[
     "push_registrations",
     "push_deliveries",
     "chain_items",
+    "chain_retention",
     "apps",
     "receive_keys",
     "key_bundle_parts",
