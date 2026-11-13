@@ -814,18 +814,29 @@ async fn test_feed_401_from_the_page_check_counts_as_a_failed_authentication() {
             .expect("hex"),
     )
     .expect("hex");
-    // The key the request verified with is no longer the app's by the next snapshot: its
-    // record is gone. The page is refused 401, without a head, and the 401 counts.
+    let phone_bytes = hex::decode(
+        app(&keys, "phone")["app_id_bytes_hex"]
+            .as_str()
+            .expect("hex"),
+    )
+    .expect("hex");
+    // The key the request verified with is no longer the app's by the next snapshot: the
+    // record held for it carries another app's key. The page is refused 401, without a
+    // head, and the 401 counts.
     let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
             .await
             .expect("conn");
-        sqlx::query("UPDATE apps SET record = NULL, receive_key = NULL WHERE app_id = $1")
-            .bind(wallet_bytes.as_slice())
-            .execute(&mut conn)
-            .await
-            .expect("update");
+        sqlx::query(
+            "UPDATE apps SET record = (SELECT record FROM apps WHERE app_id = $2), \
+             receive_key = NULL WHERE app_id = $1",
+        )
+        .bind(wallet_bytes.as_slice())
+        .bind(phone_bytes.as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("update");
     });
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
