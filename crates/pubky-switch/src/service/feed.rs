@@ -1320,6 +1320,89 @@ mod tests {
         assert!(!full(&cert, &other, &current));
     }
 
+    /// Whether some reader of `readers` is shown `row` in full.
+    fn some_full(row: &FeedRow, readers: &[&AppCert], current: &CurrentDocs) -> bool {
+        readers.iter().any(|reader| full(row, reader, current))
+    }
+
+    #[test]
+    fn test_feed_documents_some_app_may_read_are_the_ones_shown_in_full() {
+        // The store deletes a document exactly when no app may read it in full: its rule
+        // (`CurrentDocs::shows_in_full_to_some_app`) agrees with `shows` over every reader,
+        // the most permitted one and a key bundle's target among them, in each state below.
+        use pubky_switch_core::ops::KeyBundlePut;
+        let all = reader(
+            &["pay", "allowance"],
+            &[
+                Permission::ClaimsRead,
+                Permission::ListsRead,
+                Permission::ConversationAdd,
+            ],
+        );
+        let target = reader_keyed([9; 32], &["pay"], &[]);
+        let readers = [&all, &target];
+        let part =
+            pubky_switch_core::records::seal_bundle_parts(&alice_key(), &target, 1, 1, &|_| true)
+                .expect("bundle")
+                .remove(0);
+        let mut items = rows();
+        items.push(op_row(
+            23,
+            OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: target.app_id(),
+                bundle: part.bundle,
+                first_epoch: 1,
+                last_epoch: 1,
+            }),
+            Some(target.app_id()),
+        ));
+        items.push(op_row(
+            24,
+            OpKind::CertPut {
+                target_app_id: target.app_id(),
+                cert: target.signed().clone(),
+            },
+            None,
+        ));
+        let mut gone = row(1);
+        gone.item = None;
+        items.push(gone);
+        let mut states = vec![current_at_nine()];
+        let mut later = current_at_nine();
+        later.records.clear();
+        later.records.insert(10, "pay".into());
+        later.claim_entries.clear();
+        for docs in later.apps.values_mut() {
+            docs.record = Some(SignedDoc::from_parts(b"{}", &[0; 64]));
+        }
+        states.push(later);
+        let mut stored = current_at_nine();
+        stored.bundles.insert(23);
+        stored.apps.insert(
+            target.app_id(),
+            AppDocs {
+                record: None,
+                renewed_cert: Some(target.signed().clone()),
+            },
+        );
+        states.push(stored);
+        // The target app known, its renewed certificate replaced or carried since.
+        let mut carried = current_at_nine();
+        carried.apps.insert(target.app_id(), AppDocs::default());
+        states.push(carried);
+        states.push(CurrentDocs::default());
+        for (n, current) in states.iter().enumerate() {
+            for row in &items {
+                assert_eq!(
+                    current.shows_in_full_to_some_app(row).expect("rule"),
+                    some_full(row, &readers, current),
+                    "state {n}, seq {}",
+                    row.seq
+                );
+            }
+        }
+    }
+
     fn signed(name: &str) -> pubky_switch_core::sig::SignedDoc {
         let documents = vectors("documents.json");
         let doc = documents["documents"]

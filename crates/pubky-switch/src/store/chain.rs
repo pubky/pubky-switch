@@ -38,10 +38,18 @@ impl AccountTxn {
     pub async fn append_chain_item(&mut self, item: &NewChainItem<'_>) -> Result<(), StoreError> {
         self.set_chain_head(item.seq, item.stub.chain_hash)?;
         let head = self.head().clone();
+        // An `app.put` or `cert.put` names the app whose documents later supersede it.
+        let doc_app = match item.item_type {
+            ItemType::Op => super::feed::item_doc(item.item_bytes)
+                .ok()
+                .as_ref()
+                .and_then(super::documents::doc_app_of),
+            _ => None,
+        };
         sqlx::query(
             "INSERT INTO chain_items (account_id, generation, seq, item_type, item_bytes, \
-             envelope, chain_hash, server_time_ms, only_for, proof) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             envelope, chain_hash, server_time_ms, only_for, proof, doc_app) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(&head.id)
         .bind(to_db(head.generation, "generation")?)
@@ -53,6 +61,7 @@ impl AccountTxn {
         .bind(time_to_db(item.server_time_ms)?)
         .bind(item.only_for.map(|app| app.to_vec()))
         .bind(item.proof.map(encode_doc).transpose()?)
+        .bind(doc_app.map(|app| app.to_vec()))
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;

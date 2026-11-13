@@ -85,6 +85,7 @@ pub use upload::{
 };
 pub use waiting::{
     waiting_read, waiting_read_erased, waiting_read_recovered, waiting_read_revoked,
+    waiting_through_a_handle,
 };
 pub use watching::watching;
 
@@ -178,6 +179,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("waiting read, a recovery in place", |world| {
         Box::pin(waiting_read_recovered(world))
+    }),
+    ("waiting through a handle", |world| {
+        Box::pin(waiting_through_a_handle(world))
     }),
     ("connect request", |world| Box::pin(connect_request(world))),
     ("connect request, the list full", |world| {

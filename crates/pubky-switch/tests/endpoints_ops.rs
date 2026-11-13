@@ -1913,3 +1913,424 @@ async fn test_claims_served_through_a_longer_renewal_past_the_earlier_expiry() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_claims_compacted_or_deleted_entries_lose_their_documents() {
+    // A live claim's entry keeps its document. The `done` that settles it compacts it to a
+    // tombstone, whose entries show as stubs: their documents and proofs go in that same
+    // transaction (Switch wire 6.8, 7.5). A failed claim's entries keep theirs until the
+    // claim is deleted, at a request past its deadline and the reconciliation window.
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let ops = wallet_batch(60, 1, vec![claim(ClaimType::Attempt, 0, None)]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let attempt = head_seq(&body);
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), attempt).await,
+        (true, true)
+    );
+    let ops = wallet_batch(61, 1, vec![claim(ClaimType::Done, 1, None)]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let done = head_seq(&body);
+    assert_eq!(claim_entry_rows(&replay).await, 0, "a tombstone keeps none");
+    for seq in [attempt, done] {
+        assert_eq!(
+            chain_document_kept(&replay, &alice_id(), seq).await,
+            (false, false),
+            "seq {seq}"
+        );
+    }
+    let deadline = ms(AT) + 60_000;
+    let ops = wallet_batch(
+        62,
+        1,
+        vec![
+            claim_at(9, ClaimType::Attempt, 0, Some(deadline)),
+            claim_at(9, ClaimType::Failed, 1, None),
+        ],
+    );
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let failed = head_seq(&body);
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), failed).await,
+        (true, true)
+    );
+    // A request past the deadline and the reconciliation window: step 4 deletes the claim.
+    let late = pubky_switch_core::time::rfc3339(deadline + 31 * DAY_MS);
+    set_time(&replay.clock, &late);
+    read_claim(&replay, &late).await;
+    for seq in [failed - 1, failed] {
+        assert_eq!(
+            chain_document_kept(&replay, &alice_id(), seq).await,
+            (false, false),
+            "seq {seq}"
+        );
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The `seq`s of the chain items whose kept document concerns app `app`.
+async fn app_documents(replay: &Replay, app: &[u8; 16]) -> Vec<i64> {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let seqs = sqlx::query_scalar(
+        "SELECT seq FROM chain_items WHERE account_id = $1 AND doc_app = $2 \
+         AND item_bytes IS NOT NULL ORDER BY seq",
+    )
+    .bind(alice_id())
+    .bind(app.as_slice())
+    .fetch_all(&mut conn)
+    .await
+    .expect("seqs");
+    conn.close().await.expect("close");
+    seqs
+}
+
+#[tokio::test]
+async fn test_ops_replaced_app_record_loses_its_document() {
+    // The wallet's app record replaced by a newer one: the earlier `app.put` shows as its
+    // stub from then on, and its document and proof go in the same transaction; the new
+    // one keeps both (Switch wire 7.5).
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (keys, cert) = wallet_keys(&replay).await;
+    let earlier = app_documents(&replay, &cert.app_id()).await;
+    assert_eq!(earlier.len(), 1, "the registration's app.put");
+    let earlier = u64::try_from(earlier[0]).expect("seq");
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), earlier).await,
+        (true, true)
+    );
+    let record = AppRecord::sign(&keys, AppRecordBody::new(&cert, Vec::new(), ms(AT) + 1_000))
+        .expect("record");
+    let ops = wallet_batch(
+        63,
+        1,
+        vec![(
+            Vec::new(),
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )],
+    );
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let newer = head_seq(&body);
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), earlier).await,
+        (false, false)
+    );
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), newer).await,
+        (true, true)
+    );
+    assert_eq!(
+        app_documents(&replay, &cert.app_id()).await,
+        vec![i64::try_from(newer).expect("seq")]
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_ops_app_record_from_before_the_rule_is_found_once_checked() {
+    // An `app.put` chained before documents were deleted carries no `doc_app`. The check of
+    // older documents notes which app it concerns, so the record that later replaces it
+    // finds it and deletes its document (Switch wire 7.5).
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (keys, cert) = wallet_keys(&replay).await;
+    let earlier = u64::try_from(app_documents(&replay, &cert.app_id()).await[0]).expect("seq");
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("UPDATE chain_items SET doc_app = NULL WHERE account_id = $1")
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("as before the rule");
+    sqlx::query(
+        "UPDATE accounts SET documents_checked_seq = 0, documents_check_end = last_seq \
+         WHERE id = $1",
+    )
+    .bind(alice_id())
+    .execute(&mut conn)
+    .await
+    .expect("unchecked");
+    conn.close().await.expect("close");
+    let (status, _) = read_claim(&replay, AT).await;
+    assert_eq!(status, 404, "a request runs the check");
+    assert_eq!(
+        app_documents(&replay, &cert.app_id()).await,
+        vec![i64::try_from(earlier).expect("seq")]
+    );
+    let record = AppRecord::sign(&keys, AppRecordBody::new(&cert, Vec::new(), ms(AT) + 1_000))
+        .expect("record");
+    let ops = wallet_batch(
+        64,
+        1,
+        vec![(
+            Vec::new(),
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )],
+    );
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), earlier).await,
+        (false, false)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The wallet's feed from the start, in one page: its items.
+async fn wallet_feed(replay: &Replay, at: &str) -> Vec<Value> {
+    let keys = vectors("keys.json");
+    let path = format!("/v1/{}/feed?limit=500", alice_id());
+    let request = app_request(app(&keys, "wallet"), "GET", &path, Vec::new(), ms(at));
+    let (status, body, _) = answer_of(replay.service.handle(request).await);
+    assert_eq!(status, 200, "{body}");
+    body["items"].as_array().expect("items").clone()
+}
+
+fn shown_as(items: &[Value], seq: u64) -> Value {
+    items
+        .iter()
+        .find(|item| item["seq"] == seq)
+        .unwrap_or_else(|| panic!("no item {seq}"))["type"]
+        .clone()
+}
+
+/// How many `claim_entries` rows the account keeps.
+async fn claim_entry_rows(replay: &Replay) -> i64 {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let rows = sqlx::query_scalar("SELECT count(*) FROM claim_entries WHERE account_id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    conn.close().await.expect("close");
+    rows
+}
+
+#[tokio::test]
+async fn test_claims_tombstone_read_after_its_entries_lost_their_documents() {
+    // A claim compacted to a tombstone: its entries lost their documents and their rows
+    // (Switch wire 7.4.8 "A tombstone has no entries"), while the live claim kept its row;
+    // its read still answers the tombstone's view, with no entries, and the feed shows them
+    // as stubs.
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let ops = wallet_batch(60, 1, vec![claim(ClaimType::Attempt, 0, None)]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let attempt = head_seq(&body);
+    assert_eq!(
+        claim_entry_rows(&replay).await,
+        1,
+        "a live claim keeps its entry"
+    );
+    let ops = wallet_batch(61, 1, vec![claim(ClaimType::Done, 1, None)]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let done = head_seq(&body);
+    assert_eq!(claim_entry_rows(&replay).await, 0, "a tombstone keeps none");
+    for seq in [attempt, done] {
+        assert_eq!(
+            chain_document_kept(&replay, &alice_id(), seq).await,
+            (false, false)
+        );
+    }
+    let (status, body) = read_claim(&replay, AT).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["claim"]["tombstone"], Value::Bool(true), "{body}");
+    assert_eq!(body["claim"]["step"], 2, "{body}");
+    assert_eq!(body["entries"], serde_json::json!([]), "{body}");
+    let items = wallet_feed(&replay, AT).await;
+    assert_eq!(shown_as(&items, attempt), "stub");
+    assert_eq!(shown_as(&items, done), "stub");
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A failed claim at `[key; 32]`, pinned to `deadline`, that step 4's bounded batch won't
+/// reach: its stored deletion time cleared, as for a claim past the bound when more fall
+/// due at once. The `seq`s of its two entries.
+async fn failed_claim_step_4_misses(replay: &Replay, id: u8, key: u8, deadline: u64) -> [u64; 2] {
+    let ops = wallet_batch(
+        id,
+        1,
+        vec![
+            claim_at(key, ClaimType::Attempt, 0, Some(deadline)),
+            claim_at(key, ClaimType::Failed, 1, None),
+        ],
+    );
+    let (status, body) = post_app(replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let failed = head_seq(&body);
+    for seq in [failed - 1, failed] {
+        assert_eq!(
+            chain_document_kept(replay, &alice_id(), seq).await,
+            (true, true),
+            "a failed claim's entries stay while it does"
+        );
+    }
+    assert_eq!(
+        sql_on(
+            replay,
+            &alice_id(),
+            "UPDATE claims SET delete_after_ms = NULL, delete_after_entry_ms = NULL \
+             WHERE account_id = $1",
+        )
+        .await,
+        1
+    );
+    [failed - 1, failed]
+}
+
+#[tokio::test]
+async fn test_claims_due_claim_its_read_finds_keeps_its_documents() {
+    // `GET /claims` of a claim that is due but that step 4 didn't reach: the read answers
+    // 404, and the deletion it made is undone with that refusal, as every refused
+    // endpoint's writes are (Switch wire 7.3 step 10). The claim stays, and so do its
+    // entries' documents: what the read noted finds them current again.
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let deadline = ms(AT) + 60_000;
+    let entries = failed_claim_step_4_misses(&replay, 70, 7, deadline).await;
+    let late = pubky_switch_core::time::rfc3339(deadline + 31 * DAY_MS);
+    set_time(&replay.clock, &late);
+    let (status, _) = read_claim(&replay, &late).await;
+    assert_eq!(status, 404, "due");
+    assert_eq!(
+        claim_count(&replay).await,
+        1,
+        "the refusal undid the deletion"
+    );
+    for seq in entries {
+        assert_eq!(
+            chain_document_kept(&replay, &alice_id(), seq).await,
+            (true, true),
+            "seq {seq}"
+        );
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_claims_due_claim_a_batch_deletes_loses_its_documents() {
+    // A batch naming a claim that is due but that step 4 didn't reach: the batch deletes
+    // it, and its entries' documents go; the new attempt it writes at the key keeps its own.
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let deadline = ms(AT) + 60_000;
+    let entries = failed_claim_step_4_misses(&replay, 71, 9, deadline).await;
+    let late = deadline + 31 * DAY_MS;
+    let late_text = pubky_switch_core::time::rfc3339(late);
+    set_time(&replay.clock, &late_text);
+    let ops = wallet_batch(
+        72,
+        1,
+        vec![claim_at(9, ClaimType::Attempt, 0, Some(late + 60_000))],
+    );
+    let (status, body) = post_app(&replay, "wallet", &ops, None, &late_text).await;
+    assert_eq!(status, 200, "{body}");
+    let attempt = head_seq(&body);
+    for seq in entries {
+        assert_eq!(
+            chain_document_kept(&replay, &alice_id(), seq).await,
+            (false, false),
+            "seq {seq}"
+        );
+    }
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), attempt).await,
+        (true, true)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_ops_replaced_renewed_certificate_loses_its_document() {
+    // The signer's renewed certificate for the wallet, replaced by a later one: the first
+    // `cert.put` loses its document and proof, the second keeps both, and the wallet's
+    // documents are its `app.put` and the second `cert.put` (Switch wire 7.5).
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (app_keys, old) = wallet_keys(&replay).await;
+    let registration = app_documents(&replay, &old.app_id()).await;
+    assert_eq!(registration.len(), 1);
+    let alice = IdentityKey::from_secret(hex32(&alice(&vectors("keys.json"))["secret_hex"]));
+    let renew = |issued: u64, id: u8| {
+        let renewed = AppCert::issue(
+            &alice,
+            AppCertBody::new(
+                alice_key(),
+                app_keys.signing_public(),
+                app_keys.bundle_public(),
+                old.scopes().to_vec(),
+                old.permissions(),
+                issued,
+                issued + 180 * DAY_MS,
+            ),
+        )
+        .expect("cert");
+        sign_batch(
+            &alice,
+            &alice_key(),
+            None,
+            1,
+            [id; 16],
+            vec![(
+                Vec::new(),
+                OpKind::CertPut {
+                    target_app_id: renewed.app_id(),
+                    cert: renewed.signed().clone(),
+                },
+            )],
+        )
+        .expect("batch")
+    };
+    let mut seqs = Vec::new();
+    for (issued, id) in [(ms(AT) - 2_000, 34), (ms(AT) - 1_000, 35)] {
+        let request = signer_request(
+            "POST",
+            &ops_path(),
+            OpsRequest::new(&renew(issued, id), None).to_json(),
+            ms(AT),
+        );
+        let (status, body, _) = answer_of(replay.service.handle(request).await);
+        assert_eq!(status, 200, "{body}");
+        seqs.push(head_seq(&body));
+    }
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), seqs[0]).await,
+        (false, false),
+        "replaced"
+    );
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), seqs[1]).await,
+        (true, true)
+    );
+    let mut expected = registration;
+    expected.push(i64::try_from(seqs[1]).expect("seq"));
+    assert_eq!(app_documents(&replay, &old.app_id()).await, expected);
+    let items = wallet_feed(&replay, AT).await;
+    assert_eq!(shown_as(&items, seqs[0]), "stub");
+    assert_eq!(shown_as(&items, seqs[1]), "chain");
+    replay.db.drop_database().await.expect("drop");
+}

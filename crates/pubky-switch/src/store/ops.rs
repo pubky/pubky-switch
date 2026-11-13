@@ -292,6 +292,11 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(db)?;
+        // A new record or renewed certificate supersedes the earlier one's document. Noted
+        // at every app row write, a cursor move included: bounded, at one indexed lookup of
+        // the app's `app.put` and `cert.put` items and one read of the account's app rows
+        // before the commit.
+        self.note_app_documents(app.app_id);
         self.note_change();
         Ok(())
     }
@@ -369,12 +374,21 @@ impl AccountTxn {
         parts: &[StoredBundlePart],
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
-        sqlx::query("DELETE FROM key_bundle_parts WHERE account_id = $1 AND target_app_id = $2")
-            .bind(&id)
-            .bind(target.as_slice())
-            .execute(self.conn())
-            .await
-            .map_err(db)?;
+        // A part no longer stored shows as its stub; one stored again keeps its document.
+        let gone: Vec<i64> = sqlx::query_scalar(
+            "DELETE FROM key_bundle_parts WHERE account_id = $1 AND target_app_id = $2 \
+             RETURNING seq",
+        )
+        .bind(&id)
+        .bind(target.as_slice())
+        .fetch_all(self.conn())
+        .await
+        .map_err(db)?;
+        let gone: Vec<u64> = gone
+            .into_iter()
+            .map(|seq| from_db(seq, "seq"))
+            .collect::<Result<_, _>>()?;
+        self.note_superseded(gone);
         for part in parts {
             sqlx::query(
                 "INSERT INTO key_bundle_parts (account_id, target_app_id, first_epoch, \
@@ -434,6 +448,20 @@ impl AccountTxn {
     pub async fn put_record(&mut self, record: &StoredRecord) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         let state = &record.state;
+        // The write it replaces shows as its stub from now on (Switch wire 7.5).
+        let replaced: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT generation, version FROM shared_records WHERE account_id = $1 AND key = $2",
+        )
+        .bind(&id)
+        .bind(state.key.as_slice())
+        .fetch_optional(self.conn())
+        .await
+        .map_err(db)?;
+        if let Some((generation, version)) = replaced
+            && from_db(generation, "generation")? == self.head().generation
+        {
+            self.note_superseded([from_db(version, "version")?]);
+        }
         let (proof, upload_seq, exact, base) = match &record.origin {
             RecordOrigin::Written { proof, upload_base } => {
                 (Some(encode_doc(proof)?), None, true, *upload_base)
@@ -635,7 +663,38 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(db)?;
+        // A tombstone's entries are compacted away (Switch wire 6.8, 7.4.8 "A tombstone has
+        // no entries"): their documents go, and so do their rows, each entry's op and proof
+        // with it. No read of a tombstone needs them: `GET /claims` reads none for it, and
+        // the feed, `GET /apps`' proof generations and the documents' rule count only a live
+        // claim's. A recovery upload that reopens it rebuilds it from the upload, with no
+        // entries of its own from before.
+        if claim.tombstone {
+            let entries = self.entry_seqs(&[claim_key.to_vec()]).await?;
+            self.note_superseded(entries);
+            let id = self.head().id.clone();
+            sqlx::query("DELETE FROM claim_entries WHERE account_id = $1 AND claim_key = $2")
+                .bind(id)
+                .bind(claim_key.as_slice())
+                .execute(self.conn())
+                .await
+                .map_err(db)?;
+        }
         Ok(())
+    }
+
+    /// The `seq`s of the entries of the claims at `claim_keys`.
+    async fn entry_seqs(&mut self, claim_keys: &[Vec<u8>]) -> Result<Vec<u64>, StoreError> {
+        let id = self.head().id.clone();
+        let seqs: Vec<i64> = sqlx::query_scalar(
+            "SELECT seq FROM claim_entries WHERE account_id = $1 AND claim_key = ANY($2)",
+        )
+        .bind(id)
+        .bind(claim_keys)
+        .fetch_all(self.conn())
+        .await
+        .map_err(db)?;
+        seqs.into_iter().map(|seq| from_db(seq, "seq")).collect()
     }
 
     /// Delete up to `bound` claims that may be deleted at `base_ms`, the time base, with
@@ -685,19 +744,33 @@ impl AccountTxn {
         let aged_before = base_ms
             .checked_sub(max_claim_age_ms)
             .map_or(Ok(-1), |at| to_db(at, "time"))?;
-        let deleted = sqlx::query(
-            "DELETE FROM claims WHERE account_id = $1 AND claim_key IN ( \
-             SELECT claim_key FROM claims WHERE account_id = $1 AND delete_known \
-             AND (delete_after_ms <= $2 OR delete_after_entry_ms <= $3) LIMIT $4)",
+        // The entries' seqs are read in the same statement, from the snapshot before the
+        // deletion cascades to them, so their documents go too (Switch wire 7.5).
+        let row = sqlx::query(
+            "WITH doomed AS (SELECT claim_key FROM claims WHERE account_id = $1 \
+                 AND delete_known AND (delete_after_ms <= $2 OR delete_after_entry_ms <= $3) \
+                 LIMIT $4), \
+             entries AS (SELECT seq FROM claim_entries WHERE account_id = $1 \
+                 AND claim_key IN (SELECT claim_key FROM doomed)), \
+             gone AS (DELETE FROM claims WHERE account_id = $1 \
+                 AND claim_key IN (SELECT claim_key FROM doomed) RETURNING claim_key) \
+             SELECT (SELECT count(*) FROM gone) AS deleted, \
+                 (SELECT coalesce(array_agg(seq), '{}') FROM entries) AS seqs",
         )
         .bind(&id)
         .bind(to_db(base_ms, "time")?)
         .bind(aged_before)
         .bind(to_db(bound, "bound")?)
-        .execute(self.conn())
+        .fetch_one(self.conn())
         .await
-        .map_err(db)?
-        .rows_affected();
+        .map_err(db)?;
+        let deleted = from_db(row.try_get("deleted")?, "deleted")?;
+        let seqs: Vec<i64> = row.try_get("seqs")?;
+        let seqs: Vec<u64> = seqs
+            .into_iter()
+            .map(|seq| from_db(seq, "seq"))
+            .collect::<Result<_, _>>()?;
+        self.note_superseded(seqs);
         if deleted > 0 {
             self.note_change();
         }
@@ -730,6 +803,8 @@ impl AccountTxn {
 
     /// Delete the claim at `claim_key`, with its entries, as step 4 would.
     pub async fn delete_claim(&mut self, claim_key: &[u8; 32]) -> Result<(), StoreError> {
+        let entries = self.entry_seqs(&[claim_key.to_vec()]).await?;
+        self.note_superseded(entries);
         let id = self.head().id.clone();
         sqlx::query("DELETE FROM claims WHERE account_id = $1 AND claim_key = $2")
             .bind(id)
@@ -781,7 +856,8 @@ impl AccountTxn {
         Ok(())
     }
 
-    /// Keep a claim entry with its proof.
+    /// Keep a claim entry with its proof, unless its claim is a tombstone, which keeps no
+    /// entries (Switch wire 7.4.8): the entry that compacts it, or one on it already.
     pub async fn add_claim_entry(
         &mut self,
         claim_key: &[u8; 32],
@@ -790,7 +866,8 @@ impl AccountTxn {
         let id = self.head().id.clone();
         sqlx::query(
             "INSERT INTO claim_entries (account_id, claim_key, step, seq, op, proof) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             SELECT $1, $2, $3, $4, $5, $6 WHERE NOT EXISTS (SELECT 1 FROM claims \
+             WHERE account_id = $1 AND claim_key = $2 AND tombstone)",
         )
         .bind(id)
         .bind(claim_key.as_slice())
@@ -801,6 +878,9 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(db)?;
+        // The entry that settles a claim compacts it in the same request, whichever of the
+        // two the batch stores first: its own document goes with the others then.
+        self.note_superseded([entry.seq]);
         Ok(())
     }
 

@@ -64,6 +64,55 @@ pub struct CurrentDocs {
     pub apps: HashMap<[u8; 16], AppDocs>,
 }
 
+impl CurrentDocs {
+    /// Whether chain item `row` shows its document in full to some current own app, by the
+    /// documents current (Switch wire 7.5): the union, over every reader, of what
+    /// `service::feed::shows` shows in full. An item it isn't for shows as a stub to every
+    /// app, whoever reads and wherever its cursor stands, so its document may go
+    /// (`AccountTxn::drop_stale_documents`).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupt`] for a stored document that doesn't read.
+    pub fn shows_in_full_to_some_app(&self, row: &FeedRow) -> Result<bool, StoreError> {
+        use pubky_switch_core::ops::{OpKind, SignedOp};
+        let Some(item) = &row.item else {
+            return Ok(false);
+        };
+        if row.item_type != ItemType::Op {
+            // Deliveries, service transitions and a conversation entry the service wrote
+            // show in full to every app, or to every app holding `lists.read`.
+            return Ok(true);
+        }
+        let op = SignedOp::peek(item).map_err(|_| StoreError::Corrupt("a signed operation"))?;
+        let body = op.body();
+        Ok(match &body.kind {
+            OpKind::Claim(_) => self.claim_entries.contains(&row.seq),
+            OpKind::RecordPut(_) => self.records.contains_key(&row.seq),
+            OpKind::KeyBundlePut(_) => row.only_for.is_some() && self.bundles.contains(&row.seq),
+            OpKind::AppPut { record } => body.app_id.is_some_and(|app| {
+                self.apps
+                    .get(&app)
+                    .is_some_and(|docs| docs.record.as_ref() == Some(record))
+            }),
+            OpKind::CertPut {
+                target_app_id,
+                cert,
+            } => self
+                .apps
+                .get(target_app_id)
+                .is_some_and(|docs| docs.renewed_cert.as_ref() == Some(cert)),
+            OpKind::AllowPut { .. }
+            | OpKind::AllowDelete { .. }
+            | OpKind::DenyPut { .. }
+            | OpKind::DenyDelete { .. }
+            | OpKind::InviteCodePut(_)
+            | OpKind::InviteCodeDelete { .. }
+            | OpKind::ReceiveKeyPut { .. } => true,
+        })
+    }
+}
+
 /// An app's current documents.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppDocs {
@@ -105,7 +154,7 @@ fn hash32(bytes: &[u8], what: &'static str) -> Result<[u8; 32], StoreError> {
 
 /// A chain item's document from its signed document bytes, `lp(body, signature)`
 /// (Switch wire 2.2), as the chain keeps it.
-fn item_doc(bytes: &[u8]) -> Result<SignedDoc, StoreError> {
+pub(super) fn item_doc(bytes: &[u8]) -> Result<SignedDoc, StoreError> {
     match pubky_switch_core::enc::split_lp(bytes).as_deref() {
         Some([body, sig]) => {
             let sig = <[u8; 64]>::try_from(sig.as_slice())
@@ -116,7 +165,7 @@ fn item_doc(bytes: &[u8]) -> Result<SignedDoc, StoreError> {
     }
 }
 
-fn row_of(row: &sqlx::postgres::PgRow) -> Result<FeedRow, StoreError> {
+pub(super) fn row_of(row: &sqlx::postgres::PgRow) -> Result<FeedRow, StoreError> {
     let item: Option<Vec<u8>> = row.try_get("item_bytes")?;
     let proof: Option<Vec<u8>> = row.try_get("proof")?;
     let chain_hash: Vec<u8> = row.try_get("chain_hash")?;
@@ -269,6 +318,60 @@ pub(super) async fn read_feed(
     Ok(Some(snapshot))
 }
 
+/// The documents current among `seqs` of `generation`: as [`current_docs`], for a set of
+/// seqs rather than a window, so a few seqs far apart read no more than they need.
+pub(super) async fn current_docs_at(
+    tx: &mut sqlx::PgConnection,
+    id: &str,
+    generation: i64,
+    seqs: &[i64],
+) -> Result<CurrentDocs, StoreError> {
+    let mut current = CurrentDocs::default();
+    for row in sqlx::query(
+        "SELECT version, read_scope FROM shared_records \
+         WHERE account_id = $1 AND generation = $2 AND version = ANY($3)",
+    )
+    .bind(id)
+    .bind(generation)
+    .bind(seqs)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(StoreError::from_db)?
+    {
+        current.records.insert(
+            from_db(row.try_get("version")?, "version")?,
+            row.try_get("read_scope")?,
+        );
+    }
+    for row in
+        sqlx::query("SELECT seq FROM key_bundle_parts WHERE account_id = $1 AND seq = ANY($2)")
+            .bind(id)
+            .bind(seqs)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(StoreError::from_db)?
+    {
+        current.bundles.insert(from_db(row.try_get("seq")?, "seq")?);
+    }
+    for row in sqlx::query(
+        "SELECT e.seq FROM claim_entries e JOIN claims c \
+         ON c.account_id = e.account_id AND c.claim_key = e.claim_key \
+         WHERE e.account_id = $1 AND e.seq = ANY($2) AND NOT c.tombstone",
+    )
+    .bind(id)
+    .bind(seqs)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(StoreError::from_db)?
+    {
+        current
+            .claim_entries
+            .insert(from_db(row.try_get("seq")?, "seq")?);
+    }
+    current.apps = app_docs(tx, id).await?;
+    Ok(current)
+}
+
 /// The documents current among the seqs in (`low`, `high`].
 async fn current_docs(
     tx: &mut sqlx::PgConnection,
@@ -325,6 +428,16 @@ async fn current_docs(
             .claim_entries
             .insert(from_db(row.try_get("seq")?, "seq")?);
     }
+    current.apps = app_docs(tx, id).await?;
+    Ok(current)
+}
+
+/// Each app's stored record and renewed certificate.
+async fn app_docs(
+    tx: &mut sqlx::PgConnection,
+    id: &str,
+) -> Result<HashMap<[u8; 16], AppDocs>, StoreError> {
+    let mut apps = HashMap::new();
     for row in sqlx::query("SELECT app_id, record, renewed_cert FROM apps WHERE account_id = $1")
         .bind(id)
         .fetch_all(&mut *tx)
@@ -334,7 +447,7 @@ async fn current_docs(
         let app_id: Vec<u8> = row.try_get("app_id")?;
         let record: Option<Vec<u8>> = row.try_get("record")?;
         let renewed: Option<Vec<u8>> = row.try_get("renewed_cert")?;
-        current.apps.insert(
+        apps.insert(
             <[u8; 16]>::try_from(app_id.as_slice()).map_err(|_| StoreError::Corrupt("app_id"))?,
             AppDocs {
                 record: record
@@ -346,5 +459,5 @@ async fn current_docs(
             },
         );
     }
-    Ok(current)
+    Ok(apps)
 }

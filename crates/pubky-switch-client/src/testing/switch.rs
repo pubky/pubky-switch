@@ -354,6 +354,10 @@ pub(crate) struct Inner {
     /// The byte budget of a feed page's items and a record page's views, [`MAX_PAGE_BYTES`]
     /// unless a test lowers it (Switch wire 7.4.4, 7.4.9).
     pub(crate) max_page_bytes: usize,
+    /// The most items or batches a feed page scans, shown to the reader or not, unless
+    /// `None`: a lower bound gives pages of items the reader isn't shown, with `more`
+    /// (Switch wire 7.4.4).
+    pub(crate) max_page_scan: Option<usize>,
     /// The bodies of the requests an `Unreachable` fault failed.
     pub(crate) unreached: Vec<Vec<u8>>,
     /// The peer copies of other identities' `identity.json` (Switch wire 7.4.5).
@@ -460,6 +464,7 @@ impl Inner {
             seen_at_arrival: false,
             feed_limit: None,
             max_page_bytes: MAX_PAGE_BYTES,
+            max_page_scan: None,
             unreached: Vec::new(),
             peers: HashMap::new(),
             appended: HashMap::new(),
@@ -2375,8 +2380,8 @@ impl Inner {
                 _ => groups.push(vec![item]),
             }
         }
-        for group in groups {
-            if items.len() >= limit {
+        for (scanned, group) in groups.into_iter().enumerate() {
+            if items.len() >= limit || self.max_page_scan.is_some_and(|max| scanned >= max) {
                 truncated = true;
                 break;
             }

@@ -961,3 +961,114 @@ pub async fn app_status(replay: &Replay, name: &str, at_ms: u64) -> Value {
         .unwrap_or_else(|| panic!("no status for {name}"))
         .clone()
 }
+
+/// Whether account `account`'s chain item at `seq` keeps its document, and its proof
+/// (Switch wire 7.5).
+pub async fn chain_document_kept(replay: &Replay, account: &str, seq: u64) -> (bool, bool) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let kept: (bool, bool) = sqlx::query_as(
+        "SELECT item_bytes IS NOT NULL, proof IS NOT NULL FROM chain_items \
+         WHERE account_id = $1 AND seq = $2 \
+         AND generation = (SELECT generation FROM accounts WHERE id = $1)",
+    )
+    .bind(account)
+    .bind(i64::try_from(seq).expect("seq"))
+    .fetch_one(&mut conn)
+    .await
+    .expect("chain item");
+    conn.close().await.expect("close");
+    kept
+}
+
+/// The documents and proofs account `account`'s chain items keep now, by `seq`, added to
+/// `into` where it holds none for that `seq` yet.
+pub async fn capture_documents(
+    replay: &Replay,
+    account: &str,
+    into: &mut std::collections::BTreeMap<i64, (Vec<u8>, Option<Vec<u8>>)>,
+) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let rows: Vec<(i64, Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT seq, item_bytes, proof FROM chain_items WHERE account_id = $1 \
+         AND item_bytes IS NOT NULL \
+         AND generation = (SELECT generation FROM accounts WHERE id = $1)",
+    )
+    .bind(account)
+    .fetch_all(&mut conn)
+    .await
+    .expect("documents");
+    conn.close().await.expect("close");
+    for (seq, item, proof) in rows {
+        into.entry(seq).or_insert((item, proof));
+    }
+}
+
+/// Put back the documents `from` holds into account `account`'s chain items that lost
+/// theirs, as a service from before deleted documents left them; the number put back.
+pub async fn restore_documents(
+    replay: &Replay,
+    account: &str,
+    from: &std::collections::BTreeMap<i64, (Vec<u8>, Option<Vec<u8>>)>,
+) -> u64 {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let mut restored = 0;
+    for (seq, (item, proof)) in from {
+        restored += sqlx::query(
+            "UPDATE chain_items SET item_bytes = $3, proof = $4 WHERE account_id = $1 \
+             AND seq = $2 AND item_bytes IS NULL \
+             AND generation = (SELECT generation FROM accounts WHERE id = $1)",
+        )
+        .bind(account)
+        .bind(seq)
+        .bind(item)
+        .bind(proof)
+        .execute(&mut conn)
+        .await
+        .expect("restore")
+        .rows_affected();
+    }
+    conn.close().await.expect("close");
+    restored
+}
+
+/// Run `sql` with `$1` bound to `account`; the rows it changed.
+pub async fn sql_on(replay: &Replay, account: &str, sql: &str) -> u64 {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let changed = sqlx::query(sql)
+        .bind(account)
+        .execute(&mut conn)
+        .await
+        .expect("sql")
+        .rows_affected();
+    conn.close().await.expect("close");
+    changed
+}
+
+/// `documents_checked_seq` and `documents_check_end` of account `account`.
+pub async fn documents_check(replay: &Replay, account: &str) -> (i64, i64) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let row: (i64, i64) = sqlx::query_as(
+        "SELECT documents_checked_seq, documents_check_end FROM accounts WHERE id = $1",
+    )
+    .bind(account)
+    .fetch_one(&mut conn)
+    .await
+    .expect("check");
+    conn.close().await.expect("close");
+    row
+}
