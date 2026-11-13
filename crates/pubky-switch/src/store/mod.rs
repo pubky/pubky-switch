@@ -226,6 +226,15 @@ pub enum StoreError {
 const LOCK_NOT_AVAILABLE: &str = "55P03";
 
 impl StoreError {
+    /// Whether the database answered with an error, so what failed is known not to have
+    /// committed; otherwise (a lost connection, a protocol failure) a commit may have landed.
+    pub fn is_refused(&self) -> bool {
+        matches!(
+            self,
+            Self::Database(sqlx::Error::Database(_)) | Self::LockTimeout
+        )
+    }
+
     /// Map a database error, telling a lock timeout apart.
     pub(crate) fn from_db(error: sqlx::Error) -> Self {
         match &error {
