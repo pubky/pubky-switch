@@ -5689,13 +5689,18 @@ async fn test_feed_wait_across_a_move_followed_outside_a_read() {
 
 #[tokio::test]
 async fn test_move_sends_writes_kept_during_the_freeze_once_in_order() {
-    // Three writes while the account is frozen: the first is sent and answered `410 moved`,
-    // the next two are kept unsent behind it. At the next service each goes once, in the
-    // order the calls kept them, and nothing more goes to the old one.
+    writes_kept_during_a_freeze_reach_the_next_service().await;
+}
+
+/// Five writes while the account is frozen: the first is sent and answered `410 moved`, the
+/// next four are kept unsent behind it. At the next service each goes once, in the order the
+/// calls kept them, and nothing more goes to the old one. Also run on a small stack
+/// (`protocol_api.rs`): the read that follows the move sends them.
+pub(super) async fn writes_kept_during_a_freeze_reach_the_next_service() {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = lists_app(&w, &router).await;
-    let pubkys: Vec<[u8; 32]> = ["carol", "erin", "dave"]
+    let pubkys: Vec<[u8; 32]> = ["carol", "erin", "dave", "frank", "grace"]
         .iter()
         .map(|name| IdentityKey::from_secret(seed(&format!("{name}/identity"))).public())
         .collect();

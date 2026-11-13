@@ -402,6 +402,12 @@ async fn test_receive_context_second_message_builds_on_the_first() {
 
 #[tokio::test]
 async fn test_receive_context_conflict_reads_again_and_builds_again() {
+    conflict_reads_again_and_builds_again().await;
+}
+
+/// An entry whose effect, built on what the app holds, meets `409 conflict`: it reads the
+/// record again and builds again. Also run on a small stack.
+async fn conflict_reads_again_and_builds_again() {
     let w = World::new();
     let protocol = ApiProtocol::new(Mode::Record);
     let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
@@ -4186,9 +4192,15 @@ where
 }
 
 #[test]
-fn test_receive_runs_its_deepest_paths_on_a_one_mebibyte_stack() {
-    // A read whose entry's effect writes a record through the context, and one whose effect
-    // makes an attempt: the deepest paths of a read, on a 1 MiB stack.
+fn test_receive_runs_on_a_one_mebibyte_stack() {
+    // In a debug build, on a 1 MiB stack: a read whose entry's effect writes a record
+    // through the context, one whose effect makes an attempt, one whose effect meets `409
+    // conflict` and builds again, and the read that follows a move and sends the writes
+    // kept during the freeze.
+    on_a_small_stack(1 << 20, conflict_reads_again_and_builds_again);
+    on_a_small_stack(1 << 20, || {
+        super::moves::writes_kept_during_a_freeze_reach_the_next_service()
+    });
     for mode in [Mode::Record, Mode::Attempt] {
         on_a_small_stack(1 << 20, move || async move {
             let w = World::new();
