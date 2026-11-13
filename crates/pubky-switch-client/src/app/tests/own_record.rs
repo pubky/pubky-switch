@@ -2014,3 +2014,144 @@ async fn test_own_record_superseding_record_taken_is_checked_on_the_homeserver_a
     assert_eq!(app.state.accepted.as_ref(), Some(later.signed()));
     assert_eq!(w.published(id), Some(bytes_of(later.signed())));
 }
+
+/// The later record another device put carries a renewal, and the directory read that
+/// would take it fails. The app still comes to present the renewal, and its next record
+/// call doesn't leave every read failing.
+#[tokio::test]
+async fn test_own_record_superseded_under_a_renewal_whose_take_fails_recovers() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::LoseAnswer {
+        path: "/ops".into(),
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    w.clock.advance_ms(1_000);
+    let renewed = super::flows::renew_listed(&w, &app);
+    let accepts = w.protocol.accepts(&renewed);
+    let mut later = AppRecordBody::new(&renewed, accepts, w.clock.now_ms());
+    later.label = Some("other device".into());
+    let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: later.signed().clone(),
+            },
+        )
+        .unwrap();
+    w.clock.advance_ms(pubky_switch_core::ops::BATCH_PROOFS_MS);
+    // The first directory read goes through, the second fails.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/directory".into(),
+        after: 1,
+    });
+    let first = app.receive(None).await;
+    for _ in 0..3 {
+        w.clock.advance_ms(1_000);
+        let _ = app.receive(None).await;
+    }
+    let taken = app.cert().hash() == renewed.hash();
+    w.clock.advance_ms(1_000);
+    let call = app.update_accepts().await;
+    let mut reads = Vec::new();
+    for _ in 0..3 {
+        w.clock.advance_ms(1_000);
+        reads.push(app.receive(None).await.map(|_| ()));
+    }
+    assert!(
+        taken && reads.iter().all(Result::is_ok),
+        "renewal taken: {taken}; first read {first:?}; update_accepts {call:?}; reads {reads:?}"
+    );
+    let held = AppRecord::verify(&w.held(id).unwrap(), &app.identity()).unwrap();
+    assert_eq!(held.body().label.as_deref(), Some("other device"));
+}
+
+/// Another device takes a renewal and puts a record carrying it while this device is
+/// offline, with no record kept here. This device comes to present the renewal, and its
+/// next record call doesn't leave every read failing.
+#[tokio::test]
+async fn test_own_record_renewal_another_device_took_while_offline_is_taken() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(1_000);
+    let renewed = super::flows::renew_listed(&w, &app);
+    let accepts = w.protocol.accepts(&renewed);
+    let mut later = AppRecordBody::new(&renewed, accepts, w.clock.now_ms());
+    later.label = Some("other device".into());
+    let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: later.signed().clone(),
+            },
+        )
+        .unwrap();
+    w.clock.advance_ms(1_000);
+    let mut reads = Vec::new();
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        reads.push(app.receive(None).await.map(|_| ()));
+    }
+    let taken = app.cert().hash() == renewed.hash();
+    w.clock.advance_ms(1_000);
+    let call = app
+        .set_protocol_member(PROTO, member(json!({ "b": 2 })), None)
+        .await;
+    w.clock.advance_ms(1_000);
+    let after = app.receive(None).await.map(|_| ());
+    assert!(
+        taken && after.is_ok(),
+        "renewal taken: {taken}; reads {reads:?}; a change {call:?}; read after {after:?}"
+    );
+}
+
+/// A listed renewal no record in the directory carries yet: a read looks once and takes
+/// nothing, looks again only once the doc cache's interval has passed, and takes it then
+/// from the record another device has put meanwhile.
+#[tokio::test]
+async fn test_own_record_listed_renewal_not_in_the_directory_is_looked_for_again_later() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    app.receive(None).await.unwrap();
+    let old = app.cert().clone();
+    w.clock.advance_ms(1_000);
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["scope-a"],
+    );
+    list_renewal(&w, id, &old, &renewed);
+    app.refresh_identity().await.unwrap();
+    let _ = app.receive(None).await;
+    let looked = app.renewal_looked_ms.expect("looked, and found nothing");
+    assert_eq!(app.cert().hash(), old.hash());
+    w.clock.advance_ms(1_000);
+    let _ = app.receive(None).await;
+    assert_eq!(app.renewal_looked_ms, Some(looked), "not looked again yet");
+    // Another device puts its record under the renewal; the next look takes it.
+    let accepts = w.protocol.accepts(&renewed);
+    let later = AppRecordBody::new(&renewed, accepts, w.clock.now_ms());
+    let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: later.signed().clone(),
+            },
+        )
+        .unwrap();
+    w.clock.advance_ms(crate::app::DOC_CACHE_MS);
+    let _ = app.receive(None).await;
+    assert_eq!(app.cert().hash(), renewed.hash());
+    assert_eq!(app.renewal_looked_ms, None);
+    app.receive(None).await.unwrap();
+}

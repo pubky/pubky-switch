@@ -142,7 +142,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `meta` | identity, App ID, switch origin, pinned service key, generation followed | |
 | `keys` | the app's signing and bundle secrets (`AppKeys`) | yes |
 | `cert` | the certificate the app presents (signed) | |
-| `cert/renewal` | a renewed certificate from `cert.put`, until its `identity.json` lists it | |
+| `cert/renewal` | a renewed certificate from `cert.put`, until its `identity.json` lists it. A listed certificate the app holds no `cert.put` for, a renewal another device took whose `cert.put` the feed showed only as a stub once that device's record carried it, is taken at a read's start from the own record in the directory, under the renewal checks, as after a restore; a look that doesn't find it is made again at most every `DOC_CACHE_MS` (10 minutes, in memory) while the listing lasts | |
 | `record` | the app record the service holds or is being given (signed) | |
 | `naming` | the naming key | yes |
 | `scope/<epoch>/<scope>` | one scope key | yes |

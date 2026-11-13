@@ -5,8 +5,11 @@
 //! from `cert.put` and takes it once its own `identity.json` lists it: it presents it from
 //! then on, and delivers its record carrying it (`app.put`), signed once and kept before it
 //! is sent. An app without the `cert.put`, such as one restored from a backup older than
-//! the renewal, takes the listed certificate from its own record in its directory, under
-//! the checks of Switch spec 3.2 step 3.
+//! the renewal, or one that was offline while another device of the app took the renewal
+//! and put its record (the feed then shows the `cert.put` only as a stub), takes the
+//! listed certificate from its own record in its directory, under the checks of Switch
+//! spec 3.2 step 3: after a restore, and at a read's start while its own `identity.json`
+//! lists another certificate (Switch wire 7.2 "How an own app reads it").
 
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, OpKind};
@@ -270,6 +273,43 @@ impl App {
             self.published_checked_ms = None;
         }
         Ok(())
+    }
+
+    /// Take a renewal another device of the app took (Switch wire 7.2 "How an own app reads
+    /// it", spec 3.2 step 3): the own `identity.json` lists another certificate than the
+    /// one the app presents, and the app holds no `cert.put` for it, which the feed showed
+    /// only as a stub once that device's record carried it. Without it every write is
+    /// refused `403 not_current`. Taken from the own record in the directory, as after a
+    /// restore ([`App::take_listed_cert`]). Only a directory read tells whether that record
+    /// carries it yet, so a look that doesn't find it is made again at most every
+    /// [`super::DOC_CACHE_MS`] while the listing lasts; a look that fails fails the read,
+    /// and the next read looks again. `None` when no look was due.
+    pub(crate) async fn take_renewal_listed_elsewhere(
+        &mut self,
+    ) -> Result<Option<Listed>, AppError> {
+        let me = self.state.meta.app_id;
+        let doc = &self.state.own_doc;
+        let Some(listed) = doc.listed_cert(&me) else {
+            return Ok(None);
+        };
+        let held = self
+            .state
+            .renewal
+            .as_ref()
+            .is_some_and(|r| r.hash() == listed);
+        if listed == self.state.cert.hash() || held || doc.lists_removed(&me) {
+            return Ok(None);
+        }
+        let now = self.now();
+        if self
+            .renewal_looked_ms
+            .is_some_and(|at| now >= at && now - at < super::DOC_CACHE_MS)
+        {
+            return Ok(None);
+        }
+        let found = Box::pin(self.take_listed_cert()).await?;
+        self.renewal_looked_ms = (self.state.cert.hash() != listed).then_some(now);
+        Ok(Some(found))
     }
 
     /// What the switch's directory shows it holds for this app, beside the record `batch`

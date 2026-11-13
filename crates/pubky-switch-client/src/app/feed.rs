@@ -422,8 +422,22 @@ impl App {
             }
         }
         // A renewed certificate is taken before the kept effect goes again: the effect may
-        // wait on it, refused for the expired one (`403 cert_expired`).
+        // wait on it, refused for the expired one (`403 cert_expired`). So is one another
+        // device took, which the feed showed only as a stub.
         self.adopt_renewal().await?;
+        if matches!(
+            self.take_renewal_listed_elsewhere().await?,
+            Some(super::renewal::Listed::NotCurrentHere)
+        ) {
+            if let Some(stop) = self.not_current_here() {
+                self.events.push(stop);
+            }
+            return Ok(ReceiveReport {
+                stopped: true,
+                cursor: self.cursor(),
+                ..ReceiveReport::default()
+            });
+        }
         // A copy of the lists not known to be complete is refreshed before any entry, the
         // ones stored locally included, is handed over.
         self.refresh_lists_if_owed().await?;
