@@ -105,8 +105,8 @@ use crate::store::{MAX_BATCH_BYTES, MAX_VALUE_BYTES};
 /// got.
 pub const FEED_PAGES_PER_READ: u32 = 4;
 
-/// Where a read stopped on its budget went on to, kept so the next read goes on from there
-/// rather than from the cursor, past the entries held behind it (`feed_at`, `STATE.md`).
+/// Where a read that stopped with more to do went on to, kept so the next read goes on from
+/// there rather than from the cursor, past the entries held behind it (`feed_at`, `STATE.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct FeedAt {
     generation: u64,
@@ -665,7 +665,10 @@ impl App {
                     // lists first, and so does one past the read's one listing or its page
                     // budget, which the report says.
                     Some(PageEnd::ListFirst(through)) => {
+                        // The page is committed through the `missed` item: a read that stops
+                        // here for the listing keeps where it got, as a budget's stop does.
                         if listed {
+                            self.feed_goes_on(after.max(through), blocked).await?;
                             report.more = true;
                             break;
                         }
@@ -681,6 +684,7 @@ impl App {
                         match listing {
                             Listing::Listed => listed = true,
                             Listing::Unfinished => {
+                                self.feed_goes_on(after.max(through), blocked).await?;
                                 report.more = true;
                                 break;
                             }
@@ -746,8 +750,8 @@ impl App {
         Ok(report)
     }
 
-    /// Keep where a read that a budget stopped got to (`feed_at`): the next read goes on from
-    /// `after`, with the lowest `seq` held so far.
+    /// Keep where a read that stopped with more to do got to (`feed_at`): the next read goes
+    /// on from `after`, with the lowest `seq` held so far.
     async fn feed_goes_on(&mut self, after: u64, blocked: Option<u64>) -> Result<(), AppError> {
         let at = FeedAt {
             generation: self.state.cursor.generation,
