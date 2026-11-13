@@ -81,24 +81,36 @@ impl AccountTxn {
             Some(at) => (to_db(at.generation, "generation")?, to_db(at.seq, "seq")?),
             None => (i64::MAX, i64::MAX),
         };
-        let forgotten = sqlx::query(
+        let forgotten: Vec<(i64, i64)> = sqlx::query_as(
             "DELETE FROM shared_records r WHERE r.account_id = $1 AND r.key IN ( \
                  SELECT s.key FROM shared_records s \
                  WHERE s.account_id = $1 AND s.deleted AND NOT s.from_upload \
                  AND (s.generation, s.version) <= ($2, $3) \
                  AND NOT EXISTS (SELECT 1 FROM divergent_uploads d \
                                  WHERE d.account_id = s.account_id AND d.key = s.key) \
-                 ORDER BY s.generation, s.version LIMIT $4)",
+                 ORDER BY s.generation, s.version LIMIT $4) \
+             RETURNING r.generation, r.version",
         )
         .bind(&id)
         .bind(generation)
         .bind(seq)
         .bind(to_db(bound, "bound")?)
-        .execute(self.conn())
+        .fetch_all(self.conn())
         .await
-        .map_err(StoreError::from_db)?
-        .rows_affected();
-        Ok(forgotten)
+        .map_err(StoreError::from_db)?;
+        // A forgotten delete's item is no record's current write any more, so it shows as its
+        // stub to every app and its document goes before the commit (Switch wire 7.5), as a
+        // write that replaces a record's current write notes it. One of an earlier generation
+        // has no item in the chain served.
+        let served = self.head().generation;
+        let mut stale = Vec::with_capacity(forgotten.len());
+        for (generation, version) in &forgotten {
+            if from_db(*generation, "generation")? == served {
+                stale.push(from_db(*version, "version")?);
+            }
+        }
+        self.note_superseded(stale);
+        Ok(u64::try_from(forgotten.len()).unwrap_or(u64::MAX))
     }
 
     /// Whether the once-a-minute sweep is due at service time `now_ms` (Switch wire 9.1): a

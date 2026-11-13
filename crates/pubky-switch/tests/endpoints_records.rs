@@ -1006,10 +1006,21 @@ async fn test_records_deleted_key_every_reader_passed_is_forgotten() {
     // A request in the same minute as the last sweep sweeps nothing.
     let answer = get_as(&replay, "phone", &format!("records/{}", b64(&key))).await;
     assert_eq!(body(&answer)["deleted"], true, "once a minute");
+    // The held delete is the record's current write: its document and proof stay.
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), deleted_at).await,
+        (true, true)
+    );
     next_minute(&replay);
     let answer = get_as(&replay, "phone", &format!("records/{}", b64(&key))).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert_eq!(record_rows(&replay, &key).await, 0);
+    // Forgotten, it is no record's current write: its document goes with the key, and the
+    // feed shows its stub (Switch wire 7.5).
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), deleted_at).await,
+        (false, false)
+    );
     assert_eq!(record_rows(&replay, &live).await, 1, "a live record stays");
     // A write naming the forgotten delete's own version is refused for good; a writer that
     // held or followed the delete names `{0, 0}` instead (Switch spec 8.2, 10.3).
