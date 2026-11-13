@@ -9456,6 +9456,54 @@ async fn test_records_write_served_with_an_earlier_cert_names_no_app() {
     assert!(phone.flagged_writes().await.unwrap().is_empty());
 }
 
+/// The wallet's honest write under its renewed certificate, served with the earlier one,
+/// read by a phone that holds only the earlier one, and `phone` after it: the phone reads
+/// the directory for the renewed certificate, which counts, and takes the write. With
+/// `fail_first`, that directory read fails to connect first.
+async fn earlier_cert_view_read_with_the_directory(fail_first: bool) -> (Setup, App, [u8; 32]) {
+    let s = Setup::new();
+    let mut phone = s.join("phone").await;
+    let (mut wallet, _, _, earlier) = own_write_under_a_closed_renewal(&s).await;
+    let target = s.target("n2");
+    wallet
+        .put_record(&target, &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+    s.w.switch.lock().shared.records.get_mut(&key).unwrap().cert = Some(earlier.signed().clone());
+    phone.refresh_identity().await.unwrap();
+    if fail_first {
+        s.w.switch.fail_next(Fault::Unreachable {
+            path: "/directory".into(),
+            after: 0,
+        });
+        phone.read_record(&target).await.unwrap();
+        assert!(phone.shared_record(&key).await.unwrap().is_none());
+        s.w.clock.advance_ms(crate::app::SENDER_REREAD_MS);
+    }
+    phone.read_record(&target).await.unwrap();
+    (s, phone, key)
+}
+
+/// A healthy directory: the phone takes the wallet's write at its first read.
+#[tokio::test]
+async fn test_records_view_cert_settled_by_the_directory_is_taken() {
+    let (_s, phone, key) = earlier_cert_view_read_with_the_directory(false).await;
+    let held = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["b"]);
+    assert!(phone.flagged_writes().await.unwrap().is_empty());
+}
+
+/// The directory read fails to connect at the first read: nothing marks the certificate
+/// asked, and a later read, past the pacing, reads the directory again and takes the write.
+#[tokio::test]
+async fn test_records_failed_directory_read_is_tried_again_later() {
+    let (_s, phone, key) = earlier_cert_view_read_with_the_directory(true).await;
+    let held = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["b"]);
+    assert!(phone.flagged_writes().await.unwrap().is_empty());
+}
+
 /// The wallet's honest write under its earlier certificate, made before the renewal
 /// closed, served without the proof that dates it: the service withheld the proof, so
 /// nothing names the wallet.

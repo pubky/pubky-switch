@@ -1812,17 +1812,31 @@ impl App {
         // write may be the writer's under that one. Without a record view, the view decides
         // (step 1). With one, its `cert` is only the service's pick, as the write names no
         // certificate: the app reads its directory for the writer's listed certificate, once
-        // for each while it runs, and if that doesn't settle it, a failure of steps 4 and 5
-        // is the service's word, and the write is ignored, naming no app.
+        // for each the directory answers for while it runs. If that doesn't settle it, a
+        // failure of steps 4 and 5 is the service's word, and the write is ignored, naming no
+        // app. A read that fails marks nothing: a later write's judging reads again, once
+        // `SENDER_REREAD_MS` has passed, so a failing directory costs at most one request a
+        // minute.
         let mut unheld = !own && !counts && self.unheld_in_force(&writer, &certs, time);
+        let now = self.now();
+        let paced = self
+            .directory_failed_ms
+            .is_some_and(|at| at <= now && now - at < super::SENDER_REREAD_MS);
         if unheld
             && evidence.cert.is_some()
+            && !paced
             && let Some(listed) = self.state.own_doc.listed_cert(&writer)
             && !certs.known.iter().any(|cert| cert.hash() == listed)
             && !self.directory_asked.contains(&listed)
         {
-            self.directory_asked.push(listed);
-            if self.refresh_own_apps().await.is_ok()
+            let answered = self.refresh_own_apps().await.is_ok();
+            if answered {
+                self.directory_failed_ms = None;
+                self.directory_asked.push(listed);
+            } else {
+                self.directory_failed_ms = Some(now);
+            }
+            if answered
                 && let Some(again) = self.writer_certs(evidence, &writer, tx).await?
                 && let Some(found) = self.write_cert(&again, time, write_scopes)
             {
