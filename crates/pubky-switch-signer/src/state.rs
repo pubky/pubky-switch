@@ -48,14 +48,12 @@ pub(crate) struct AskedRenewal {
     /// The scopes the user asked to remove.
     pub(crate) remove: Vec<String>,
     /// The switch permissions the user's renewal would have removed, by name.
-    #[serde(default)]
     pub(crate) remove_permissions: Vec<String>,
     /// The earliest expiry the user asked for, when earlier than the certificate's.
     pub(crate) expires_by: Option<u64>,
     /// The scopes the user asked to add.
     pub(crate) add: Vec<String>,
     /// The switch permissions the user's renewal would have added, by name.
-    #[serde(default)]
     pub(crate) add_permissions: Vec<String>,
     /// The latest expiry the user asked for, when later than the certificate's.
     pub(crate) expires_from: Option<u64>,
@@ -199,7 +197,6 @@ pub(crate) struct Newest {
     /// The service time at which the switch took it, from its delivery's transition proof;
     /// `None` for an adopted copy. A reduction's cutoff is this time plus the clock tolerance
     /// (Switch wire 3.8).
-    #[serde(default)]
     pub(crate) delivered_at: Option<u64>,
 }
 
@@ -231,65 +228,50 @@ pub(crate) struct SignerState {
     /// The version of a newer `identity.json` this install signed itself that the switch or
     /// the Homeserver holds: the records are behind, and nothing is signed until a restore
     /// from the signer backup replaces them ([`crate::Signer::restore`]).
-    #[serde(default)]
     pub(crate) records_behind: Option<u64>,
     /// The document hash of another body at the mark's version that the Homeserver
     /// published, which raised [`Alert::Equivocation`].
-    #[serde(default)]
     pub(crate) homeserver_other: Option<[u8; 32]>,
     /// That copy, once the user has seen its alert: publication writes the switch's copy over
     /// it (Switch wire 3.3 "Deliver, then publish").
-    #[serde(default)]
     pub(crate) republish_over: Option<[u8; 32]>,
     /// The revocations asked for whose removal isn't delivered yet, with the earlier
     /// `distrust_from` the user picked, if any (Switch spec 12.2).
-    #[serde(default)]
     pub(crate) revoking: Vec<Revoking>,
     /// The removed apps whose Homeserver record is still to be deleted (Switch spec 12.2
     /// step 4).
-    #[serde(default)]
     pub(crate) cleanup: Vec<[u8; 16]>,
     /// The apps of `cleanup` whose [`Alert::GrantRevocationOwed`] was raised: once for each
     /// owed deletion, so the user can clear it while a deletion keeps failing.
-    #[serde(default)]
     pub(crate) grant_reminded: Vec<[u8; 16]>,
     /// The removed apps a restore found whose record may still be on the Homeserver: the
     /// routine run checks them, a few at a time, and owes the deletion of those it finds.
-    #[serde(default)]
     pub(crate) deletion_checks: Vec<[u8; 16]>,
     /// A restore's backup write is owed: it raced another signer, so it is written once its
     /// delivery has won (Switch wire 3.13).
-    #[serde(default)]
     pub(crate) backup_owed: bool,
     /// The hand-over this install is making, until it takes effect or is aborted (Switch wire
     /// 3.12): it signs nothing for the identity but the abort meanwhile.
-    #[serde(default)]
     pub(crate) handing_over: Option<HandingOver>,
     /// This install is taking the identity over from a hand-over, until its first delivery
     /// has won and the received secret is in the vault (Switch wire 3.12).
-    #[serde(default)]
     pub(crate) taking_over: bool,
     /// A take-over's first version won, and its publication waits for its backup (Switch wire
     /// 3.12): the old signer's deletion relies on that order.
-    #[serde(default)]
     pub(crate) publish_after_backup: bool,
     /// The hand-over took effect, naming this install as the signer: committed before the key
     /// is deleted, so records a crash leaves behind are deleted on the next open and count as
     /// none for a new set-up (Switch spec 12.8).
-    #[serde(default)]
     pub(crate) handed_over_to: Option<[u8; 16]>,
     /// The full-bundle requests whose answer the switch refused, not tried again until the
     /// app asks anew.
-    #[serde(default)]
     pub(crate) refused_requests: Vec<RefusedRequest>,
     /// The service time at which the switch took the first version this signer delivered
     /// that lists each app: no app left or was revoked before it (Switch spec 12.3).
-    #[serde(default)]
     pub(crate) listed_at: Vec<([u8; 16], u64)>,
     /// The alerts the user hasn't cleared.
     pub(crate) alerts: Vec<Alert>,
     /// The certificate lifetime new certificates get, in milliseconds (Switch spec 3.2).
-    #[serde(default = "default_cert_lifetime")]
     pub(crate) cert_lifetime_ms: u64,
     /// The automatic renewals in a row no record of their app has taken up, each by the app
     /// and the hash of the certificate it issued: at two for an app, the signer stops renewing
@@ -299,16 +281,13 @@ pub(crate) struct SignerState {
     /// dropped with its certificate when that version is never delivered
     /// ([`SignerState::prune_unreferenced`]). This install's own: a new install starts with
     /// none.
-    #[serde(default)]
     pub(crate) untaken_renewals: Vec<([u8; 16], [u8; 32])>,
     /// The companion claims of approvals, signed once, until the host has delivered them
     /// (Switch wire 3.10).
-    #[serde(default)]
     pub(crate) claims: Vec<PendingClaim>,
     /// The switch showed a rollback or an equivocation, and no delivery has succeeded since:
     /// the signer doesn't know that the switch holds its high-water version, so it releases
     /// no claim.
-    #[serde(default)]
     pub(crate) switch_unconfirmed: bool,
     /// The highest data epoch whose keys this signer ever sent in a bundle, by a rotation it
     /// gave up too. While it is above the newest version's `data_epoch`, some apps may hold
@@ -318,77 +297,63 @@ pub(crate) struct SignerState {
     /// 3.2, 3.5). A restore or a hand-over takes it as the highest `last_epoch` of the parts
     /// it receives and of `keys_through` and `bundle_ranges` in `GET /apps` (Switch wire 3.5,
     /// 3.12, 7.4.12), never below the newest `data_epoch`.
-    #[serde(default)]
     pub(crate) epoch_through: u64,
     /// The version that was delivered again for its service time, because a closing delivery
     /// is owed and the delivery's answer was lost: its retry's answer must carry that time
     /// (Switch wire 7.4.2). It concerns only that version.
-    #[serde(default)]
     pub(crate) time_asked: Option<u64>,
     /// The version whose retry gave no service time either: the closing stays owed, with
     /// [`Alert::ReductionNotClosed`] shown, until a later version's delivery carries a service
     /// time to close at.
-    #[serde(default)]
     pub(crate) closing_unavailable: Option<u64>,
     /// The identity's account at its switch is erased (Switch spec 12.7): the records stay,
     /// and nothing more is signed for that account.
-    #[serde(default)]
     pub(crate) erased: bool,
     /// A provider loss is declared and its version not delivered yet (Switch spec 12.6 step
     /// 1): its own steps pass the recovery's gate ([`crate::signer::gate::recovery_key`])
     /// while an alarm about the lost service is held, and every other signing step is
     /// refused ([`crate::error::Refusal::Recovering`]).
-    #[serde(default)]
     pub(crate) recovering: bool,
     /// The document a declared recovery builds on (Switch spec 12.6 step 1): the newest this
     /// install signed when it was first declared, a version in flight to the lost service
     /// included, since that service may have taken it and apps seen it. Kept while the
     /// recovery is declared again elsewhere, and dropped once its version is delivered.
-    #[serde(default)]
     pub(crate) recovery_base: Option<SignedDoc>,
     /// The generation a declared recovery declares lost (Switch spec 12.6 step 1): its
     /// version is the next one, with `recovery_from` this. Kept while the recovery is
     /// declared again, since its base may be a recovery's own version not delivered yet, as
     /// one restored from a backup written mid-recovery.
-    #[serde(default)]
     pub(crate) lost_generation: Option<u64>,
     /// The Homeserver's `identity.json` was missing or didn't verify when the recovery was
     /// declared, and the records explained it, or the user confirmed them anyway (Switch spec
     /// 12.6 step 1): a backup missing or unreadable is then written over without that copy.
-    #[serde(default)]
     pub(crate) homeserver_copy_waived: bool,
     /// The recovery's version is delivered and lists apps whose revocation is pending: they
     /// are revoked at the new service before the version is published, which is how apps
     /// find the service (Switch spec 12.6 step 1).
-    #[serde(default)]
     pub(crate) revoke_at_service: bool,
     /// The renewals the user asked for, each as its app and the new certificate's hash, whose
     /// flow is in progress: one delivered ends that app's [`Alert::RenewalRefused`] for a
     /// renewal that reduced nothing, as the user's newest choice, and one refused is the
     /// user's, with what it asked (Switch spec 3.2). Emptied once the flow ends.
-    #[serde(default)]
     pub(crate) user_renewals: Vec<([u8; 16], [u8; 32])>,
     /// What the user asked of each renewal that didn't happen, beside its
     /// [`Alert::RenewalRefused`]: whether the alert holds is judged from the certificate
     /// `identity.json` lists against it (Switch spec 3.2). One per app; it goes with the alert.
-    #[serde(default)]
     pub(crate) asked_renewals: Vec<AskedRenewal>,
     /// Some version of the identity was published on the Homeserver, by this install or,
     /// for records restored or received, by the install they came from (Switch spec 4.3). A
     /// missing `identity.json` is explained without it only by an erasure (Switch spec 12.6
-    /// step 1). Records kept before this was are taken as published.
-    #[serde(default = "published_before")]
+    /// step 1).
     pub(crate) ever_published: bool,
     /// The service the recovery in progress last went to, for its status (Switch spec 12.6
     /// step 1).
-    #[serde(default)]
     pub(crate) recovery_origin: Option<String>,
     /// Each service an earlier declaration of the recovery in progress enrolled at, with
     /// the key its enrollment answered: declared again there, the signer reads under that
     /// key whether the earlier version was taken, since a service that took it answers
     /// another enrollment with a pending key, and the version's refusal with the first
     /// (Switch wire 3.7, 7.4.2).
-    #[serde(default)]
     pub(crate) recovery_services: Vec<Service>,
     /// A recovery declared in place, at the service that served the lost generation: that
     /// service, under the key it served the lost generation with. Until it takes the
@@ -403,23 +368,19 @@ pub(crate) struct SignerState {
     /// recovery's other records once its version is delivered, and as soon as an answer under
     /// the key the version names shows the lost generation served there no more: that version
     /// taken, by this install or another, or the account one the enrollment made.
-    #[serde(default)]
     pub(crate) recovery_serving: Option<Service>,
     /// The later step of [`crate::Signer::run_due`] the next run starts from: the one a run
     /// whose time passed didn't start, so each comes in turn whatever the device clock does
     /// (design note, section 4.5). Zero, the first, otherwise.
-    #[serde(default)]
     pub(crate) due_from: u8,
     /// The recovery's version that a service took names another install: a restore's, from
     /// a backup written mid-recovery. This install signs the next version naming itself, as
     /// a restore does (Switch wire 3.13).
-    #[serde(default)]
     pub(crate) owes_own_version: bool,
     /// The staged admission a recovery started is the signer's to end (Switch spec 12.6 step
     /// 2): none of the listed apps holds `lists.manage`, or the user asked. `POST
     /// /recovery/admission` is owed, sent again at every run, after publication, until `GET
     /// /apps` shows the wait ended or no wait.
-    #[serde(default)]
     pub(crate) admission_owed: bool,
 }
 
@@ -439,7 +400,6 @@ pub(crate) struct HandingOver {
     /// version.
     pub(crate) abort: Option<[u8; 32]>,
     /// The take-back, once it is signed: kept to be sent again, the same bytes.
-    #[serde(default)]
     pub(crate) take_back: Option<TakeBack>,
 }
 
@@ -486,10 +446,8 @@ pub(crate) struct Revoking {
     /// compromise.
     pub(crate) distrust_from: Option<u64>,
     /// The revocation's time, from the proof of the switch's answer (Switch wire 7.4.12).
-    #[serde(default)]
     pub(crate) revoked_at: Option<u64>,
     /// Whether the switch answered the revocation, so it serves the app no more.
-    #[serde(default)]
     pub(crate) taken: bool,
 }
 
@@ -518,16 +476,6 @@ pub(crate) struct PendingClaim {
     /// The claim's plaintext: the approval's JSON bytes, then the identity key's signature.
     #[serde(with = "pubky_switch_core::enc::serde_b64_vec")]
     pub(crate) plaintext: Vec<u8>,
-}
-
-/// Records kept before `ever_published` was are taken as published.
-fn published_before() -> bool {
-    true
-}
-
-/// The certificate lifetime of records written before it was kept: the default.
-fn default_cert_lifetime() -> u64 {
-    DEFAULT_CERT_LIFETIME_MS
 }
 
 impl SignerState {
@@ -727,17 +675,14 @@ pub(crate) enum Flow {
         unpublished: bool,
         /// The App IDs whose grant reminder this erasure raised: withdrawn if it ends without
         /// erasing the account.
-        #[serde(default)]
         reminded: Vec<[u8; 16]>,
         /// An erasure request went out and no answer came back: it may have landed, so the
         /// operator's `404` now means it did, once it has held for 24 hours (Switch wire
         /// 7.4.16).
-        #[serde(default)]
         unanswered: bool,
         /// The device time a check first met the operator's `404` after the request in
         /// doubt, kept until an answer the pinned key signs: erased but unconfirmed, the
         /// erasure done at the first run 24 hours on (Switch wire 7.4.16, spec 12.7 step 5).
-        #[serde(default)]
         first_404_ms: Option<u64>,
     },
     /// Delivering a new `identity.json` version, then publishing it.
@@ -806,12 +751,11 @@ pub(crate) async fn load(
             "another layout version or identity".into(),
         ));
     }
-    // An erased account has nothing left to resume: a flow stored with it, as an earlier
-    // version could leave one, is never loaded (Switch spec 12.7).
-    let flow = match store.get(&ns, FLOW_KEY).await? {
-        Some(bytes) if !state.erased => Some(decode(&bytes)?),
-        Some(_) | None => None,
-    };
+    let flow = store
+        .get(&ns, FLOW_KEY)
+        .await?
+        .map(|bytes| decode(&bytes))
+        .transpose()?;
     Ok(Some((state, flow)))
 }
 
@@ -851,20 +795,19 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn test_state_records_kept_before_the_publication_flag_count_as_published() {
+    fn test_state_round_trips_every_member() {
         let state = SignerState::new([1; 32], [2; 16]);
-        let mut value = serde_json::to_value(&state).unwrap();
-        value.as_object_mut().unwrap().remove("ever_published");
-        let read: SignerState = serde_json::from_value(value).unwrap();
-        assert!(read.ever_published);
         assert!(
             !state.ever_published,
             "a new identity's records start unpublished"
         );
+        assert_eq!(state.cert_lifetime_ms, DEFAULT_CERT_LIFETIME_MS);
+        let read: SignerState = decode(&encode(&state).unwrap()).unwrap();
+        assert_eq!(read, state);
     }
-
-    use super::*;
 
     #[test]
     fn test_identity_near_limit_raised_replaced_and_cleared() {
@@ -885,20 +828,5 @@ mod tests {
         assert_eq!(state.alerts, [near(limit + 10)]);
         state.note_size(1_000, limit);
         assert!(state.alerts.is_empty());
-    }
-
-    #[test]
-    fn test_state_written_before_the_approval_fields_still_reads() {
-        // The records as they were written before the certificate lifetime and the claims
-        // were kept: both take their defaults.
-        let state = SignerState::new([1; 32], [2; 16]);
-        let mut value = serde_json::to_value(&state).unwrap();
-        let object = value.as_object_mut().unwrap();
-        object.remove("cert_lifetime_ms");
-        object.remove("claims");
-        let read: SignerState = decode(&serde_json::to_vec(&value).unwrap()).unwrap();
-        assert_eq!(read.cert_lifetime_ms, DEFAULT_CERT_LIFETIME_MS);
-        assert!(read.claims.is_empty());
-        assert_eq!(read, state);
     }
 }
