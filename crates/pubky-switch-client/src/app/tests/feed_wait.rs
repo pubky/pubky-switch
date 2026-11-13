@@ -1909,3 +1909,185 @@ async fn test_outbox_keeps_one_conversation_entry_behind_kept_batches() {
     let applied = conversations(&s.w);
     assert_eq!(applied.iter().filter(|pubky| **pubky == peer).count(), 1);
 }
+
+// -------------------------------------------------------------------------------------
+// Bounded calls: the outbox and a peek
+
+/// A note from alice's app to bob.
+fn note_to_bob(s: &Setup, text: &str) -> OutgoingMessage {
+    let mut body = Map::new();
+    body.insert("text".into(), json!(text));
+    OutgoingMessage::new(s.w.bob.public(), "sample.note", body)
+}
+
+/// How many times each of `ids`, all queued, was tried, in order.
+async fn tries(app: &App, ids: &[String]) -> Vec<u64> {
+    let mut out = Vec::new();
+    for id in ids {
+        match app.delivery(id).await.unwrap() {
+            Some(crate::app::Delivery::Queued { tries, .. }) => out.push(tries),
+            other => panic!("{other:?}"),
+        }
+    }
+    out
+}
+
+impl Setup {
+    /// From now on each request to bob's switch takes `ms` of the app's clock.
+    fn slow_peer(&self, ms: u64) -> Arc<Slow> {
+        let slow = Arc::new(Slow {
+            inner: self.peer.transport(),
+            clock: Arc::clone(&self.w.clock),
+            ms: std::sync::atomic::AtomicU64::new(ms),
+        });
+        self.router
+            .add(PEER_ORIGIN, Arc::clone(&slow) as Arc<dyn Transport>);
+        slow
+    }
+
+    /// Flush while a flush says more, at most `rounds` times; returns the messages done.
+    async fn flush_all(&self, app: &mut App, rounds: usize) -> Vec<String> {
+        let mut done = Vec::new();
+        for _ in 0..rounds {
+            let report = app.flush_outbox().await.unwrap();
+            done.extend(report.done.iter().cloned());
+            if !report.more {
+                return done;
+            }
+        }
+        panic!("still more after {rounds} flushes");
+    }
+}
+
+#[tokio::test]
+async fn test_flush_outbox_tries_at_most_its_budget_and_goes_round() {
+    // Six messages to bob, whose switch answers `503 staged`: a flush tries four and says
+    // more, and the next starts after the last one tried, so the two left go first. Once
+    // bob's switch serves, flushes until none says more deliver each once.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    s.peer.set_staged(true);
+    let mut ids = Vec::new();
+    for n in 0..6 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    let report = app.flush_outbox().await.unwrap();
+    assert!(report.more, "{report:?}");
+    assert_eq!(report.queued.len(), 6, "{report:?}");
+    assert_eq!(tries(&app, &ids).await, [1, 1, 1, 1, 0, 0]);
+    let report = app.flush_outbox().await.unwrap();
+    assert!(report.more, "{report:?}");
+    assert_eq!(tries(&app, &ids).await, [2, 2, 1, 1, 1, 1]);
+    s.peer.set_staged(false);
+    let mut done = s.flush_all(&mut app, 3).await;
+    done.sort();
+    let mut all = ids.clone();
+    all.sort();
+    assert_eq!(done, all);
+    let received = s.peer.received();
+    for id in &ids {
+        assert_eq!(received.iter().filter(|m| *m == id).count(), 1, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn test_flush_outbox_on_a_slow_switch_stops_on_its_time_budget() {
+    // Each request to bob's switch takes 9 s of the app's clock: a flush tries no message
+    // past its 20 s once one went, and says more. Later flushes deliver the rest, each once.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        s.w.clock.advance_ms(1);
+        ids.push(app.queue(note_to_bob(&s, &format!("n{n}"))).await.unwrap());
+    }
+    s.slow_peer(9_000);
+    let started = s.w.clock.now_ms();
+    let report = app.flush_outbox().await.unwrap();
+    assert!(report.more, "{report:?}");
+    assert!(
+        !report.done.is_empty() && report.done.len() < ids.len(),
+        "{report:?}"
+    );
+    assert!(
+        s.w.clock.now_ms() - started <= crate::app::DEFAULT_CALL_BUDGET_MS + 2 * 9_000,
+        "within the budget and one message's try"
+    );
+    let mut done = report.done.clone();
+    done.extend(s.flush_all(&mut app, 3).await);
+    done.sort();
+    let mut all = ids.clone();
+    all.sort();
+    assert_eq!(done, all);
+    let received = s.peer.received();
+    for id in &ids {
+        assert_eq!(received.iter().filter(|m| *m == id).count(), 1, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn test_flush_message_past_its_time_budget_leaves_the_record_job_to_the_next_flush() {
+    // Bob's switch takes 25 s to answer: the message is accepted past the call's budget,
+    // and its record job starts no write. The next flush writes the record.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let target = RecordTarget::new(items(), b"n1");
+    let signed = app
+        .sign_message(note_to_bob(&s, "hello"))
+        .unwrap()
+        .with_record(crate::app::RecordJob {
+            target: target.clone(),
+            tag: b"sent".to_vec(),
+        });
+    let msg_id = app.queue_signed(signed).await.unwrap();
+    let slow = s.slow_peer(25_000);
+    let delivery = app.flush_message(&msg_id).await.unwrap();
+    assert!(
+        matches!(delivery, Some(crate::app::Delivery::Accepted { .. })),
+        "{delivery:?}"
+    );
+    let key = app.record_key(&target).unwrap();
+    assert!(app.shared_record(&key).await.unwrap().is_none());
+    assert!(
+        app.outbox_record(&msg_id).await.is_some(),
+        "the record job is owed"
+    );
+    slow.ms.store(0, std::sync::atomic::Ordering::SeqCst);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![msg_id.clone()], "{report:?}");
+    let record = app.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        record.content,
+        crate::app::RecordContent::Value(value(&[msg_id.as_str()]))
+    );
+    assert_eq!(
+        s.peer.received().iter().filter(|m| **m == msg_id).count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_peek_reads_at_most_its_page_budget() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    for _ in 0..3 {
+        s.note(app.app_id());
+    }
+    app.config.page_size = 1;
+    let from = s.router.log().len();
+    let report = app.peek().await.unwrap();
+    assert!(report.more, "{report:?}");
+    assert_eq!(report.items.len(), crate::app::PEEK_PAGES);
+    let pages = s
+        .sent_since(from)
+        .iter()
+        .filter(|line| line.contains("/feed?"))
+        .count();
+    assert_eq!(pages, crate::app::PEEK_PAGES);
+    // One page holds them all: no more.
+    app.config.page_size = 100;
+    let report = app.peek().await.unwrap();
+    assert!(!report.more, "{report:?}");
+    assert_eq!(report.items.len(), 3);
+}

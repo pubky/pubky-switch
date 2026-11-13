@@ -799,7 +799,7 @@ impl App {
 
     /// [`App::resume_batches`], for at most `limit` kept batches: returns whether more are
     /// kept that this call didn't reach, left for the next one in the same order.
-    async fn resume_kept(
+    pub(crate) async fn resume_kept(
         &mut self,
         limit: usize,
         budget: Option<&super::CallBudget>,

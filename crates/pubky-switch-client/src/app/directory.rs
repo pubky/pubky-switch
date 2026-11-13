@@ -1350,12 +1350,16 @@ impl App {
     /// the switches the app wrote to in the last 30 days whose copy is older, by the
     /// `known_version` they last answered (Switch spec 12.2 step 5, 3.2). Every switch owed
     /// is tried; the ones that fail stay owed, each on its own, and are tried again at the
-    /// next call, so one unreachable switch holds up no other.
+    /// next call, so one unreachable switch holds up no other. Past the call's `budget`, once
+    /// one was tried, the rest stay owed to the next call, and it returns `true`.
     ///
     /// # Errors
     ///
     /// An alarm or a store failure; a switch's failure only keeps it owed.
-    pub(crate) async fn deliver_to_recent_peers(&mut self) -> Result<(), AppError> {
+    pub(crate) async fn deliver_to_recent_peers(
+        &mut self,
+        budget: &super::CallBudget,
+    ) -> Result<bool, AppError> {
         let own = self.state.own_doc.clone();
         let mut judged: PeersDoc = self.reader().get(PEERS_DOC).await?.unwrap_or_default();
         let now = self.now();
@@ -1398,10 +1402,18 @@ impl App {
                 owed,
             };
         } else if judged.owed.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let mut still = Vec::new();
+        let mut sent = 0usize;
+        let mut left = false;
         for rest in std::mem::take(&mut judged.owed) {
+            // Past the call's time budget, once one went, the rest are owed to a later call.
+            if sent > 0 && self.spent(budget) {
+                still.push(rest);
+                left = true;
+                continue;
+            }
             let Ok(pubky) = pubky_switch_core::enc::pubky_key(&rest) else {
                 continue;
             };
@@ -1409,6 +1421,7 @@ impl App {
             if !recent(&peer) {
                 continue;
             }
+            sent += 1;
             match self.deliver_own_identity(&pubky, None, false).await {
                 Ok(()) => {}
                 Err(error @ (AppError::Alarm(_) | AppError::Store(_))) => return Err(error),
@@ -1419,7 +1432,8 @@ impl App {
         judged.owed = still;
         let mut tx = self.tx()?;
         tx.put(PEERS_DOC, &judged)?;
-        self.commit(tx).await
+        self.commit(tx).await?;
+        Ok(left)
     }
 }
 

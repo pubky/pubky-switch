@@ -2018,7 +2018,7 @@ async fn test_records_write_before_a_reduction_is_kept_by_every_reader() {
     // (b) A tablet that joins after the renewal lists the collection and reads the record.
     s.w.clock.advance_ms(HOUR);
     let mut tablet = s.join("tablet").await;
-    assert_eq!(tablet.list_collection(&items()).await.unwrap(), 1);
+    assert_eq!(tablet.list_collection(&items()).await.unwrap().records, 1);
     let listed = tablet.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(listed.content.value()), vec!["a"]);
     assert!(!listed.flagged);
@@ -2978,7 +2978,7 @@ async fn test_records_removed_writer_is_judged_by_distrust_from_by_every_reader(
     );
 
     let mut tablet = s.join("tablet").await;
-    assert_eq!(tablet.list_collection(&items()).await.unwrap(), 2);
+    assert_eq!(tablet.list_collection(&items()).await.unwrap().records, 2);
     let rules = flagged_rules(&tablet.take_events());
     assert_eq!(rules.len(), 1, "{rules:?}");
     assert!(rules[0].contains("distrust"), "{rules:?}");
@@ -4918,7 +4918,7 @@ async fn test_records_listing_page_of_full_marks_commits_early() {
     }
     *s.protocol.pad.lock().unwrap() = MAX_SEEN_MARK_BYTES - 64;
     let mut phone = s.join("phone").await;
-    assert_eq!(phone.list_collection(&items()).await.unwrap(), 420);
+    assert_eq!(phone.list_collection(&items()).await.unwrap().records, 420);
     for name in [&names[0], &names[419]] {
         let key = phone.record_key(&s.target(name)).unwrap();
         assert!(phone.shared_record(&key).await.unwrap().is_some());
@@ -4947,13 +4947,66 @@ async fn test_records_listing_pages_by_bytes() {
     assert_ne!(second.records[0].key, first.records[0].key);
     // The app lists the whole collection by `next`.
     let before = s.w.switch.lock().shared.listings;
-    assert_eq!(app.list_collection(&items()).await.unwrap(), 3);
+    assert_eq!(app.list_collection(&items()).await.unwrap().records, 3);
     assert_eq!(s.w.switch.lock().shared.listings - before, 3);
     // Within the budget, one page holds them all.
     s.w.switch.lock().max_page_bytes = crate::testing::MAX_PAGE_BYTES;
     let all = app.client.records(&id, None, None).await.unwrap();
     assert_eq!(all.records.len(), 3);
     assert!(all.next.is_none());
+}
+
+#[tokio::test]
+async fn test_records_listing_reads_at_most_its_page_budget_and_goes_on() {
+    // Six records, one a page: a call lists four and says more; the next goes on from
+    // there to the end. The call after that starts at the beginning again.
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    for n in 0..6 {
+        let name = format!("n{n}");
+        app.put_record(&s.target(&name), &value(&[name.as_str()]), vec![])
+            .await
+            .unwrap();
+    }
+    s.w.switch.lock().max_page_bytes = 1;
+    let listings = || s.w.switch.lock().shared.listings;
+    let before = listings();
+    let first = app.list_collection(&items()).await.unwrap();
+    assert!(first.more, "{first:?}");
+    assert_eq!(first.records, 4);
+    assert_eq!(
+        listings() - before,
+        u64::from(crate::app::LISTING_PAGES_PER_READ)
+    );
+    let second = app.list_collection(&items()).await.unwrap();
+    assert!(!second.more, "{second:?}");
+    assert_eq!(second.records, 2);
+    let third = app.list_collection(&items()).await.unwrap();
+    assert!(third.more, "{third:?}");
+    assert_eq!(third.records, 4);
+}
+
+#[tokio::test]
+async fn test_records_list_collections_reads_at_most_its_page_budget_and_goes_on() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    for n in 0..6 {
+        let name = format!("n{n}");
+        app.put_record(&s.target(&name), &value(&[name.as_str()]), vec![])
+            .await
+            .unwrap();
+    }
+    s.w.switch.lock().max_page_bytes = 1;
+    let listings = || s.w.switch.lock().shared.listings;
+    let before = listings();
+    assert!(app.list_collections().await.unwrap(), "more");
+    assert_eq!(
+        listings() - before,
+        u64::from(crate::app::LISTING_PAGES_PER_READ)
+    );
+    assert!(!app.list_collections().await.unwrap(), "to the end");
+    assert_eq!(listings() - before, 6);
+    assert!(!app.listing_owed().await.unwrap());
 }
 
 #[test]

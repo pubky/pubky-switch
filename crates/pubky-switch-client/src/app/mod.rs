@@ -80,7 +80,7 @@ pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION
 pub use kept::{KeptBatch, KeptBatchDrop, KeptBatchStatus};
 pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
 pub use parked::{ParkedMessage, ParkedSummary};
-pub use peek::{PeekReport, Peeked};
+pub use peek::{PEEK_PAGES, PeekReport, Peeked};
 pub use protocol::{
     Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
     MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need,
@@ -115,13 +115,13 @@ pub use directory::{
     SwitchAnswer, SwitchCopy, SwitchLookup,
 };
 pub use records::{
-    Collection, FlaggedWrite, KeptOp, KeptReason, LISTING_PAGES_PER_READ, PolicyFamily,
-    RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord, Unopened,
+    Collection, CollectionListed, FlaggedWrite, KeptOp, KeptReason, LISTING_PAGES_PER_READ,
+    PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord, Unopened,
 };
 pub use send::{
-    Delivery, MAX_CARRIED_OUTBOX_BYTES, OutboxReport, OutgoingMessage, RecordJob,
-    SENT_RETENTION_MS, SentMessage, SignedMessage, UNDELIVERABLE_MAX_MS, UNDELIVERABLE_MS,
-    UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
+    Delivery, MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH, OutboxReport, OutgoingMessage,
+    RecordJob, SENT_RETENTION_MS, SentMessage, SignedMessage, UNDELIVERABLE_MAX_MS,
+    UNDELIVERABLE_MS, UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

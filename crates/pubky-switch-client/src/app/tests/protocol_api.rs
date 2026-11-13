@@ -1071,7 +1071,7 @@ async fn test_policy_family_lists_and_takes_a_sub_scope_record() {
         .unwrap();
     assert_eq!(written.policy, family().sub_scope_policy("kiosk").unwrap());
     // Listed by the name scope's holder, under the family.
-    assert_eq!(wallet.list_collection(&family()).await.unwrap(), 1);
+    assert_eq!(wallet.list_collection(&family()).await.unwrap().records, 1);
     let held = wallet.records_of("sample.items").await.unwrap();
     assert_eq!(held.len(), 1);
     assert_eq!(ids(held[0].content.value()), vec!["sold".to_owned()]);
@@ -1106,7 +1106,7 @@ async fn test_policy_family_fixed_collection_flags_a_sub_scope_record() {
         .await
         .unwrap();
     // The fixed policy alone: the sub-scope's write isn't the collection's.
-    assert_eq!(wallet.list_collection(&items()).await.unwrap(), 1);
+    assert_eq!(wallet.list_collection(&items()).await.unwrap().records, 1);
     assert!(wallet.records_of("sample.items").await.unwrap().is_empty());
     let flagged = wallet.flagged_writes().await.unwrap();
     assert_eq!(flagged.len(), 1);
