@@ -400,7 +400,8 @@ pub struct EraseBody {
     /// The account's service key, the one the signer pinned.
     pub service_key: [u8; 32],
     /// The document hash of the newest `identity.json` the signer holds, its mark: the
-    /// erasure is refused when the account holds another. Absent from an older signer's.
+    /// erasure is refused when the account holds another. Absent when the signer delivered
+    /// nothing to this account.
     pub identity_hash: Option<[u8; 32]>,
 }
 

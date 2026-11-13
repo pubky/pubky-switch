@@ -178,13 +178,8 @@ pub struct Limits {
     pub max_batch: u64,
     /// The shared record quota in bytes.
     pub record_quota_bytes: u64,
-    /// The largest export the service imports; an answer without it stands for the default.
-    #[serde(default = "default_max_import_bytes")]
+    /// The largest export the service imports.
     pub max_import_bytes: u64,
-}
-
-fn default_max_import_bytes() -> u64 {
-    4_294_967_296
 }
 
 impl Default for Limits {
@@ -196,7 +191,7 @@ impl Default for Limits {
             quota_bytes: 67_108_864,
             max_batch: 8,
             record_quota_bytes: 67_108_864,
-            max_import_bytes: default_max_import_bytes(),
+            max_import_bytes: 4_294_967_296,
         }
     }
 }
@@ -365,10 +360,5 @@ mod tests {
         let mut big = answer;
         big.limits.app_limit = 256;
         assert!(big.check(&e).is_err());
-        // An answer without max_import_bytes stands for the default.
-        let text = r#"{"service_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","limits":{"app_limit":32,"max_envelope":1,"max_sealed_value":1,"quota_bytes":1,"max_batch":8,"record_quota_bytes":1},"identity":"IDENT","origin":"https://inbox.example","nonce":"AAAAAAAAAAAAAAAAAAAAAA","enrollment":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#
-            .replace("IDENT", &identity().id());
-        let read = EnrollmentAnswer::from_json(text.as_bytes()).unwrap();
-        assert_eq!(read.limits.max_import_bytes, 4_294_967_296);
     }
 }

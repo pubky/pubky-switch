@@ -4,9 +4,7 @@
 //! Reading follows Switch wire 10.3: every listed member is present, except that one marked
 //! "or `null`" may also be absent, which reads as `null`, and one marked "absent otherwise"
 //! is present only in the case named. Unknown members are ignored, as in every export part
-//! (Switch wire 1.1), with two exceptions that keep an earlier exporter's state from
-//! vanishing unseen: an `app` part with `key_bundles` and a `claim` part whose claim has
-//! `entries` are refused, whatever the member holds. Times without a `_ms` or `_s` suffix are
+//! (Switch wire 1.1). Times without a `_ms` or `_s` suffix are
 //! times of Switch wire 1.6. A part that doesn't read is `400 bad_request`; signatures are
 //! checked later, in the order of Switch wire 10.5.
 //!
@@ -630,14 +628,6 @@ impl<'a> Members<'a> {
     fn any(&self, member: &str) -> Result<Value> {
         self.present(member).cloned()
     }
-
-    /// A member that must be absent, an earlier form's.
-    fn absent(&self, member: &str, rule: &str) -> Result<()> {
-        if self.value.get(member).is_some() {
-            return Err(self.fail(member, rule));
-        }
-        Ok(())
-    }
 }
 
 fn refuse(what: &str, member: &str, rule: &str) -> Error {
@@ -706,8 +696,7 @@ impl Part {
     /// # Errors
     ///
     /// `400 bad_request` for an unknown kind, a listed member left out, a member that
-    /// doesn't read, or an earlier form's member (`key_bundles`, `entries`, a batch's
-    /// proofs).
+    /// doesn't read, or a batch with proofs.
     pub fn read(value: &Value) -> std::result::Result<Self, Refusal> {
         Self::read_value(value).map_err(|e| bad(super::reason(e)))
     }
@@ -785,10 +774,6 @@ impl Part {
                 })
             }
             "app" => {
-                m.absent(
-                    "key_bundles",
-                    "is an earlier form: the stored parts are key_bundle parts",
-                )?;
                 let receive_keys = m
                     .array("receive_keys")?
                     .iter()
@@ -832,10 +817,6 @@ impl Part {
             }
             "claim" => {
                 let c = m.object("claim")?;
-                c.absent(
-                    "entries",
-                    "is an earlier form: the entries are claim_entry parts",
-                )?;
                 let pinned_deadline = match c.value.get("pinned_deadline") {
                     None => Pin::Unpinned,
                     Some(Value::Null) => Pin::NoDeadline,
