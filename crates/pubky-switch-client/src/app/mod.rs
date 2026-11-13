@@ -667,6 +667,9 @@ pub struct App {
     /// [`AppEvent::HeldCursorAhead`], so a report isn't told again at every page; cleared by
     /// a page that isn't ahead. In memory only.
     held_ahead_told: Option<(u64, u64)>,
+    /// The read under way made a listing before handing any item: it covers a gap ahead its
+    /// first page shows (`feed.rs`). In memory only.
+    listed_before_items: bool,
     /// How many times an owed reopening failed in the read under way ([`App::receive`]):
     /// after [`records::REOPEN_TRIES_PER_READ`], it is left for the next read. In memory
     /// only.
@@ -928,6 +931,7 @@ impl App {
                 reads_begun: 0,
                 held_cursor_read: None,
                 held_ahead_told: None,
+                listed_before_items: false,
                 reopen_failures: 0,
             };
             app.update_keys_through();
@@ -1071,6 +1075,7 @@ impl App {
                 reads_begun: 0,
                 held_cursor_read: None,
                 held_ahead_told: None,
+                listed_before_items: false,
                 reopen_failures: 0,
             };
             // A store an earlier build wrote keeps the epoch read now.
@@ -1837,6 +1842,7 @@ impl App {
                 reads_begun: 0,
                 held_cursor_read: None,
                 held_ahead_told: None,
+                listed_before_items: false,
                 reopen_failures: 0,
             };
             // Every write of the one commit; what fails here is mostly a write the store

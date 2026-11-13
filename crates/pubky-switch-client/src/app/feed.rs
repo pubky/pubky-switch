@@ -616,6 +616,8 @@ impl App {
         let waits_for_key = listing == Listing::WaitsForKey;
         let unfinished = listing == Listing::Unfinished;
         let mut listed = listing == Listing::Listed;
+        // A listing this read made before any item covers a gap ahead its first page shows.
+        self.listed_before_items = listed;
         // The reopening a key taken owes, a failure's from before included, before anything
         // is handed over that may read the records it opens; only an alarm it raises fails
         // the read.
@@ -685,10 +687,11 @@ impl App {
                 let result = self.client.feed(query).await;
                 let page = self.take(result).await?;
                 let scanned = page.scanned_through;
-                match self
+                let ended = self
                     .process_page(page, after, &mut blocked, Some(budget))
-                    .await?
-                {
+                    .await;
+                self.listed_before_items = false;
+                match ended? {
                     Some(PageEnd::Read { more: true }) => {
                         after = after.max(scanned).max(self.state.cursor.seq);
                     }
@@ -895,10 +898,14 @@ impl App {
         }
         if let Some((held, _)) = compared.gap {
             // The gap ahead is handled as a `missed` item at the page's start: the
-            // protocol is handed it and a listing is owed, made before any item of the
-            // page (Switch spec 8.3 "Ahead", 12.4 condition 4).
-            self.hand_held_gap(held, &mut read)?;
-            list_through = Some(start);
+            // protocol is handed it, and a listing is owed, made before any item of the
+            // page, unless this read made one before any item, as after a restore (Switch
+            // spec 8.3 "Ahead", 12.4 condition 4).
+            let listed = self.listed_before_items;
+            self.hand_held_gap(held, !listed, &mut read)?;
+            if !listed {
+                list_through = Some(start);
+            }
         }
         // The last item processed, and where the call's time budget stopped the page.
         let mut processed: Option<u64> = None;
@@ -2614,8 +2621,9 @@ impl App {
     /// `missed` item is (Switch spec 8.3 "Ahead"): entries after `position` that an instance
     /// of the app passed, which the service may have deleted. The protocol is handed the
     /// range accepted from the cursor's time, less the clock tolerance, with no end and no
-    /// count (`entries` 0), and a listing is owed; once for each higher report (`hgap`).
-    fn hand_held_gap(&mut self, held: u64, read: &mut Read) -> Result<(), AppError> {
+    /// count (`entries` 0), and, with `list`, a listing is owed; once for each higher report
+    /// (`hgap`).
+    fn hand_held_gap(&mut self, held: u64, list: bool, read: &mut Read) -> Result<(), AppError> {
         let missed = MissedEntries {
             seq: held,
             entries: 0,
@@ -2636,8 +2644,10 @@ impl App {
             Err(_) => self.owe(held, call, read)?,
         }
         self.gap_handed(held, &mut read.tx)?;
-        super::records::owe_listing(&mut read.tx)?;
-        read.list_first = true;
+        if list {
+            super::records::owe_listing(&mut read.tx)?;
+            read.list_first = true;
+        }
         Ok(())
     }
 
