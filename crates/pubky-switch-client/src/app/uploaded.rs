@@ -37,7 +37,7 @@ use pubky_switch_core::scopes::Permission;
 
 use super::claims::{claim_key_of, reread_key};
 use super::events::AppEvent;
-use super::records::{LIST_DUE, record_key_of};
+use super::records::{owe_listing, record_key_of};
 use super::state::Tx;
 use super::{App, AppError};
 use crate::error::{ClientError, StoreError};
@@ -132,7 +132,7 @@ impl App {
                     .map(|collection| collection.name)
                     .collect();
                 tx.delete_prefix(RECORD_REREAD_PREFIX)?;
-                tx.put(LIST_DUE, &true)?;
+                owe_listing(tx)?;
                 for key in keys {
                     if let Some(held) = self.held_collection(&key).await?
                         && !listed.contains(&held.name)

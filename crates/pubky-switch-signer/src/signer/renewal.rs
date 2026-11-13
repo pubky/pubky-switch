@@ -814,22 +814,76 @@ impl Signer {
     /// newest version again where the Homeserver's copy is older, missing or unreadable
     /// (Switch wire 3.3).
     ///
+    /// Returns what the run left because one of its bounds cut it short ([`RunDue`]): a host
+    /// that sees [`RunDue::more_due`] may run again soon.
+    ///
+    /// A run is bounded, so the host can call it often and never waits long on it:
+    ///
+    /// - **Work.** Each step does a bounded amount: at most four renewals, four full-bundle
+    ///   answers, 32 checks of owed deletions and 32 record deletions, the rest left for the
+    ///   next run. That is one budget for the whole run, however its steps nest: the owed
+    ///   steps a renewal or a full-bundle answer runs again spend from it too. Nothing that
+    ///   can't be done now takes a place in it, so nothing holds the rest back for good: an
+    ///   app that hasn't joined or is being cut off isn't due for renewal, a full-bundle
+    ///   request that can't be answered is passed over, and a deletion or a check the
+    ///   Homeserver fails goes behind the others, as does an app whose renewal the
+    ///   switch refused. Every owed deletion's grant reminder is raised at once, whether or not
+    ///   its record goes in this run. The removals aren't capped: they are one version,
+    ///   whatever the number of apps removed, and one `POST /revoke` for each revocation
+    ///   pending, at most the apps listed, so no app the user removed stays current for want
+    ///   of a run. A call of [`Signer::resume`], [`Signer::renew_expiring`] or
+    ///   [`Signer::serve_full_bundles`] outside a run has a budget of its own.
+    /// - **Time.** Once 30 seconds have passed on the device clock since the run began, a
+    ///   later step starts only while none before it in this run has had work. The removals
+    ///   always run, since cutting an app off is the safe step, and so does the first later
+    ///   step with work, the next run going on from the step this one didn't start. A clock
+    ///   that goes back, which can't be read as time spent, counts as the time passed: so a
+    ///   device clock that jumps or goes back holds no step back for good, and a run that
+    ///   never sees its time pass is still bounded by its work.
+    /// - **Errors.** One step's error holds back no other: the steps after it run all the
+    ///   same, and the first error is returned once they have. The next run starts from the
+    ///   step after the one that failed, so a step that keeps failing goes last. An automatic
+    ///   renewal the switch refuses for good holds back none of the run's other renewals.
+    /// - **Requests.** With N the apps the newest version lists, at most the switch's app
+    ///   limit, and B(k) the `POST /ops` batches k operations take, eight to a batch, a run
+    ///   makes at most: the flow in progress and a closing owed, as below; the removals, N
+    ///   revocations and one version of B(N) batches; the cooperative closings, one version;
+    ///   four renewals, each B(1 + P) batches for its certificate and full key bundle of P
+    ///   parts; four full-bundle answers, each B(1 + P) batches and the newest version's
+    ///   delivery again; 32 + 32 Homeserver reads and deletions; and one republication. Each
+    ///   version is its delivery and, on the Homeserver, its backup and its publication; each
+    ///   step reads `GET /apps` and the Homeserver's copy first, a renewal four times. In the
+    ///   tests, with one-part bundles, four renewals take 28 switch requests and eight
+    ///   Homeserver writes. How long one request may take is the host's, through its Pubky
+    ///   client's timeout, so a run takes at most that many requests times it.
+    ///
     /// # Errors
     ///
     /// As [`Signer::resume`].
-    pub async fn run_due(&mut self) -> Result<()> {
+    pub async fn run_due(&mut self) -> Result<RunDue> {
+        // One budget for the whole run, however its steps nest: a `resume` inside a step
+        // spends from it too. The guard gives it back when the run ends or is dropped.
+        self.left = RunDue::default();
+        let _budget = self.budget();
+        self.run_due_steps().await
+    }
+
+    /// The steps of [`Signer::run_due`], within its budget.
+    async fn run_due_steps(&mut self) -> Result<RunDue> {
+        let began = self.env.clock.now_ms();
         // While a hand-over or a take-over is in progress, only its own step runs: nothing
         // routine is signed, and what is owed stays owed (Switch wire 3.12).
         self.refresh().await?;
         if self.state.handing_over.is_some() || self.state.taking_over {
-            return self.resume().await;
+            self.resume().await?;
+            return Ok(self.left);
         }
         // A publication that failed doesn't hold back the closings owed at the switch.
         let erased_before = self.state.erased;
         let resumed = self.resume().await;
         // The run that completes an erasure has nothing more to do (Switch spec 12.7).
         if self.state.erased && !erased_before {
-            return resumed;
+            return resumed.map(|()| self.left);
         }
         if let Err(error) = &resumed
             && (self.flow.is_some() || !matches!(error, SignerError::Homeserver(_)))
@@ -837,14 +891,54 @@ impl Signer {
             // A pending revocation still goes to the switch: it signs nothing new, and
             // cutting the app off is the safe step. What it can't send stays pending.
             let _ = self.revoke_at_switch().await;
-            return resumed;
+            return resumed.map(|()| self.left);
         }
-        self.complete_removals().await?;
-        self.complete_renewals().await?;
-        self.serve_full_bundles().await?;
-        self.renew_expiring().await?;
-        self.republish().await?;
-        resumed
+        // One step's failure holds back no other: the steps after it run all the same, and the
+        // first error is returned once they have.
+        let mut failed = self.complete_removals().await.err();
+        // The later steps start only within the run's time, and the next run does the rest,
+        // from the step this one didn't start, or from the one after a step that failed, so
+        // that one goes last. Past the run's time, a step that had nothing to do passes the
+        // turn on, so one that has work always runs: a device clock that jumps, or goes back
+        // and so can't be read as time spent, holds none of them back for good.
+        let from = usize::from(self.state.due_from) % LATER.len();
+        let mut next = 0;
+        let mut worked = false;
+        for n in 0..LATER.len() {
+            let at = (from + n) % LATER.len();
+            let now = self.env.clock.now_ms();
+            let past = now < began || now - began >= super::RUN_DUE_STEPS_MS;
+            if past && worked {
+                self.left.steps_left = true;
+                next = at;
+                break;
+            }
+            let did = match LATER[at] {
+                Later::Closings => self.complete_renewals().await.map(|done| !done.is_empty()),
+                Later::FullBundles => self.serve_full_bundles().await.map(|done| !done.is_empty()),
+                Later::Renewals => self.renew_expiring().await.map(|done| !done.is_empty()),
+                Later::Publication => self.republish().await,
+            };
+            match did {
+                Ok(did) => worked |= did,
+                Err(error) => {
+                    worked = true;
+                    if failed.is_none() {
+                        next = (at + 1) % LATER.len();
+                        failed = Some(error);
+                    }
+                }
+            }
+        }
+        if usize::from(self.state.due_from) != next {
+            let mut state = self.state.clone();
+            state.due_from = u8::try_from(next).unwrap_or(0);
+            self.commit(state, self.flow.clone()).await?;
+        }
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        resumed.map(|()| self.left)
     }
 
     /// Renew the certificate of every current app once less than half its lifetime remains,
@@ -874,13 +968,20 @@ impl Signer {
     ///   [`Alert::RenewalSkipped`] naming why (design note, decision 2). A refusal that
     ///   concerns one app only doesn't hold back the others.
     /// - [`Alert::ClockOff`] clears itself at the first run that finds the clocks agreeing.
+    /// - At most four are renewed in one call, the soonest to expire first, an app whose
+    ///   renewal the switch refused, automatic or the user's, behind the others; the rest at
+    ///   the next run, which half a lifetime leaves ample time for. Outside a run the call
+    ///   has a budget of its own, which the steps each renewal runs again share
+    ///   ([`Signer::run_due`]).
     ///
     /// # Errors
     ///
-    /// As [`Signer::renew`]. A failure of the switch, the Homeserver or the store stops the
-    /// run; a renewal it cut short is finished by [`Signer::resume`], and the apps left are
-    /// renewed at the next run.
+    /// As [`Signer::renew`]. A renewal the switch refuses for good holds back none of the
+    /// others: the first refusal is returned once they are made. Any other failure of the
+    /// switch, the Homeserver or the store stops the call; a renewal it cut short is finished
+    /// by [`Signer::resume`], and the apps left are renewed at the next run.
     pub async fn renew_expiring(&mut self) -> Result<Vec<[u8; 16]>> {
+        let _budget = self.budget();
         let read = self.ready_at_switch().await?;
         let (statuses, switch_time) = (read.answer.apps, read.answer.server_time);
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
@@ -912,7 +1013,16 @@ impl Signer {
             if carried {
                 taken.push(listed.app_id);
             }
-            if removed || !past_half_lifetime(cert, switch_time) {
+            // An app that hasn't joined can't be renewed yet (Switch wire 6.2), and one being
+            // cut off goes: neither takes a place among the renewals a run makes.
+            let joined = statuses
+                .iter()
+                .any(|s| s.app_id == listed.app_id && s.record_cert.is_some());
+            if removed
+                || !joined
+                || self.cut_off(&listed.app_id)
+                || !past_half_lifetime(cert, switch_time)
+            {
                 continue;
             }
             // Two automatic renewals in a row untaken: the app stays away, and the user
@@ -960,6 +1070,7 @@ impl Signer {
                 None => due.push((
                     listed.app_id,
                     cert.expires_at().saturating_sub(cert.issued_at()),
+                    cert.expires_at(),
                 )),
             }
         }
@@ -986,8 +1097,27 @@ impl Signer {
         if state != self.state {
             self.commit(state, None).await?;
         }
+        // The soonest to expire first, as many as the run's budget renews: the rest are due at
+        // the next. Only apps that can be renewed are due, and an app whose renewal the switch
+        // refused, automatic or the user's own, goes behind the others, so none holds a place
+        // for good.
+        let refused = |app: &[u8; 16]| {
+            self.state
+                .alerts
+                .iter()
+                .any(|alert| matches!(alert, Alert::RenewalRefused { app_id, .. } if app_id == app))
+        };
+        due.sort_by_key(|(app_id, _, expires_at)| (refused(app_id), *expires_at));
+        let allowed = self.allowance().renewals;
+        if due.len() > allowed {
+            self.left.renewals_left = true;
+            due.truncate(allowed);
+        }
+        let tried = due.len();
+        self.spend(|run| run.renewals = run.renewals.saturating_sub(tried));
         let mut renewed = Vec::new();
-        for (app_id, lifetime) in due {
+        let mut refused_now = None;
+        for (app_id, lifetime, _) in due {
             self.ready().await?;
             let by = RenewedBy::Automatic { lifetime };
             match self
@@ -1011,10 +1141,23 @@ impl Signer {
                     | Refusal::UnknownScopes { .. }
                     | Refusal::ProtocolRule { .. },
                 )) if self.flow.is_none() => {}
+                // The switch refused it for good, and its flow has ended with the alert: the
+                // next app's renewal goes on, as a refusal for one app doesn't concern another,
+                // and the first refusal is returned once the others are made.
+                Err(
+                    error @ SignerError::Switch(ClientError::Switch {
+                        status: 400..=499, ..
+                    }),
+                ) if self.flow.is_none() => {
+                    refused_now.get_or_insert(error);
+                }
                 Err(error) => return Err(error),
             }
         }
-        Ok(renewed)
+        match refused_now {
+            Some(error) => Err(error),
+            None => Ok(renewed),
+        }
     }
 
     /// How many automatic renewals of `app_id` in a row no record has taken up.
@@ -1211,4 +1354,48 @@ pub(super) fn keep_asked_with_alerts(state: &mut SignerState) {
                 if *app_id == asked.app_id)
         })
     });
+}
+
+/// The steps of [`Signer::run_due`] after the removals, in their order: past the run's time,
+/// one starts only while none before it in the run has had work.
+#[derive(Clone, Copy)]
+enum Later {
+    Closings,
+    FullBundles,
+    Renewals,
+    Publication,
+}
+
+/// [`Later`]'s steps in their order, a run starting from the one the last run didn't start.
+const LATER: [Later; 4] = [
+    Later::Closings,
+    Later::FullBundles,
+    Later::Renewals,
+    Later::Publication,
+];
+
+/// What a [`Signer::run_due`] left for the next run because one of its bounds cut it short
+/// (design note, section 4.5): a host that sees [`RunDue::more_due`] may run again soon
+/// instead of waiting for its schedule, a minute later say, and not at once: a bound can cut
+/// run after run short while what it holds back is blocked, such as a device clock that
+/// jumps at every run, so `more_due` may stay true. Work owed for another reason, such as a
+/// switch that can't be reached, isn't counted: the errors and alerts say that.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RunDue {
+    /// More certificates were due for renewal than one run renews.
+    pub renewals_left: bool,
+    /// More full-bundle requests were pending than one run answers.
+    pub full_bundles_left: bool,
+    /// More removed apps' records were owed, to check or to delete, than one run handles.
+    pub deletions_left: bool,
+    /// The run's time passed before all its later steps started.
+    pub steps_left: bool,
+}
+
+impl RunDue {
+    /// Whether any bound cut the run short.
+    pub fn more_due(&self) -> bool {
+        self.renewals_left || self.full_bundles_left || self.deletions_left || self.steps_left
+    }
 }

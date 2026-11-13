@@ -345,6 +345,11 @@ impl AccountTxn {
         stages: bool,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
+        // The check of older documents keeps its two counters (`documents_checked_seq`,
+        // `documents_check_end`), so it runs on over the new generation's first seqs. That
+        // is harmless: those items are all chained under the rule, and the check deletes
+        // only documents no app may read in full, as the write that superseded them would
+        // have (Switch wire 7.5).
         sqlx::query(
             "UPDATE accounts SET generation = $2, service_key = $3, recovery_from = $4, \
              recovery_declared_at_ms = $5, admission_staged = $6 WHERE id = $1",

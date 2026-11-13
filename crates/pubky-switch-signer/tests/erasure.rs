@@ -1662,7 +1662,8 @@ async fn test_erasure_unsigned_404_with_nothing_in_doubt_raises_account_not_host
     let (signer, id, store) = with_an_app(&world).await;
     let mark = signer.identity_doc().unwrap().unwrap();
     drop(signer);
-    let (env, transport) = nth_apps_answer(&world, store, 1, 404);
+    let (env, transport, unsigned) = apps_answers(&world, store);
+    *unsigned.lock().unwrap() = Some(404);
     let mut signer = Signer::open(env, world.keyring()).await.unwrap();
     let error = signer.run_due().await.unwrap_err();
     assert!(
@@ -1683,6 +1684,7 @@ async fn test_erasure_unsigned_404_with_nothing_in_doubt_raises_account_not_host
     let sent = transport.requests();
     assert!(!sent.is_empty());
     assert!(sent.iter().all(|r| r.method == "GET"), "only reads");
+    *unsigned.lock().unwrap() = None;
     signer.run_due().await.unwrap();
     assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
 }
@@ -1700,6 +1702,38 @@ async fn test_erasure_in_doubt_ending_erased_raises_no_account_not_hosted() {
     assert!(world.switch.erased());
     confirm_erasure(&world, &mut signer).await;
     assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
+}
+
+/// An environment whose every `GET /apps` gets an unsigned answer with the status the
+/// returned cell holds, while it holds one; the switch answers the rest.
+fn apps_answers(
+    world: &World,
+    store: Arc<MemoryStore>,
+) -> (
+    SignerEnv,
+    Arc<MockTransport>,
+    Arc<std::sync::Mutex<Option<u16>>>,
+) {
+    let switch = Arc::clone(&world.switch);
+    let unsigned = Arc::new(std::sync::Mutex::new(None));
+    let status = Arc::clone(&unsigned);
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        let held = *status.lock().unwrap();
+        if request.method == "GET"
+            && request.path_and_query.ends_with("/apps")
+            && let Some(status) = held
+        {
+            return Ok(Response {
+                status,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            });
+        }
+        switch.handle(request)
+    }));
+    let mut env = world.env(store);
+    env.transport = transport.clone();
+    (env, transport, unsigned)
 }
 
 /// `world`'s env, whose transport answers `GET /apps` number `nth`, counted from 1, with an
@@ -2233,35 +2267,18 @@ async fn test_erasure_account_not_hosted_outlasts_an_unsigned_answer_and_clears_
     let world = World::new();
     let (signer, store) = world.enrolled().await;
     drop(signer);
-    let switch = Arc::clone(&world.switch);
-    let seen = Arc::new(std::sync::Mutex::new(0usize));
-    let transport = Arc::new(MockTransport::with_handler(move |request| {
-        if request.method == "GET" && request.path_and_query.ends_with("/apps") {
-            let mut seen = seen.lock().unwrap();
-            *seen += 1;
-            let status = match *seen {
-                1 => 404,
-                2 => 503,
-                _ => return switch.handle(request),
-            };
-            return Ok(Response {
-                status,
-                headers: Vec::new(),
-                body: b"{}".to_vec(),
-            });
-        }
-        switch.handle(request)
-    }));
-    let mut env = world.env(store);
-    env.transport = transport;
+    let (env, _, unsigned) = apps_answers(&world, store);
+    *unsigned.lock().unwrap() = Some(404);
     let mut signer = Signer::open(env, world.keyring()).await.unwrap();
     signer.run_due().await.unwrap_err();
     assert!(signer.alerts().contains(&Alert::AccountNotHosted));
+    *unsigned.lock().unwrap() = Some(503);
     signer.run_due().await.unwrap_err();
     assert!(
         signer.alerts().contains(&Alert::AccountNotHosted),
         "an unsigned 503 clears nothing"
     );
+    *unsigned.lock().unwrap() = None;
     world.switch.fail_next(SwitchFault::Error {
         path: "/apps".into(),
         code: ErrorCode::NotFound,

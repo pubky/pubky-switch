@@ -24,6 +24,7 @@ mod apps;
 mod chain;
 mod claim_codec;
 mod connect;
+mod documents;
 mod enrollments;
 mod feed;
 mod handover;

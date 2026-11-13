@@ -1365,7 +1365,8 @@ async fn test_renewal_on_expiry_leaves_removed_and_unjoined_apps_and_renews_open
     let before = signer.identity_doc().unwrap().unwrap();
     assert!(before.listed_cert(&a_id).is_some(), "still listed");
     assert!(before.listed_cert(&e_id).is_some(), "still listed");
-    assert_eq!(signer.renew_expiring().await.unwrap(), [b_id, d_id]);
+    // The soonest to expire first: `b`'s certificate, renewed since, expires after `d`'s.
+    assert_eq!(signer.renew_expiring().await.unwrap(), [d_id, b_id]);
     let newest = signer.identity_doc().unwrap().unwrap();
     assert_eq!(renewals(&newest, &a_id), Vec::<Option<u64>>::new());
     assert_eq!(
