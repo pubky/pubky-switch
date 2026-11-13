@@ -27,11 +27,12 @@ use super::{BoxFuture, Header, Request, Response, Transport, TransportError};
 /// a feed read, whose long poll holds it up to 25 s and whose page may take 8 MiB (Switch
 /// wire 7.4.4), a records listing (7.4.9), the directory (7.4.10), the apps and an app's
 /// key bundle parts (7.4.11, 7.4.12), a claim's entries (7.4.8), the admission lists
-/// (7.4.6), a batch of operations (6.4), an append, whose `409 stale_key` carries the
-/// directory (7.6), a recovery upload (7.4.14), the handover (7.4.17), an enrollment
-/// (7.4.1), and a move's export and import (10.2 to 10.4). Every other call gets
-/// [`HttpConfig::request_timeout_ms`], the time sample a write takes first included: a feed
-/// read of one item with no wait. At the limits some long calls carry tens of megabytes: a
+/// (7.4.6), a batch of operations whose body passes a mebibyte (6.4), an append, whose
+/// `409 stale_key` carries the directory (7.6), a recovery upload (7.4.14), the handover
+/// (7.4.17), an enrollment (7.4.1), and a move's export and import (10.2 to 10.4). Every
+/// other call gets [`HttpConfig::request_timeout_ms`]: the time sample a write takes
+/// first, a feed read of one item with no wait, and a smaller batch among them, so an
+/// ordinary write is two short calls. At the limits some long calls carry tens of megabytes: a
 /// host on a slow network raises the settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -105,6 +106,9 @@ pub struct HttpTransport {
     long_timeout: Duration,
 }
 
+/// The body size past which a batch of operations gets the long timeout.
+const LONG_BODY_BYTES: usize = 1 << 20;
+
 /// Whether `request` is a call whose request or answer can pass a mebibyte, or the feed's
 /// long poll ([`HttpConfig`]): judged by its method, its path after `/v1/{id}/` and, for a
 /// feed read, its query.
@@ -126,7 +130,9 @@ fn is_long_call(request: &Request) -> bool {
     };
     match request.method.as_str() {
         // A feed read of one item with no wait, the time sample a write takes first, is
-        // short: one item is under 1 MiB (Switch wire 7.1 "Answer sizes").
+        // short. Its page runs to the end of a batch whose items it starts (Switch wire
+        // 7.4.4), so it may carry up to about 5 MiB, under the short timeout all the same:
+        // a write's time sample at the end of the feed meets no batch.
         "GET" if rest == "feed" => {
             let mut params = query.split('&');
             params.clone().any(|param| param.starts_with("wait="))
@@ -140,9 +146,12 @@ fn is_long_call(request: &Request) -> bool {
                 || rest.starts_with("claims/")
                 || (rest.starts_with("apps/") && rest.ends_with("/keys"))
         }
-        // A batch's items take up to 5 MiB; an append's `409 stale_key` carries the
-        // directory, and an import's start its manifest.
-        "POST" => matches!(rest, "ops" | "inbox" | "recovery/upload" | "import"),
+        // A batch's items take up to 5 MiB: one whose body passes a mebibyte is long, a
+        // smaller one short, its answer proofs and a head, or a `409 conflict` with one
+        // record's view (under 1 MiB). An append's `409 stale_key` carries the directory,
+        // and an import's start its manifest.
+        "POST" if rest == "ops" => request.body.len() > LONG_BODY_BYTES,
+        "POST" => matches!(rest, "inbox" | "recovery/upload" | "import"),
         "PUT" => rest == "handover" || rest.starts_with("import/chunks/"),
         _ => false,
     }
@@ -495,7 +504,6 @@ mod tests {
             ("GET", "/v1/x/allow"),
             ("GET", "/v1/x/handover"),
             ("PUT", "/v1/x/handover"),
-            ("POST", "/v1/x/ops"),
             ("POST", "/v1/x/inbox?apps_version=1"),
             ("POST", "/v1/x/recovery/upload"),
             ("POST", "/v1/enroll"),
@@ -521,6 +529,13 @@ mod tests {
         ] {
             assert!(!is_long_call(&call(method, path)), "{method} {path}");
         }
+        // A batch is long only once its body passes a mebibyte.
+        let batch = |bytes: usize| Request {
+            body: vec![b'x'; bytes],
+            ..call("POST", "/v1/x/ops")
+        };
+        assert!(!is_long_call(&batch(LONG_BODY_BYTES)));
+        assert!(is_long_call(&batch(LONG_BODY_BYTES + 1)));
         // The time sample, as a write sends it.
         let sample = crate::client::answers::FeedQuery {
             after: Some(pubky_switch_core::ops::Position {
