@@ -6806,6 +6806,148 @@ async fn test_records_waiting_entry_passed_over_while_the_start_reopening_fails(
     assert_eq!(*protocol.runs.lock().unwrap(), 2);
 }
 
+/// A new entry read after the key bundle part on the same page, whose step reads a record
+/// held `Unreadable` that the key opens: the reopening waits for the page's end, so the
+/// step still finds the record not open and waits for a key the app now holds. Once the
+/// record opens the entry is taken.
+#[tokio::test]
+async fn test_records_entry_after_the_key_on_its_page_is_taken_once_the_record_opens() {
+    let s = Setup::new();
+    let protocol = Arc::new(SharedReader {
+        items: ItemsProtocol::default(),
+        runs: std::sync::Mutex::new(0),
+    });
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let mut wallet = App::join(s.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let mut phone = s.join("phone").await;
+    record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    let shared = RecordTarget::new(items(), b"shared");
+    phone
+        .put_record(&shared, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    let key = wallet.record_key(&shared).unwrap();
+    assert!(
+        wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()
+            .is_none(),
+        "held unreadable for now"
+    );
+    // The key's part, then a note, both unread: one page.
+    store_parts_for(&s, &wallet.cert().clone());
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (seq, _) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "after the key" }),
+            &[wallet.app_id()],
+        )
+        .unwrap();
+    let mut events = Vec::new();
+    for _ in 0..4 {
+        s.w.clock.advance_ms(crate::app::MAX_CURSOR_DEFER_MS + 1);
+        events.extend(wallet.receive(None).await.unwrap().events);
+    }
+    assert_eq!(
+        ids(wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        vec!["a"],
+        "the record opened"
+    );
+    assert!(
+        wallet.stored_at(seq).is_none(),
+        "still stored as {:?} after {} runs; {:?}",
+        wallet.stored_at(seq).map(|stored| stored.reason),
+        *protocol.runs.lock().unwrap(),
+        events
+            .iter()
+            .filter(|e| matches!(e, AppEvent::Parked { .. } | AppEvent::AwaitingKeys { .. }))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The same with the key taken by the step's own fetch. The wallet read `shared`, sealed
+/// at a data epoch it doesn't know yet, from the switch: held `Unreadable`, and no key is
+/// missing for the epoch it knows, so no full bundle is asked for. The feed then shows the
+/// epoch rise, then a note whose step reads `shared` and fetches the key bundle, whose part
+/// the feed shows only after the note. The step runs again on the record still not open, as
+/// the reopening waits for the page's end; once the record opens the entry is taken in the
+/// same read.
+#[tokio::test]
+async fn test_records_entry_whose_own_fetch_takes_the_key_is_taken_once_the_record_opens() {
+    let s = Setup::new();
+    let protocol = Arc::new(SharedReader {
+        items: ItemsProtocol::default(),
+        runs: std::sync::Mutex::new(0),
+    });
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let mut wallet = App::join(s.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let shared = RecordTarget::new(items(), b"shared");
+    phone
+        .put_record(&shared, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let held = wallet.read_record(&shared).await.unwrap().unwrap();
+    assert!(held.content.value().is_none(), "{:?}", held.content);
+    let key = wallet.record_key(&shared).unwrap();
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (seq, _) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "reads shared" }),
+            &[wallet.app_id()],
+        )
+        .unwrap();
+    // The wallet's part is stored after the note: the feed shows it after the note, and
+    // a fetch made at the note reads it.
+    store_parts_for(&s, &wallet.cert().clone());
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(
+        ids(wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        vec!["a"],
+        "the record opened"
+    );
+    assert!(
+        wallet.stored_at(seq).is_none(),
+        "still stored as {:?} after {} runs; {:?}",
+        wallet.stored_at(seq).map(|stored| stored.reason),
+        *protocol.runs.lock().unwrap(),
+        report.events
+    );
+}
+
 /// A record write sealed at an epoch whose key a later item of the same page brings: the
 /// write is taken unreadable in the page's open writes, the key's fetch reopens what the
 /// store holds, and the record must still open once the key is held.

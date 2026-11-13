@@ -1335,20 +1335,34 @@ impl App {
             }
         }
         let reason = ParkReason::AwaitingKey { data_epoch };
-        // Stored already for the same epoch: it stays as it is, but for the keys its step
-        // ran with now, so it is due again only once they change. No event: nothing new.
-        let keys_held = self.keys_held();
+        // The keys its step ran with, so it is due again only once they change. While a
+        // reopening is owed, which a key this page or this step's fetch took leaves until
+        // the page's end, the record the step read may be one it opens: no count then, and
+        // the entry, held while the reopening is owed, is due once it is done.
+        let keys_at = if self.reader().exists(super::records::REOPEN_DUE).await? {
+            None
+        } else {
+            Some(self.keys_held())
+        };
+        // Stored already for the same epoch: it stays as it is, but for that count. No
+        // event: nothing new.
         if let Some(id) = entry.stored
             && let Some(stored) = self.state.parked.get_mut(&id)
             && stored.reason == reason
         {
-            if stored.keys_at != Some(keys_held) {
-                stored.keys_at = Some(keys_held);
+            if stored.keys_at != keys_at {
+                stored.keys_at = keys_at;
                 read.tx.put(&key::parked(id), &*stored)?;
             }
             return Ok(Some(Step::Hold));
         }
-        self.park(entry, &received.plaintext, reason, read)?;
+        let id = self.park(entry, &received.plaintext, reason, read)?;
+        if keys_at.is_none()
+            && let Some(stored) = self.state.parked.get_mut(&id)
+        {
+            stored.keys_at = None;
+            read.tx.put(&key::parked(id), &*stored)?;
+        }
         Ok(Some(Step::Pass))
     }
 

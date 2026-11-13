@@ -490,8 +490,10 @@ pub(crate) struct ParkedEntry {
     /// For an entry that waits for a scope key ([`ParkReason::AwaitingKey`]): how many
     /// scope keys the app held when its step last ran. Keys are only ever added while the
     /// app runs, so another count is a changed key set, and only that makes the entry due
-    /// again (`feed.rs`, `due_again`); `None` before its step ran so, or for an entry an
-    /// earlier build stored, which is due once its epoch's keys are held.
+    /// again (`feed.rs`, `due_again`); `None` before its step ran so, for an entry an
+    /// earlier build stored, or for one whose step ran while a reopening was owed
+    /// (`records::REOPEN_DUE`): such an entry is due once its epoch's keys are held and
+    /// no reopening is owed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) keys_at: Option<u64>,
 }
