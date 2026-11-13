@@ -129,7 +129,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   good is its App ID, its revocation or departure time and rotation, and its kids (Switch
   spec 3.6), so no app registers one of them again and an envelope wrapped to one gets
   `409 stale_key` naming the app in `not_current`, as before the purge. `GET /apps` shows it
-  as the service does, with no unread entries.
+  as the service does, with no unread entries. Unlike a move by the spec (Switch wire 9.1,
+  10.3), `import_into` copies the kept kids to the next switch.
 - **Forgotten deleted keys** (Switch spec 10.3, wire 9.1), as at the service: a record
   whose current write is its delete, written here and not taken from a recovery upload,
   goes once the cursor of every app the held `identity.json` lists, neither revoked nor
