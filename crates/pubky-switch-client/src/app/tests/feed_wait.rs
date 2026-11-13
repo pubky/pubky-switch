@@ -1162,3 +1162,308 @@ async fn test_receive_with_kept_batches_whose_answers_are_lost_says_no_more() {
         report.events
     );
 }
+
+// -------------------------------------------------------------------------------------
+// Bounded calls: a write's kept batches, and a read's time budget
+
+/// The switch's transport, each request of which takes `ms` of the app's clock, as a switch
+/// that answers each request just inside its timeout.
+struct Slow {
+    inner: Arc<dyn Transport>,
+    clock: Arc<crate::clock::TestClock>,
+    ms: std::sync::atomic::AtomicU64,
+}
+
+impl Transport for Slow {
+    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+        Box::pin(async move {
+            let answer = self.inner.send(request).await;
+            self.clock
+                .advance_ms(self.ms.load(std::sync::atomic::Ordering::SeqCst));
+            answer
+        })
+    }
+}
+
+impl Setup {
+    /// From now on each request to alice's switch takes `ms` of the app's clock.
+    fn slow(&self, ms: u64) -> Arc<Slow> {
+        let slow = Arc::new(Slow {
+            inner: Arc::clone(&self.gate) as Arc<dyn Transport>,
+            clock: Arc::clone(&self.w.clock),
+            ms: std::sync::atomic::AtomicU64::new(ms),
+        });
+        self.router
+            .add(ORIGIN, Arc::clone(&slow) as Arc<dyn Transport>);
+        slow
+    }
+
+    /// The requests sent to alice's switch since `from`, the router's log length then.
+    fn sent_since(&self, from: usize) -> Vec<String> {
+        self.router.log()[from..]
+            .iter()
+            .filter(|line| line.contains(ORIGIN))
+            .cloned()
+            .collect()
+    }
+
+    /// Freeze alice's account, so every write is kept and answered `410 moved`.
+    fn freeze(&self) -> Freeze {
+        let next = SigningKey::from_bytes(&seed("service/alice/next"));
+        let freeze = Freeze::sign(
+            &self.w.alice,
+            FreezeBody {
+                identity: self.w.alice.public(),
+                inbox: Inbox::new("https://next.example", next.verifying_key().to_bytes()),
+                next_generation: 2,
+                issued_at: self.w.clock.now_ms(),
+                nonce: [2; 16],
+            },
+        )
+        .unwrap();
+        self.w.switch.freeze(&freeze).unwrap();
+        freeze
+    }
+}
+
+#[tokio::test]
+async fn test_write_sends_one_kept_batch_again_and_keeps_its_own_behind_the_rest() {
+    // Three writes kept while the account was frozen. The next write sends the oldest again,
+    // and, two still kept, keeps its own behind them and says which one is ahead; reads then
+    // send them all, in the order they were kept.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let freeze = s.freeze();
+    for n in 0..3u8 {
+        s.w.clock.advance_ms(1_000);
+        let error = app
+            .submit_batch(conversation([n + 10; 32]))
+            .await
+            .unwrap_err();
+        assert!(error.kept_batch().is_some(), "{error:?}");
+    }
+    s.w.switch.unfreeze(&freeze).unwrap();
+    let before = conversations(&s.w).len();
+    let error = app.submit_batch(conversation([13; 32])).await.unwrap_err();
+    let own = error.kept_batch().expect("its own batch kept");
+    let AppError::Refused(crate::app::Refusal::KeptBatchesAhead(ahead)) = error.unkept() else {
+        panic!("{error:?}");
+    };
+    assert_eq!(ahead.kept, 2, "the two still kept from before");
+    assert!(ahead.kept_since_ms.is_some() && ahead.answer_until_ms.is_some());
+    assert_eq!(
+        conversations(&s.w)[before..],
+        [[10; 32]],
+        "one sent again first"
+    );
+    assert!(app.kept_batch(own).await.unwrap().is_some());
+    app.receive(None).await.unwrap();
+    let all: Vec<[u8; 32]> = (10..14).map(|n| [n; 32]).collect();
+    assert_eq!(conversations(&s.w)[before..], all[..], "in the order kept");
+    assert!(app.kept_batches().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_write_behind_a_failing_kept_batch_names_it() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let lost = s.lose_answers();
+    s.w.clock.advance_ms(1_000);
+    let first = app
+        .submit_batch(conversation([10; 32]))
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .expect("kept");
+    s.w.clock.advance_ms(1_000);
+    let error = app.submit_batch(conversation([11; 32])).await.unwrap_err();
+    let AppError::Ahead { ahead, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(ahead.batch_id, first);
+    assert_eq!(ahead.kept, 1);
+    assert!(
+        matches!(error.unkept(), AppError::Transport(TransportError::Timeout)),
+        "{error:?}"
+    );
+    assert_eq!(error.kept_batch(), None, "nothing of this write is kept");
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    lost.found();
+}
+
+#[tokio::test]
+async fn test_kept_batches_never_sent_go_in_the_order_they_were_kept() {
+    // Batches kept behind others are never sent: their creation number orders them, not
+    // their random IDs.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let freeze = s.freeze();
+    s.w.clock.advance_ms(1_000);
+    app.submit_batch(conversation([10; 32])).await.unwrap_err();
+    app.submit_batch(conversation([11; 32])).await.unwrap_err();
+    s.w.switch.unfreeze(&freeze).unwrap();
+    s.gate.set(|mode| mode.paused = false);
+    // Each of these sends the oldest again and is kept behind the rest, unsent.
+    let lost = s.lose_answers();
+    for n in 20..26u8 {
+        let _ = app.submit_batch(conversation([n; 32])).await;
+    }
+    lost.found();
+    let before = conversations(&s.w).len();
+    for _ in 0..4 {
+        if !app.receive(None).await.unwrap().more {
+            break;
+        }
+    }
+    let sent: Vec<[u8; 32]> = conversations(&s.w)[before..]
+        .iter()
+        .copied()
+        .filter(|pubky| pubky[0] >= 20)
+        .collect();
+    let mut sorted = sent.clone();
+    sorted.sort_unstable();
+    assert_eq!(sent, sorted, "in creation order");
+    assert!(app.kept_batches().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_write_on_a_slow_switch_sends_at_most_three_requests() {
+    // Each request takes just under the short timeout: a write with one batch kept ahead
+    // sends it again, takes its time sample and sends its own, and so ends within about
+    // 30 s at the default timeouts.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let freeze = s.freeze();
+    s.w.clock.advance_ms(1_000);
+    app.submit_batch(conversation([10; 32])).await.unwrap_err();
+    s.w.switch.unfreeze(&freeze).unwrap();
+    s.slow(9_900);
+    let from = s.router.log().len();
+    let started = s.w.clock.now_ms();
+    app.submit_batch(conversation([11; 32])).await.unwrap();
+    let sent = s.sent_since(from);
+    assert!(sent.len() <= 3, "{sent:?}");
+    assert!(s.w.clock.now_ms() - started <= 30_000);
+}
+
+#[tokio::test]
+async fn test_receive_on_a_slow_switch_stops_on_its_time_budget_and_goes_on() {
+    // A feed of many pages, each request taking 9 s of the app's clock: a read stops once its
+    // 20 s are spent, says more, and the next read goes on from where it got, not from the
+    // cursor; across a restart too. Every entry is handed over once.
+    let s = Setup::new(false);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = s
+        .join_on("wallet", Arc::clone(&store) as Arc<dyn StateStore>)
+        .await;
+    let id = app.app_id();
+    let notes: Vec<u64> = (0..12).map(|_| s.note(app.app_id())).collect();
+    app.config.page_size = 1;
+    s.slow(9_000);
+    let mut handed = Vec::new();
+    let started = s.w.clock.now_ms();
+    let report = app.receive(None).await.unwrap();
+    assert!(report.more, "{:?}", report.events);
+    handed.extend(received(&report.events));
+    assert!(
+        s.w.clock.now_ms() - started <= crate::app::DEFAULT_CALL_BUDGET_MS + 3 * 9_000,
+        "within the budget and the read's last requests"
+    );
+    assert!(
+        !handed.is_empty() && handed.len() < notes.len(),
+        "{handed:?}"
+    );
+    drop(app);
+    let env =
+        s.w.signer
+            .env_with(store, Arc::clone(&s.router) as Arc<dyn Transport>);
+    let mut config = World::config();
+    config.page_size = 1;
+    let mut app = App::load(env, s.protocol.clone(), config, id)
+        .await
+        .unwrap();
+    for _ in 0..20 {
+        let from = s.router.log().len();
+        let report = app.receive(None).await.unwrap();
+        handed.extend(received(&report.events));
+        // Each read goes on past what the one before handed over.
+        let after = s.sent_since(from);
+        assert!(after.len() <= 8, "{after:?}");
+        if !report.more {
+            break;
+        }
+    }
+    assert_eq!(handed, notes, "each once, in order");
+}
+
+#[tokio::test]
+async fn test_receive_reads_at_most_its_page_budget() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let notes: Vec<u64> = (0..6).map(|_| s.note(app.app_id())).collect();
+    app.config.page_size = 1;
+    let from = s.router.log().len();
+    let report = app.receive(None).await.unwrap();
+    assert!(report.more);
+    let pages = s
+        .sent_since(from)
+        .iter()
+        .filter(|line| line.contains("/feed?"))
+        .count();
+    assert_eq!(pages, crate::app::FEED_PAGES_PER_READ as usize);
+    let mut handed = received(&report.events);
+    for _ in 0..4 {
+        let report = app.receive(None).await.unwrap();
+        handed.extend(received(&report.events));
+        if !report.more {
+            break;
+        }
+    }
+    assert_eq!(handed, notes);
+}
+
+#[tokio::test]
+async fn test_update_record_takes_one_time_sample_for_all_its_tries() {
+    // The phone writes the record after the wallet's last read: the wallet's first try is
+    // refused `409 conflict`, the next builds on the phone's write, and the call takes its
+    // service time once.
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = RecordTarget::new(items(), b"n1");
+    app.put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    s.settle(&mut app).await;
+    phone.receive(None).await.unwrap();
+    phone
+        .put_record(&target, &value(&["p"]), vec![])
+        .await
+        .unwrap();
+    let samples = |from: usize| {
+        s.sent_since(from)
+            .iter()
+            .filter(|line| {
+                line.contains("/feed?") && line.contains("limit=1") && !line.contains("wait=")
+            })
+            .count()
+    };
+    let puts = |from: usize| {
+        s.sent_since(from)
+            .iter()
+            .filter(|line| line.contains("/ops"))
+            .count()
+    };
+    let from = s.router.log().len();
+    let updated = app
+        .update_record(&target, vec![], |_| Some(value(&["w"])))
+        .await
+        .unwrap();
+    assert!(updated.is_some());
+    assert!(
+        puts(from) >= 2,
+        "a conflict, then the write: {:?}",
+        s.sent_since(from)
+    );
+    assert_eq!(samples(from), 1, "{:?}", s.sent_since(from));
+}

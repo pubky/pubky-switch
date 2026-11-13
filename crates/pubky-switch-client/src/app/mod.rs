@@ -70,12 +70,12 @@ mod send;
 mod tests;
 
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
-pub use error::{Alarm, AppError, Refusal};
+pub use error::{Alarm, AppError, KeptAhead, Refusal};
 pub use events::{
     AppEvent, BackupRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId, EventIdError,
     ParkReason, RefusedCall,
 };
-pub use feed::{ReceiveReport, SENDER_REREAD_MS};
+pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use kept::{KeptBatch, KeptBatchDrop, KeptBatchStatus};
 pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
@@ -88,7 +88,7 @@ pub use protocol::{
     ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, WriteBase, decode_local_state,
     encode_local_state, local_writes_bytes,
 };
-pub use provider::ProviderStatus;
+pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
 pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
@@ -102,7 +102,9 @@ pub use wait::{
 };
 
 pub use admission::{INVITE_CODE_BYTES, InviteCode, LISTS_TOO_LARGE_RETRY_MS, SenderDisposition};
-pub use batch::{KEPT_RESENDS_PER_READ, MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};
+pub use batch::{
+    KEPT_RESENDS_PER_READ, KEPT_RESENDS_PER_WRITE, MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in,
+};
 pub use claims::{
     CLAIM_REREADS_PER_READ, ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead,
     ClaimWritten, ObligationDeadline, claim_conflict,
@@ -199,6 +201,31 @@ pub struct AppConfig {
     /// needs public data does (Switch spec 4.2); such an app leaves in two steps (Switch spec
     /// 12.3). It needs [`AppEnv::homeserver_writer`].
     pub publishes_record: bool,
+    /// The time budget of one call, in milliseconds by the app's clock: 20 s by default.
+    /// Once it has passed since a bounded call began, the call starts no further request
+    /// and returns as when its request budget runs out, with what is left kept for the next
+    /// call ([`ReceiveReport::more`], a write's batch kept). A call so ends within the
+    /// budget and one more request's timeout ([`crate::transport::HttpConfig`]).
+    pub call_budget_ms: u64,
+}
+
+/// [`AppConfig::call_budget_ms`] by default.
+pub const DEFAULT_CALL_BUDGET_MS: u64 = 20_000;
+
+/// The time budget of one bounded call ([`AppConfig::call_budget_ms`]): when it began, by
+/// the app's clock. Passed down to the loops of the call, so a call made inside another
+/// keeps its own and a dropped call leaves nothing behind.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CallBudget {
+    began_ms: u64,
+    budget_ms: u64,
+}
+
+impl CallBudget {
+    /// Whether the call has spent its budget at `now_ms`: it starts no further request.
+    pub(crate) fn spent(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.began_ms) >= self.budget_ms
+    }
 }
 
 impl Default for AppConfig {
@@ -210,6 +237,7 @@ impl Default for AppConfig {
             cursor_defer_ms: DEFAULT_CURSOR_DEFER_MS,
             page_size: 100,
             publishes_record: false,
+            call_budget_ms: DEFAULT_CALL_BUDGET_MS,
         }
     }
 }
@@ -2559,6 +2587,19 @@ impl App {
     }
 
     /// Reload after a failed commit, and refuse calls the app's state forbids.
+    /// The time budget of a call that begins now ([`AppConfig::call_budget_ms`]).
+    pub(crate) fn begin_budget(&self) -> CallBudget {
+        CallBudget {
+            began_ms: self.now(),
+            budget_ms: self.config.call_budget_ms,
+        }
+    }
+
+    /// Whether `budget` is spent now.
+    pub(crate) fn spent(&self, budget: &CallBudget) -> bool {
+        budget.spent(self.now())
+    }
+
     async fn ready_local(&mut self) -> Result<(), AppError> {
         // Each call takes a service time of its own before it judges a kept batch's age.
         self.time_fresh_at = None;

@@ -116,6 +116,34 @@ pub enum Refusal {
         /// The owed protocol calls it would carry.
         owed_calls: u64,
     },
+    /// A write waits behind batches kept from earlier calls, which a write sends again
+    /// first, one per call, and none of which it overtakes (Switch wire 6.4 step 5): its
+    /// own batch is kept unsent behind them ([`AppError::Kept`]), to go after them. The
+    /// host reads ([`super::App::receive`]), which sends the kept batches again oldest
+    /// first, and finds its batch's fate with [`super::App::kept_batch`].
+    KeptBatchesAhead(KeptAhead),
+}
+
+/// The batch kept from an earlier call that a write waits behind ([`Refusal::KeptBatchesAhead`],
+/// [`AppError::Ahead`]): the oldest, which goes first.
+///
+/// While its resend fails it blocks the batches behind it, since no write overtakes
+/// another. That lasts at most until its answer window ends, [`super::KEPT_BATCH_ANSWER_MS`]
+/// after it was kept (`answer_until_ms`): past it no answer tells whether the switch
+/// applied it, so it isn't sent again, and goes, reported with its attempts
+/// ([`super::AppEvent::KeptBatchDropped`]). Until then a host waits, and reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeptAhead {
+    /// The oldest kept batch's ID ([`super::App::kept_batch`]).
+    pub batch_id: [u8; 16],
+    /// When its first send left, service time in Unix milliseconds; `None` while it was
+    /// never sent.
+    pub kept_since_ms: Option<u64>,
+    /// When its answer window ends; `None` while it was never sent, which has no window.
+    pub answer_until_ms: Option<u64>,
+    /// How many batches are kept from earlier calls.
+    pub kept: u64,
 }
 
 impl std::fmt::Display for Refusal {
@@ -131,6 +159,11 @@ impl std::fmt::Display for Refusal {
             }
             Refusal::NotNow(why) => write!(f, "not now: {why}"),
             Refusal::Usage(why) => write!(f, "usage: {why}"),
+            Refusal::KeptBatchesAhead(ahead) => write!(
+                f,
+                "kept behind {} batches kept from earlier calls, the oldest kept since {:?}",
+                ahead.kept, ahead.kept_since_ms
+            ),
             Refusal::CarriedTooLarge {
                 duty_events,
                 owed_calls,
@@ -223,6 +256,17 @@ pub enum AppError {
         /// Why it couldn't be settled now.
         error: Box<AppError>,
     },
+    /// A write's resend of the oldest batch kept from an earlier call failed with `error`:
+    /// nothing of the write was kept or sent, since no write overtakes a kept batch. `ahead`
+    /// names that batch and how long it has been kept ([`KeptAhead`]).
+    /// [`AppError::code`] and [`AppError::unkept`] see through this variant.
+    #[error("a batch kept from an earlier call is ahead and couldn't be sent: {error}")]
+    Ahead {
+        /// The kept batch ahead.
+        ahead: KeptAhead,
+        /// Why its resend failed.
+        error: Box<AppError>,
+    },
 }
 
 impl AppError {
@@ -235,10 +279,10 @@ impl AppError {
         }
     }
 
-    /// The error, without the [`AppError::Kept`] around it.
+    /// The error, without the [`AppError::Kept`] or [`AppError::Ahead`] around it.
     pub fn unkept(&self) -> &AppError {
         match self {
-            AppError::Kept { error, .. } => error,
+            AppError::Kept { error, .. } | AppError::Ahead { error, .. } => error.unkept(),
             other => other,
         }
     }

@@ -32,7 +32,7 @@ use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use super::claims::ObligationDeadline;
-use super::error::{Refusal, RefusalPlace, refused_at, refused_for_good};
+use super::error::{KeptAhead, Refusal, RefusalPlace, refused_at, refused_for_good};
 use super::events::AppEvent;
 use super::kept::{Ended, KeptBatchDrop, index_kept};
 use super::protocol::{LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
@@ -115,8 +115,29 @@ fn refused_before_lookup(error: &AppError) -> bool {
 /// the read says so ([`super::ReceiveReport::more`]).
 pub const KEPT_RESENDS_PER_READ: usize = 4;
 
+/// The most batches kept from earlier calls that a write sends again before its own
+/// ([`App::submit_batch`]): with more kept, its own batch is kept behind them.
+pub const KEPT_RESENDS_PER_WRITE: usize = 1;
+
+/// The next creation number of a kept batch ([`PendingBatch::queued_n`]).
+const KEPT_NEXT: &str = "keptn";
+
 /// `opq/<batch_id>`: a kept batch, under the batch ID it was first kept under, whatever ID
 /// its bytes carry once signed again (`kept.rs`).
+/// The order kept batches go in (Switch wire 6.4 step 5): those sent before by their first
+/// send's service time, then those never sent by their creation number, each with the ID
+/// last, so no write overtakes an earlier one.
+fn kept_order(
+    (id, pending): &([u8; 16], PendingBatch),
+) -> (bool, Option<u64>, Option<u64>, [u8; 16]) {
+    (
+        pending.kept_ms.is_none(),
+        pending.kept_ms,
+        pending.queued_n,
+        *id,
+    )
+}
+
 pub(crate) fn pending_key(batch_id: &[u8; 16]) -> String {
     format!("{PENDING_PREFIX}{}", b64(batch_id))
 }
@@ -266,6 +287,10 @@ pub(crate) struct PendingBatch {
     /// which can't be ambiguous and so has no window yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kept_ms: Option<u64>,
+    /// Its creation number among the app's kept batches, in the commit that keeps it: the
+    /// order of those never sent. `None` for one an earlier build kept, which goes first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) queued_n: Option<u64>,
 }
 
 impl std::fmt::Debug for PendingBatch {
@@ -290,6 +315,20 @@ impl App {
     /// done (the newer document isn't on the Homeserver yet, or a write was sealed under a
     /// key the app doesn't hold), the call returns the `409 stale_epoch`, and the caller
     /// builds the batch again ([`App::record_op`] seals at the epoch the app holds then).
+    ///
+    /// **Kept batches ahead, and the worst case.** A batch kept from an earlier call goes
+    /// before any later write, oldest first, and no write overtakes it (Switch wire 6.4 step
+    /// 5). A write sends at most one of them again ([`KEPT_RESENDS_PER_WRITE`]) before its
+    /// own. With more kept, its own batch is kept unsent behind them and the call fails with
+    /// [`AppError::Kept`] around [`Refusal::KeptBatchesAhead`], which names the oldest and
+    /// when it was first sent: the host reads ([`App::receive`]), which sends them again in
+    /// order. A kept batch whose resend fails blocks the ones behind it until its answer
+    /// window ends ([`super::KEPT_BATCH_ANSWER_MS`], 30 days less an hour from its first
+    /// send), and is then dropped and reported. So a write sends at most three requests: the
+    /// kept batch, a time sample and its own batch, each under the short timeout for a batch
+    /// under a mebibyte (10 s by default), and ends within about 30 s at the default
+    /// timeouts; a batch over a mebibyte takes the long one. A `409 stale_epoch` adds the
+    /// newer `identity.json`, the key bundle and one more send.
     ///
     /// # Errors
     ///
@@ -316,30 +355,57 @@ impl App {
     /// state: the batch was applied and its outcome committed, and the attempt is written
     /// `failed`; a rollback for an attempt stamped at or after its deadline.
     pub async fn submit_batch(&mut self, batch: OpBatch) -> Result<Submitted, AppError> {
-        Box::pin(async move { Ok(self.submit_checked(batch).await?.0) }).await
+        Box::pin(async move { Ok(self.submit_checked(batch, false).await?.0) }).await
     }
 
     /// [`App::submit_batch`], with the claim view each own `attempt`'s proof shows, in the
     /// batch's order.
+    ///
+    /// `again` for a further try within one call ([`App::update_record`]): the service time
+    /// the first try took still counts, and no kept batch is sent again, so the call takes
+    /// one time sample and resends at most one kept batch in all. With batches kept, this
+    /// one is kept behind them.
     pub(crate) async fn submit_checked(
         &mut self,
         batch: OpBatch,
+        again: bool,
     ) -> Result<(Submitted, Vec<ClaimView>), AppError> {
+        let fresh = self.time_fresh_at;
         self.ready_local().await?;
+        if again {
+            self.time_fresh_at = fresh;
+        }
         self.refuse_when_stopped()?;
         refuse_lifecycle_ops(batch.ops.iter().map(|(_, kind)| kind))?;
         self.refuse_before_upload().await?;
-        match self.resume_batches().await {
-            Ok(()) => {}
+        // At most one batch kept from an earlier call goes first; with more kept, this
+        // one is kept behind them (Switch wire 6.4 step 5), so the call sends at most two.
+        let resent = if again {
+            Ok(self.kept_ahead().await?.is_some())
+        } else {
+            self.resume_kept(KEPT_RESENDS_PER_WRITE, None).await
+        };
+        let behind = match resent {
+            Ok(false) => None,
+            Ok(true) => self.kept_ahead().await?,
             // A frozen account takes no write, but the app queues its writes for the next
             // service (Switch spec 12.5 step 2): the new batch is kept too, and the call
             // reports the `410 moved` its own send gets.
             Err(AppError::Switch(ClientError::Switch {
                 code: ErrorCode::Moved,
                 ..
-            })) => {}
+            })) => None,
+            Err(error @ (AppError::Transport(_) | AppError::Switch(_))) => {
+                return Err(match self.kept_ahead().await? {
+                    Some(ahead) => AppError::Ahead {
+                        ahead,
+                        error: Box::new(error),
+                    },
+                    None => error,
+                });
+            }
             Err(error) => return Err(error),
-        }
+        };
         let attempts: Vec<(usize, ClaimEntry)> = batch
             .ops
             .iter()
@@ -361,7 +427,7 @@ impl App {
             .iter()
             .any(|(_, kind)| matches!(kind, OpKind::RecordPut(_)))
             .then(|| batch.clone());
-        let submitted = match (self.submit_new(batch).await, unsigned) {
+        let submitted = match (self.submit_new_behind(batch, behind).await, unsigned) {
             (Ok(submitted), _) => submitted,
             (Err(stale), Some(unsigned)) if stale.code() == Some(ErrorCode::StaleEpoch) => {
                 self.submit_resealed(unsigned, stale).await?
@@ -457,6 +523,16 @@ impl App {
     /// Sign `batch` once, keep it, send it and commit its outcome, without sending the
     /// batches kept from earlier calls first.
     pub(crate) async fn submit_new(&mut self, batch: OpBatch) -> Result<Submitted, AppError> {
+        self.submit_new_behind(batch, None).await
+    }
+
+    /// [`App::submit_new`], keeping the batch unsent when batches kept from earlier calls
+    /// are `behind` it ([`Refusal::KeptBatchesAhead`]).
+    async fn submit_new_behind(
+        &mut self,
+        batch: OpBatch,
+        behind: Option<KeptAhead>,
+    ) -> Result<Submitted, AppError> {
         if batch.ops.is_empty() || batch.ops.len() > MAX_BATCH_ENTRIES {
             return Err(
                 Refusal::Usage("Switch wire 6.4: a batch has 1 to 8 entries".into()).into(),
@@ -495,6 +571,7 @@ impl App {
             // Stamped at its first send ([`App::run_pending`]): kept now, it goes out with
             // the next call that writes when this one can't reach the service.
             kept_ms: None,
+            queued_n: None,
         };
         // The kept batches together stay within what a provider change carries in its one
         // commit ([`MAX_KEPT_BATCHES_BYTES`]).
@@ -513,9 +590,24 @@ impl App {
             ))
             .into());
         }
+        let queued_n: u64 = self.reader().get(KEPT_NEXT).await?.unwrap_or(0);
+        let pending = PendingBatch {
+            queued_n: Some(queued_n),
+            ..pending
+        };
         let mut tx = self.tx()?;
+        tx.put(KEPT_NEXT, &queued_n.saturating_add(1))?;
         tx.put(&pending_key(&id), &pending)?;
         index_kept(&mut tx, &id, &pending, &signed)?;
+        if let Some(ahead) = behind {
+            // Kept behind the batches from earlier calls: it goes after them, by the reads
+            // and writes that send them again (Switch wire 6.4 step 5).
+            self.commit(tx).await?;
+            return Err(AppError::Kept {
+                batch_id: id,
+                error: Box::new(AppError::Refused(Refusal::KeptBatchesAhead(ahead))),
+            });
+        }
         // From the commit that keeps it, a failure that leaves the batch kept says so, so
         // the caller can tell its own batch kept from an earlier one that couldn't be sent:
         // a commit answered `StoreError::Unknown` may have kept it too.
@@ -663,19 +755,45 @@ impl App {
     /// dropped unsent, never applied, and reported with its attempts
     /// ([`AppEvent::KeptBatchDropped`]).
     pub(crate) async fn resume_batches(&mut self) -> Result<(), AppError> {
-        self.resume_kept(usize::MAX).await.map(|_| ())
+        self.resume_kept(usize::MAX, None).await.map(|_| ())
+    }
+
+    /// The batch kept from an earlier call that goes first, and how many are kept; `None`
+    /// with none kept.
+    pub(crate) async fn kept_ahead(&self) -> Result<Option<KeptAhead>, AppError> {
+        let mut kept = self.kept_batches().await?;
+        kept.sort_by_key(kept_order);
+        let count = u64::try_from(kept.len()).unwrap_or(u64::MAX);
+        Ok(kept.first().map(|(id, pending)| KeptAhead {
+            batch_id: *id,
+            kept_since_ms: pending.kept_ms,
+            answer_until_ms: pending
+                .kept_ms
+                .map(|at| at.saturating_add(super::KEPT_BATCH_ANSWER_MS)),
+            kept: count,
+        }))
     }
 
     /// [`App::resume_batches`], for at most `limit` kept batches: returns whether more are
     /// kept that this call didn't reach, left for the next one in the same order.
-    async fn resume_kept(&mut self, limit: usize) -> Result<bool, AppError> {
+    async fn resume_kept(
+        &mut self,
+        limit: usize,
+        budget: Option<&super::CallBudget>,
+    ) -> Result<bool, AppError> {
         if self.refuse_before_upload().await.is_err() {
             return Ok(false);
         }
         let mut kept = self.kept_batches().await?;
-        kept.sort_by_key(|(id, pending)| (pending.kept_ms.is_none(), pending.kept_ms, *id));
-        let left = kept.len() > limit;
-        for (id, pending) in kept.into_iter().take(limit) {
+        kept.sort_by_key(kept_order);
+        let mut left = kept.len() > limit;
+        for (index, (id, pending)) in kept.into_iter().take(limit).enumerate() {
+            // Past the call's time budget no further batch is sent: those left go at the
+            // next call, in the same order.
+            if index > 0 && budget.is_some_and(|budget| self.spent(budget)) {
+                left = true;
+                break;
+            }
             let batch = self.without_stale_cursor(Batch::from_body(pending.body.clone())?)?;
             // Never sent, as its record shows: no answer of it can be ambiguous, so it has
             // no window, and goes out as a first send would, an attempt in it only while the
@@ -777,6 +895,7 @@ impl App {
     /// second value says more are kept, for the next read.
     pub(crate) async fn resume_batches_before_feed(
         &mut self,
+        budget: Option<&super::CallBudget>,
     ) -> Result<(Option<AppEvent>, bool), AppError> {
         let now = self.now();
         let waiting = |kept: usize, code: Option<ErrorCode>| AppEvent::KeptBatchesWaiting {
@@ -792,7 +911,7 @@ impl App {
                 return Ok((Some(waiting(kept, Some(ErrorCode::RateLimited))), false));
             }
         }
-        match self.resume_kept(KEPT_RESENDS_PER_READ).await {
+        match self.resume_kept(KEPT_RESENDS_PER_READ, budget).await {
             Ok(left) => Ok((None, left)),
             Err(error @ (AppError::Transport(_) | AppError::Switch(_))) => {
                 let kept = self.reader().scan_raw(PENDING_PREFIX).await?.len();

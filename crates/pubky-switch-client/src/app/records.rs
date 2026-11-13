@@ -1004,7 +1004,10 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             let mut pages = u32::MAX;
-            match self.list_from(collection, None, &mut pages, None).await? {
+            match self
+                .list_from(collection, None, &mut pages, None, None)
+                .await?
+            {
                 Listed::Done(listed) | Listed::Paused(listed) => Ok(listed),
             }
         })
@@ -1020,11 +1023,16 @@ impl App {
         mut after: Option<[u8; 32]>,
         pages: &mut u32,
         mut progress: Option<&mut ListProgress>,
+        budget: Option<&super::CallBudget>,
     ) -> Result<Listed, AppError> {
         let id = collection.id(&self.state.meta.identity);
         let mut listed = 0u64;
         loop {
-            if *pages == 0 {
+            // Past a read's time budget, once it asked for one page, it pauses as on its
+            // page budget.
+            let spent =
+                budget.is_some_and(|budget| *pages < LISTING_PAGES_PER_READ && self.spent(budget));
+            if *pages == 0 || spent {
                 return Ok(Listed::Paused(listed));
             }
             *pages -= 1;
@@ -1123,6 +1131,7 @@ impl App {
     pub(crate) async fn list_collections_if_due(
         &mut self,
         pages: &mut u32,
+        budget: Option<&super::CallBudget>,
     ) -> Result<Listing, AppError> {
         if !self.reader().exists(LIST_DUE).await? {
             return Ok(Listing::NotDue);
@@ -1150,7 +1159,7 @@ impl App {
                 _ => None,
             };
             if let Listed::Paused(_) = self
-                .list_from(collection, after, pages, Some(&mut progress))
+                .list_from(collection, after, pages, Some(&mut progress), budget)
                 .await?
             {
                 return Ok(Listing::Unfinished);
@@ -2090,7 +2099,11 @@ impl App {
         value: &[u8],
         conditions: Vec<Condition>,
     ) -> Result<SharedRecord, AppError> {
-        Box::pin(async move { self.write_record(target, Some(value), conditions).await }).await
+        Box::pin(async move {
+            self.write_record(target, Some(value), conditions, false)
+                .await
+        })
+        .await
     }
 
     /// Delete the record at `target`: a write whose sealed value is empty (Switch spec
@@ -2106,22 +2119,31 @@ impl App {
         target: &RecordTarget,
         conditions: Vec<Condition>,
     ) -> Result<SharedRecord, AppError> {
-        Box::pin(async move { self.write_record(target, None, conditions).await }).await
+        Box::pin(async move { self.write_record(target, None, conditions, false).await }).await
     }
 
+    /// `again` for a further try within one [`App::update_record`] ([`App::submit_checked`]).
     async fn write_record(
         &mut self,
         target: &RecordTarget,
         value: Option<&[u8]>,
         conditions: Vec<Condition>,
+        again: bool,
     ) -> Result<SharedRecord, AppError> {
+        let fresh = self.time_fresh_at;
         self.ready_local().await?;
+        if again {
+            self.time_fresh_at = fresh;
+        }
         let key = self.record_key(target)?;
         let entry = self.record_op(target, value, conditions).await?;
         self.note_pending_name(&key, &target.collection).await?;
         // `409 stale_epoch` is followed inside `submit_batch`: the write is sealed again at
         // the new data epoch and sent once more.
-        match self.submit_batch(OpBatch::new().entry(entry)).await {
+        match self
+            .submit_checked(OpBatch::new().entry(entry), again)
+            .await
+        {
             Ok(_) => self
                 .shared_record(&key)
                 .await?
@@ -2145,10 +2167,16 @@ impl App {
     /// for the key (Switch spec 3.5, 8.2). The outbox's record jobs go through here, so a
     /// message's record job waits the same way.
     ///
+    /// **Worst case.** At most four tries, a further one only within the call's time budget
+    /// ([`super::AppConfig::call_budget_ms`], 20 s by default). The call takes one time
+    /// sample and sends at most one kept batch again in all ([`App::submit_batch`]); each try
+    /// sends its batch, and after a conflict reads the record again: two short calls. So it
+    /// ends within the budget and one try, about 40 s at the default timeouts.
+    ///
     /// # Errors
     ///
     /// As [`App::put_record`]; [`Refusal::NotNow`] while the held value waits for its key;
-    /// `409 conflict` when the record kept changing.
+    /// `409 conflict` when the record kept changing, or when the budget ran out first.
     pub async fn update_record(
         &mut self,
         target: &RecordTarget,
@@ -2157,8 +2185,14 @@ impl App {
     ) -> Result<Option<SharedRecord>, AppError> {
         Box::pin(async move {
             let key = self.record_key(target)?;
+            let budget = self.begin_budget();
             let mut last = None;
-            for _ in 0..UPDATE_TRIES {
+            for attempt in 0..UPDATE_TRIES {
+                // A further try only within the call's time budget: past it the call
+                // returns the conflict it last met.
+                if attempt > 0 && self.spent(&budget) {
+                    break;
+                }
                 let current = self.shared_record(&key).await?;
                 if current.as_ref().is_some_and(|r| r.content.waits_for_key()) {
                     return Err(Refusal::NotNow(
@@ -2172,7 +2206,10 @@ impl App {
                 let Some(next) = change(value) else {
                     return Ok(None);
                 };
-                match self.put_record(target, &next, conditions.clone()).await {
+                match self
+                    .write_record(target, Some(&next), conditions.clone(), attempt > 0)
+                    .await
+                {
                     Ok(record) => return Ok(Some(record)),
                     Err(error) if error.code() == Some(ErrorCode::Conflict) => last = Some(error),
                     Err(error) => return Err(error),
