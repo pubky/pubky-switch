@@ -236,8 +236,9 @@ impl Protocols {
     /// # Errors
     ///
     /// [`ProtocolError`] for an empty set, a malformed or repeated protocol name, a protocol
-    /// owning no scope, a scope name that breaks the scope rule or has a sub-scope, and a scope
-    /// name declared twice.
+    /// owning no scope, a scope name that breaks the scope rule or has a sub-scope, a scope
+    /// whose root isn't the protocol's own (Switch wire 3.1 "Scope roots"), and a scope name
+    /// declared twice.
     pub fn new(protocols: Vec<Arc<dyn Protocol>>) -> std::result::Result<Self, ProtocolError> {
         if protocols.is_empty() {
             return Err(ProtocolError::NoProtocols);
@@ -1065,20 +1066,20 @@ mod roots {
         // One rule for every protocol: no name is set aside for one protocol, and none is
         // refused for being, or beginning, another protocol's root (Switch wire 3.1 "Scope roots").
         for (name, root) in [
-            ("pay", "pay"),
-            ("request", "request"),
-            ("manage", "manage_contacts"),
-            ("ext", "ext-cap"),
+            ("notes", "notes"),
+            ("photos", "photos_share"),
+            ("files", "files-sync"),
+            ("a1", "a1_b"),
         ] {
             Protocols::new(vec![Arc::new(Claims(name, root))])
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
-        let error = Protocols::new(vec![Arc::new(Claims("tasks", "pay"))]).unwrap_err();
+        let error = Protocols::new(vec![Arc::new(Claims("tasks", "notes"))]).unwrap_err();
         assert_eq!(
             error,
             ProtocolError::ForeignRoot {
                 protocol: "tasks".into(),
-                scope: "pay".into()
+                scope: "notes".into()
             }
         );
     }

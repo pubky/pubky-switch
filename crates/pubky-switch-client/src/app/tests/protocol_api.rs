@@ -803,7 +803,7 @@ async fn test_submit_batch_checks_its_attempt_with_another_write() {
     let w = World::new();
     let mut app = join(&w, &ApiProtocol::new(Mode::Plain), "wallet").await;
     let entry = app
-        .record_op(&inbox(), Some(&value(&["paying"])), vec![])
+        .record_op(&inbox(), Some(&value(&["working"])), vec![])
         .await
         .unwrap();
     let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
@@ -823,7 +823,7 @@ async fn send_apart(
     orphan_after_s: u64,
 ) -> (crate::client::Batch, crate::client::Submitted) {
     let entry = app
-        .record_op(&inbox(), Some(&value(&["paying"])), vec![])
+        .record_op(&inbox(), Some(&value(&["working"])), vec![])
         .await
         .unwrap();
     let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, orphan_after_s, None);
@@ -1072,7 +1072,7 @@ async fn test_policy_family_lists_and_takes_a_sub_scope_record() {
     .await;
     let target = RecordTarget::new(family().sub_scope("kiosk").unwrap(), b"k1");
     let written = kiosk
-        .put_record(&target, &value(&["sold"]), vec![])
+        .put_record(&target, &value(&["first"]), vec![])
         .await
         .unwrap();
     assert_eq!(written.policy, family().sub_scope_policy("kiosk").unwrap());
@@ -1080,11 +1080,11 @@ async fn test_policy_family_lists_and_takes_a_sub_scope_record() {
     assert_eq!(wallet.list_collection(&family()).await.unwrap().records, 1);
     let held = wallet.records_of("sample.items").await.unwrap();
     assert_eq!(held.len(), 1);
-    assert_eq!(ids(held[0].content.value()), vec!["sold".to_owned()]);
+    assert_eq!(ids(held[0].content.value()), vec!["first".to_owned()]);
     assert!(wallet.flagged_writes().await.unwrap().is_empty());
     // And from the feed, by a later write.
     kiosk
-        .put_record(&target, &value(&["sold", "paid"]), vec![])
+        .put_record(&target, &value(&["first", "second"]), vec![])
         .await
         .unwrap();
     wallet.receive(None).await.unwrap();
@@ -1108,7 +1108,7 @@ async fn test_policy_family_fixed_collection_flags_a_sub_scope_record() {
     .await;
     let target = RecordTarget::new(family().sub_scope("kiosk").unwrap(), b"k1");
     kiosk
-        .put_record(&target, &value(&["sold"]), vec![])
+        .put_record(&target, &value(&["first"]), vec![])
         .await
         .unwrap();
     // The fixed policy alone: the sub-scope's write isn't the collection's.
@@ -2474,11 +2474,11 @@ async fn test_queue_stored_reads_the_protocols_opaque_members() {
     let protocol = ApiProtocol::new(Mode::Plain);
     *protocol.opaque.lock().unwrap() = vec![crate::app::OpaqueRule {
         kind: None,
-        member: "amount".into(),
+        member: "score".into(),
     }];
     let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
     let mut body = Map::new();
-    body.insert("amount".into(), json!(1.5));
+    body.insert("score".into(), json!(1.5));
     let message = OutgoingMessage::new(p.bob.identity().public(), "sample.note", body);
     let signed = wallet.sign_message(message).unwrap();
     let msg_id = wallet.queue_stored(signed.plaintext()).await.unwrap();

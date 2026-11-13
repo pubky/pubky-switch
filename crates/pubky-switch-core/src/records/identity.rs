@@ -591,7 +591,8 @@ impl IdentityDoc {
 
 /// The `identity.json` bodies an app has seen, one hash per identity and version, from any
 /// source (Switch wire 3.3, "Equivocation"). A second body at one version shows equivocation:
-/// the app stops paying that identity, or anyone when it is its own, and alerts the user.
+/// the app makes no attempt that relies on that identity, or none at all when it is its own,
+/// and alerts the user.
 #[derive(Clone, Debug, Default)]
 pub struct SeenBodies {
     seen: BTreeMap<([u8; 32], u64), [u8; 32]>,

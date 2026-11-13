@@ -474,7 +474,7 @@ async fn test_feed_wait_doesnt_hold_the_app_while_it_writes_and_sends() {
     let waiting = tokio::spawn(app.feed_wait(25).wait());
     held(&s.w, 1).await;
     let mut body = Map::new();
-    body.insert("text".into(), json!("paid"));
+    body.insert("text".into(), json!("done"));
     let host = async {
         let (_, delivery) = app
             .send(OutgoingMessage::new(s.w.bob.public(), "sample.note", body))
