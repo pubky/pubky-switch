@@ -173,6 +173,25 @@ impl Service {
     ) -> Result<(ServiceKey, u64, AnnouncedLimits), ApiError> {
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         let enrollment_hash = enrollment.signed().doc_hash().map_err(|_| unavailable())?;
+        // An account a restored database brought back after its erasure goes first, so the
+        // enrollment makes a new account and answers nothing from the old one (Switch spec
+        // 6.5). A new account is created after the ledger's erasure time, so it is never
+        // taken for a restored one, even when the erased account's time ran ahead.
+        if let Some(found) = self
+            .store
+            .lookup(identity_text)
+            .await
+            .map_err(|e| store_error(&e))?
+        {
+            self.erase_if_restored(identity_text, found.created_at_ms)
+                .await?;
+        }
+        let erased_at_ms = self
+            .keys
+            .erasure(identity_text)
+            .await
+            .map_err(|_| unavailable())?;
+        let created_at_ms = erased_at_ms.map_or(base_ms, |at| base_ms.max(at.saturating_add(1)));
         // An account that doesn't exist yet is made, then answered like any other.
         if self
             .store
@@ -199,7 +218,7 @@ impl Service {
                     identity_key,
                     generation,
                     service_key: key.id.clone(),
-                    created_at_ms: base_ms,
+                    created_at_ms,
                     limits,
                     identity_doc,
                     revoked_apps,

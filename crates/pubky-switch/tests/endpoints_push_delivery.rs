@@ -706,6 +706,52 @@ async fn test_push_delivery_sends_signed_webhooks_and_drops_the_rows() {
 }
 
 #[tokio::test]
+async fn test_push_delivery_of_a_restored_erased_account_is_never_sent() {
+    // A database restored from before alice's erasure holds her registration and a queued
+    // webhook. Before the webhook is signed the account is erased again, so the relay gets
+    // nothing, even with the registration's push key still in the key store (Switch spec
+    // 6.5): the check doesn't rest on the erasure having deleted that key.
+    let Some((setup, _key)) = registered(&[H1]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    append(replay, 1, true).await;
+    assert_eq!(queued(replay).await.len(), 1);
+    let mut db = conn(replay).await;
+    let (key, created): (String, i64) =
+        sqlx::query_as("SELECT service_key, created_at_ms FROM accounts WHERE id = $1")
+            .bind(alice_id())
+            .fetch_one(&mut db)
+            .await
+            .expect("account");
+    db.close().await.expect("close");
+    // The key store as the erasure left it: the erasure recorded, the service key gone.
+    replay
+        .keys
+        .record_erasure(&alice_id(), u64::try_from(created).expect("time") + 60_000)
+        .await
+        .expect("ledger");
+    replay
+        .keys
+        .delete(&KeyId::parse(&key).expect("key id"))
+        .await
+        .expect("delete");
+    let _ = replay.service.deliver_pushes().await;
+    assert!(setup.relay.seen().is_empty(), "no webhook");
+    assert!(queued(replay).await.is_empty(), "erased with the account");
+    assert_eq!(registrations(replay).await, 0);
+    let mut db = conn(replay).await;
+    let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut db)
+        .await
+        .expect("count");
+    db.close().await.expect("close");
+    assert_eq!(accounts, 0);
+    setup.replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_push_delivery_failures_retried_20s_later_3_times() {
     for mode in [Mode::Status(500), Mode::Redirect] {
         let Some((setup, key)) = registered(&[H1]).await else {
@@ -1085,6 +1131,14 @@ impl KeyStore for Gate {
     }
     fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>> {
         self.inner.erasure(identity)
+    }
+
+    fn erasures(&self) -> KeyFuture<'_, Vec<(String, u64)>> {
+        self.inner.erasures()
+    }
+
+    fn forget_erasures_before(&self, before_ms: u64) -> KeyFuture<'_, usize> {
+        self.inner.forget_erasures_before(before_ms)
     }
 }
 

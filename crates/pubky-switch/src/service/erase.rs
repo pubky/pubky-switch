@@ -21,6 +21,19 @@
 //! If the deletion can't commit, nothing is deleted and the answer is `503`, signed with the
 //! account's key, without a head; the signer retries. Afterwards every request for the
 //! account, the retry of a lost `200` included, finds no account: the operator's `404`.
+//!
+//! **A restored database** (spec 6.5). The key store, apart from the database's backups,
+//! keeps each erasure in its ledger. A database restored from a backup taken before an
+//! erasure brings the account back, its key and mark already gone. Such an account, one
+//! created at or before the time the ledger holds for its identity, is erased again before
+//! anything is served or signed for it ([`Service::erase_if_restored`]): at start, for every
+//! identity the ledger holds; at every request to an account, right after its lookup and
+//! before anything else; at an enrollment of the identity, before the account is read; and
+//! before a queued webhook of the account is signed. An account created after the erasure,
+//! by an enrollment since, is a new account: an enrollment creates it later than the time
+//! the ledger holds, so it is never taken for a restored one. The ledger keeps an erasure
+//! until every database backup that could hold its account has aged out
+//! (`keys.backup_retention_days`).
 
 use std::sync::Arc;
 
@@ -161,6 +174,7 @@ impl Service {
         // recorded (7.4.16 Order). Otherwise the operator's `503`, without a head: the signer
         // keeps the request in doubt and retries, and its retry gets the operator's `404`
         // once the next sweep has deleted the key.
+        self.forget_aged_erasures().await;
         let done = left.is_some_and(|left| !left.iter().any(|owed| owed == &account));
         if !done {
             let error = ApiError::unavailable("7.6: a temporary failure");
@@ -184,6 +198,128 @@ impl Service {
         to_the_end(sweep_owed(self.store.clone(), self.keys.clone()))
             .await
             .flatten()
+    }
+
+    /// Erase account `account` again if a restored database brought it back after its
+    /// erasure (Switch spec 6.5): the ledger holds an erasure of the identity at or after
+    /// `created_at_ms`, the account's creation time. Whether it was such an account; once
+    /// `true`, the account is gone and nothing is to be served for it.
+    ///
+    /// # Errors
+    ///
+    /// `503` when the ledger can't be read or the erasure can't commit: nothing is served
+    /// for an account that may be one, and the next request tries again.
+    pub(super) async fn erase_if_restored(
+        &self,
+        account: &str,
+        created_at_ms: u64,
+    ) -> Result<bool, ApiError> {
+        let unavailable = || ApiError::unavailable("7.6: a temporary failure");
+        let erased_at_ms = match self.keys.erasure(account).await {
+            Ok(Some(at)) if created_at_ms <= at => at,
+            Ok(_) => return Ok(false),
+            Err(failure) => {
+                tracing::error!(%failure, "reading the erasure ledger");
+                return Err(unavailable());
+            }
+        };
+        if self.erase_restored(account, erased_at_ms).await {
+            Ok(true)
+        } else {
+            Err(unavailable())
+        }
+    }
+
+    /// Erase again account `account`, which a restored database brought back after its
+    /// erasure at `erased_at_ms`: as an erasure does, its state deleted and its keys owed in
+    /// one commit, then the owed keys deleted, its ledger entry kept, with no answer to sign.
+    /// Whether the account is gone: erased here, or already, or not a restored one any more
+    /// (a new account made meanwhile is left as it is).
+    async fn erase_restored(&self, account: &str, erased_at_ms: u64) -> bool {
+        let (store, keys, id) = (self.store.clone(), self.keys.clone(), account.to_string());
+        // Run to the end in a task of its own, as an erasure is: a request dropped meanwhile
+        // can't stop it between the commit and the keys' deletion.
+        let erased = to_the_end(async move {
+            let Some(mut txn) = store.begin(&id).await? else {
+                return Ok(false);
+            };
+            if txn.head().created_at_ms > erased_at_ms {
+                return Ok(false);
+            }
+            // A request that looked the account up before this signs nothing for it: its key is
+            // gone already, and the keyed sections wait for this commit (store/keying.rs).
+            txn.exclude_signers().await?;
+            txn.erase(erased_at_ms).await?;
+            let _ = sweep_owed(store, keys).await;
+            Ok::<_, crate::store::StoreError>(true)
+        })
+        .await;
+        match erased {
+            Some(Ok(erased)) => {
+                if erased {
+                    // No account ID in the log (Switch wire 9.4).
+                    tracing::warn!(
+                        "erased again an account a restored database brought back after its erasure"
+                    );
+                    self.forget_account(account);
+                }
+                true
+            }
+            Some(Err(failure)) => {
+                tracing::error!(%failure, "erasing again a restored account");
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Erase again every account a restored database brought back after its erasure, for
+    /// every identity the key store's ledger holds (Switch spec 6.5). Run at start, before
+    /// the service takes requests; the check at each request covers what this misses. The
+    /// number erased, or `None` when the ledger or the accounts can't be read.
+    pub async fn erase_restored_accounts(&self) -> Option<usize> {
+        let ledger = match self.keys.erasures().await {
+            Ok(ledger) => ledger,
+            Err(failure) => {
+                tracing::error!(%failure, "reading the erasure ledger");
+                return None;
+            }
+        };
+        if ledger.is_empty() {
+            return Some(0);
+        }
+        let restored = match self.store.restored_erased(&ledger).await {
+            Ok(restored) => restored,
+            Err(failure) => {
+                tracing::error!(%failure, "finding accounts restored after their erasure");
+                return None;
+            }
+        };
+        let mut erased = 0;
+        for (account, erased_at_ms) in &restored {
+            if self.erase_restored(account, *erased_at_ms).await {
+                erased += 1;
+            }
+        }
+        Some(erased)
+    }
+
+    /// Forget the ledger's erasures older than `keys.backup_retention_days`, whose accounts
+    /// no kept database backup can hold any more (Switch spec 6.5), by trusted time only: a
+    /// clock ahead would forget an erasure too early. Without the setting, every erasure is
+    /// kept. Run at start and after each erasure.
+    pub(super) async fn forget_aged_erasures(&self) {
+        let Some(retention_ms) = self.backup_retention_ms else {
+            return;
+        };
+        let reading = self.time.read();
+        if !reading.trusted {
+            return;
+        }
+        let before_ms = reading.base_ms.saturating_sub(retention_ms);
+        if let Err(failure) = self.keys.forget_erasures_before(before_ms).await {
+            tracing::error!(%failure, "forgetting aged erasures");
+        }
     }
 
     /// Forget every count the service keeps for `account` (Switch wire 7.4.16, 9.4).

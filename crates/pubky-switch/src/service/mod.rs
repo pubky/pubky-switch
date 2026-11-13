@@ -11,12 +11,18 @@
 //! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
 //! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
 //! `POST /v1/{id}/inbox`, `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`,
-//! `GET /v1/{id}/apps`, `POST /v1/{id}/apps/{app_id}/revoke`, `GET /v1/{id}/directory`,
+//! `GET /v1/{id}/records/{key}` and `GET /v1/{id}/records`, `GET /v1/{id}/allow`,
+//! `POST`, `GET` and `DELETE /v1/{id}/connect`, `GET /v1/{id}/apps`,
+//! `POST /v1/{id}/apps/{app_id}/revoke`, `GET /v1/{id}/directory`,
 //! `GET` and `POST /v1/{id}/apps/{app_id}/keys`, `POST /v1/{id}/apps/{app_id}/leave`,
+//! `POST /v1/{id}/recovery/admission` and `POST /v1/{id}/recovery/upload`,
 //! `PUT` and `GET /v1/{id}/handover`, `POST /v1/{id}/erase`, and `PUT /v1/{id}/push`. A
 //! `notify` entry's webhooks are queued with it and sent to the relays by a background
-//! worker ([`Service::deliver_pushes_until`]). Every other call is answered
-//! `503 unavailable`.
+//! worker ([`Service::deliver_pushes_until`]). The freeze, the export and the import are
+//! answered `503 unavailable`.
+//!
+//! An account a restored database brought back after its erasure is erased again right
+//! after its lookup, before anything is served or signed for it (Switch spec 6.5; `erase`).
 
 mod admission;
 mod allow;
@@ -131,6 +137,9 @@ pub struct Service {
     resolver: Resolver,
     /// How many webhooks delivery sends at once (`push.concurrency`).
     push_concurrency: usize,
+    /// How long the erasure ledger keeps an erasure: the age of the oldest database backup
+    /// kept (`keys.backup_retention_days`); `None` keeps it for good (Switch spec 6.5).
+    backup_retention_ms: Option<u64>,
     /// Turns to hold a registration while its webhook is signed, each on a connection of the
     /// request pool: a quarter of the pool, at least one, so requests keep the rest.
     push_holds: tokio::sync::Semaphore,
@@ -281,9 +290,27 @@ impl Service {
         time: Arc<TrustedTime>,
         limits: Limits,
     ) -> Self {
-        let service = Self::new(origin, store, keys, time, limits);
-        let _ = service.sweep_erased_keys().await;
-        service
+        Self::new(origin, store, keys, time, limits).started().await
+    }
+
+    /// The passes a service runs once, before it takes requests, after its settings: the
+    /// keys erasures left owed go (Switch wire 7.4.16), then the accounts a restored database
+    /// brought back after their erasure (spec 6.5; the check at each request covers a
+    /// failure here), then the ledger's erasures past `keys.backup_retention_days`.
+    pub async fn started(self) -> Self {
+        let _ = self.sweep_erased_keys().await;
+        let _ = self.erase_restored_accounts().await;
+        self.forget_aged_erasures().await;
+        self
+    }
+
+    /// Keep the erasure ledger's entries for `days` after their erasure, the age of the
+    /// oldest database backup the operator keeps (`keys.backup_retention_days`, Switch spec
+    /// 6.5); `None` keeps them for good.
+    #[must_use]
+    pub fn with_backup_retention_days(mut self, days: Option<u64>) -> Self {
+        self.backup_retention_ms = days.map(|days| days.saturating_mul(24 * 60 * 60 * 1000));
+        self
     }
 
     /// A service at `origin`, the switch origin `identity.json` names.
@@ -332,6 +359,7 @@ impl Service {
             push_enabled: crate::config::PushConfig::default().enabled,
             resolver: push::system_resolver(),
             push_concurrency: crate::config::PushConfig::default().concurrency,
+            backup_retention_ms: None,
             push_holds,
             #[cfg(any(test, feature = "test-util"))]
             relay_route: None,
@@ -476,6 +504,27 @@ impl Service {
                     .await;
             }
         };
+        // Still step 2: an account a restored database brought back after its erasure is
+        // erased again here, before anything is served or signed for it, and answered as one
+        // the service doesn't host (Switch spec 6.5). Every call to an account passes this
+        // lookup; an enrollment and the push worker check on their own.
+        match self.erase_if_restored(&account, found.created_at_ms).await {
+            Ok(false) => {}
+            Ok(true) => {
+                let by_signer = self
+                    .signed_by_identity(&account, &request, base_ms)
+                    .is_some();
+                let error = self.no_such_account(&account, by_signer).await;
+                return self
+                    .operator_answer(request_signature.as_ref(), base_ms, &error)
+                    .await;
+            }
+            Err(error) => {
+                return self
+                    .operator_answer(request_signature.as_ref(), base_ms, &error)
+                    .await;
+            }
+        }
         let call = &request.route.call;
         let stamped_ms = found.stamped_time_ms;
         // The key the account had at the lookup, which an answer after a wait checks again.
