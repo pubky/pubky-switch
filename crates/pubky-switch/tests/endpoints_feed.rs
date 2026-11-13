@@ -172,6 +172,54 @@ async fn test_feed_pages_from_the_start_by_limit() {
 }
 
 #[tokio::test]
+async fn test_feed_page_with_no_items_carries_its_head_and_cursor_alone() {
+    // `limit=0` shows no item and covers no position: `next` is where it starts, `more`
+    // whether items follow, with the head and cursor of any page (Switch wire 7.4.4).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let full = body(&read(&replay, "wallet", "?after=1:4", &at).await);
+    let answer = read(&replay, "wallet", "?after=1:4&limit=0", &at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    let page = body(&answer);
+    assert_eq!(seqs(&page), Vec::<u64>::new());
+    assert_eq!(
+        (
+            page["next"].clone(),
+            page["scanned_through"].clone(),
+            page["more"].clone()
+        ),
+        (json!("1:4"), json!(4), json!(true))
+    );
+    assert_eq!(page["head"], full["head"]);
+    assert_eq!(page["cursor"], full["cursor"]);
+    // At the head nothing follows; from the start, everything does.
+    let page = body(&read(&replay, "wallet", "?after=1:9&limit=0", &at).await);
+    assert_eq!(
+        (seqs(&page), page["next"].clone(), page["more"].clone()),
+        (vec![], json!("1:9"), json!(false))
+    );
+    let page = body(&read(&replay, "wallet", "?limit=0", &at).await);
+    assert_eq!(
+        (seqs(&page), page["next"].clone(), page["more"].clone()),
+        (vec![], json!("1:0"), json!(true))
+    );
+    // The reader's checks run as for any page: a revoked app is refused.
+    let answer = read(&replay, "phone", "?limit=0", &at).await;
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (403, json!("not_current"))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_feed_page_ends_at_the_byte_budget() {
     let limits = Limits {
         max_page_bytes: 1,
@@ -224,7 +272,7 @@ async fn test_feed_refusals() {
     for query in [
         "?after=9",
         "?after=1:x",
-        "?limit=0",
+        "?limit=0&wait=1",
         "?limit=501",
         "?wait=26",
     ] {

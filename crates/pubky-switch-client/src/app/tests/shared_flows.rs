@@ -6005,7 +6005,7 @@ async fn test_scripted_feed_query_is_read_as_the_service_reads_it() {
         "feed?after=1:0&after=1:1",
         "feed?limit=%zz",
         "feed?limit=+5",
-        "feed?limit=0",
+        "feed?limit=0&wait=1",
         "feed?limit=501",
         "feed?wait=26",
         "feed?wait=+1",
@@ -6018,6 +6018,7 @@ async fn test_scripted_feed_query_is_read_as_the_service_reads_it() {
     }
     for rest in [
         "feed?limit=%35",
+        "feed?limit=0",
         "feed?limit=500",
         "feed?after=1%3A0&wait=0",
     ] {

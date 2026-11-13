@@ -1120,6 +1120,46 @@ fn items_of<'a>(feed: &'a Value, kind: &str) -> Vec<&'a Value> {
 }
 
 #[tokio::test]
+async fn test_inbox_a_page_with_no_items_doesnt_end_a_lagging_mark() {
+    // A lagging app that only takes the time (`limit=0`) reads no entry, so it stays marked;
+    // a page that may show items ends the mark (Switch wire 7.4.4).
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    for byte in 1..=3 {
+        append_to(&replay, &["executor"], byte).await;
+    }
+    assert!(lagging(&replay, "executor").await);
+    let path = |query: &str| format!("/v1/{}/feed?{query}", alice_id());
+    let read = |query: &str| {
+        app_request(
+            app(&vectors("keys.json"), "executor"),
+            "GET",
+            &path(query),
+            Vec::new(),
+            ms(&at()),
+        )
+    };
+    let answer = replay.service.handle(read("limit=0")).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(lagging(&replay, "executor").await, "still marked");
+    let answer = replay.service.handle(read("limit=1")).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(!lagging(&replay, "executor").await, "a page ends the mark");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_inbox_a13_a_lagging_app_is_told_what_it_missed() {
     let Some(replay) = lagging_replay().await else {
         return;

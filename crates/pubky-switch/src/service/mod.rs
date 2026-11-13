@@ -1664,8 +1664,13 @@ impl Service {
                         time_ms,
                     )
                     .map_err(|error| Refused::with_head(error, serving))?;
-                // The reader's feed read ends its lagging mark (Switch wire 7.4.4).
-                if let Some(reader) = writer.as_ref() {
+                // The reader's feed read ends its lagging mark, unless it reads no entry
+                // (`limit=0`, Switch wire 7.4.4).
+                let reads = matches!(
+                    &answer.deferred,
+                    Some(Deferred::Feed(read)) if read.reads_items()
+                );
+                if reads && let Some(reader) = writer.as_ref() {
                     txn.set_lagging(&[reader.app_id()], false)
                         .await
                         .map_err(|error| Refused::with_head(store_error(&error), serving))?;
