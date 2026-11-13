@@ -102,7 +102,17 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   senders, isn't shown. Marks are judged at every such request, the switch's clock being
   trusted. A scripted `missed` item (`push_missed`, or `push_missed_unparsable` for one whose times don't parse) is shown to every app and a scripted
   `unreadable` item (`push_unreadable`) has an `entry_id` of its own, and both stay
-  whatever the cursors. Checkpoints and dropped stubs exist only when a test scripts them;
+  whatever the cursors. Chain retention follows the service's rule by default (`Retention`,
+  Switch wire 7.4.4, 9.1): at each request of an own app or the signer, outside a freeze and
+  on a serving account, it signs a checkpoint once `checkpoint_behind` chain items may go and
+  drops the stubs behind it that every current app's cursor has passed or that are
+  `cursor_hold_ms` old, never inside a batch and at most `per_request` at a time. It differs
+  in one way: an app that hasn't moved its cursor yet holds the stubs from the time the switch
+  took its first record, not from its registration's `seq`; an app `identity.json` lists that
+  has no row here yet holds nothing, as for the service. Retention is on by default, for every
+  test: none reaches 1,000 chain items unless it means to. `set_retention(None)` keeps every
+  stub, and a test may still script a checkpoint and the stubs dropped by hand. Once the
+  service retains too, the harness comparison is what shows the two agree;
   claims are deleted only when `GET /claims` finds them deletable; batch records are never
   dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
@@ -193,9 +203,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   answer (Switch wire 7.3 steps 5 to 8), whatever the route: no `Switch-Head`,
   `Switch-Server-Time` the last time stamped, and the app not seen. A departed app that
   delivered its record keeps it, so it goes on to the route's checks, as at the service,
-  until the test call `purge` frees it, as a service may once the signer purges the app
-  from `removed` (Switch wire 9.1): then it meets the first call's refusal, without the
-  head. The service keeps a purged app's record, so it answers that app with the head.
+  until the test call `purge` frees it, as a service does once the signer purges the app
+  from `removed`, keeping only its App ID (Switch wire 9.1): then it meets the first call's
+  refusal, without the head. A known gap of the reference service: it doesn't free a
+  purged app's record yet, so it still answers that app with the head.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
   delivered its record: current, with an unexpired certificate, the stored renewed one once
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
