@@ -906,6 +906,7 @@ impl Service {
             }),
             generation: snapshot.generation,
             tip,
+            checkpoint: snapshot.checkpoint,
             key_mark: mark,
             identity_key: read.identity_key,
             time_ms,
@@ -930,6 +931,8 @@ pub(super) struct Answered {
     generation: u64,
     /// The chain's head as the page shows it.
     tip: ChainTip,
+    /// The latest checkpoint, which the page carries (Switch wire 7.4.4).
+    checkpoint: Option<SignedHead>,
     /// The key's mark when the page was read, which its head must not be behind.
     key_mark: Option<Mark>,
     identity_key: [u8; 32],
@@ -937,9 +940,10 @@ pub(super) struct Answered {
 }
 
 impl Answered {
-    /// The page's answer at its service time, `{ items, next, scanned_through, more, head }`
-    /// in the member order of the wire's example (Switch wire 7.4.4), with the head, signed
-    /// here inside the answer's proof, also in `Switch-Head`.
+    /// The page's answer at its service time, `{ items, next, scanned_through, more, head,
+    /// checkpoint }` in the member order of the wire's example (Switch wire 7.4.4), with the
+    /// head, signed here inside the answer's proof, also in `Switch-Head`; `checkpoint` only
+    /// once there is one.
     pub(super) fn answer(&self, signing: &Signing<'_>) -> (Answer, u64) {
         let Some(head) = signing.head(self.key_mark.as_ref(), &self.identity_key, &self.tip) else {
             return (Answer::error(&behind_the_mark()), self.time_ms);
@@ -961,6 +965,10 @@ impl Answered {
         body.extend_from_slice(if self.page.more { b"true" } else { b"false" });
         body.extend_from_slice(b",\"head\":");
         body.extend_from_slice(&head.to_json());
+        if let Some(checkpoint) = &self.checkpoint {
+            body.extend_from_slice(b",\"checkpoint\":");
+            body.extend_from_slice(&checkpoint.to_json());
+        }
         body.push(b'}');
         (Answer::ok(body).with_head(Some(head)), self.time_ms)
     }

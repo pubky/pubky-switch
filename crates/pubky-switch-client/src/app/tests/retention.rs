@@ -232,26 +232,26 @@ async fn test_retention_turned_off_keeps_every_stub() {
 }
 
 #[tokio::test]
-async fn test_retention_an_app_yet_to_move_its_cursor_holds_from_its_registration() {
-    // The phone joins after the wallet's first items and never moves its cursor: what came
-    // before its registration may go, nothing after it, inside 30 days.
+async fn test_retention_an_app_yet_to_move_its_cursor_holds_every_stub() {
+    // The phone joins after the wallet's first items and never moves its cursor: what went
+    // before it joined stays gone, and nothing more goes inside 30 days, as at the service,
+    // which keeps no registration `seq`; once 30 days old, the rest go.
     let w = World::new();
     w.switch.set_retention(retention(2));
     let mut wallet = writer(&w, "wallet").await;
     write(&mut wallet, 3).await;
     read_a_note(&w, &mut [&mut wallet]).await;
+    write(&mut wallet, 1).await;
+    let before = w.switch.retained().1;
     w.clock.advance_ms(1_000);
     let phone = writer(&w, "phone").await;
-    let joined = w.switch.lock().seq;
     write(&mut wallet, 3).await;
     read_a_note(&w, &mut [&mut wallet]).await;
     write(&mut wallet, 1).await;
-    let (checkpoint, dropped) = w.switch.retained();
-    assert!(checkpoint.is_some(), "what came before it went");
-    assert!(
-        dropped < joined,
-        "dropped through {dropped}, joined at {joined}"
-    );
+    assert_eq!(w.switch.retained().1, before, "held by the phone");
+    w.clock.advance_ms(31 * DAY);
+    write(&mut wallet, 1).await;
+    assert!(w.switch.retained().1 > before, "30 days old");
     drop(phone);
 }
 
@@ -299,4 +299,243 @@ async fn test_retention_stops_while_the_account_is_frozen() {
     w.clock.advance_ms(31 * DAY);
     let _ = wallet.receive(None).await;
     assert_eq!(w.switch.retained(), kept);
+}
+
+#[tokio::test]
+async fn test_retention_a_page_without_the_checkpoint_is_a_rollback() {
+    // The phone stops reading; 31 days on, the stubs after it are dropped behind a
+    // checkpoint. A switch whose pages drop the stubs and leave the checkpoint out, as
+    // an instance on code from before the checkpoint member, shows the phone a broken
+    // chain: it raises a rollback, where with the checkpoint it reconciles.
+    let w = World::new();
+    w.switch.set_retention(retention(3));
+    let mut wallet = writer(&w, "wallet").await;
+    let mut phone = writer(&w, "phone").await;
+    read_a_note(&w, &mut [&mut wallet, &mut phone]).await;
+    let phone_at = w.switch.lock().apps[&phone.app_id()].cursor;
+    write(&mut wallet, 5).await;
+    read_a_note(&w, &mut [&mut wallet]).await;
+    write(&mut wallet, 1).await;
+    w.clock.advance_ms(31 * DAY);
+    write(&mut wallet, 1).await;
+    assert!(w.switch.retained().1 > phone_at, "dropped once 30 days old");
+    w.switch.set_retention(None);
+    w.switch.lock().checkpoint = None;
+    let read = phone.receive(None).await;
+    assert!(read.is_err(), "the read fails");
+    assert!(
+        matches!(phone.alarm(), Some(crate::app::Alarm::Rollback { .. })),
+        "{:?}",
+        phone.alarm()
+    );
+}
+
+/// The `seq`s of the switch's chain items, oldest first.
+fn chain_seqs(w: &World) -> Vec<u64> {
+    w.switch
+        .lock()
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            crate::testing::Item::Chain { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_retention_never_drops_the_head() {
+    // The wallet's cursor stands at the head, every stub passed: the checkpoint and the
+    // drop stop short of the head, as at the service.
+    let w = World::new();
+    w.switch.set_retention(retention(1));
+    let mut wallet = writer(&w, "wallet").await;
+    write(&mut wallet, 3).await;
+    wallet.receive(None).await.unwrap();
+    wallet.flush_cursor().await.unwrap();
+    let head = w.switch.lock().tip.seq;
+    assert_eq!(w.switch.lock().apps[&wallet.app_id()].cursor, head);
+    wallet.receive(None).await.unwrap();
+    let (checkpoint, dropped) = w.switch.retained();
+    let at = checkpoint.expect("a checkpoint").seq;
+    assert!(
+        at < head && dropped < head,
+        "the head {head} stays: {at}, {dropped}"
+    );
+}
+
+#[tokio::test]
+async fn test_retention_a_look_that_ends_inside_a_batch_still_signs() {
+    // The sweep looks at as many stubs as a checkpoint waits for, and the last it looks at
+    // is inside a batch of three: the stubs that may go are counted before the batch edge,
+    // so the checkpoint goes at the item before the batch, as at the service. Counted only
+    // at batch ends, they would stay short at every request.
+    let w = World::new();
+    let mut wallet = writer(&w, "wallet").await;
+    write(&mut wallet, 1).await;
+    wallet
+        .submit_batch(
+            OpBatch::new()
+                .op(OpKind::DenyPut { pubky: [7; 32] })
+                .op(OpKind::DenyPut { pubky: [8; 32] })
+                .op(OpKind::DenyPut { pubky: [9; 32] }),
+        )
+        .await
+        .unwrap();
+    write(&mut wallet, 2).await;
+    wallet.receive(None).await.unwrap();
+    wallet.flush_cursor().await.unwrap();
+    let seqs = chain_seqs(&w);
+    let batch = batch_of_three(&w);
+    let first = seqs.iter().position(|seq| *seq == batch[0]).unwrap();
+    // The look ends at the batch's second item.
+    let look = first + 2;
+    w.switch.set_retention(Some(Retention {
+        checkpoint_behind: u64::try_from(look).unwrap(),
+        per_request: look,
+        ..Retention::default()
+    }));
+    wallet.receive(None).await.unwrap();
+    let (checkpoint, dropped) = w.switch.retained();
+    assert_eq!(checkpoint.map(|c| c.seq), Some(seqs[first - 1]));
+    assert_eq!(dropped, seqs[first - 1]);
+}
+
+/// Two devices of the wallet sharing its cursor: `a` joined, `b` its second device from
+/// `a`'s backup, with `b`'s own cursor move read since, so it holds evidence as any app
+/// does. `b` then stops, and `a` reads and writes on until the stubs after `b`'s position
+/// are dropped behind a checkpoint, under 30 days old, which `a`'s cursor passed. `b` is
+/// a device of an app whose devices share the cursor when `multi_device`.
+async fn device_left_behind(multi_device: bool) -> (World, App, App) {
+    let w = World::new();
+    w.switch.set_retention(retention(3));
+    let mut a = writer(&w, "wallet").await;
+    a.set_multi_device(true).await.unwrap();
+    read_a_note(&w, &mut [&mut a]).await;
+    let backup = a.backup().await.unwrap();
+    let mut b = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    b.end_reconcile(crate::app::UserConfirmed::new())
+        .await
+        .unwrap();
+    b.set_multi_device(multi_device).await.unwrap();
+    read_a_note(&w, &mut [&mut b]).await;
+    b.receive(None).await.unwrap();
+    let b_at = w.switch.lock().apps[&b.app_id()].cursor;
+    write(&mut a, 5).await;
+    read_a_note(&w, &mut [&mut a]).await;
+    write(&mut a, 1).await;
+    let (checkpoint, dropped) = w.switch.retained();
+    assert!(
+        checkpoint.is_some() && dropped > b_at,
+        "dropped past b's position"
+    );
+    (w, a, b)
+}
+
+#[tokio::test]
+async fn test_retention_a_device_behind_its_apps_shared_cursor_reconciles() {
+    // The other device moved the shared cursor past the stubs, so their absence is no
+    // evidence: the device behind continues from the checkpoint in reconcile mode, raises
+    // no rollback, and catches up once reconciled (Switch wire 7.4.4).
+    let (w, mut a, mut b) = device_left_behind(true).await;
+    b.receive(None).await.unwrap();
+    assert_eq!(b.alarm(), None);
+    assert!(b.reconcile_mode());
+    b.end_reconcile(crate::app::UserConfirmed::new())
+        .await
+        .unwrap();
+    write(&mut a, 2).await;
+    b.receive(None).await.unwrap();
+    assert_eq!(b.alarm(), None);
+    assert_eq!(
+        b.cursor().seq,
+        w.switch.lock().tip.seq,
+        "caught up to the head"
+    );
+    assert!(!a.reconcile_mode());
+    a.receive(None).await.unwrap();
+    assert_eq!(a.alarm(), None);
+}
+
+#[tokio::test]
+async fn test_retention_a_single_device_app_behind_dropped_stubs_still_raises_a_rollback() {
+    // The same position for an app on one device: its cursor is its own, so the service
+    // rule keeps the stubs from its position while they are under 30 days old, and their
+    // absence is a rollback (Switch wire 7.4.4).
+    let (_w, _a, mut b) = device_left_behind(false).await;
+    assert!(b.receive(None).await.is_err());
+    assert!(
+        matches!(b.alarm(), Some(crate::app::Alarm::Rollback { .. })),
+        "{:?}",
+        b.alarm()
+    );
+}
+
+/// As [`device_left_behind`], with `b` more than 30 days behind but holding a mark: its
+/// own write 31 days on, whose stub `a`'s cursor then passes and the switch drops behind a
+/// checkpoint. The seq of that write.
+async fn device_with_a_held_mark(multi_device: bool) -> (World, App, App, u64) {
+    let w = World::new();
+    w.switch.set_retention(retention(3));
+    let mut a = writer(&w, "wallet").await;
+    a.set_multi_device(true).await.unwrap();
+    read_a_note(&w, &mut [&mut a]).await;
+    let backup = a.backup().await.unwrap();
+    let mut b = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    b.end_reconcile(crate::app::UserConfirmed::new())
+        .await
+        .unwrap();
+    b.set_multi_device(multi_device).await.unwrap();
+    read_a_note(&w, &mut [&mut b]).await;
+    b.receive(None).await.unwrap();
+    w.clock.advance_ms(31 * DAY);
+    write(&mut b, 1).await;
+    let held = w.switch.lock().tip.seq;
+    write(&mut a, 5).await;
+    read_a_note(&w, &mut [&mut a]).await;
+    write(&mut a, 1).await;
+    let (checkpoint, dropped) = w.switch.retained();
+    assert!(
+        checkpoint.is_some() && dropped >= held,
+        "the held mark's stub dropped"
+    );
+    (w, a, b, held)
+}
+
+#[tokio::test]
+async fn test_retention_a_device_holding_a_mark_behind_its_shared_cursor_reconciles() {
+    // Its own write's stub is gone, but another device moved the shared cursor past it:
+    // no evidence, so the device continues from the checkpoint in reconcile mode (Switch
+    // wire 7.4.4).
+    let (_w, _a, mut b, _) = device_with_a_held_mark(true).await;
+    b.receive(None).await.unwrap();
+    assert_eq!(b.alarm(), None);
+    assert!(b.reconcile_mode());
+}
+
+#[tokio::test]
+async fn test_retention_a_single_device_app_holding_a_mark_raises_a_rollback() {
+    // On one device the cursor is its own, so the stub of its recent write stays behind
+    // the cursor: its absence is a rollback (Switch wire 7.4.4).
+    let (_w, _a, mut b, _) = device_with_a_held_mark(false).await;
+    assert!(b.receive(None).await.is_err());
+    assert!(
+        matches!(b.alarm(), Some(crate::app::Alarm::Rollback { .. })),
+        "{:?}",
+        b.alarm()
+    );
 }

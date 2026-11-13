@@ -402,6 +402,12 @@ async fn test_receive_context_second_message_builds_on_the_first() {
 
 #[tokio::test]
 async fn test_receive_context_conflict_reads_again_and_builds_again() {
+    conflict_reads_again_and_builds_again().await;
+}
+
+/// An entry whose effect, built on what the app holds, meets `409 conflict`: it reads the
+/// record again and builds again. Also run on a small stack.
+async fn conflict_reads_again_and_builds_again() {
     let w = World::new();
     let protocol = ApiProtocol::new(Mode::Record);
     let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
@@ -4681,4 +4687,46 @@ async fn test_hold_queued_refuses_the_own_identity() {
         "{error:?}"
     );
     assert!(wallet.held_counterparties().await.unwrap().is_empty());
+}
+
+/// Run `body` on a thread with a stack of `bytes`, in a runtime of that thread alone, as a
+/// host on small threads does.
+fn on_a_small_stack<F>(bytes: usize, body: impl FnOnce() -> F + Send + 'static)
+where
+    F: std::future::Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(bytes)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(body());
+        })
+        .unwrap()
+        .join()
+        .expect("the read runs within the stack");
+}
+
+#[test]
+fn test_receive_runs_on_a_one_mebibyte_stack() {
+    // In a debug build, on a 1 MiB stack: a read whose entry's effect writes a record
+    // through the context, one whose effect makes an attempt, one whose effect meets `409
+    // conflict` and builds again, and the read that follows a move and sends the writes
+    // kept during the freeze.
+    on_a_small_stack(1 << 20, conflict_reads_again_and_builds_again);
+    on_a_small_stack(1 << 20, || {
+        super::moves::writes_kept_during_a_freeze_reach_the_next_service()
+    });
+    for mode in [Mode::Record, Mode::Attempt] {
+        on_a_small_stack(1 << 20, move || async move {
+            let w = World::new();
+            let protocol = ApiProtocol::new(mode);
+            let mut app = join(&w, &protocol, "wallet").await;
+            w.note(app.app_id(), "hello");
+            app.receive(None).await.unwrap();
+            assert!(!protocol.seen().is_empty());
+        });
+    }
 }

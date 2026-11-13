@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use futures_util::TryStreamExt;
 use pubky_switch_core::{
-    chain::{ItemType, Stub},
+    chain::{ItemType, SignedHead, Stub},
     ops::Position,
     sig::SignedDoc,
 };
@@ -40,6 +40,9 @@ pub struct FeedSnapshot {
     pub last_seq: u64,
     /// The newest chain item's `seq` and chain hash; `None` before the first.
     pub chain: Option<(u64, [u8; 32])>,
+    /// The latest checkpoint, which every page carries (Switch wire 7.4.4); `None` before the
+    /// first.
+    pub checkpoint: Option<SignedHead>,
     /// The `seq` the page starts after: the reader's `after`, or 0 for a position of
     /// another generation (Switch wire 7.4.4).
     pub start: u64,
@@ -221,7 +224,8 @@ pub(super) async fn read_feed(
         .map_err(StoreError::from_db)?;
     let Some(row) = sqlx::query(
         "SELECT generation, last_seq, chain_seq, chain_hash, service_key, stamped_time_ms, \
-         identity_doc FROM accounts WHERE id = $1",
+         identity_doc, r.checkpoint FROM accounts \
+         LEFT JOIN chain_retention r ON r.account_id = accounts.id WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -240,9 +244,16 @@ pub(super) async fn read_feed(
         _ => return Err(StoreError::Corrupt("chain head")),
     };
     // A position of another sequence reads from the start of this one (Switch wire 7.4.4).
+    // One behind the oldest kept stub reads on from there: the stubs dropped show no more,
+    // the inbox entries at those positions still do, and the page carries the checkpoint.
     let start = after
         .filter(|position| position.generation == generation)
         .map_or(0, |position| position.seq);
+    let checkpoint: Option<Vec<u8>> = row.try_get("checkpoint")?;
+    let checkpoint = checkpoint
+        .as_deref()
+        .map(super::retention::decode_checkpoint)
+        .transpose()?;
     let window_end = start.saturating_add(positions).min(last_seq);
     let identity_doc: Option<Vec<u8>> = row.try_get("identity_doc")?;
     let reader_kept: bool = sqlx::query_scalar(
@@ -264,6 +275,7 @@ pub(super) async fn read_feed(
         reader_kept,
         last_seq,
         chain,
+        checkpoint,
         start,
         window_end,
         current: CurrentDocs::default(),
