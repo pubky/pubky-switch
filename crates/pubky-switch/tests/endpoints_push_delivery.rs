@@ -1894,3 +1894,102 @@ async fn test_push_handles_past_8_at_one_relay_host_are_refused() {
     assert_eq!(status(set(8)).await, 200);
     setup.replay.db.drop_database().await.expect("drop");
 }
+
+/// Make each claim's `UPDATE` sleep 5 s before it runs, once `when` holds of the queue: a
+/// claim the database is slow to finish.
+async fn slow_claims(replay: &Replay, when: &str) {
+    sql(
+        replay,
+        &format!(
+            "CREATE FUNCTION slow_claim() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF {when} THEN PERFORM pg_sleep(5); END IF; RETURN NULL; END $$"
+        ),
+    )
+    .await;
+    sql(
+        replay,
+        "CREATE TRIGGER slow_claim BEFORE UPDATE ON push_deliveries \
+         FOR EACH STATEMENT EXECUTE FUNCTION slow_claim()",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_push_delivery_slow_claim_is_cut_off_after_2_seconds() {
+    // A claim the database is slow to finish claims nothing after 2 s, so it holds the
+    // claims' lock, which every instance's claims wait for, no longer than that.
+    let Some((setup, _)) = registered(&[H1]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    queue_rows(replay, &alice_id(), 1).await;
+    slow_claims(replay, "true").await;
+    let started = std::time::Instant::now();
+    let claimed = replay.db.store().claim_pushes(16).await;
+    let took = started.elapsed();
+    let attempts = queued(replay).await[0].1;
+    setup.replay.db.drop_database().await.expect("drop");
+    assert!(claimed.is_err(), "claimed after {took:?}");
+    assert!(took < Duration::from_secs(4), "cut off after {took:?}");
+    assert_eq!(attempts, 0, "the row's attempt counted");
+}
+
+#[tokio::test]
+async fn test_push_delivery_attempt_runs_while_the_worker_waits_on_a_claim() {
+    // An attempt paused at signing goes on while the worker waits on its next claim, which
+    // the database is slow to answer: the webhook goes as soon as the key loads, not once
+    // the claim ends.
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let (gate, service) = gated(&setup);
+    setup.replay.service = setup.instance();
+    register(&setup.replay, &[H1], None).await;
+    append(&setup.replay, 1, true).await;
+    // Only claims after the first, which takes the row, are slow.
+    slow_claims(
+        &setup.replay,
+        "EXISTS (SELECT 1 FROM push_deliveries WHERE attempts > 0)",
+    )
+    .await;
+    gate.armed.store(true, Ordering::SeqCst);
+    let running = tokio::spawn({
+        let service = service.clone();
+        async move { service.deliver_pushes().await }
+    });
+    gate.paused.notified().await;
+    // The worker is in its next claim once the database sleeps in it.
+    let mut watcher = conn(&setup.replay).await;
+    let started = std::time::Instant::now();
+    loop {
+        let (sleeping,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+             AND wait_event = 'PgSleep'",
+        )
+        .fetch_one(&mut watcher)
+        .await
+        .expect("activity");
+        if sleeping > 0 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no claim after the first"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    watcher.close().await.expect("close");
+    gate.release.notify_one();
+    let released = std::time::Instant::now();
+    while setup.relay.seen().is_empty() && released.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let waited = released.elapsed();
+    running.abort();
+    setup.replay.db.drop_database().await.expect("drop");
+    // The claim is cut off 2 s after it began; the webhook goes well before.
+    assert!(
+        waited < Duration::from_secs(1),
+        "the webhook waited {waited:?} for the claim"
+    );
+}

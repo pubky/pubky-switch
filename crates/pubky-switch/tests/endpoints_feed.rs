@@ -1100,10 +1100,7 @@ async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
         .await;
         sql(
             &replay,
-            &format!(
-                "SELECT pg_notify('{}', $1)",
-                pubky_switch::changes::CHANNEL
-            ),
+            &format!("SELECT pg_notify('{}', $1)", pubky_switch::changes::CHANNEL),
         )
         .await;
     });
