@@ -227,18 +227,14 @@ impl SignerRecords {
 
     /// Read a backup's records from their JSON, the parts concatenated, with `key`, the
     /// identity key the restoring install holds (Switch wire 3.13 "Parts and plaintext"):
-    /// the checks of [`SignerRecords::parse`], with `kind` `pubky-switch.signer_backup` and
-    /// no `identity_secret`.
+    /// the checks of [`SignerRecords::parse`], with `kind` `pubky-switch.signer_backup`; the
+    /// records hold `key`.
     ///
     /// # Errors
     ///
-    /// As [`SignerRecords::parse`]; [`Error::Invalid`] for a plaintext that holds
-    /// `identity_secret`.
+    /// As [`SignerRecords::parse`].
     pub fn parse_backup(json: &[u8], key: &IdentityKey) -> Result<Self> {
         let wire = read_plaintext(json, BACKUP_KIND, &key.public())?;
-        if wire.identity_secret.is_some() {
-            return invalid("Switch wire 3.13: a backup holds no identity_secret");
-        }
         Self::from_wire(&wire, key.clone())
     }
 
@@ -1613,11 +1609,12 @@ mod tests {
     }
 
     #[test]
-    fn test_backup_plaintext_refuses_another_shape() {
+    fn test_backup_and_handover_plaintexts_are_not_taken_for_each_other() {
         let r = records(Some([4; 32]));
         let backup = r.to_backup_json().unwrap();
         let handover = r.to_json().unwrap();
-        // Each kind's reader refuses the other's plaintext.
+        // The kind keeps the two apart: a hand-over's plaintext isn't a backup's, and a
+        // backup's, which holds no secret, isn't a hand-over's.
         let error = SignerRecords::parse_backup(&handover, &identity()).unwrap_err();
         assert!(
             error
@@ -1630,26 +1627,15 @@ mod tests {
                 .to_string()
                 .contains("kind isn't pubky-switch.signer_handover")
         );
-        // A backup that holds the secret is refused.
-        let mut with_secret: serde_json::Value = serde_json::from_slice(&backup).unwrap();
-        with_secret["identity_secret"] = b64(&identity().secret_bytes()).into();
-        let error =
-            SignerRecords::parse_backup(&serde_json::to_vec(&with_secret).unwrap(), &identity())
-                .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("a backup holds no identity_secret")
-        );
-        // Another identity's key doesn't read it.
-        assert!(SignerRecords::parse_backup(&backup, &IdentityKey::from_secret([9; 32])).is_err());
-        // A hand-over without its secret is refused.
+        // A hand-over carries the secret it hands over.
         let mut without: serde_json::Value = serde_json::from_slice(&handover).unwrap();
         without.as_object_mut().unwrap().remove("identity_secret");
         let error =
             SignerRecords::parse(&serde_json::to_vec(&without).unwrap(), &identity().public())
                 .unwrap_err();
         assert!(error.to_string().contains("no identity_secret"));
+        // Another identity's key doesn't read a backup.
+        assert!(SignerRecords::parse_backup(&backup, &IdentityKey::from_secret([9; 32])).is_err());
     }
 
     #[test]
