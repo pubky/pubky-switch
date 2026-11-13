@@ -12,8 +12,9 @@
 //! 4. It delivers and publishes the version that moves the app from `apps` to `removed`, with
 //!    `distrust_from` the switch's revocation time or an earlier time the user picked, drops
 //!    its `renewed` entries, and raises `data_epoch` by one.
-//! 5. It deletes the app's Homeserver record. Its Pubky grant can't be revoked through the
-//!    Pubky SDK yet, so [`Alert::GrantRevocationOwed`] asks the user to revoke it.
+//! 5. It deletes the app's Homeserver record. The signer doesn't revoke the app's Pubky
+//!    grants: [`Alert::GrantRevocationOwed`] asks the host to, through the Pubky SDK's grant
+//!    manager.
 //!
 //! A departure, an app's own `leave`, is completed by the same steps 3 to 5 once the signer
 //! sees it in `GET /apps`, with the departure time as `distrust_from` (Switch spec 12.3); its

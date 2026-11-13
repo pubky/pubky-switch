@@ -11,7 +11,10 @@ use super::Signer;
 use crate::alert::Alert;
 use crate::error::Result;
 
-/// Where an app stands in the newest `identity.json` (Switch spec 12.2).
+/// Where an app stands in the newest `identity.json` (Switch spec 12.2), as this install's
+/// records show it. An app that left by itself is `Listed` until a version removes it: its
+/// alerts tell it apart. During a recovery, `Revoking { at_switch: true }` is the lost
+/// service's answer until the recovery's version is delivered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AppStanding {
@@ -35,17 +38,22 @@ pub struct AppSummary {
     pub app_id: [u8; 16],
     /// Where it stands.
     pub standing: AppStanding,
-    /// The certificate the newest version lists for it: its scopes, switch permissions,
-    /// `issued_at` and `expires_at`. `None` for a removed app.
+    /// The document hash of the certificate the newest version lists for it; `None` for a
+    /// removed app.
+    pub listed_cert: Option<[u8; 32]>,
+    /// That certificate: its scopes, switch permissions, `issued_at` and `expires_at`. `None`
+    /// for a removed app, and for a listed one whose certificate this install doesn't hold,
+    /// as in a version it adopted from another install.
     pub cert: Option<AppCert>,
     /// Whether a renewal of it is open: an earlier certificate of it is in `renewed` without
     /// an `until` yet (Switch wire 3.8).
     pub renewal_open: bool,
-    /// The registered protocols that own some of its scopes, in their registration order.
-    pub protocols: Vec<String>,
+    /// The registered protocols that own some of its scopes, in their registration order;
+    /// `None` when `cert` is, since its scopes are then unknown here.
+    pub protocols: Option<Vec<String>>,
     /// Its scopes that no registered protocol owns: the steps that need its keys wait for
-    /// them (design note, decision 2).
-    pub unowned_scopes: Vec<String>,
+    /// them (design note, decision 2). `None` when `cert` is.
+    pub unowned_scopes: Option<Vec<String>>,
     /// From when its messages are distrusted: a removed app's `distrust_from`, or the earlier
     /// time the user picked for a revocation in progress (Switch spec 12.2).
     pub distrust_from: Option<u64>,
@@ -94,7 +102,7 @@ impl Signer {
                 .iter()
                 .find(|cert| cert.hash() == listed.cert)
                 .cloned();
-            let scopes = cert.as_ref().map_or(&[][..], AppCert::scopes);
+            let scopes = cert.as_ref().map(AppCert::scopes);
             let revoking = self.state.revoking.iter().find(|r| r.app_id == app_id);
             apps.push(AppSummary {
                 app_id,
@@ -106,14 +114,16 @@ impl Signer {
                     .renewed
                     .iter()
                     .any(|renewed| renewed.app_id == app_id && renewed.until.is_none()),
-                protocols: self
-                    .env
-                    .protocols
-                    .protocols_of(scopes)
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
-                unowned_scopes: self.env.protocols.unowned(scopes),
+                listed_cert: Some(listed.cert),
+                protocols: scopes.map(|scopes| {
+                    self.env
+                        .protocols
+                        .protocols_of(scopes)
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                }),
+                unowned_scopes: scopes.map(|scopes| self.env.protocols.unowned(scopes)),
                 distrust_from: revoking.and_then(|r| r.distrust_from),
                 untaken_renewals: untaken_of(&app_id),
                 alerts: alerts_of(&app_id),
@@ -124,10 +134,11 @@ impl Signer {
             apps.push(AppSummary {
                 app_id: removed.app_id,
                 standing: AppStanding::Removed,
+                listed_cert: None,
                 cert: None,
                 renewal_open: false,
-                protocols: Vec::new(),
-                unowned_scopes: Vec::new(),
+                protocols: None,
+                unowned_scopes: None,
                 distrust_from: Some(removed.distrust_from),
                 untaken_renewals: 0,
                 alerts: alerts_of(&removed.app_id),
