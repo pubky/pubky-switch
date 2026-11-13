@@ -233,10 +233,14 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;
-        Ok(())
+        // The deliveries queued under the registration it replaces go with it (Switch wire
+        // 8.2): none is sent with the new key, which has no handles yet.
+        self.drop_pushes_except(&registration.app_id, &registration.handles)
+            .await
     }
 
-    /// Replace the handles of `app`'s registration, at `at_ms`.
+    /// Replace the handles of `app`'s registration, at `at_ms`; the deliveries queued for a
+    /// handle the list no longer holds go.
     pub async fn set_push_handles(
         &mut self,
         app: &[u8; 16],
@@ -255,12 +259,12 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;
-        Ok(())
+        self.drop_pushes_except(app, handles).await
     }
 
     /// Remove the push registrations of every app but those of `keep`, every one when
     /// `None`, owing their keys' deletion (Switch wire 8.1: the setting goes when the app
-    /// stops being current). Returns how many went.
+    /// stops being current), and their queued deliveries with them. Returns how many went.
     pub async fn drop_push_registrations(
         &mut self,
         keep: Option<&[[u8; 16]]>,

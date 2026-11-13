@@ -332,6 +332,14 @@ impl Service {
         })
         .await
         .map_err(|e| store_error(&e))?;
+        // A `notify` entry owes each handle of each target's registration a webhook, queued
+        // with the entry and sent by the background worker, never during the append (Switch
+        // spec 9 step 4, Switch wire 8.2).
+        if header.notify && self.push_enabled {
+            txn.queue_pushes(&targets, time_ms)
+                .await
+                .map_err(|e| store_error(&e))?;
+        }
         // An append brings the pressure lagging marks answer, with trusted time (Switch wire
         // 7.4.4).
         if trusted {

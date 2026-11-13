@@ -22,10 +22,12 @@ pub struct Recovery {
 /// The tables of an account's state for one generation at this service, which a recovery in
 /// place empties (Switch wire 3.3): its chain, its own apps and what they wrote, its lists,
 /// invites, batches and inbox, its flagged senders and pending connect requests, a hand-over,
-/// the counterparties' copies and their floors, and its apps' push registrations.
+/// the counterparties' copies and their floors, and its apps' push registrations and their
+/// queued deliveries.
 const GENERATION_STATE: &[&str] = &[
-    // Its keys owed first (`start_recovery_in_place`).
+    // Its keys owed first (`start_recovery_in_place`); their queued deliveries go with them.
     "push_registrations",
+    "push_deliveries",
     "chain_items",
     "apps",
     "receive_keys",

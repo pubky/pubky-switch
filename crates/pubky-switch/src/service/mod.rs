@@ -13,8 +13,9 @@
 //! `POST /v1/{id}/inbox`, `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`,
 //! `GET /v1/{id}/apps`, `POST /v1/{id}/apps/{app_id}/revoke`, `GET /v1/{id}/directory`,
 //! `GET` and `POST /v1/{id}/apps/{app_id}/keys`, `POST /v1/{id}/apps/{app_id}/leave`,
-//! `PUT` and `GET /v1/{id}/handover`, `POST /v1/{id}/erase`, and `PUT /v1/{id}/push`, whose
-//! registrations are kept while nothing is sent to a relay yet. Every other call is answered
+//! `PUT` and `GET /v1/{id}/handover`, `POST /v1/{id}/erase`, and `PUT /v1/{id}/push`. A
+//! `notify` entry's webhooks are queued with it and sent to the relays by a background
+//! worker ([`Service::deliver_pushes_until`]). Every other call is answered
 //! `503 unavailable`.
 
 mod admission;
@@ -38,9 +39,13 @@ mod records;
 mod recovery;
 pub mod rules;
 mod upload;
+mod webhooks;
 
 pub use push::Resolver;
 pub use recovery::AdmissionEnd;
+pub use webhooks::PushRound;
+#[cfg(any(test, feature = "test-util"))]
+pub use webhooks::RelayRoute;
 
 pub use enroll::announced_limits;
 
@@ -117,6 +122,11 @@ pub struct Service {
     push_enabled: bool,
     /// Resolves relay hosts for the address check (Switch wire 8.1, 8.2).
     resolver: Resolver,
+    /// How many webhooks one round of delivery sends at once (`push.concurrency`).
+    push_concurrency: usize,
+    /// Where webhooks connect in tests.
+    #[cfg(any(test, feature = "test-util"))]
+    relay_route: Option<webhooks::RelayRoute>,
 }
 
 /// A source of entry IDs.
@@ -301,14 +311,34 @@ impl Service {
             entry_ids: Arc::new(random_entry_id),
             push_enabled: true,
             resolver: push::system_resolver(),
+            push_concurrency: crate::config::PushConfig::default().concurrency,
+            #[cfg(any(test, feature = "test-util"))]
+            relay_route: None,
         }
     }
 
     /// The service with push registrations on or off (`push.enabled`, Switch wire 8.1): off,
-    /// `PUT /push` is `400`, as at a service that sends no pushes.
+    /// `PUT /push` is `400`, as at a service that sends no pushes, and no entry queues a
+    /// webhook.
     #[must_use]
     pub fn with_push(mut self, enabled: bool) -> Self {
         self.push_enabled = enabled;
+        self
+    }
+
+    /// The service sending at most `concurrency` webhooks at once (`push.concurrency`).
+    #[must_use]
+    pub fn with_push_concurrency(mut self, concurrency: usize) -> Self {
+        self.push_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// The service connecting webhooks, over plain HTTP, to the listener `route` maps each
+    /// checked address to, for tests whose relays run in process.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_relay_route(mut self, route: webhooks::RelayRoute) -> Self {
+        self.relay_route = Some(route);
         self
     }
 

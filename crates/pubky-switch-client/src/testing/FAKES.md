@@ -123,7 +123,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   first append writes and the entries a recovery upload's list merge writes included. Unlike the service: no `connect_per_min` or
   `stranger_per_min` (no rates, above), and no flag hits. A sender the allowlist admits is
   answered `pending` with nothing kept, as at the service. Neither switch sends the push
-  `policy.connect_requests.push` asks for yet: neither sends a webhook.
+  `policy.connect_requests.push` asks for yet.
 - **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
   by a write here, as at the service (Recovery uploads, below).
 - **Directory** (Switch wire 7.4.10): an app is reachable from its first receive key until
@@ -350,8 +350,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   erasure. The service can owe the erased account's key when its key store fails, and until
   the key is gone it answers a request signed with the identity key, whatever its timestamp,
   with the operator's `503` in place of that `404`; every other caller gets the `404` at once.
-- **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay, as at the
-  service, which sends no webhook yet either. The same as the service: the body goes through
+- **Push** (Switch wire 8.1): registrations only. The service queues a webhook to each
+  handle for every `notify` entry and sends it to the relay (8.2); the scripted switch
+  neither sends nor records one, since a webhook goes to the relay, never to an app, so no
+  client flow sees it, and an app learns of the entry by reading its feed at either switch.
+  The same as the service: the body goes through
   the core's checks (`parse_push_body`, `400`), the signer is `403 permission_missing`, an
   app that isn't current `403 not_current`, a staged account `503 staged`, 8.1's start and handle cases and their `409 conflict`s, one registration per
   app, and the registration dropped when its app stops being current (a revocation, a

@@ -1,7 +1,8 @@
 //! `PUT /v1/{id}/push` (Switch wire 8.1, spec 9) on `chain.json`'s account: the wallet's
 //! push registration, its cases and refusals, one registration per app, its push key kept in
 //! the key store and deleted through the owed-deletion ledger when the registration is
-//! replaced or removed, and both sides of a crash around a key's commit.
+//! replaced or removed, its queued deliveries going with it, and both sides of a crash
+//! around a key's commit.
 //!
 //! Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run them; see `store::testing`.
 
@@ -265,6 +266,30 @@ async fn owed(replay: &Replay) -> Vec<String> {
 async fn registrations(replay: &Replay) -> i64 {
     let mut conn = conn(replay).await;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM push_registrations")
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    conn.close().await.expect("close");
+    count
+}
+
+/// Queue a webhook for the wallet's registration, as a `notify` entry would (wire 8.2).
+async fn queue_one(replay: &Replay) {
+    let mut conn = conn(replay).await;
+    sqlx::query(
+        "INSERT INTO push_deliveries (account_id, app_id, push_key_id, handle, entry_at_ms, \
+         next_attempt_ms) SELECT account_id, app_id, push_key_id, 'handle', 0, 0 \
+         FROM push_registrations",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("queued");
+    conn.close().await.expect("close");
+}
+
+async fn deliveries(replay: &Replay) -> i64 {
+    let mut conn = conn(replay).await;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM push_deliveries")
         .fetch_one(&mut conn)
         .await
         .expect("count");
@@ -638,6 +663,8 @@ async fn test_push_recovery_in_place_removes_every_registration() {
     };
     started(&replay, RELAY, None).await;
     let id = stored(&replay).await.expect("held").1;
+    queue_one(&replay).await;
+    assert_eq!(deliveries(&replay).await, 1);
     // An enrollment at the serving account: its pending key starts the next generation.
     let enrollment = {
         use pubky_switch_core::records::{Enrollment, EnrollmentBody};
@@ -695,6 +722,7 @@ async fn test_push_recovery_in_place_removes_every_registration() {
         String::from_utf8_lossy(&answer.body)
     );
     assert_eq!(registrations(&replay).await, 0);
+    assert_eq!(deliveries(&replay).await, 0);
     assert!(!exists(&keys, &id).await);
     assert!(owed(&replay).await.is_empty());
     replay.db.drop_database().await.expect("drop");
@@ -735,7 +763,9 @@ async fn test_push_erasure_deletes_the_push_keys() {
     };
     started(&replay, RELAY, None).await;
     let id = stored(&replay).await.expect("held").1;
+    queue_one(&replay).await;
     assert_eq!(erase(&replay).await.status, 200);
+    assert_eq!(deliveries(&replay).await, 0);
     assert!(!exists(&keys, &id).await);
     assert!(owed(&replay).await.is_empty());
     replay.db.drop_database().await.expect("drop");

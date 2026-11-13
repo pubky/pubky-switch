@@ -1,14 +1,15 @@
 //! `PUT /v1/{id}/push` (Switch spec 9, Switch wire 8.1): an own app starts a push
 //! registration, at most one per app, and sets its handles.
 //!
-//! **Nothing is sent yet.** The service keeps registrations; webhooks to relays (8.2) aren't
-//! sent until delivery is served, so a registered app gets no push meanwhile.
+//! A `notify` entry queues a webhook to each of the app's handles, sent by the delivery
+//! worker (8.2, `service::webhooks`); a replacement or a new list of handles drops the ones
+//! queued for what it lets go.
 //!
 //! - **Before the lock**, after the app's request verified: the body is read and checked
 //!   (`400`): its form, at most 8 handles, none on a start, no `replaces` with `push_key`, and
 //!   the relay URL, `https://` on port 443 without user info, whose host must resolve only to
-//!   public addresses, the checks switch origins take (wire 7.1, 8.2). Delivery will resolve
-//!   and check the host again at each connection. A service that sends no pushes
+//!   public addresses, the checks switch origins take (wire 7.1, 8.2). Delivery resolves and
+//!   checks the host again at each connection. A service that sends no pushes
 //!   (`push.enabled` off) answers every registration `400`. A start that will need a new push
 //!   key, by the registration read without the lock, has its key minted here: owed deleting
 //!   first, then generated in the key store under its row's lock (`store::push`).

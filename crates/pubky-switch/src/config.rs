@@ -32,19 +32,25 @@ pub struct Config {
     pub push: PushConfig,
 }
 
-/// Push (Switch spec 9, Switch wire 8). The service keeps registrations; it sends no
-/// webhook to a relay yet.
+/// Push (Switch spec 9, Switch wire 8): registrations, and the webhooks a `notify` entry
+/// queues for them, sent by a background worker in each instance.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PushConfig {
-    /// Take push registrations (`PUT /v1/{id}/push`); off, every one is answered `400`, as
-    /// a service that sends no pushes answers (Switch wire 8.1).
+    /// Take push registrations (`PUT /v1/{id}/push`) and send webhooks; off, every
+    /// registration is answered `400`, as a service that sends no pushes answers (Switch
+    /// wire 8.1), and nothing is queued or sent.
     pub enabled: bool,
+    /// The most webhooks one instance sends at once; 0 is taken as 1.
+    pub concurrency: usize,
 }
 
 impl Default for PushConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            concurrency: 16,
+        }
     }
 }
 

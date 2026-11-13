@@ -30,6 +30,8 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
 pubky-switch-core.workspace = true
+# Webhooks to push relays (Switch wire 8.2), over rustls with the webpki roots.
+reqwest.workspace = true
 roughenough-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
