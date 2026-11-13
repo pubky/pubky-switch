@@ -905,6 +905,15 @@ impl Service {
                 chain_hash,
             }),
             generation: snapshot.generation,
+            // The caller's own cursor, from the page's snapshot (Switch spec 8.3, wire
+            // 7.4.4). Its `seq` alone: a cooperative move and a key change in place continue
+            // the sequence, and a recovery starts the account's apps afresh, so every cursor
+            // the account holds is a position of its current sequence.
+            cursor: snapshot
+                .reader
+                .as_ref()
+                .and_then(|app| app.cursor)
+                .map_or(0, |cursor| cursor.seq),
             tip,
             checkpoint: snapshot.checkpoint,
             key_mark: mark,
@@ -929,6 +938,8 @@ pub(super) struct Answered {
     /// The head as a mark, `None` before the first chain item.
     mark: Option<Mark>,
     generation: u64,
+    /// The `seq` of the caller's cursor the service holds, 0 before its first move.
+    cursor: u64,
     /// The chain's head as the page shows it.
     tip: ChainTip,
     /// The latest checkpoint, which the page carries (Switch wire 7.4.4).
@@ -940,8 +951,8 @@ pub(super) struct Answered {
 }
 
 impl Answered {
-    /// The page's answer at its service time, `{ items, next, scanned_through, more, head,
-    /// checkpoint }` in the member order of the wire's example (Switch wire 7.4.4), with the
+    /// The page's answer at its service time, `{ items, next, scanned_through, more, cursor,
+    /// head, checkpoint }` in the member order of the wire's example (Switch wire 7.4.4), with the
     /// head, signed here inside the answer's proof, also in `Switch-Head`; `checkpoint` only
     /// once there is one.
     pub(super) fn answer(&self, signing: &Signing<'_>) -> (Answer, u64) {
@@ -963,6 +974,8 @@ impl Answered {
         body.extend_from_slice(self.page.scanned_through.to_string().as_bytes());
         body.extend_from_slice(b",\"more\":");
         body.extend_from_slice(if self.page.more { b"true" } else { b"false" });
+        body.extend_from_slice(b",\"cursor\":");
+        body.extend_from_slice(self.cursor.to_string().as_bytes());
         body.extend_from_slice(b",\"head\":");
         body.extend_from_slice(&head.to_json());
         if let Some(checkpoint) = &self.checkpoint {
