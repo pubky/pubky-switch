@@ -1996,7 +1996,11 @@ impl App {
             },
             conditions,
         };
-        if !own
+        // The app's own write is never checked against what it saw, also when the feed or a
+        // view shows it before its answer: the app chose it (Switch spec 3.1, a device with
+        // the app's keys shares its state), and a flag would name the app itself.
+        let own_writer = own || accepted.writer == self.state.meta.app_id;
+        if !own_writer
             && let Some(mark) = &seen
             && let Some(reason) = self.protocol.record_regression_on(
                 &accepted.collection.name,
@@ -2155,8 +2159,9 @@ impl App {
     /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app;
     /// [`Refusal::Usage`] when the certificate holds none of the write scopes, for a value
     /// that isn't strict JSON (Switch wire 6.2), before anything is fetched, marked, signed
-    /// or sent, or when the protocol's mark of the value ([`super::Protocol::record_seen`]) is over
-    /// [`super::MAX_SEEN_MARK_BYTES`]; [`Refusal::NotNow`] while the app lacks the read
+    /// or sent, or, for a write that isn't a delete, when the protocol's mark of the value
+    /// ([`super::Protocol::record_seen`]) is over [`super::MAX_SEEN_MARK_BYTES`]: a delete
+    /// makes no mark, and is never refused for one; [`Refusal::NotNow`] while the app lacks the read
     /// scope's key at the current data epoch (it fetches its key bundle first); a store
     /// failure.
     pub async fn record_op(
