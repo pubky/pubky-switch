@@ -2,11 +2,16 @@
 //!
 //! The signer writes two files there, which only it writes and no app's grant covers (Switch
 //! spec 3.4): `identity.json` (Switch wire 3.3), public, and the signer's backup (Switch wire
-//! 3.13), under `/priv`, which the Homeserver serves to the identity's own session only. It also deletes a removed app's record, which the app wrote under its own grant
-//! (Switch spec 12.2 step 4), and, when the account is erased, `identity.json` and every app
-//! record it knows of (Switch spec 12.7 step 5). The host implements [`Homeserver`] on its
-//! Pubky client, with the identity's own session; how it signs in, and the request deadlines,
-//! are the host's.
+//! 3.13), under `/priv`, which the Homeserver serves only to the identity's sessions whose
+//! capabilities cover it. It also deletes a removed app's record, which the app wrote under
+//! its own grant (Switch spec 12.2 step 4), and, when the account is erased, `identity.json`
+//! and every app record it knows of (Switch spec 12.7 step 5).
+//!
+//! The host implements [`Homeserver`] on its Pubky client, with a session of the identity's
+//! whose capabilities cover, for read and write, `/pub/pubky-switch/v1/` and
+//! `/priv/pubky-switch/v1/signer-backup.json`: without the second, every backup read and
+//! write fails, and so every delivery stops (Switch wire 3.13). How it signs in, and the
+//! request deadlines, are the host's.
 
 use pubky_switch_client::TransportError;
 use pubky_switch_client::transport::BoxFuture;
@@ -17,7 +22,7 @@ use pubky_switch_client::transport::BoxFuture;
 /// `/pub/pubky-switch/v1/identity.json` and `/priv/pubky-switch/v1/signer-backup.json`.
 pub trait Homeserver: Send + Sync {
     /// The bytes of the identity's file at `path`, `None` when there is no such file. A `/priv`
-    /// path is read with the identity's own session.
+    /// path is read with the host's session for the identity, whose capabilities cover it.
     ///
     /// # Errors
     ///

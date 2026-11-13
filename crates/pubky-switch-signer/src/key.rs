@@ -309,9 +309,9 @@ impl IdentityKeyring {
         Ok(keyring)
     }
 
-    /// Take the identity secret received in a hand-over into `vault` (Switch spec 12.8). The secret must be the key of `identity`. It is added
-    /// like a new one, so it never replaces another identity's secret, even one added at the
-    /// same moment. A vault that already holds this same secret, as after a retry, is fine.
+    /// Take the identity secret received in a hand-over into `vault` (Switch spec 12.8). The
+    /// secret must be the key of `identity`. It is added like a new one, so it never replaces
+    /// another identity's secret, even one added at the same moment. A vault that already holds this same secret, as after a retry, is fine.
     ///
     /// # Errors
     ///

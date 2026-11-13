@@ -20,8 +20,8 @@ pub const APP_REQUEST_KIND: &str = "pubky-switch.app_request";
 pub const IDENTITY_PATH: &str = "/pub/pubky-switch/v1/identity.json";
 
 /// The path of the signer's backup on the Homeserver, under `/priv`, which the Homeserver
-/// serves to the identity's own session only, and which no app's grant may cover (Switch
-/// wire 3.13).
+/// serves only to the identity's sessions whose capabilities cover it, and which no app's
+/// grant may cover (Switch wire 3.13).
 pub const SIGNER_BACKUP_PATH: &str = "/priv/pubky-switch/v1/signer-backup.json";
 
 /// The members of an app request, which refuses any other (Switch wire 1.1, 3.9).

@@ -81,7 +81,6 @@ struct RecordsIn {
     v: u64,
     kind: String,
     identity: String,
-    #[serde(default)]
     identity_secret: Option<String>,
     identity_doc: SignedDoc,
     revoked_apps: Vec<String>,
@@ -882,8 +881,8 @@ pub fn succeeded(
 
 /// A signer backup (Switch wire 3.13): the signer's records, without the identity key, sealed
 /// in parts to the identity's backup key and signed, kept on the Homeserver at
-/// [`super::SIGNER_BACKUP_PATH`], which the Homeserver serves to the identity's own session
-/// only.
+/// [`super::SIGNER_BACKUP_PATH`], under `/priv`. Sealed to the backup key, it opens only for a
+/// holder of the identity key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SignerBackup(SealedParts);
@@ -1636,6 +1635,66 @@ mod tests {
         assert!(error.to_string().contains("no identity_secret"));
         // Another identity's key doesn't read a backup.
         assert!(SignerRecords::parse_backup(&backup, &IdentityKey::from_secret([9; 32])).is_err());
+    }
+
+    #[test]
+    fn test_backup_and_handover_never_open_as_each_other() {
+        // The two formats share their records; the kind of each plaintext, the label of each
+        // signature and each recipient keep them apart (Switch wire 3.12, 3.13).
+        let (mine, _) = certs();
+        let r = records(None);
+        let id = identity().public();
+        let randomness = [envelope::FixedRandomness {
+            content_key: [1; 32],
+            nonce: [2; 24],
+            ikm_e: [3; 32],
+        }];
+        // A backup's plaintext, sealed and signed as a hand-over to a listed app, opens and
+        // verifies, and the hand-over's reader refuses it at its kind.
+        let backup_json = r.to_backup_json().unwrap();
+        let as_handover = SignerHandover::seal_parts_with(
+            &identity(),
+            &mine.app_id(),
+            &mine.bundle_key(),
+            &[backup_json.as_slice()],
+            &randomness,
+        )
+        .unwrap();
+        let error = as_handover
+            .open(&id, &mine.app_id(), &app().bundle_secret())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("kind isn't pubky-switch.signer_handover"),
+            "{error}"
+        );
+        // A hand-over's plaintext, sealed and signed as a backup, opens and verifies, and the
+        // backup's reader refuses it at its kind.
+        let handover_json = r.to_json().unwrap();
+        let as_backup =
+            SignerBackup::seal_parts_with(&identity(), &[handover_json.as_slice()], &randomness)
+                .unwrap();
+        as_backup.verify(&id).unwrap();
+        let error = as_backup.open(&identity()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("kind isn't pubky-switch.signer_backup"),
+            "{error}"
+        );
+        // A sealed backup's envelopes and signature aren't a hand-over's.
+        let backup = SignerBackup::seal(&identity(), &r).unwrap();
+        let swapped = SignerHandover::from_parts(backup.envelopes().to_vec(), backup.sig());
+        assert!(matches!(
+            swapped.verify(&id, &mine.app_id()),
+            Err(Error::Signature(_))
+        ));
+        assert!(
+            swapped
+                .open(&id, &mine.app_id(), &app().bundle_secret())
+                .is_err()
+        );
     }
 
     #[test]

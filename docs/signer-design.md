@@ -11,7 +11,7 @@ Status: for review, before any code. Scope: identity management on the Pubky Swi
 **Dependencies:**
 - `pubky-switch-core`: documents, signatures, derivations, envelopes, the scope rule and chain verification. It is pure, and time is passed in.
 - `pubky-switch-client`: the Switch client (request signing, response and proof verification, batches), the `StateStore` trait and the clock.
-- **The identity's Homeserver,** through a `Homeserver` trait (`get` and `put` of the identity's own files) that the host implements on its Pubky session for the identity, as the client reads Homeserver files through `HomeserverReader`. The signer writes `identity.json` there, public, and the backup, under `/priv`, which the Homeserver serves to the identity's own session only; no app's grant covers either (spec 3.4).
+- **The identity's Homeserver,** through a `Homeserver` trait (`get` and `put` of the identity's own files) that the host implements on its Pubky session for the identity, as the client reads Homeserver files through `HomeserverReader`. The signer writes `identity.json` there, public, and the backup, under `/priv`, which the Homeserver serves only to the identity's sessions whose capabilities cover it; no app's grant covers either (spec 3.4). The host's session needs read and write capabilities on `/pub/pubky-switch/v1/`, for `identity.json` and the app records the signer deletes, and on `/priv/pubky-switch/v1/signer-backup.json`, for the backup.
 
 So the direction is `pubky-switch-signer -> pubky-switch-client -> pubky-switch-core`. The bindings expose it alongside a protocol's SDK, which is how "the signer core ships in the SDK" holds.
 
