@@ -369,6 +369,15 @@ pub enum AppEvent {
         /// owed then, and asked by a later read.
         resend_asked: bool,
     },
+    /// A read stopped before handing anything, because a deny list change or gap the
+    /// protocol must take first failed again ([`super::Protocol::deny_list_changed`],
+    /// [`super::Protocol::deny_list_gap`]): raised from the [`super::RETRY_EVENT_READS`]th
+    /// such read in a row on, on each. Nothing after it is handed until the protocol takes
+    /// it; the host repairs or frees the protocol's store.
+    DenyListHeld {
+        /// The reads in a row that stopped there, this one included.
+        reads: u32,
+    },
     /// Entries the service deleted while the app was lagging (Switch spec 8.2).
     Missed {
         /// The item's `seq`.
@@ -881,6 +890,14 @@ pub enum RefusedCall {
     Missed(MissedEntries),
     /// [`super::Protocol::deny_list_changed`].
     DenyListChanged(DenyListChange),
+    /// [`super::Protocol::deny_list_gap`], about the gap after this position; the copy of
+    /// the lists was taken without its writes.
+    DenyListGap {
+        /// The generation of the last position the history is known complete through.
+        generation: u64,
+        /// That position's `seq`.
+        seq: u64,
+    },
     /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at this loss;
     /// the loss went on without them.
     ProviderLost(ProviderLoss),
@@ -899,6 +916,10 @@ pub(crate) enum KeptRefusal {
         declared_at_ms: u64,
         accepted_from_ms: u64,
         uncertain_until_ms: u64,
+    },
+    DenyGap {
+        generation: u64,
+        seq: u64,
     },
 }
 
@@ -919,6 +940,7 @@ impl KeptRefusal {
                 accepted_from_ms,
                 uncertain_until_ms,
             }),
+            Self::DenyGap { generation, seq } => RefusedCall::DenyListGap { generation, seq },
         }
     }
 }

@@ -5250,7 +5250,15 @@ fn denies(protocol: &SampleProtocol) -> Vec<([u8; 32], bool)> {
 
 /// A manager that changes the deny list, and a reader with `lists.read`.
 async fn deny_list_apps(w: &World) -> (App, App) {
-    let manager = join_holding(w, "manager", &[Permission::ListsManage]).await;
+    // The manager has a protocol of its own, so what reaches `w.protocol` is the reader's.
+    let manager = join_with(
+        w,
+        "manager",
+        &[Permission::ListsManage],
+        Arc::new(MemoryStore::new()),
+        Arc::new(SampleProtocol::default()) as Arc<dyn Protocol>,
+    )
+    .await;
     let reader = join_holding(w, "reader", &[Permission::ListsRead]).await;
     (manager, reader)
 }
@@ -5296,21 +5304,32 @@ async fn test_deny_list_changes_without_lists_read_reach_no_protocol() {
 
 #[tokio::test]
 async fn test_deny_list_change_owed_holds_the_later_ones_back() {
-    // A call that fails is owed, and the changes after it wait behind it, also when the
-    // owed one fails again at the next read: the protocol gets them in feed order.
+    // A change that fails is owed, and the read stops after it: nothing later is handed,
+    // also while it fails again at the next read, which stops at its start. Once the
+    // protocol takes it, the rest go in feed order. After RETRY_EVENT_READS reads held,
+    // the host is told.
     let w = World::new();
     let (mut manager, mut reader) = deny_list_apps(&w).await;
     let (a, b) = ([1; 32], [2; 32]);
     manager.deny(&a).await.unwrap();
     manager.deny(&b).await.unwrap();
-    *w.protocol.failing_deny.lock().unwrap() = 2;
-    reader.receive(None).await.unwrap();
-    assert!(denies(&w.protocol).is_empty());
-    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 2);
     manager.undeny(&a).await.unwrap();
-    reader.receive(None).await.unwrap();
+    *w.protocol.failing_deny.lock().unwrap() = 3;
+    let first = reader.receive(None).await.unwrap();
+    assert!(first.stopped);
     assert!(denies(&w.protocol).is_empty());
-    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 3);
+    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        held.extend(reader.receive(None).await.unwrap().events);
+    }
+    assert!(denies(&w.protocol).is_empty());
+    assert!(
+        held.iter()
+            .any(|e| matches!(e, AppEvent::DenyListHeld { reads } if *reads >= 2)),
+        "{held:?}"
+    );
+    reader.receive(None).await.unwrap();
     reader.receive(None).await.unwrap();
     assert_eq!(denies(&w.protocol), vec![(a, true), (b, true), (a, false)]);
     assert_eq!(reader.owed_protocol_calls().await.unwrap(), 0);
@@ -5340,4 +5359,235 @@ async fn test_deny_list_changes_since_a_backup_reach_the_restored_protocol() {
     restored.end_reconcile(UserConfirmed::new()).await.ok();
     restored.receive(None).await.unwrap();
     assert_eq!(denies(&restored_protocol), vec![(b, true), (a, false)]);
+}
+
+/// The sample protocol, logging the `seq` of each message and deny list change it takes,
+/// in the order it takes them.
+#[derive(Default)]
+struct OrderedProtocol {
+    sample: SampleProtocol,
+    log: std::sync::Mutex<Vec<(&'static str, u64)>>,
+}
+
+impl Protocol for OrderedProtocol {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.sample.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.sample.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &pubky_switch_core::message::Message,
+        sender: &pubky_switch_core::records::AppCert,
+        own: &pubky_switch_core::records::AppCert,
+    ) -> Result<(), String> {
+        self.sample.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &pubky_switch_core::records::AppCert) -> Vec<String> {
+        self.sample.accepts(cert)
+    }
+
+    fn check_body(&self, message: &crate::app::ReceivedMessage) -> Result<(), String> {
+        self.sample.check_body(message)
+    }
+
+    fn receive(&self, message: &crate::app::ReceivedMessage) -> crate::app::Outcome {
+        self.log.lock().unwrap().push(("message", message.seq));
+        self.sample.receive(message)
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &crate::app::ResendNeeded,
+    ) -> Result<Vec<crate::app::LocalWrite>, crate::app::StoreFailure> {
+        self.sample.resend_needed(needed)
+    }
+
+    fn missed(
+        &self,
+        missed: &crate::app::MissedEntries,
+    ) -> Result<Vec<crate::app::LocalWrite>, crate::app::StoreFailure> {
+        self.sample.missed(missed)
+    }
+
+    fn deny_list_changed(
+        &self,
+        change: &crate::app::DenyListChange,
+    ) -> Result<Vec<crate::app::LocalWrite>, crate::app::StoreFailure> {
+        let writes = self.sample.deny_list_changed(change)?;
+        self.log.lock().unwrap().push(("deny", change.seq));
+        Ok(writes)
+    }
+}
+
+/// An app `name` holding `permissions`, with `protocol`, in `store`.
+async fn join_with(
+    w: &World,
+    name: &str,
+    permissions: &[Permission],
+    store: Arc<MemoryStore>,
+    protocol: Arc<dyn Protocol>,
+) -> App {
+    let request = w
+        .signer
+        .approve(
+            &app_keys(name),
+            &AppSpec::new(&["scope-a"]).with_permissions(permissions),
+        )
+        .unwrap();
+    App::join(
+        w.env_on(store as Arc<dyn StateStore>),
+        protocol,
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_deny_list_change_owed_comes_before_a_later_message() {
+    // Feed order across the calls: a message accepted after a deny list change reaches the
+    // protocol after it, also when the change was owed.
+    let w = World::new();
+    let mut manager = join_holding(&w, "manager", &[Permission::ListsManage]).await;
+    let ordered = Arc::new(OrderedProtocol::default());
+    let mut reader = join_with(
+        &w,
+        "reader",
+        &[Permission::ListsRead, Permission::ConversationAdd],
+        Arc::new(MemoryStore::new()),
+        Arc::clone(&ordered) as Arc<dyn Protocol>,
+    )
+    .await;
+    let bob = w.bob.public();
+    manager.deny(&bob).await.unwrap();
+    reader.receive(None).await.unwrap();
+    manager.undeny(&bob).await.unwrap();
+    w.note(reader.app_id(), "after the undeny");
+    *ordered.sample.failing_deny.lock().unwrap() = 1;
+    reader.receive(None).await.unwrap();
+    reader.receive(None).await.unwrap();
+    let log = ordered.log.lock().unwrap().clone();
+    assert_eq!(log.len(), 3, "{log:?}");
+    assert!(log.windows(2).all(|pair| pair[0].1 < pair[1].1), "{log:?}");
+}
+
+#[tokio::test]
+async fn test_deny_list_change_of_the_apps_own_is_handed_once() {
+    // An app that changes the deny list and reads it: its own change comes back by the
+    // feed, and goes to its protocol once.
+    let w = World::new();
+    let protocol = Arc::new(SampleProtocol::default());
+    let mut both = join_with(
+        &w,
+        "both",
+        &[Permission::ListsRead, Permission::ListsManage],
+        Arc::new(MemoryStore::new()),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+    )
+    .await;
+    both.deny(&[5; 32]).await.unwrap();
+    both.receive(None).await.unwrap();
+    both.undeny(&[5; 32]).await.unwrap();
+    both.receive(None).await.unwrap();
+    both.receive(None).await.unwrap();
+    assert_eq!(denies(&protocol), vec![([5; 32], true), ([5; 32], false)]);
+}
+
+#[tokio::test]
+async fn test_deny_list_change_owed_at_a_restore_in_place_is_handed_once_in_order() {
+    // A restore in place keeps the calls the protocol still owes, and reads the feed again
+    // from the backup's cursor: each change still goes once, in feed order.
+    let w = World::new();
+    let mut manager = join_holding(&w, "manager", &[Permission::ListsManage]).await;
+    let store = Arc::new(MemoryStore::new());
+    let protocol = Arc::new(SampleProtocol::default());
+    let mut reader = join_with(
+        &w,
+        "reader",
+        &[Permission::ListsRead],
+        Arc::clone(&store),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+    )
+    .await;
+    reader.receive(None).await.unwrap();
+    let backup = reader.backup().await.unwrap();
+    let (x, a) = ([1; 32], [2; 32]);
+    manager.deny(&x).await.unwrap();
+    reader.receive(None).await.unwrap();
+    manager.deny(&a).await.unwrap();
+    *protocol.failing_deny.lock().unwrap() = 1;
+    reader.receive(None).await.unwrap();
+    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
+    drop(reader);
+    protocol.denies.lock().unwrap().clear();
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    restored.receive(None).await.unwrap();
+    restored.receive(None).await.unwrap();
+    assert_eq!(denies(&protocol), vec![(x, true), (a, true)]);
+}
+
+#[tokio::test]
+async fn test_deny_list_changes_dropped_behind_a_checkpoint_tell_the_restored_protocol() {
+    // A backup older than the retained history: the changes behind the checkpoint can't
+    // come from the feed, so the restored protocol is told the gap, with the list now
+    // (Switch spec 12.4 "Older than the retained history").
+    let w = World::new();
+    w.switch.set_retention(Some(crate::testing::Retention {
+        checkpoint_behind: 3,
+        ..crate::testing::Retention::default()
+    }));
+    let mut wallet = join_with(
+        &w,
+        "wallet",
+        &[Permission::ListsRead, Permission::ListsManage],
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+    )
+    .await;
+    wallet.receive(None).await.unwrap();
+    let backup = wallet.backup().await.unwrap();
+    for i in 1..=5u8 {
+        wallet.deny(&[i; 32]).await.unwrap();
+    }
+    w.note(wallet.app_id(), "past");
+    wallet.receive(None).await.unwrap();
+    wallet.deny(&[0xee; 32]).await.unwrap();
+    wallet.deny(&[0xef; 32]).await.unwrap();
+    assert!(w.switch.retained().1 > 0, "nothing dropped");
+    drop(wallet);
+    let restored_protocol = Arc::new(SampleProtocol::default());
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        Arc::clone(&restored_protocol) as Arc<dyn Protocol>,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        events.extend(restored.receive(None).await.unwrap().events);
+    }
+    assert!(restored.reconcile_mode());
+    // The protocol is told the gap, with the deny list as it stands now, before any
+    // change after it.
+    let gaps = restored_protocol.deny_gaps.lock().unwrap().clone();
+    assert_eq!(gaps.len(), 1, "gaps {gaps:?}, events {events:?}");
+    assert!(gaps[0].denied.contains(&[1; 32]), "{gaps:?}");
+    assert!(gaps[0].denied.contains(&[0xef; 32]), "{gaps:?}");
+    assert_eq!(gaps[0].generation, backup.cursor.generation);
 }

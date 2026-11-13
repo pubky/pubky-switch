@@ -938,6 +938,11 @@ impl App {
                 });
             }
             let mut tx = self.tx()?;
+            // The deny list's history has the same gap (Switch spec 8.3).
+            if let Some((verified_seq, _)) = checked.gap {
+                self.note_deny_gap(self.state.cursor.generation, verified_seq, &mut tx)
+                    .await?;
+            }
             if let Some(chain) = self.state.chain.as_mut() {
                 chain.write(&mut tx)?;
             }

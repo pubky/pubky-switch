@@ -498,6 +498,9 @@ impl App {
             None,
         )?;
         let time_ms = self.state.cursor.time_ms;
+        // The lists come back at the next service by the uploads, not as list changes: the
+        // deny list's history has a gap after the lost sequence's position (Switch spec 12.6).
+        let lost_at = (self.state.cursor.generation, self.state.cursor.seq);
         self.state.cursor = Cursor {
             generation,
             seq: 0,
@@ -540,6 +543,7 @@ impl App {
         // then, the old service's being all the app knows.
         tx.delete(super::admission::LISTS_AT)?;
         tx.delete(super::admission::LISTS_TOO_LARGE)?;
+        self.note_deny_gap(lost_at.0, lost_at.1, &mut tx).await?;
         // The lost service's divergent uploads aren't the new one's.
         tx.delete_prefix(super::uploaded::DIVERGENT_PREFIX)?;
         // Entries stored locally stay as they are: their local IDs, not the `seq`s they

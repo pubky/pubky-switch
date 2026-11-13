@@ -440,6 +440,38 @@ impl App {
         for code in list.invite_codes.iter().filter(|c| c.written_by == me) {
             tx.put(&code_key(&code.code_hash), &())?;
         }
+        // A gap in the deny list's history is told with this copy, in its commit, before
+        // anything later is handed (Switch spec 8.3). A protocol that fails leaves the copy
+        // as it was, still owed, and the read hands nothing meanwhile.
+        if self.state.cert.has_permission(Permission::ListsRead)
+            && let Some((generation, seq)) = self
+                .reader()
+                .get::<(u64, u64)>(super::feed::DENY_GAP)
+                .await?
+        {
+            let gap = super::protocol::DenyListGap {
+                generation,
+                seq,
+                denied: list.deny.clone(),
+            };
+            match self.protocol.deny_list_gap(&gap) {
+                Ok(writes)
+                    if super::protocol::local_writes_bytes(&writes)
+                        > super::protocol::MAX_STEP_LOCAL_BYTES =>
+                {
+                    self.keep_duty(
+                        &mut tx,
+                        super::events::Duty::LocalWritesRefused {
+                            call: super::events::KeptRefusal::DenyGap { generation, seq },
+                        },
+                    )?;
+                }
+                Ok(writes) => tx.local(&writes)?,
+                Err(failure) => return Err(AppError::Protocol(failure)),
+            }
+            tx.delete(super::feed::DENY_GAP)?;
+            tx.put(super::feed::DENY_GAP_TOLD, &(generation, seq))?;
+        }
         self.commit(tx).await
     }
 

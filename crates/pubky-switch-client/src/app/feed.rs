@@ -115,6 +115,11 @@ struct FeedAt {
 }
 
 const FEED_AT: &str = "feed_at";
+/// `dgap`: a gap in the deny list's history the protocol isn't told of yet, the position it
+/// is complete through ([`App::note_deny_gap`]).
+pub(crate) const DENY_GAP: &str = "dgap";
+/// `dgapt`: the last such gap told, so a gap shown again at every page isn't owed again.
+pub(crate) const DENY_GAP_TOLD: &str = "dgapt";
 
 /// What one read did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -344,8 +349,8 @@ struct Read {
     /// A `missed` item owed a listing of the collections: no later item of the read is
     /// processed before it (Switch wire 7.4.4).
     list_first: bool,
-    /// A deny list change is owed, kept or in this read: later ones are owed behind it, so
-    /// the protocol gets them in feed order. Set from the store when the read starts.
+    /// A deny list change of this page the protocol didn't take: owed, and the page stops
+    /// after it, so nothing later is handed before it (Switch spec 8.3).
     deny_owed: bool,
 }
 
@@ -668,6 +673,24 @@ impl App {
         // The entries waiting for a key that are due when the retries begin; those a fetch
         // later in the read brings the key of are tried again at its end.
         let mut due_at_start = Vec::new();
+        // The owed calls first, in feed order: a deny list change or gap the protocol must
+        // take before anything later stops the read while it fails, nothing handed (Switch
+        // spec 8.3).
+        let deny_held = !waits_for_key && !unfinished && {
+            self.retry_owed().await?;
+            self.deny_held().await?
+        };
+        if deny_held {
+            self.deny_held_reads = self.deny_held_reads.saturating_add(1);
+            if self.deny_held_reads >= RETRY_EVENT_READS {
+                self.events.push(AppEvent::DenyListHeld {
+                    reads: self.deny_held_reads,
+                });
+            }
+            report.stopped = true;
+        } else {
+            self.deny_held_reads = 0;
+        }
         if waits_for_key {
             // Receiving waits for the key, and the read says so. The feed item that would
             // answer the full-bundle request isn't read meanwhile, so the request is made
@@ -675,14 +698,13 @@ impl App {
             // The read's upkeep below goes on.
             self.ask_again_while_a_listing_waits().await?;
             self.events.push(AppEvent::ListingWaitsForKey);
-        } else if !unfinished {
-            // The stored entries' retries, the owed calls, and the feed to its end.
+        } else if !unfinished && !deny_held {
+            // The stored entries' retries and the feed to its end.
             // None while a reopening is owed: the retries here skip them then.
             if !self.reader().exists(super::records::REOPEN_DUE).await? {
                 due_at_start = self.awaiting_due();
             }
             self.retry_parked(Some(budget)).await?;
-            self.retry_owed().await?;
             let mut wait = wait.map(|seconds| self.long_poll_seconds(seconds).0);
             // The read position moves on page by page, past a held entry, while the cursor
             // stays before it (Switch spec 8.2); the held `seq` carries over to later pages.
@@ -893,6 +915,7 @@ impl App {
         if restore_at_read == Some(super::state::RestorePending::Read) {
             chain.restore = None;
         }
+        let history_gap = checked.gap.map(|(verified_seq, _)| verified_seq);
         if let Some((verified_seq, checkpoint_seq)) = checked.gap {
             self.events.push(AppEvent::ContinuityUnverified {
                 verified_seq,
@@ -909,9 +932,19 @@ impl App {
         // item, and blocks the cursor there if it is still held; later pages of the read
         // carry the block on.
         let mut read = Read::new(self.tx()?, *blocked, self.protocol.opaque_members());
-        read.deny_owed = self.deny_owed().await?;
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
+        }
+        // Items behind a checkpoint never come: the deny list's history has a gap, which
+        // the protocol is told, with the list read after it, before anything of the page
+        // (Switch spec 8.3, 12.4).
+        if let Some(verified_seq) = history_gap
+            && self
+                .note_deny_gap(self.state.cursor.generation, verified_seq, &mut read.tx)
+                .await?
+        {
+            self.end_page(read).await?;
+            return Ok(None);
         }
         if let Some(freeze) = &page.freeze {
             // Nothing on a frozen service's page is processed: its items come again from
@@ -1018,6 +1051,12 @@ impl App {
             processed = Some(seq);
             if self.state.alarm.is_some() {
                 stopped = Some(seq);
+                break;
+            }
+            // A deny list change the protocol didn't take: passed and owed, and nothing after
+            // it is handed until the protocol takes it (Switch spec 8.3).
+            if read.deny_owed {
+                stopped = Some(seq.saturating_add(1));
                 break;
             }
             // Switch wire 7.4.4: the listing a `missed` item owes comes before any later
@@ -2707,10 +2746,10 @@ impl App {
         change: &DenyListChange,
         read: &mut Read,
     ) -> Result<(), AppError> {
-        let call = OwedCall::from(change);
-        if read.deny_owed {
-            return self.owe(change.seq, call, read);
+        if !self.state.cert.has_permission(Permission::ListsRead) {
+            return Ok(());
         }
+        let call = OwedCall::from(change);
         match self.protocol.deny_list_changed(change) {
             Ok(writes) if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES => {
                 self.local_writes_refused(change.seq, call, read)
@@ -2718,19 +2757,93 @@ impl App {
             Ok(writes) => read.tx.local(&writes),
             Err(_) => {
                 read.deny_owed = true;
+                self.deny_owed_known = Some(true);
+                // This read stops at it: the first of the reads held there.
+                self.deny_held_reads = 1;
                 self.owe(change.seq, call, read)
             }
         }
     }
 
-    /// Whether a deny list change is owed.
-    async fn deny_owed(&self) -> Result<bool, AppError> {
-        Ok(self
-            .reader()
-            .scan::<OwedCall>(key::OWED_PREFIX)
-            .await?
-            .iter()
-            .any(|(_, call)| call.is_deny()))
+    /// Whether a deny list change or gap the protocol must take first is still owed, for
+    /// an app holding `lists.read`.
+    async fn deny_held(&mut self) -> Result<bool, AppError> {
+        if !self.state.cert.has_permission(Permission::ListsRead) {
+            return Ok(false);
+        }
+        let owed = match self.deny_owed_known {
+            Some(owed) => owed,
+            None => {
+                let owed = self
+                    .reader()
+                    .scan::<OwedCall>(key::OWED_PREFIX)
+                    .await?
+                    .iter()
+                    .any(|(_, call)| call.is_deny());
+                self.deny_owed_known = Some(owed);
+                owed
+            }
+        };
+        Ok(owed || self.reader().exists(DENY_GAP).await?)
+    }
+
+    /// Note a gap in the deny list's history after `generation` and `seq`, in `tx`, for an
+    /// app holding `lists.read`: the copy of the lists is read again, and the protocol told
+    /// with it before anything later ([`Protocol::deny_list_gap`]). The earliest gap owed is
+    /// kept; one told already isn't noted again. Whether one was noted now.
+    pub(crate) async fn note_deny_gap(
+        &self,
+        generation: u64,
+        seq: u64,
+        tx: &mut Tx,
+    ) -> Result<bool, AppError> {
+        if !self.state.cert.has_permission(Permission::ListsRead) {
+            return Ok(false);
+        }
+        let reader = self.reader();
+        if reader.get::<(u64, u64)>(DENY_GAP_TOLD).await? == Some((generation, seq)) {
+            return Ok(false);
+        }
+        let at = match reader.get::<(u64, u64)>(DENY_GAP).await? {
+            Some(owed) => owed.min((generation, seq)),
+            None => (generation, seq),
+        };
+        tx.put(DENY_GAP, &at)?;
+        tx.delete(super::admission::LISTS_AT)?;
+        Ok(true)
+    }
+
+    /// Whether a deny list operation is the identity's own, signed by an app of the identity
+    /// whose certificate holds `lists.manage` (Switch wire 6.2, which gives the signer no
+    /// deny list operation): only then is it applied to the copy of the lists and handed to
+    /// the protocol. The body alone is the service's word. A writer whose certificate the app doesn't hold has the
+    /// own directory read once for it while the app runs, as for a record write's writer.
+    async fn deny_op_verified(
+        &mut self,
+        doc: &SignedDoc,
+        body: &pubky_switch_core::ops::OpBody,
+        tx: &Tx,
+    ) -> Result<bool, AppError> {
+        let identity = self.state.meta.identity;
+        if body.identity != identity {
+            return Ok(false);
+        }
+        let Some(writer) = body.app_id else {
+            return Ok(false);
+        };
+        let mut certs = self.writer_certs_held(&writer).await?;
+        certs.extend(self.pending_certs(tx, &writer));
+        if certs.is_empty() && !self.deny_writers_asked.contains(&writer) {
+            self.deny_writers_asked.push(writer);
+            if self.refresh_own_apps().await.is_ok() {
+                certs = self.writer_certs_held(&writer).await?;
+            }
+        }
+        Ok(certs.iter().any(|cert| {
+            cert.app_id() == writer
+                && cert.has_permission(Permission::ListsManage)
+                && SignedOp::verify(doc, &cert.signing_key(), &identity, Some(&writer)).is_ok()
+        }))
     }
 
     /// A call the protocol couldn't answer: kept in the commit that passes its item, and
@@ -2745,13 +2858,14 @@ impl App {
     /// own: one answered commits its writes and goes, in one commit; one that fails again
     /// stays for the next read, and the others are still made.
     ///
-    /// Deny list changes go in feed order, which their keys keep: the first that fails again
-    /// holds every later one back.
+    /// They go in feed order, which their keys keep: a deny list change that fails again
+    /// holds every later call back, of any kind, so nothing reaches the protocol before it
+    /// (Switch spec 8.3).
     async fn retry_owed(&mut self) -> Result<(), AppError> {
         let owed = self.reader().scan::<OwedCall>(key::OWED_PREFIX).await?;
         let mut deny_held = false;
         for (rest, call) in owed {
-            if deny_held && call.is_deny() {
+            if deny_held {
                 continue;
             }
             let answer = call.make(self.protocol.as_ref());
@@ -2780,6 +2894,7 @@ impl App {
             tx.delete(&format!("{}{rest}", key::OWED_PREFIX))?;
             self.commit(tx).await?;
         }
+        self.deny_owed_known = Some(deny_held);
         Ok(())
     }
 
@@ -2894,6 +3009,13 @@ impl App {
                     return Ok(Step::Pass);
                 };
                 let body = op.body();
+                let deny = matches!(
+                    body.kind,
+                    OpKind::DenyPut { .. } | OpKind::DenyDelete { .. }
+                );
+                if deny && !self.deny_op_verified(&item.item, body, &read.tx).await? {
+                    return Ok(Step::Pass);
+                }
                 self.note_list_op(body, &mut read.tx)?;
                 if let OpKind::DenyPut { pubky } | OpKind::DenyDelete { pubky } = &body.kind {
                     let change = DenyListChange {

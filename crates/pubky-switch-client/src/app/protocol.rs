@@ -547,10 +547,16 @@ pub struct MissedEntries {
 }
 
 /// A change to the identity's deny list, as the feed shows it to an app holding `lists.read`
-/// (Switch spec 8.3): a `deny.put` or a `deny.delete`, made by any of the identity's apps,
-/// this one included, or by the signer. The protocol gets each in feed order
-/// ([`Protocol::deny_list_changed`]), so one restored from a backup rebuilds who was denied
-/// since the backup's cursor.
+/// (Switch spec 8.3): a `deny.put` or a `deny.delete` whose signature the app verified, made
+/// by an app of the identity whose certificate holds `lists.manage`, this one included. One
+/// the app can't verify so, such as one whose writer's certificate it can't find, is neither
+/// handed nor applied to the app's copy of the lists, and names nobody. The protocol gets each in feed order ([`Protocol::deny_list_changed`]),
+/// so one restored from a backup rebuilds who was denied since the backup's cursor; where
+/// that history has a gap, it is told so instead ([`Protocol::deny_list_gap`]).
+///
+/// A genuine change the service shows again reads as a new one (Switch spec 13.5): a
+/// protocol takes a change as setting a state, `pubky` denied or not, rather than as a
+/// count.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DenyListChange {
@@ -564,6 +570,22 @@ pub struct DenyListChange {
     pub added: bool,
     /// The item's service time, in Unix milliseconds.
     pub at_ms: u64,
+}
+
+/// A gap in the deny list's history (Switch spec 8.3, 12.4, 12.6): changes after
+/// `generation` and `seq` may never reach the protocol, as after a restore from a backup
+/// older than the retained history, or after a provider loss. `denied` is the deny list as
+/// the service holds it now, read with `GET /allow` (Switch wire 7.4.11), so the protocol
+/// can start again from it, or hold what the gap covers ([`Protocol::deny_list_gap`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DenyListGap {
+    /// The generation of the last position the history is known complete through.
+    pub generation: u64,
+    /// That position's `seq`.
+    pub seq: u64,
+    /// The deny list now.
+    pub denied: Vec<[u8; 32]>,
 }
 
 /// A protocol on the Switch, as the app layer uses it. Object-safe; the app holds an
@@ -703,17 +725,43 @@ pub trait Protocol: Send + Sync {
 
     /// A change to the deny list the feed shows (Switch spec 8.3): the protocol keeps what
     /// it needs of it and returns the local writes that keep it, committed with the cursor
-    /// passing the item. The app makes the calls in feed order. Nothing by default.
+    /// passing the item. Nothing by default.
+    ///
+    /// - **Who gets them:** an app holding `lists.read`, its own changes included, which
+    ///   come back by its feed. An app without it gets none.
+    /// - **Order:** feed order, across everything the app hands over. While a change is
+    ///   owed, the read hands nothing after it: no later item, owed call or entry stored
+    ///   locally. So an undeny is seen before the message after it.
+    /// - **Again:** a change may come twice, after a crash before its commit and after a
+    ///   restore, whose feed hands it again; its writes commit once. A protocol keys what it
+    ///   keeps by the change's place, or takes it as setting a state.
+    /// - **Before and after:** an entry held, accepted before a change, may come again at a
+    ///   later read, after the change.
     ///
     /// # Errors
     ///
-    /// As [`Protocol::resend_needed`], failure included. While a change is owed, the app owes
-    /// each later one behind it rather than call this, and makes them again oldest first,
-    /// stopping at the first that fails again, so the protocol never gets one before an
-    /// earlier one. Writes over [`MAX_STEP_LOCAL_BYTES`] aren't committed and the change isn't
-    /// made again, with [`super::AppEvent::LocalWritesRefused`].
+    /// As [`Protocol::resend_needed`]. A failed change is owed and made again at the start
+    /// of each later read, before anything else is handed; the read stops there while it
+    /// fails, and after [`RETRY_EVENT_READS`] such reads the app tells the host
+    /// ([`super::AppEvent::DenyListHeld`]). Writes over [`MAX_STEP_LOCAL_BYTES`] aren't
+    /// committed and the change isn't made again, with
+    /// [`super::AppEvent::LocalWritesRefused`].
     fn deny_list_changed(&self, change: &DenyListChange) -> Result<Vec<LocalWrite>, StoreFailure> {
         let _ = change;
+        Ok(Vec::new())
+    }
+
+    /// A gap in the deny list's history, with the list as it stands now ([`DenyListGap`]):
+    /// the protocol starts again from it, or fails closed for what the gap covers. Made
+    /// once the app has read the list after the gap, before any later change or item is
+    /// handed, its writes committed with that copy of the lists. Nothing by default.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreFailure`]: the copy isn't taken, and the call is made again at the next
+    /// read, which hands nothing else meanwhile, as for [`Protocol::deny_list_changed`].
+    fn deny_list_gap(&self, gap: &DenyListGap) -> Result<Vec<LocalWrite>, StoreFailure> {
+        let _ = gap;
         Ok(Vec::new())
     }
 

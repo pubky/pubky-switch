@@ -90,6 +90,8 @@ pub(crate) struct SampleProtocol {
     pub(crate) denies: Mutex<Vec<crate::app::DenyListChange>>,
     /// How many of the next deny list change calls fail.
     pub(crate) failing_deny: Mutex<u32>,
+    /// The deny list gaps handed over.
+    pub(crate) deny_gaps: Mutex<Vec<crate::app::DenyListGap>>,
 }
 
 impl SampleProtocol {
@@ -209,6 +211,14 @@ impl Protocol for SampleProtocol {
             key: format!("deny/{}", change.seq).into_bytes(),
             value: vec![u8::from(change.added)],
         }])
+    }
+
+    fn deny_list_gap(
+        &self,
+        gap: &crate::app::DenyListGap,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.deny_gaps.lock().unwrap().push(gap.clone());
+        Ok(Vec::new())
     }
 }
 
