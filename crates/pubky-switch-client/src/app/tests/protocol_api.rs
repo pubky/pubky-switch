@@ -1484,6 +1484,8 @@ async fn test_outbox_record_job_given_up_names_the_batch_it_left_kept() {
     p.clock
         .set_ms(accepted_at_ms + crate::app::SENT_RETENTION_MS);
     wallet.flush_outbox().await.unwrap();
+    // A flush sends no kept batch itself: the next read does, and past its window drops it.
+    wallet.receive(None).await.unwrap();
     let events = wallet.unacknowledged_events().await.unwrap();
     assert!(
         events.iter().any(|e| matches!(

@@ -8982,3 +8982,75 @@ async fn test_records_second_device_write_reopened_by_a_key_fetch_marks_its_valu
         report.events
     );
 }
+
+/// Two slow switches that keep failing, met first among those owed an app's removal: the
+/// healthy switch behind them gets it within one loop "flush while more" of the host.
+#[tokio::test]
+async fn test_send_two_slow_failing_peers_dont_starve_the_others() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.send(s.note("hello")).await.unwrap();
+    let bob = pubky_switch_core::enc::pubky_id(&s.w.bob.public());
+    let slow: Vec<_> = (0..300)
+        .map(|n| identity(&format!("peer{n}")))
+        .filter(|key| pubky_switch_core::enc::pubky_id(&key.public()) < bob)
+        .take(2)
+        .collect();
+    assert_eq!(slow.len(), 2);
+    let ns = crate::store::client_namespace(&app.app_id());
+    for (n, key) in slow.into_iter().enumerate() {
+        let origin = format!("https://slow{n}.example");
+        let pubky = key.public();
+        let published = PeerSwitch::new(
+            key,
+            &origin,
+            Arc::clone(&s.w.clock),
+            Arc::clone(&s.w.homeserver),
+        );
+        published
+            .add_app("shop", &AppSpec::new(&["scope-a"]), &["sample.note"], false)
+            .unwrap();
+        s.router.add(
+            &origin,
+            Arc::new(SlowDown {
+                clock: Arc::clone(&s.w.clock),
+                ms: 25_000,
+            }) as Arc<dyn Transport>,
+        );
+        let mut tx = crate::app::state::Tx::new(&ns);
+        crate::app::directory::put_peer(
+            &mut tx,
+            &pubky,
+            &crate::app::directory::PeerSwitch {
+                known_version: Some(1),
+                last_sent_ms: Some(s.w.clock.now_ms()),
+            },
+        )
+        .unwrap();
+        tx.commit(&StoreHandle::inline(
+            Arc::clone(&s.w.store) as Arc<dyn StateStore>
+        ))
+        .await
+        .unwrap();
+    }
+    let doc = s.w.next_doc(|body| {
+        body.removed.push(RemovedApp {
+            app_id: [9; 16],
+            distrust_from: START,
+        })
+    });
+    app.refresh_identity().await.unwrap();
+    let mut flushes = 0;
+    loop {
+        flushes += 1;
+        if !app.flush_outbox().await.unwrap().more {
+            break;
+        }
+        assert!(flushes < 10, "the loop settles");
+    }
+    let held = s.peer.lock().peers.get(&s.w.alice.public()).cloned();
+    assert!(
+        held.is_some_and(|held| held.version() == doc.version()),
+        "the healthy switch has the removal after {flushes} flushes"
+    );
+}
