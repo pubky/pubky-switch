@@ -121,6 +121,12 @@ fn opened(stored: &ParkedEntry) -> Option<Opened> {
     Some(Opened { plaintext, msg_id })
 }
 
+/// The `msg_id` of the message an entry stored locally holds; `None` for stored bytes that
+/// don't read as a message with one.
+pub(crate) fn stored_msg_id(stored: &ParkedEntry) -> Option<String> {
+    opened(stored).map(|opened| opened.msg_id)
+}
+
 fn summary(id: u64, stored: &ParkedEntry) -> ParkedSummary {
     let opened = opened(stored);
     ParkedSummary {

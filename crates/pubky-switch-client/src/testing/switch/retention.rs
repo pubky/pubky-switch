@@ -2,9 +2,12 @@
 //! entry goes once every current target that isn't lagging has passed it; an app whose
 //! unread entries pass its share of the inbox quota is marked lagging while another app
 //! reads; a lagging app is told what went unread in a `missed` item; and an entry left with
-//! no current target becomes an `unreadable` item.
+//! no current target becomes an `unreadable` item. A removed app is purged, as the service
+//! purges it (Switch wire 9.1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use pubky_switch_core::claims::Claim;
 
 use super::{Inner, Item};
 
@@ -72,6 +75,11 @@ impl Inner {
     /// Each app's unread entries, and of those the ones it is the only current target of
     /// (Switch wire 7.4.12 `unread_entries`, `sole_target_unread`).
     pub(super) fn unread_counts(&self, app: &[u8; 16]) -> (u64, u64) {
+        // A purged app has no cursor: none of the entries naming it counts as unread for it,
+        // as at the service.
+        if self.apps.get(app).is_some_and(|held| held.purged) {
+            return (0, 0);
+        }
         let current = self.current_app_ids();
         let cursor = self.cursor_of(app);
         let (mut unread, mut sole) = (0_u64, 0_u64);
@@ -125,15 +133,143 @@ impl Inner {
         let current = self.current_app_ids();
         self.convert_unreadable(&current);
         self.release_passed(&current, true);
+        self.forget_deleted_keys();
+    }
+
+    /// Forget the deleted keys nothing refers to (Switch spec 10.3, wire 9.1), as the
+    /// service does: the record's current write is its delete, written here, not taken
+    /// from a recovery upload; the cursor of every app the held `identity.json` lists that
+    /// isn't revoked or departed is at or past it, lagging or not, an app with no cursor
+    /// here holding every key; and no divergent upload names the key. With no document held,
+    /// nothing goes. The record goes, so its delete shows as its stub, its reads are `404`,
+    /// and a create at the key starts afresh.
+    fn forget_deleted_keys(&mut self) {
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let waited: Vec<u64> = doc
+            .body()
+            .apps
+            .iter()
+            .map(|listed| listed.app_id)
+            .filter(|app| {
+                !self.kept_app_ids.contains(app)
+                    && !self.apps.get(app).is_some_and(|held| held.departed)
+            })
+            .map(|app| self.cursor_of(&app))
+            .collect();
+        let shared = &mut self.shared;
+        let divergent = &shared.divergent;
+        shared.records.retain(|key, held| {
+            !held.state.deleted
+                || held.uploaded.is_some()
+                || divergent.contains_key(key)
+                || waited.iter().any(|cursor| *cursor < held.seq)
+        });
+    }
+
+    /// The sweep the service runs once a minute of service time (Switch wire 9.1), at the
+    /// first request a minute after the last: invite codes that expired or ran out go.
+    pub(super) fn minute_sweep(&mut self) {
+        let now = self.now();
+        let shared = &mut self.shared;
+        if shared
+            .swept_at
+            // A mark ahead of the clock, left before it stepped back, is due at once, as at
+            // the service.
+            .is_some_and(|at| at <= now && now < at.saturating_add(60_000))
+        {
+            return;
+        }
+        shared.swept_at = Some(now);
+        shared
+            .invites
+            .retain(|_, invite| invite.uses < invite.max_uses && now < invite.expires_at);
+    }
+
+    /// Purge the removed apps that may go, every one or only those of `among`, as the
+    /// service does at a delivery, a revocation and the batch or upload that resolves an
+    /// app's last open attempt (Switch wire 9.1): a revoked or departed app, or an App ID an
+    /// enrollment named, that the newest `identity.json` lists in neither `apps` nor
+    /// `removed`, whose departure's rotation is done, and that owns no attempt open or
+    /// `unknown`.
+    pub(super) fn purge_removed(&mut self, among: Option<&[[u8; 16]]>) {
+        let Some(doc) = &self.doc else {
+            return;
+        };
+        let removed = self
+            .apps
+            .iter()
+            .filter(|(_, held)| held.departed && !held.purged)
+            .map(|(id, _)| *id)
+            .chain(self.kept_app_ids.iter().copied());
+        let owners: BTreeSet<[u8; 16]> =
+            self.shared.claims.values().flat_map(open_owners).collect();
+        let gone: BTreeSet<[u8; 16]> = removed
+            .filter(|id| among.is_none_or(|among| among.contains(id)))
+            .filter(|id| doc.listed_cert(id).is_none() && !doc.lists_removed(id))
+            .filter(|id| {
+                self.apps
+                    .get(id)
+                    .is_none_or(|held| held.departed_at.is_none() || held.rotated)
+            })
+            .filter(|id| !owners.contains(id))
+            .collect();
+        for app in gone {
+            self.purge_app(&app);
+        }
+    }
+
+    /// Purge the removed apps whose last open or `unknown` attempt a request resolved,
+    /// `before` holding the claims as they were before it.
+    pub(crate) fn purge_released(&mut self, before: &BTreeMap<[u8; 32], Claim>) {
+        let still: BTreeSet<[u8; 16]> = self.shared.claims.values().flat_map(open_owners).collect();
+        let released: Vec<[u8; 16]> = before
+            .values()
+            .flat_map(open_owners)
+            .filter(|owner| !still.contains(owner))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if !released.is_empty() {
+            self.purge_removed(Some(&released));
+        }
+    }
+
+    /// What the switch holds of `app` goes, down to its App ID, its revocation or departure
+    /// time and rotation, and its kids (Switch wire 9.1, spec 3.6): its record and
+    /// certificates, receive keys, cursor, last-seen time, lagging mark, full-bundle
+    /// request, key bundle parts and listing. Its claims, records and the entries naming it
+    /// stay, and so do its kids, so none is registered again and an envelope wrapped to one
+    /// is told the app isn't current.
+    fn purge_app(&mut self, app: &[u8; 16]) {
+        if let Some(held) = self.apps.get_mut(app) {
+            held.record = None;
+            held.record_at = None;
+            held.cert = None;
+            held.renewed = None;
+            held.receive_key = None;
+            held.receive_n = None;
+            held.cursor = 0;
+            held.lagging = false;
+            held.full_requested = None;
+            held.full_completed = None;
+            held.last_seen = None;
+            held.purged = true;
+        }
+        self.bundles.remove(app);
+        self.listed_at_epoch.remove(app);
     }
 
     /// After the chain item of a delivery, a revocation or a leave, `was` holding the apps
     /// current before it: an app it no longer makes current stops holding entries, each
     /// entry left with no current target becomes an unreadable item, a departed app's mark
     /// ends, and when the set of current apps changed, and with it the shares, the marks
-    /// are judged again.
+    /// are judged again. An app no longer current loses its push registration (Switch wire
+    /// 8.1).
     pub(super) fn after_departure(&mut self, mut was: Vec<[u8; 16]>) {
         let mut current = self.current_app_ids();
+        self.push.retain(|app, _| current.contains(app));
         self.release_passed(&current, false);
         self.convert_unreadable(&current);
         let gone: Vec<[u8; 16]> = self
@@ -281,4 +417,13 @@ impl Inner {
             });
         }
     }
+}
+
+/// The owners of an attempt open or `unknown` on `claim` (Switch wire 6.8).
+fn open_owners(claim: &Claim) -> impl Iterator<Item = [u8; 16]> + '_ {
+    claim
+        .attempts
+        .iter()
+        .filter(|attempt| !claim.tombstone && attempt.outcome.unresolved())
+        .map(|attempt| attempt.owner)
 }

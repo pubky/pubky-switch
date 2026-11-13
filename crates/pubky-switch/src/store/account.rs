@@ -105,6 +105,7 @@ impl Committed {
 pub struct Savepoint {
     head: AccountHead,
     changed: bool,
+    owed: usize,
 }
 
 /// Why a commit gave no [`Committed`].
@@ -130,6 +131,8 @@ pub struct AccountTxn {
     flag_hits: Vec<[u8; 32]>,
     /// The flagged senders kept (`max_flags`), for the hits above.
     max_flags: u64,
+    /// The push keys this request owes deleting once it commits (`store::push`).
+    pub(super) owed: Vec<KeyId>,
     /// Chain items this request may have superseded, whose documents go before the commit
     /// if no app may read them any more (`documents.rs`).
     pub(super) superseded: std::collections::BTreeSet<u64>,
@@ -273,6 +276,7 @@ impl AccountTxn {
             last_seen: None,
             flag_hits: Vec::new(),
             max_flags: 0,
+            owed: Vec::new(),
             superseded: std::collections::BTreeSet::new(),
             documents_of_apps: std::collections::BTreeSet::new(),
             reader: None,
@@ -370,6 +374,7 @@ impl AccountTxn {
         Ok(Savepoint {
             head: self.head.clone(),
             changed: self.changed,
+            owed: self.owed.len(),
         })
     }
 
@@ -387,6 +392,7 @@ impl AccountTxn {
             ..savepoint.head
         };
         self.changed = savepoint.changed;
+        self.owed.truncate(savepoint.owed);
         Ok(())
     }
 
@@ -483,14 +489,25 @@ impl AccountTxn {
 
     /// Erase the account (Switch wire 7.4.16): delete its row, and with it every row of its
     /// state, which all reference it with `ON DELETE CASCADE`; owe the deletion of its service
-    /// key and of a pending key of the next generation, in `erased_keys`, stamped `erased_at`;
-    /// then commit. A request waiting on the account's changes wakes, and finds it gone. The
+    /// key, of a pending key of the next generation and of its apps' push keys (Switch wire
+    /// 8.1), in `erased_keys`, stamped `erased_at`; then commit. A request waiting on the account's changes wakes, and finds it gone. The
     /// keys go after the commit ([`Store::erased_keys`]): a key deleted first, by an erasure
     /// that then failed to commit, would leave an account no key can answer for.
     ///
     /// [`Store::erased_keys`]: super::Store::erased_keys
     pub async fn erase(mut self, erased_at: u64) -> Result<(), StoreError> {
         let pending_key = self.pending_key().await?;
+        // The push keys' deletion records no erasure: the service key's does (spec 6.5).
+        sqlx::query(
+            "INSERT INTO erased_keys (key_id, account_id, erased_at_ms, reason) \
+             SELECT push_key_id, account_id, $2, 'push' FROM push_registrations \
+             WHERE account_id = $1 ON CONFLICT (key_id) DO NOTHING",
+        )
+        .bind(&self.head.id)
+        .bind(to_db(erased_at, "erased_at_ms")?)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(StoreError::from_db)?;
         let deleted = sqlx::query("DELETE FROM accounts WHERE id = $1")
             .bind(&self.head.id)
             .execute(&mut *self.tx)

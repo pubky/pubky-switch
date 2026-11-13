@@ -1,6 +1,7 @@
 //! The app's public futures are `Send`, so a host can run them on a multi-threaded runtime.
 //! A future that holds a value that isn't `Send` across an await stops this file compiling.
 
+use pubky_switch_core::message::MessagePlaintext;
 use serde_json::Map;
 
 use super::*;
@@ -15,6 +16,7 @@ fn futures_are_send(
     protocol: Arc<dyn Protocol>,
     backup: &AppBackup,
     request: JoinRequest,
+    plaintext: &MessagePlaintext,
 ) {
     assert_send(&app.receive(None));
     assert_send(&app.check_for_move());
@@ -32,6 +34,7 @@ fn futures_are_send(
     assert_send(&app.flush_outbox());
     assert_send(&app.listing_owed());
     assert_send(&app.send(OutgoingMessage::new([0; 32], "sample.note", Map::new())));
+    assert_send(&app.queue_stored(plaintext));
     assert_send(&app.leave(LeaveMode::TwoStep));
     assert_send(&App::load(
         env.clone(),
@@ -50,5 +53,6 @@ fn futures_are_send(
 
 #[test]
 fn test_send_futures_of_the_app_are_send() {
-    let _ = futures_are_send as fn(&mut App, AppEnv, Arc<dyn Protocol>, &AppBackup, JoinRequest);
+    let _ = futures_are_send
+        as fn(&mut App, AppEnv, Arc<dyn Protocol>, &AppBackup, JoinRequest, &MessagePlaintext);
 }

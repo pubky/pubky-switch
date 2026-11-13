@@ -369,6 +369,11 @@ impl Service {
         txn.note_rotations(&removed, doc.data_epoch())
             .await
             .map_err(|e| store_error(&e))?;
+        // Then the removed apps it leaves in neither list, rotated and owning no open or
+        // `unknown` attempt, are purged down to their App IDs (Switch wire 9.1).
+        super::purge::purge_removed_apps(txn, Some(doc), None)
+            .await
+            .map_err(|e| store_error(&e))?;
         let head = self
             .head(txn, signer)
             .await

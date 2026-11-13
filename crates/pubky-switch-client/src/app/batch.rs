@@ -1110,8 +1110,13 @@ impl App {
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         tx.local(&pending.local)?;
+        // A message whose delivery the app gave up meanwhile, a copy `queue_stored` queued,
+        // isn't queued again: the protocol was told it wasn't delivered.
+        let now = self.now();
         for item in &pending.queued {
-            if !self.knows_message(item.msg_id()).await? {
+            if !self.knows_message(item.msg_id()).await?
+                && !super::send::given_up(&self.reader(), item.msg_id(), now).await?
+            {
                 super::send::put_outbox_item(tx, item)?;
             }
         }
@@ -1174,7 +1179,9 @@ impl App {
     /// A `record_version` condition on the version of record `key` the app holds, or the
     /// version the switch showed for it when the app refused that write: the next write
     /// builds on it (Switch wire 6.3, Switch spec 10.3). `{0, 0}` for a record the app holds
-    /// nothing of.
+    /// nothing of, and when that write, held or refused, is a delete: `{0, 0}` matches a
+    /// deleted record as an absent or forgotten one, so the condition holds once the service
+    /// forgets the key.
     ///
     /// # Errors
     ///
@@ -1183,7 +1190,7 @@ impl App {
         let version = self
             .held_record(key)
             .await?
-            .map_or(RecordVersion::NONE, |held| held.base_version());
+            .map_or(RecordVersion::NONE, |held| held.write_base());
         Ok(Condition::RecordVersion { key: *key, version })
     }
 

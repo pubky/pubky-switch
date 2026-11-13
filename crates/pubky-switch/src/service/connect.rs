@@ -19,8 +19,8 @@
 //!   `404` when none is pending. A contact, a conversation entry or a deny list entry for
 //!   the sender answers its request too (the store does it with the entry).
 //!
-//! Push for connect requests (`policy.connect_requests.push`) isn't sent yet: push isn't
-//! served (Switch wire 8).
+//! Push for connect requests (`policy.connect_requests.push`) isn't sent yet: push
+//! registrations are kept, but no webhook is sent (Switch wire 8).
 
 use pubky_switch_core::{
     enc::{pubky_id, pubky_key},

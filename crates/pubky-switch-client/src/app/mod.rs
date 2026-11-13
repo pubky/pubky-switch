@@ -70,7 +70,7 @@ mod send;
 mod tests;
 
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
-pub use error::{Alarm, AppError, KeptAhead, Refusal};
+pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
     AppEvent, BackupRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId, EventIdError,
     ParkReason, RefusedCall,
@@ -634,6 +634,10 @@ pub struct App {
     peer_rereads: HashMap<[u8; 32], u64>,
     /// How many reads ([`App::receive`]) this app began since it was loaded.
     reads_begun: u64,
+    /// How many times an owed reopening failed in the read under way ([`App::receive`]):
+    /// after [`records::REOPEN_TRIES_PER_READ`], it is left for the next read. In memory
+    /// only.
+    reopen_failures: u32,
     /// When the Homeserver copy of the app's record was last read to compare it with the
     /// newest record the switch accepted, device clock (`own_record.rs`). In memory only.
     published_checked_ms: Option<u64>,
@@ -715,6 +719,7 @@ fn uncertain_copy(
             reason: ParkReason::Uncertain,
             round: state.parked_round.number,
             released: false,
+            keys_at: None,
         },
     ))
 }
@@ -880,6 +885,7 @@ impl App {
                 read_done_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
+                reopen_failures: 0,
             };
             app.update_keys_through();
             app.events.clear();
@@ -1017,6 +1023,7 @@ impl App {
                 read_done_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
+                reopen_failures: 0,
             };
             // A store an earlier build wrote keeps the epoch read now.
             if !app.reader().exists(key::DUTY_EPOCH).await? {
@@ -1244,7 +1251,9 @@ impl App {
             }
             send::put_outbox_item(tx, &item)?;
         }
+        let now = self.now();
         for (msg_id, resend) in &backup.outbox_left_out {
+            send::note_given_up(tx, msg_id, now)?;
             self.keep_duty(
                 tx,
                 events::Duty::MessageUndelivered {
@@ -1745,6 +1754,7 @@ impl App {
                 read_done_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
+                reopen_failures: 0,
             };
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.

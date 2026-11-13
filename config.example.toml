@@ -127,3 +127,7 @@ connect_retry_ms = 30000               # keep trying to reach the database at st
 # database backups don't cover, and back it up on its own. Required to run the service.
 [keys]
 # path = "/var/lib/pubky-switch/keys"
+
+# Push (Switch wire 8). Registrations are kept; no webhook is sent to a relay yet.
+[push]
+enabled = false                        # off (the default while no push is sent): every PUT /push is 400

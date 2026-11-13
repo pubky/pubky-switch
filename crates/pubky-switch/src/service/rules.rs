@@ -355,6 +355,10 @@ mod tests {
             ErrorCode::Staged
         );
         assert!(staged_gate(&Call::Feed, false).is_ok());
+        assert_eq!(
+            staged_gate(&Call::PutPush, true).expect_err("staged").code,
+            ErrorCode::Staged
+        );
     }
 
     #[test]
@@ -375,6 +379,7 @@ mod tests {
             Call::GetApps,
             Call::Leave(String::new()),
             Call::Erase,
+            Call::PutPush,
         ] {
             assert_eq!(other_app_refusal(&call).code, ErrorCode::PermissionMissing);
         }

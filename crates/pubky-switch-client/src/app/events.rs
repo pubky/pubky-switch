@@ -305,11 +305,14 @@ pub enum AppEvent {
         conflicting: bool,
     },
     /// An entry stored because its sender's standing couldn't be checked
-    /// ([`ParkReason::Unverifiable`]) was dropped without being processed, past the bounds
-    /// Switch spec 8.2 sets ([`super::MAX_UNVERIFIED_AGE_MS`],
+    /// ([`ParkReason::Unverifiable`]), or because it waits for a scope key
+    /// ([`ParkReason::AwaitingKey`]), was dropped without being processed, past the bounds
+    /// Switch spec 8.2 sets for both together ([`super::MAX_UNVERIFIED_AGE_MS`],
     /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]). The protocol
     /// may ask the sender to send it again while the sender still keeps it (Switch spec
-    /// 11). A duty event, kept in the commit that deletes the entry.
+    /// 11). A duty event, kept in the commit that deletes the entry. Later versions may
+    /// add members: a pattern on it ends in `..`.
+    #[non_exhaustive]
     StoredEntryDropped {
         /// The duty event's ID.
         id: EventId,
@@ -326,6 +329,18 @@ pub enum AppEvent {
         accepted_at_ms: u64,
         /// Which bound it was past.
         reason: DropReason,
+        /// The data epoch whose scope key the entry waited for
+        /// ([`ParkReason::AwaitingKey`]); `None` for an entry whose sender couldn't be
+        /// checked.
+        awaited_epoch: Option<u64>,
+        /// The `msg_id` of the message given up: named only for an entry that waited for a
+        /// scope key, which passed the recipient checks before it was stored, so its sender
+        /// signed it, and only when nothing else may still apply the message: no other entry
+        /// stored locally holds it, no kept effect is its, and it isn't processed. A copy
+        /// dropped while another still waits names none; the last to go names it. `None` too
+        /// for an entry whose sender couldn't be checked, whose `msg_id` no check stands
+        /// behind.
+        msg_id: Option<String>,
     },
     /// An entry stored locally was processed.
     Unparked {
@@ -388,6 +403,26 @@ pub enum AppEvent {
     RestoreQuestion {
         /// The registrations' numbers.
         n: Vec<u64>,
+    },
+    /// Entries stored locally wait for scope keys the app doesn't hold yet
+    /// ([`ParkReason::AwaitingKey`], Switch spec 3.5, 8.2): the data epochs they wait for,
+    /// in order, and how many entries wait. Raised in the report of every read while any
+    /// waits; informational, since the entries are kept and each later read tells it again.
+    /// Each is processed once a key bundle brings its key, or dropped past the bounds
+    /// ([`AppEvent::StoredEntryDropped`]).
+    AwaitingKeys {
+        /// The data epochs waited for, each once, lowest first.
+        epochs: Vec<u64>,
+        /// How many entries wait.
+        entries: u64,
+    },
+    /// The records held `Unreadable` that a scope key taken opens couldn't be reopened now,
+    /// such as for a store that refused a commit (Switch spec 3.5): the reopening stays owed
+    /// and is made again at the next read, and the read went on. Informational: what is
+    /// owed is in the store, so the next read that fails again tells it again.
+    ReopeningOwed {
+        /// Why, without content.
+        error: String,
     },
     /// The app holds every scope key through this data epoch (Switch spec 3.5).
     KeysThrough {
@@ -646,13 +681,19 @@ pub enum AppEvent {
     /// make: it was deleted from the outbox at once. Also a message a restore didn't
     /// deliver again because its backup was older than [`super::SENT_RETENTION_MS`]: the
     /// device the backup came from may have delivered it since ([`super::App::backup`]).
-    /// A duty event.
+    /// Also a delivery with a replay deadline not made by it: one a restore put back, a copy
+    /// [`super::App::queue_stored`] queued, or a re-send of either (Switch spec 11). Once a
+    /// delivery is given up, `queue_stored` refuses the message
+    /// ([`super::WontDeliver::GivenUp`]), so a protocol hears of it once. A duty event.
     MessageUndelivered {
         /// The duty event's ID.
         id: EventId,
         /// The message ID.
         msg_id: String,
-        /// Whether it was a re-send of a message accepted before.
+        /// Whether this app had the message accepted before, and only a re-send of it was
+        /// given up. `false` says that this app's store never saw it accepted: a message a
+        /// restore put back, or one queued again with `queue_stored`, may still have been
+        /// delivered by the device the backup came from.
         resend: bool,
     },
     /// The shared record write a sent message named ([`super::RecordJob`]) was given up:
@@ -931,6 +972,10 @@ pub(crate) enum Duty {
         sender: [u8; 32],
         accepted_at_ms: u64,
         reason: DropReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        awaited_epoch: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg_id: Option<String>,
     },
     KeptBatchDropped {
         #[serde(with = "serde_b64")]
@@ -1058,6 +1103,8 @@ impl Duty {
                 sender,
                 accepted_at_ms,
                 reason,
+                awaited_epoch,
+                msg_id,
             } => AppEvent::StoredEntryDropped {
                 id,
                 stored_id,
@@ -1066,6 +1113,8 @@ impl Duty {
                 sender,
                 accepted_at_ms,
                 reason,
+                awaited_epoch,
+                msg_id,
             },
             Self::KeptBatchDropped { batch_id } => AppEvent::KeptBatchDropped { id, batch_id },
             Self::BatchRefused { batch_id, code } => AppEvent::BatchRefused { id, batch_id, code },
@@ -1126,8 +1175,9 @@ pub enum BackupRefusal {
     TooLarge,
 }
 
-/// Which of the bounds on entries stored as [`ParkReason::Unverifiable`] an entry was
-/// dropped past (Switch spec 8.2, [`AppEvent::StoredEntryDropped`]).
+/// Which of the bounds on entries stored as [`ParkReason::Unverifiable`] or
+/// [`ParkReason::AwaitingKey`], counted together, an entry was dropped past (Switch spec
+/// 8.2, [`AppEvent::StoredEntryDropped`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum DropReason {
@@ -1135,10 +1185,10 @@ pub enum DropReason {
     /// judged on the highest service time the app verified.
     Age,
     /// Its sender identity held more than [`super::MAX_UNVERIFIED_PER_SENDER`] such
-    /// entries, and it was that sender's accepted earliest.
+    /// entries, of both reasons, and it was that sender's accepted earliest.
     PerSender,
-    /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries were stored, and it was the
-    /// one accepted earliest of the sender identity that held the most.
+    /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries, of both reasons, were stored,
+    /// and it was the one accepted earliest of the sender identity that held the most.
     Total,
 }
 
@@ -1193,13 +1243,28 @@ pub enum ParkReason {
     /// A build earlier than schema 3 (`STATE.md`) refuses a store that holds this reason, or
     /// [`ParkReason::EffectTooLarge`], from the schema version alone, so neither is misread.
     Released,
+    /// Its receive step needs a scope key of `data_epoch` that the app doesn't hold yet
+    /// (Switch spec 3.5, 8.2): the step answered [`super::Outcome::AwaitKey`], or applied an
+    /// effect with a write the context couldn't seal for want of the current data epoch's
+    /// key, after the key bundle was fetched once. It is stored at once, with no bounded
+    /// wait and no [`AppEvent::StoreFailing`]. It is tried again once the app holds every
+    /// key of `data_epoch` its certificate is given and a key came since its step last ran,
+    /// and not before, so an entry whose key never comes, or one its certificate is never
+    /// given, costs a read no request and no step. It is bounded together with the entries
+    /// stored as [`ParkReason::Unverifiable`], and dropped past the bounds
+    /// ([`AppEvent::StoredEntryDropped`]).
+    AwaitingKey {
+        /// The data epoch whose key the step waits for.
+        data_epoch: u64,
+    },
 }
 
 impl ParkReason {
     /// Whether an entry stored for this reason is processed again by a later read: one
     /// whose sender couldn't be checked, whose write hit a quota, whose receive step the
-    /// store kept from finishing, or that the host released. The others stay stored until
-    /// the protocol or the host acts on them ([`super::App::forget_parked`]).
+    /// store kept from finishing, that waits for a scope key (once the key is held), or that
+    /// the host released. The others stay stored until the protocol or the host acts on
+    /// them ([`super::App::forget_parked`]).
     pub fn tried_again(self) -> bool {
         matches!(
             self,
@@ -1208,6 +1273,22 @@ impl ParkReason {
                 | Self::StoreUnavailable
                 | Self::StoreRejected
                 | Self::Released
+                | Self::AwaitingKey { .. }
         )
+    }
+
+    /// Whether entries stored for this reason count against the bounds of Switch spec 8.2
+    /// (`unverified.rs`): those whose sender couldn't be checked and those that wait for a
+    /// scope key, together.
+    pub(crate) fn bounded(self) -> bool {
+        matches!(self, Self::Unverifiable | Self::AwaitingKey { .. })
+    }
+
+    /// The data epoch an entry stored for this reason waits for, if it waits for a key.
+    pub(crate) fn awaited_epoch(self) -> Option<u64> {
+        match self {
+            Self::AwaitingKey { data_epoch } => Some(data_epoch),
+            _ => None,
+        }
     }
 }

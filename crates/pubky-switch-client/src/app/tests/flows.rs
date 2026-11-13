@@ -24,6 +24,7 @@ use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::Fault;
 
 const HOUR: u64 = 3_600_000;
+const MINUTE: u64 = 60_000;
 
 fn has(events: &[AppEvent], pred: impl Fn(&AppEvent) -> bool) -> bool {
     events.iter().any(pred)
@@ -732,6 +733,7 @@ async fn test_app_missed_call_the_protocol_fails_is_made_again() {
     assert_eq!(missed[0].seq, seq);
     assert_eq!(missed[0].entries, 3);
     assert_eq!(missed[0].accepted_from_ms, now - CLOCK_TOLERANCE_MS);
+    assert_eq!(missed[0].accepted_until_ms, now);
     assert_eq!(
         app.protocol_get(mark.as_bytes()).await.unwrap(),
         Some(b"1".to_vec())
@@ -739,6 +741,82 @@ async fn test_app_missed_call_the_protocol_fails_is_made_again() {
     // Once.
     app.receive(None).await.unwrap();
     assert_eq!(w.protocol.missed.lock().unwrap().len(), 1);
+}
+
+/// Switch wire 7.5: the protocol is given the item's last acceptance time as well as the
+/// first, raised to the time it asks from when it is earlier.
+#[tokio::test]
+async fn test_missed_entries_carry_the_items_last_acceptance_time() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.note(app.app_id(), "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    let after = w.switch.push_missed(3, now + 10 * MINUTE, now + HOUR);
+    let before = w.switch.push_missed(2, now - 10 * HOUR, now - 9 * HOUR);
+    app.receive(None).await.unwrap();
+    let missed = w.protocol.missed.lock().unwrap().clone();
+    let of = |seq: u64| missed.iter().find(|m| m.seq == seq).unwrap().clone();
+    let after = of(after);
+    assert_eq!(
+        (after.accepted_from_ms, after.accepted_until_ms),
+        (now + 10 * MINUTE, now + HOUR)
+    );
+    // Missed before the cursor's time: from that time less the tolerance, to that time.
+    let before = of(before);
+    assert_eq!(before.accepted_from_ms, now - CLOCK_TOLERANCE_MS);
+    assert_eq!(before.accepted_until_ms, before.accepted_from_ms);
+}
+
+/// An item whose last acceptance time doesn't parse asks for no re-send, as one whose first
+/// doesn't, and still owes the listing (Switch wire 7.4.4).
+#[tokio::test]
+async fn test_missed_entries_last_time_unparsable_asks_for_nothing() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.note(app.app_id(), "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    let seq = w.switch.push_missed_until_unparsable(3, now - HOUR);
+    let (behind, _) = w.note(app.app_id(), "behind it");
+    app.receive(None).await.unwrap();
+    assert!(w.protocol.missed.lock().unwrap().is_empty());
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+    assert!(app.cursor().seq >= behind && behind > seq);
+    // The listing it owes was made: none is owed any more, and the item behind was read.
+    assert!(!app.listing_owed().await.unwrap());
+}
+
+/// A missed-entries call kept owed in the form written before, without the item's last
+/// acceptance time, still reads and is made, with no end.
+#[tokio::test]
+async fn test_missed_entries_owed_call_of_the_earlier_form_is_made_without_an_end() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    let mut tx = app.tx().unwrap();
+    tx.put(
+        &crate::app::state::key::owed(1, 9),
+        &json!({ "Missed": { "seq": 9, "entries": 2, "accepted_from_ms": now } }),
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let mut app = w.load(me).await;
+    app.receive(None).await.unwrap();
+    let missed = w.protocol.missed.lock().unwrap().clone();
+    assert_eq!(missed.len(), 1);
+    assert_eq!(
+        (
+            missed[0].seq,
+            missed[0].accepted_from_ms,
+            missed[0].accepted_until_ms
+        ),
+        (9, now, u64::MAX)
+    );
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -4950,7 +5028,7 @@ async fn test_missed_local_writes_over_the_bound_are_refused_and_the_feed_goes_o
             AppEvent::LocalWritesRefused {
                 call: RefusedCall::Missed(missed),
                 ..
-            } if missed.seq == seq
+            } if missed.seq == seq && missed.accepted_until_ms == now
         )),
         "{:?}",
         report.events

@@ -43,6 +43,7 @@ const ACCOUNT_TABLES: &[(&str, &str)] = &[
     ("pending_revoked_apps", "account_id"),
     ("divergent_uploads", "account_id"),
     ("connect_requests", "account_id"),
+    ("push_registrations", "account_id"),
 ];
 
 fn alice_id() -> String {
@@ -944,6 +945,12 @@ struct Gate {
 impl KeyStore for Gate {
     fn generate(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceKey> {
         self.inner.generate()
+    }
+    fn generate_as<'a>(
+        &'a self,
+        id: &'a KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceKey> {
+        self.inner.generate_as(id)
     }
     fn public_key<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
         self.inner.public_key(id)
@@ -3001,6 +3008,12 @@ impl KeyStore for SignerPause {
     fn generate(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceKey> {
         self.inner.generate()
     }
+    fn generate_as<'a>(
+        &'a self,
+        id: &'a KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceKey> {
+        self.inner.generate_as(id)
+    }
     fn public_key<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
         self.inner.public_key(id)
     }
@@ -3137,6 +3150,12 @@ struct Recorder {
 impl KeyStore for Recorder {
     fn generate(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceKey> {
         self.inner.generate()
+    }
+    fn generate_as<'a>(
+        &'a self,
+        id: &'a KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceKey> {
+        self.inner.generate_as(id)
     }
     fn public_key<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
         self.inner.public_key(id)
@@ -3432,6 +3451,165 @@ async fn test_erase_lost_lock_failure_to_the_signer_while_a_key_is_owed_is_the_5
     );
     assert!(no_head(&answer));
     assert!(operator_signed(&answer, Some(&signature)));
+}
+
+/// `first`, then `second`, queued in that order behind a hold on alice's account row, and
+/// answered once the hold ends: so they run one after the other, as two requests that come
+/// at the same moment do.
+async fn queued(
+    replay: &Replay,
+    first: impl std::future::Future<Output = SwitchResponse>,
+    second: impl std::future::Future<Output = SwitchResponse>,
+) -> (SwitchResponse, SwitchResponse) {
+    let mut holder = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(alice_id())
+        .execute(&mut holder)
+        .await
+        .expect("lock");
+    let options = replay.db.options().clone();
+    let (first, (second, ())) = tokio::join!(first, async {
+        lock_waiters(&options, 1).await;
+        tokio::join!(second, async {
+            lock_waiters(&options, 2).await;
+            sqlx::query("COMMIT")
+                .execute(&mut holder)
+                .await
+                .expect("commit");
+        })
+    });
+    (first, second)
+}
+
+/// An invite code that expired at `at`, for the minute's sweep to drop, and the sweep due
+/// at the next request.
+async fn expired_invite(replay: &Replay, at: &str) {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("UPDATE accounts SET swept_at_ms = NULL WHERE id = $1")
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("due");
+    sqlx::query(
+        "INSERT INTO invite_codes (account_id, code_hash, max_uses, writer, expires_at_ms, \
+         context) VALUES ($1, decode(repeat('ab', 32), 'hex'), 1, \
+         decode(repeat('cd', 16), 'hex'), $2, 'null')",
+    )
+    .bind(alice_id())
+    .bind(i64::try_from(ms(at)).expect("ms"))
+    .execute(&mut conn)
+    .await
+    .expect("invite");
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn test_erase_and_a_sweep_at_the_same_moment_run_one_after_the_other() {
+    // A request that sweeps and the erasure, at the same moment, in either order: each
+    // takes the account's lock, so one runs after the other. A sweep before the erasure is
+    // answered, and the erasure then deletes everything; a sweep after it finds no account
+    // and gets the operator's answer (Switch wire 7.3 step 4, 7.4.16).
+    for sweep_first in [true, false] {
+        let Some(replay) = replay().await else { return };
+        replay_chain_through_revoke(&replay).await;
+        let at = revoke_time();
+        expired_invite(&replay, &at).await;
+        log_swept_invite_codes(&replay).await;
+        let apps = || {
+            replay.service.handle(signer_request(
+                "GET",
+                &format!("/v1/{}/apps", alice_id()),
+                Vec::new(),
+                ms(&at),
+            ))
+        };
+        let key = alice_service_key();
+        let (swept, erased) = if sweep_first {
+            queued(&replay, apps(), erase(&replay, &key, &at)).await
+        } else {
+            let (erased, swept) = queued(&replay, erase(&replay, &key, &at), apps()).await;
+            (swept, erased)
+        };
+        assert_eq!(
+            erased.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&erased.body)
+        );
+        if sweep_first {
+            assert_eq!(
+                swept.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&swept.body)
+            );
+        } else {
+            // The operator's answer: `404`, or `503` while the erased key is still being
+            // deleted (7.4.16); never one of the account's.
+            assert!(
+                matches!(swept.status, 404 | 503) && no_head(&swept),
+                "{}",
+                String::from_utf8_lossy(&swept.body)
+            );
+        }
+        assert!(
+            rows(&replay, &alice_id())
+                .await
+                .iter()
+                .all(|(_, count)| *count == 0),
+            "sweep first: {sweep_first}"
+        );
+        // A sweep ran before the erasure took the account: whichever request came first
+        // swept the expired code at its step 4.
+        assert_eq!(
+            swept_invite_codes(&replay).await,
+            1,
+            "sweep first: {sweep_first}"
+        );
+        replay.db.drop_database().await.expect("drop");
+    }
+}
+
+#[tokio::test]
+async fn test_erase_after_a_purge() {
+    // The wallet revoked and purged (Switch wire 9.1): the erasure deletes every row as
+    // before, the purged App ID's included.
+    let Some(replay) = replay().await else { return };
+    let (_, at) = purge_wallet(&replay).await;
+    let answer = erase(
+        &replay,
+        &alice_service_key(),
+        &pubky_switch_core::time::rfc3339(at),
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    for (table, count) in rows(&replay, &alice_id()).await {
+        assert_eq!(count, 0, "{table}");
+    }
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            at,
+        ))
+        .await;
+    assert_eq!(answer.status, 404);
+    replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]

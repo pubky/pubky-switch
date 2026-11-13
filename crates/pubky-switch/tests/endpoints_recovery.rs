@@ -2159,19 +2159,24 @@ async fn test_upload_contact_also_denied_is_denied() {
     replay.db.drop_database().await.expect("drop");
 }
 
-/// The executor, listed in alice's document, current again at generation 2 with its
-/// record: its keys.
-async fn executor_registers(replay: &Replay, at: u64) -> Value {
-    let keys = vectors("keys.json");
-    let executor = app(&keys, "executor").clone();
-    let record: SignedDoc = serde_json::from_value(
+/// The executor's app record from the vectors.
+fn executor_record() -> SignedDoc {
+    serde_json::from_value(
         named(
             &vectors("documents.json")["documents"],
             "executor app record",
         )["signed"]
             .clone(),
     )
-    .expect("record");
+    .expect("record")
+}
+
+/// The executor, listed in alice's document, current again at generation 2 with its
+/// record: its keys.
+async fn executor_registers(replay: &Replay, at: u64) -> Value {
+    let keys = vectors("keys.json");
+    let executor = app(&keys, "executor").clone();
+    let record = executor_record();
     let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(&executor["signing_secret_hex"]));
     let app_id: [u8; 16] = hex::decode(executor["app_id_bytes_hex"].as_str().expect("hex"))
         .expect("hex")
@@ -2618,6 +2623,124 @@ async fn test_upload_known_limit_a_proofless_unknown_applies_to_a_live_attempt()
     replay.db.drop_database().await.expect("drop");
 }
 
+/// The executor's claim entry `fields`, an operation of the lost generation 1 in the batch
+/// `[id; 16]`, uploaded with its certificate and no proof.
+fn executor_proofless(id: u8, fields: ClaimFields) -> Value {
+    let keys = vectors("keys.json");
+    let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(
+        &app(&keys, "executor")["signing_secret_hex"],
+    ));
+    let batch = pubky_switch_core::ops::sign_batch(
+        &secret,
+        &alice_key().public(),
+        Some(app_id_of("executor")),
+        1,
+        [id; 16],
+        vec![(Vec::new(), OpKind::Claim(fields))],
+    )
+    .expect("batch");
+    let cert =
+        pubky_switch_core::records::AppRecord::verify(&executor_record(), &alice_key().public())
+            .expect("record")
+            .cert()
+            .clone();
+    json!({ "op": batch[0].signed(), "cert": cert.signed() })
+}
+
+#[tokio::test]
+async fn test_purge_at_the_recovery_upload_that_resolves_the_apps_last_attempt() {
+    // The wallet's live attempt keeps it, revoked and in neither list, while the attempt is
+    // open and then `unknown`; the executor's upload of evidence that settles it purges the
+    // wallet, down to its App ID (Switch wire 9.1 "Sweeps", 7.4.14).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let executor = executor_registers(&replay, at).await;
+    let (fields, key) = live_attempt(&replay, at).await;
+    let wallet = wallet_app_id();
+    let keys = vectors("keys.json");
+    let revoke = format!(
+        "/v1/{}/apps/{}/revoke",
+        alice_id(),
+        app(&keys, "wallet")["app_id"].as_str().expect("id")
+    );
+    let revoked = replay
+        .service
+        .handle(signer_request("POST", &revoke, Vec::new(), at))
+        .await;
+    assert_eq!(
+        revoked.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&revoked.body)
+    );
+    let removing = deliver_next(&replay, held(&replay).await.signed(), at, |body| {
+        body.apps.retain(|listed| listed.app_id != wallet);
+        body.removed.push(pubky_switch_core::records::RemovedApp {
+            app_id: wallet,
+            distrust_from: at,
+        });
+        body.data_epoch += 1;
+    })
+    .await;
+    deliver_next(&replay, &removing, at, |body| {
+        body.removed.retain(|removed| removed.app_id != wallet);
+    })
+    .await;
+    // In neither list, but its attempt is open: it keeps everything.
+    assert_eq!(holdings(&replay, &wallet).await, [1, 1, 0, 1]);
+    // An upload that leaves the attempt unresolved, `unknown`, purges nothing.
+    let mut unknown = fields.clone();
+    unknown.kind = ClaimType::Unknown;
+    unknown.expected_step = 1;
+    unknown.orphan_after = None;
+    let body = json!({ "claims": [executor_proofless(93, unknown)] });
+    let answer = upload_as(&replay, &executor, &body, at).await;
+    assert_eq!(
+        json_of(&answer)["result"]["claims"],
+        json!([key]),
+        "{}",
+        json_of(&answer)
+    );
+    assert_eq!(holdings(&replay, &wallet).await, [1, 1, 0, 1]);
+    let kept = app_status(&replay, "wallet", at).await;
+    assert_eq!(kept["open_attempts"][0]["outcome"], "unknown", "{kept}");
+    assert!(!kept["record_cert"].is_null(), "{kept}");
+    // The upload of the evidence that settles it purges the wallet.
+    let mut done = fields;
+    done.kind = ClaimType::Done;
+    done.expected_step = 2;
+    done.orphan_after = None;
+    done.basis = Some(pubky_switch_core::claims::Basis::Evidence);
+    done.evidence_ref = Some(vec![5; 32]);
+    let body = json!({ "claims": [executor_proofless(94, done)] });
+    let answer = upload_as(&replay, &executor, &body, at).await;
+    assert_eq!(
+        json_of(&answer)["result"]["claims"],
+        json!([key]),
+        "{}",
+        json_of(&answer)
+    );
+    assert_eq!(holdings(&replay, &wallet).await, [0, 0, 0, 0]);
+    let purged = app_status(&replay, "wallet", at).await;
+    assert_eq!(
+        (
+            purged["record_cert"].clone(),
+            purged["open_attempts"].clone(),
+            purged["revoked_at"].clone(),
+        ),
+        (Value::Null, json!([]), json!(rfc3339(at)))
+    );
+    // Its App ID stays, and so does the claim it created.
+    assert_eq!(
+        (
+            rows_naming(&replay, "kept_app_ids", "app_id", &wallet).await,
+            rows_naming(&replay, "claims", "creator", &wallet).await,
+        ),
+        (1, 1)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
 #[tokio::test]
 async fn test_upload_bound_past_the_integer_range_is_unverified() {
     // A proofless operation built on (1, 2^53 - 1): its bound would be past what a record
@@ -2876,6 +2999,148 @@ async fn test_upload_from_a_revoked_app_is_refused_without_its_judgment() {
     replay.db.drop_database().await.expect("drop");
 }
 
+/// Wait until `n` backends of the test database wait for a lock.
+async fn lock_waiters(options: &sqlx::postgres::PgConnectOptions, n: i64) {
+    let mut watcher = sqlx::PgConnection::connect_with(options)
+        .await
+        .expect("conn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+             AND datname = current_database()",
+        )
+        .fetch_one(&mut watcher)
+        .await
+        .expect("count");
+        if count >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{count} waiting, not {n}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// `first`, then `second`, queued in that order behind a hold on alice's account row, and
+/// answered once the hold ends: so they run one after the other, as two requests that come
+/// at the same moment do.
+async fn queued(
+    replay: &Replay,
+    first: impl std::future::Future<Output = SwitchResponse>,
+    second: impl std::future::Future<Output = SwitchResponse>,
+) -> (SwitchResponse, SwitchResponse) {
+    let mut holder = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(alice_id())
+        .execute(&mut holder)
+        .await
+        .expect("lock");
+    let options = replay.db.options().clone();
+    let (first, (second, ())) = tokio::join!(first, async {
+        lock_waiters(&options, 1).await;
+        tokio::join!(second, async {
+            lock_waiters(&options, 2).await;
+            sqlx::query("COMMIT")
+                .execute(&mut holder)
+                .await
+                .expect("commit");
+        })
+    });
+    (first, second)
+}
+
+#[tokio::test]
+async fn test_recovery_in_place_and_a_sweep_at_the_same_moment_run_one_after_the_other() {
+    // A request that sweeps and a recovery in place, at the same moment, in either order:
+    // each takes the account's lock, so one runs after the other, and both are answered.
+    // The recovery starts the account afresh either way: a sweep before it dropped what it
+    // could from the old state, one after it sweeps the fresh state and takes nothing of
+    // it (Switch wire 7.3 step 4, 3.3).
+    for sweep_first in [true, false] {
+        let Some(replay) = replay().await else { return };
+        let (pending, at) = serving_with_a_pending_key(&replay).await;
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        sqlx::query(
+            "INSERT INTO invite_codes (account_id, code_hash, max_uses, writer, \
+             expires_at_ms, context) VALUES ($1, decode(repeat('ab', 32), 'hex'), 1, \
+             decode(repeat('cd', 16), 'hex'), $2, 'null')",
+        )
+        .bind(alice_id())
+        .bind(i64::try_from(at).expect("ms"))
+        .execute(&mut conn)
+        .await
+        .expect("invite");
+        // Due now: the minute's mark cleared, and each sweep's deletes logged.
+        sqlx::query("UPDATE accounts SET swept_at_ms = NULL WHERE id = $1")
+            .bind(alice_id())
+            .execute(&mut conn)
+            .await
+            .expect("due");
+        log_swept_invite_codes(&replay).await;
+        let before = held(&replay).await;
+        let recovery = next_generation(&before, pending, Some(1));
+        let apps = || {
+            replay.service.handle(signer_request(
+                "GET",
+                &format!("/v1/{}/apps", alice_id()),
+                Vec::new(),
+                at,
+            ))
+        };
+        let deliver = async { deliver(&replay, recovery, Some(before.hash()), at).await.0 };
+        let (swept, recovered) = if sweep_first {
+            queued(&replay, apps(), deliver).await
+        } else {
+            let (recovered, swept) = queued(&replay, deliver, apps()).await;
+            (swept, recovered)
+        };
+        assert_eq!(
+            recovered.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&recovered.body)
+        );
+        assert_eq!(
+            swept.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&swept.body)
+        );
+        assert_eq!(
+            chain(&replay).await,
+            [(2, 1, "service".into()), (2, 2, "identity".into())],
+            "sweep first: {sweep_first}"
+        );
+        assert_eq!(
+            scalar_i64(
+                &replay,
+                "SELECT count(*) FROM invite_codes WHERE account_id = $1"
+            )
+            .await,
+            0
+        );
+        // A sweep ran: whichever request came first swept the expired code at its step 4.
+        assert_eq!(
+            swept_invite_codes(&replay).await,
+            1,
+            "sweep first: {sweep_first}"
+        );
+        conn.close().await.expect("close");
+        replay.db.drop_database().await.expect("drop");
+    }
+}
+
 #[tokio::test]
 async fn test_admission_staged_holds_back_connect_requests_whatever_the_policy() {
     // The recovery document takes no connect requests: while admission is staged a
@@ -2915,6 +3180,65 @@ async fn test_admission_staged_holds_back_connect_requests_whatever_the_policy()
     assert_eq!(
         code(&replay.service.handle(ask()).await),
         (403, "not_admitted".into())
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_in_place_after_a_purge() {
+    // The wallet revoked and purged (Switch wire 9.1): a provider loss in place keeps its
+    // App ID as before, so the recovery's document can't list it again, and `GET /apps`
+    // still shows it revoked.
+    let Some(replay) = replay().await else { return };
+    let (_, revoked_at) = purge_wallet(&replay).await;
+    let at = revoked_at + 60_000;
+    set_time(&replay.clock, &rfc3339(at));
+    let answer = enroll(&replay, enrollment(3, None), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let pending = answered_key(&answer);
+    let before = held(&replay).await;
+    let wallet = app_id_of("wallet");
+    let mut listing: IdentityBody = before.body().clone();
+    listing.version += 1;
+    listing.generation += 1;
+    listing.inbox.service_key = pending;
+    listing.recovery_from = Some(1);
+    listing.apps.push(pubky_switch_core::records::ListedApp {
+        app_id: wallet,
+        cert: [1; 32],
+    });
+    let listing = IdentityDoc::sign(&alice_key(), listing).expect("sign");
+    let (answer, _) = deliver(&replay, listing.signed().clone(), Some(before.hash()), at).await;
+    assert_eq!(code(&answer), (400, "bad_request".into()));
+    let recovery = next_generation(&before, pending, Some(1));
+    let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        rows_naming(&replay, "kept_app_ids", "app_id", &wallet).await,
+        1
+    );
+    let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
+    let apps = json_of(&replay.service.handle(request).await);
+    let status = apps["apps"]
+        .as_array()
+        .expect("apps")
+        .iter()
+        .find(|s| s["app_id"] == pubky_switch_core::enc::zbase32_encode(&wallet).as_str())
+        .expect("the wallet's kept App ID")
+        .clone();
+    assert_eq!(
+        (status["current"].clone(), status["revoked_at"].clone()),
+        (json!(false), json!(rfc3339(revoked_at)))
     );
     replay.db.drop_database().await.expect("drop");
 }

@@ -33,9 +33,11 @@ mod inbox;
 mod keying;
 mod ops;
 mod peers;
+mod push;
 mod records;
 mod recovery;
 mod snapshot;
+mod sweeps;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 
@@ -62,6 +64,7 @@ pub use ops::{
     StoredInvite, StoredListEntry, StoredRecord,
 };
 pub use peers::{HeldPeer, PeerFloor};
+pub use push::{OwedKey, PushRegistration};
 pub use recovery::{RECOVERY_KEEPS, Recovery, recovery_clears};
 pub use snapshot::SnapshotRead;
 
@@ -79,8 +82,9 @@ pub struct ErasedKey {
     pub account: String,
     /// When the account was erased, in its service time.
     pub erased_at_ms: u64,
-    /// The key was retired by a generation change at an account that lives on, not erased
-    /// with it: its deletion records no erasure (Switch wire 3.3).
+    /// The key wasn't erased with its account, so its deletion records no erasure: a service
+    /// key a generation change retired at an account that lives on (Switch wire 3.3), or a
+    /// push key (Switch wire 8.1).
     pub retired: bool,
 }
 
@@ -199,6 +203,9 @@ pub enum StoreError {
     /// The account's lock wasn't free within `lock_timeout_ms`.
     #[error("the account is busy")]
     LockTimeout,
+    /// A concurrent change took what the request relied on; a retry finds the new state.
+    #[error("raced: {0}")]
+    Raced(&'static str),
     /// A value doesn't fit what the database stores, or the reverse.
     #[error("value out of range: {0}")]
     OutOfRange(&'static str),
@@ -396,7 +403,7 @@ impl Store {
                         .map_err(|_| StoreError::Corrupt("erased_keys.key_id"))?,
                     account: row.try_get("account_id")?,
                     erased_at_ms: from_db(row.try_get("erased_at_ms")?, "erased_at_ms")?,
-                    retired: row.try_get::<String, _>("reason")? == "retired",
+                    retired: row.try_get::<String, _>("reason")? != "erasure",
                 })
             })
             .collect()
@@ -410,16 +417,6 @@ impl Store {
             .fetch_one(&self.pool)
             .await
             .map_err(StoreError::from_db)
-    }
-
-    /// The erasure owes nothing more of `key`: it is deleted, and the erasure recorded.
-    pub async fn forget_erased_key(&self, key: &crate::keys::KeyId) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM erased_keys WHERE key_id = $1")
-            .bind(key.as_str())
-            .execute(&self.pool)
-            .await
-            .map_err(StoreError::from_db)?;
-        Ok(())
     }
 
     /// Look account `id` up without taking its lock: its service key and the service time

@@ -116,7 +116,31 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   stub, and a test may still script a checkpoint and the stubs dropped by hand. Once the
   service retains too, the harness comparison is what shows the two agree;
   claims are deleted only when `GET /claims` finds them deletable; batch records are never
-  dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`.
+  dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`, which
+  answers it `409 conflict` as the service's sweep does.
+- **Purge of removed apps** (Switch wire 9.1), in `switch/retention.rs` `purge_removed`, by
+  the service's rule and at the service's requests: a revoked or departed app, or an App ID
+  an enrollment named, that the newest `identity.json` lists in neither `apps` nor
+  `removed`, whose departure's rotation is done and that owns no attempt open or `unknown`,
+  is purged at the delivery that leaves it out, at its revocation, and at the batch or
+  recovery upload that resolves the last such attempt it owned (and at the test call
+  `fail_attempt` that does). Its record, certificates, receive keys, cursor, last-seen
+  time, lagging mark, full-bundle request, key bundle parts and listing go; what stays for
+  good is its App ID, its revocation or departure time and rotation, and its kids (Switch
+  spec 3.6), so no app registers one of them again and an envelope wrapped to one gets
+  `409 stale_key` naming the app in `not_current`, as before the purge. `GET /apps` shows it
+  as the service does, with no unread entries.
+- **Forgotten deleted keys** (Switch spec 10.3, wire 9.1), as at the service: a record
+  whose current write is its delete, written here and not taken from a recovery upload,
+  goes once the cursor of every app the held `identity.json` lists, neither revoked nor
+  departed, is at or past it, lagging or not, an app with no cursor here holding every key;
+  a key a divergent upload names stays, and with no document held nothing goes. Its read
+  is then `404`, its delete shows as its stub and a create at it starts afresh; a
+  `record_version` condition of `{0, 0}` matches it, as it matches a held delete. Unlike
+  the service: it forgets only at a cursor move, so a revocation alone frees nothing until
+  the next one, not at the minute's sweep, and every such key at once, not 256 a minute;
+  its cursors are `seq`s with no generation; the frozen account's exception has nothing to
+  check (no freeze is served here either).
 - **Superseded documents** (Switch wire 7.5): unlike the service, which deletes a chain
   item's document and proof once no app may read it in full, the switch keeps every
   document and decides at each read which show (`Readers`). Every answer is the same, since
@@ -124,7 +148,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   switch's items could tell. The harness flow `records, superseded writes read late` reads
   replaced writes at both switches from cursors that stand before them.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
-  revocation"); a code planted for a faulty export never expires.
+  revocation"); a code planted for a faulty export never expires. Codes that expired or
+  ran out go at the first request a minute of the switch's clock after the last sweep,
+  or at once when the clock is behind that sweep's mark, as at the service; until then `invite_uses_left` still shows a spent code at 0. Unlike
+  the service, any request sweeps, a signer's or a caller's that doesn't verify included,
+  and none waits for trusted time, the switch's clock being trusted.
 - **Lists**: `flagged` is always empty.
 - **Connect requests** (Switch wire 7.4.7), in `switch/inbox.rs` `connect` and
   `switch/shared.rs`: as at the service (`crates/pubky-switch/src/service/connect.rs`), in its
@@ -139,9 +167,12 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   or the signer's `POST /connect` is `403 permission_missing`. A contact, a conversation
   entry or a deny list entry for the sender answers its request, the entry an invite code's
   first append writes and the entries a recovery upload's list merge writes included. Unlike the service: no `connect_per_min` or
-  `stranger_per_min` (no rates, above), and no flag hits. A sender the allowlist admits is
+  `stranger_per_min` (no rates, above), and no flag hits; and it reads `Switch-Cert` at
+  check 5, after the staged and policy checks, answering a bad one `400`, where the service
+  checks it before the account's lock (`400`, or `401` for a certificate that doesn't
+  verify), so a staged or policy-off answer can come first here. A sender the allowlist admits is
   answered `pending` with nothing kept, as at the service. Neither switch sends the push
-  `policy.connect_requests.push` asks for yet: push isn't served.
+  `policy.connect_requests.push` asks for yet: neither sends a webhook.
 - **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
   by a write here, as at the service (Recovery uploads, below). `make_divergent`, public,
   sets it for one record the switch holds, without a loss or an upload (a key it holds no
@@ -216,12 +247,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `app.put` or doesn't parse, gets `403 not_current`
   at authentication, before the account's lock and before a staged or frozen account's
   answer (Switch wire 7.3 steps 5 to 8), whatever the route: no `Switch-Head`,
-  `Switch-Server-Time` the last time stamped, and the app not seen. A departed app that
-  delivered its record keeps it, so it goes on to the route's checks, as at the service,
-  until the test call `purge` frees it, as a service does once the signer purges the app
-  from `removed`, keeping only its App ID (Switch wire 9.1): then it meets the first call's
-  refusal, without the head. A known gap of the reference service: it doesn't free a
-  purged app's record yet, so it still answers that app with the head.
+  `Switch-Server-Time` the last time stamped, and the app not seen. A revoked or departed
+  app that delivered its record keeps it, so it goes on to the route's checks, as at the
+  service, until it is purged (Purge of removed apps, above): then it meets the first
+  call's refusal, without the head, as at the service.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
   delivered its record: current, with an unexpired certificate, the stored renewed one once
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
@@ -307,7 +336,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     `not_current`) before recording anything, and it counts any scripted error other than a
     `401`;
   - `revoked_at`, `departed_at`, and `awaiting_rotation` for a departure until a delivered
-    version removes it at a higher data epoch. That stays done after a purge;
+    version removes it at a higher data epoch. That stays done after a purge, which keeps
+    these three and clears the rest, as at the service (Purge of removed apps, above);
   - `open_attempts`: the attempts the app owns that are open or `unknown`;
   - `record_cert`, `record_at`, `full_bundle_requested`, `bundle_ranges` and
     `cert_expires_at`;
@@ -332,7 +362,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `revoke`; an app that left is answered as one revoked already, with no proof. `leave` is a
   test call and also a route, `POST /apps/{app_id}/leave`, which checks only that the app
   hasn't departed: it takes any body, departs an app with no record or one whose certificate
-  has expired or isn't listed, keeps the app's invite codes and push registration, and
+  has expired or isn't listed, keeps the app's invite codes, drops its push registration, and
   stamps the test clock's time. The service refuses another app's path and the
   signer with `403 permission_missing`, where this switch answers `404` (Switch wire
   7.4.12). `request_full_bundle` is a test call for the app's own
@@ -376,7 +406,17 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   erasure. The service can owe the erased account's key when its key store fails, and until
   the key is gone it answers a request signed with the identity key, whatever its timestamp,
   with the operator's `503` in place of that `404`; every other caller gets the `404` at once.
-- **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
+- **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay, as at the
+  service, which sends no webhook yet either. The same as the service: the body goes through
+  the core's checks (`parse_push_body`, `400`), the signer is `403 permission_missing`, an
+  app that isn't current `403 not_current`, a staged account `503 staged`, 8.1's start and handle cases and their `409 conflict`s, one registration per
+  app, and the registration dropped when its app stops being current (a revocation, a
+  departure, a delivery that no longer lists it) and with the generation at a recovery. What
+  differs: the relay's host isn't resolved, so a name that resolves to a private address is
+  taken; push keys come from a counter and the service key (`mint`), not the key store, and
+  no secret key is held apart from the registration, so nothing is owed deleting and no
+  sweep runs; it always takes registrations (no `push.enabled`); and a frozen account answers
+  `410 moved`, which the service, holding no freezes yet, never does.
 
 ## Signer flows: what runs against the service too
 
