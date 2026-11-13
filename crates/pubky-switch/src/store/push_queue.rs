@@ -199,11 +199,15 @@ impl Store {
         .rows_affected())
     }
 
-    /// Claim at most `limit` due deliveries, oldest first, each leased for
-    /// [`PUSH_LEASE_MS`] with its attempt counted: within its minute, under 3 attempts, not
-    /// claimed by another instance, and with at most [`PUSH_PER_ACCOUNT`] of its account's
-    /// rows in flight, those already leased by any instance included. Claims of every
-    /// instance take turns (the module's doc). The claim commits before anything is sent.
+    /// Claim at most `limit` due deliveries, each leased for [`PUSH_LEASE_MS`] with its
+    /// attempt counted: within its minute, under 3 attempts, not claimed by another instance,
+    /// and with at most [`PUSH_PER_ACCOUNT`] of its account's rows in flight, those already
+    /// leased by any instance included. The least loaded accounts go first: a row's place is
+    /// its account's rows in flight plus its rank among that account's due rows, then its due
+    /// time, so a free slot goes to an account with fewer webhooks in flight before an older
+    /// row of a busier one, and accounts whose relays never answer can't hold every slot
+    /// while another account's webhooks wait behind theirs. Claims of every instance take
+    /// turns (the module's doc). The claim commits before anything is sent.
     pub async fn claim_pushes(&self, limit: usize) -> Result<Vec<QueuedPush>, StoreError> {
         let mut tx = self.pool().begin().await.map_err(StoreError::from_db)?;
         // Statement 1: the claims' lock, in a READ COMMITTED transaction whatever the pool's
@@ -223,17 +227,18 @@ impl Store {
         let rows = sqlx::query(concat!(
             "UPDATE push_deliveries SET attempts = attempts + 1, next_attempt_ms = ",
             db_now_ms!(),
-            " + $2 WHERE id IN (SELECT id FROM push_deliveries WHERE id IN (\
-             SELECT due.id FROM (SELECT d.id, d.account_id, row_number() OVER \
+            " + $2 WHERE id IN (SELECT p.id FROM push_deliveries p JOIN (\
+             SELECT ranked.id, ranked.n + (SELECT count(*) FROM push_deliveries l \
+             WHERE l.account_id = ranked.account_id AND l.next_attempt_ms > ",
+            db_now_ms!(),
+            " + $4) AS place FROM (SELECT d.id, d.account_id, row_number() OVER \
              (PARTITION BY d.account_id ORDER BY d.next_attempt_ms, d.id) AS n \
              FROM push_deliveries d WHERE d.next_attempt_ms <= ",
             db_now_ms!(),
             " AND d.attempts < 3 AND d.entry_at_ms + $3 > ",
             db_now_ms!(),
-            ") due WHERE due.n + (SELECT count(*) FROM push_deliveries l \
-             WHERE l.account_id = due.account_id AND l.next_attempt_ms > ",
-            db_now_ms!(),
-            " + $4) <= $5) ORDER BY next_attempt_ms, id LIMIT $1 FOR UPDATE SKIP LOCKED) \
+            ") ranked) c ON c.id = p.id WHERE c.place <= $5 \
+             ORDER BY c.place, p.next_attempt_ms, p.id LIMIT $1 FOR UPDATE OF p SKIP LOCKED) \
              RETURNING id, account_id, app_id, push_key_id, handle, attempts"
         ))
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))

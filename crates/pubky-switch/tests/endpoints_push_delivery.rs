@@ -466,6 +466,38 @@ async fn other_account(setup: &Setup) -> String {
     other
 }
 
+/// A copy of alice's account at the switch, `id`, its wallet registered at alice's relay
+/// with a push key of its own and `H1`: its ID.
+async fn silent_account(setup: &Setup, id: &str) -> String {
+    let replay = &setup.replay;
+    let key = replay.keys.generate().await.expect("push key");
+    let mut conn = conn(replay).await;
+    sqlx::query(
+        "INSERT INTO accounts SELECT (jsonb_populate_record(NULL::accounts, \
+         to_jsonb(a) || jsonb_build_object('id', $2::text))).* FROM accounts a WHERE a.id = $1",
+    )
+    .bind(alice_id())
+    .bind(id)
+    .execute(&mut conn)
+    .await
+    .expect("account");
+    sqlx::query(
+        "INSERT INTO push_registrations (account_id, app_id, relay_url, push_key_id, \
+         push_public, handles, set_at_ms) SELECT $2, app_id, relay_url, $3, $4, ARRAY[$5], \
+         set_at_ms FROM push_registrations WHERE account_id = $1",
+    )
+    .bind(alice_id())
+    .bind(id)
+    .bind(key.id.as_str())
+    .bind(key.public.as_slice())
+    .bind(H1)
+    .execute(&mut conn)
+    .await
+    .expect("registration");
+    conn.close().await.expect("close");
+    id.to_string()
+}
+
 /// Wait, at most 10 s, until `check` holds.
 async fn until(what: &str, check: impl Fn() -> bool) {
     let started = std::time::Instant::now();
@@ -1280,6 +1312,45 @@ async fn test_push_delivery_slow_relay_of_one_account_holds_up_no_other() {
         assert!(
             queued_at.elapsed() < Duration::from_millis(2_500),
             "the other account's webhook waits for alice's"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    running.abort();
+    setup.replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_push_delivery_silent_relays_of_two_accounts_hold_up_no_third() {
+    // Two accounts whose relays never answer hold every slot of an instance between them,
+    // with more of their webhooks due. A third account's webhook, queued after theirs,
+    // takes the first slot that frees: a free slot goes to the least loaded account, not to
+    // the oldest row.
+    let Some((setup, _)) = registered(&[H1]).await else {
+        return;
+    };
+    let replay = &setup.replay;
+    setup.relay.set(Mode::Hang);
+    let second = silent_account(&setup, "second-account").await;
+    let other = other_account(&setup).await;
+    queue_rows(replay, &alice_id(), 40).await;
+    queue_rows(replay, &second, 40).await;
+    let service = Arc::new(setup.instance());
+    let running = tokio::spawn({
+        let service = service.clone();
+        async move { service.deliver_pushes().await }
+    });
+    until("every slot held by the silent relays", || {
+        setup.relay.seen().len() >= 16
+    })
+    .await;
+    let queued_at = std::time::Instant::now();
+    queue_rows(replay, &other, 1).await;
+    // The first slots free once the first hung attempts end, about 5 s after their claim;
+    // oldest first, the silent accounts' rows would take them, wave after wave.
+    while setup.fast.seen().is_empty() {
+        assert!(
+            queued_at.elapsed() < Duration::from_secs(8),
+            "the third account's webhook waits behind the silent ones"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
