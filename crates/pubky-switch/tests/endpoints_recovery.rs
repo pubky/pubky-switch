@@ -2918,3 +2918,144 @@ async fn test_admission_staged_holds_back_connect_requests_whatever_the_policy()
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_upload_after_the_lost_generation_deleted_a_superseded_document() {
+    // At generation 1 the record's update (seq 8) deleted its create's document (seq 6).
+    // After the loss of generation 1 the wallet uploads both writes, with the lost service's
+    // proofs, from what it holds: the service takes the record at (1, 8), as it would with
+    // the create's document kept, since an upload reads nothing the chain kept.
+    let Some(replay) = replay().await else { return };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), 6).await,
+        (false, false)
+    );
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), 8).await,
+        (true, true)
+    );
+    let before = held(&replay).await;
+    let recovery = next_generation(&before, pending, Some(1));
+    let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    let (status, body) = wallet_registers(&replay, 77, 2, 3, true, at).await;
+    assert_eq!(status, 200, "{body}");
+    let body = json!({
+        "lost_identity": before.signed(),
+        "records": [uploaded_op(6, Some(CREATED)), uploaded_op(8, Some(UPDATED))],
+    });
+    let answer = upload(&replay, &body, at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let (record, _) = record_and_claim_keys();
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    assert_eq!(
+        (view["generation"].clone(), view["version"].clone()),
+        (json!(1), json!(8))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_in_place_old_documents_check_runs_on_over_the_new_sequence() {
+    // The check of older documents half done when a recovery in place empties the chain:
+    // it runs on to its end over the new generation's seqs and deletes none of their
+    // documents, which are all current; requests succeed throughout.
+    let Some(replay) = replay().await else { return };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let id = alice_id();
+    sql_on(
+        &replay,
+        &id,
+        "UPDATE accounts SET documents_checked_seq = 0, documents_check_end = 200 \
+         WHERE id = $1",
+    )
+    .await;
+    let before = held(&replay).await;
+    let recovery = next_generation(&before, pending, Some(1));
+    let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    let (checked, end) = documents_check(&replay, &id).await;
+    assert!(checked < end, "{checked} of {end}");
+    let (status, body) = wallet_registers(&replay, 77, 2, 3, true, at).await;
+    assert_eq!(status, 200, "{body}");
+    let mut reads = 0;
+    while documents_check(&replay, &id).await.0 < end {
+        wallet_get(&replay, "feed?limit=500", at).await;
+        reads += 1;
+        assert!(reads < 10, "the check ends");
+    }
+    let items = chain(&replay).await;
+    assert!(items.iter().all(|(generation, ..)| *generation == 2));
+    for (_, seq, kind) in &items {
+        let kept = chain_document_kept(&replay, &id, u64::try_from(*seq).expect("seq")).await;
+        assert!(kept.0, "seq {seq} ({kind}) keeps its document");
+    }
+    let feed = wallet_get(&replay, "feed?limit=500", at).await;
+    for item in feed["items"].as_array().expect("items") {
+        assert_ne!(item["type"], json!("stub"), "{item}");
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_reopened_tombstone_shows_its_earlier_entries_as_stubs() {
+    // The wallet's attempt and its `done` compact the claim to a tombstone, which keeps no
+    // entries (Switch wire 7.4.8). An upload then adds an attempt of the lost generation and
+    // reopens it: the claim reads as the upload left it, at step 3 with no entry from before,
+    // and the feed shows the two earlier entries as their stubs (Switch wire 10.5).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let (fields, key) = live_attempt(&replay, at).await;
+    let attempt = scalar_i64(&replay, "SELECT last_seq FROM accounts WHERE id = $1").await;
+    let mut done = fields.clone();
+    done.kind = ClaimType::Done;
+    done.expected_step = 1;
+    done.orphan_after = None;
+    done.basis = Some(pubky_switch_core::claims::Basis::Owner);
+    let batch = wallet_batch(92, 2, vec![(Vec::new(), OpKind::Claim(done))]);
+    let written = wallet_ops(&replay, &batch, at).await;
+    assert_eq!(
+        written.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&written.body)
+    );
+    let settled = scalar_i64(&replay, "SELECT last_seq FROM accounts WHERE id = $1").await;
+    let rows = "SELECT count(*) FROM claim_entries WHERE account_id = $1";
+    assert_eq!(scalar_i64(&replay, rows).await, 0, "a tombstone keeps none");
+    let read = wallet_get(&replay, &format!("claims/{key}"), at).await;
+    assert_eq!(read["claim"]["tombstone"], json!(true), "{read}");
+    assert_eq!(read["entries"], json!([]), "{read}");
+    let mut uploaded = fields;
+    uploaded.attempt_id = vec![10; 16];
+    let lost_op = wallet_batch(93, 1, vec![(Vec::new(), OpKind::Claim(uploaded))]);
+    let answer = upload(&replay, &json!({ "claims": [proofless(&lost_op[0])] }), at).await;
+    assert_eq!(
+        json_of(&answer)["result"]["claims"],
+        json!([key]),
+        "{}",
+        json_of(&answer)
+    );
+    let read = wallet_get(&replay, &format!("claims/{key}"), at).await;
+    assert_eq!(read["claim"]["tombstone"], json!(false), "{read}");
+    assert_eq!(read["claim"]["step"], json!(3), "{read}");
+    assert_eq!(read["entries"], json!([]), "{read}");
+    let feed = wallet_get(&replay, "feed?limit=500", at).await;
+    for seq in [attempt, settled] {
+        let item = feed["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["seq"] == json!(seq))
+            .cloned()
+            .expect("the entry");
+        assert_eq!(item["type"], json!("stub"), "{item}");
+    }
+    replay.db.drop_database().await.expect("drop");
+}

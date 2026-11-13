@@ -292,7 +292,10 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(db)?;
-        // A new record or renewed certificate supersedes the earlier one's document.
+        // A new record or renewed certificate supersedes the earlier one's document. Noted
+        // at every app row write, a cursor move included: bounded, at one indexed lookup of
+        // the app's `app.put` and `cert.put` items and one read of the account's app rows
+        // before the commit.
         self.note_app_documents(app.app_id);
         self.note_change();
         Ok(())
@@ -660,10 +663,22 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(db)?;
-        // A tombstone's entries are compacted away (Switch wire 6.8): their documents go.
+        // A tombstone's entries are compacted away (Switch wire 6.8, 7.4.8 "A tombstone has
+        // no entries"): their documents go, and so do their rows, each entry's op and proof
+        // with it. No read of a tombstone needs them: `GET /claims` reads none for it, and
+        // the feed, `GET /apps`' proof generations and the documents' rule count only a live
+        // claim's. A recovery upload that reopens it rebuilds it from the upload, with no
+        // entries of its own from before.
         if claim.tombstone {
             let entries = self.entry_seqs(&[claim_key.to_vec()]).await?;
             self.note_superseded(entries);
+            let id = self.head().id.clone();
+            sqlx::query("DELETE FROM claim_entries WHERE account_id = $1 AND claim_key = $2")
+                .bind(id)
+                .bind(claim_key.as_slice())
+                .execute(self.conn())
+                .await
+                .map_err(db)?;
         }
         Ok(())
     }
@@ -841,7 +856,8 @@ impl AccountTxn {
         Ok(())
     }
 
-    /// Keep a claim entry with its proof.
+    /// Keep a claim entry with its proof, unless its claim is a tombstone, which keeps no
+    /// entries (Switch wire 7.4.8): the entry that compacts it, or one on it already.
     pub async fn add_claim_entry(
         &mut self,
         claim_key: &[u8; 32],
@@ -850,7 +866,8 @@ impl AccountTxn {
         let id = self.head().id.clone();
         sqlx::query(
             "INSERT INTO claim_entries (account_id, claim_key, step, seq, op, proof) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             SELECT $1, $2, $3, $4, $5, $6 WHERE NOT EXISTS (SELECT 1 FROM claims \
+             WHERE account_id = $1 AND claim_key = $2 AND tombstone)",
         )
         .bind(id)
         .bind(claim_key.as_slice())
