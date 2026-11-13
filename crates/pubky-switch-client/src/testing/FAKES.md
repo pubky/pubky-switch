@@ -141,7 +141,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   the service: it forgets only at a cursor move, so a revocation alone frees nothing until
   the next one, not at the minute's sweep, and every such key at once, not 256 a minute;
   its cursors are `seq`s with no generation; the frozen account's exception has nothing to
-  check (no freeze is served here either).
+  check (no freeze is served here either). The harness flows `records, a deleted key
+  forgotten` and `invite code, spent and expired codes swept` look a step after what frees
+  a key or spends a code, where both switches have swept.
 - **Superseded documents** (Switch wire 7.5): unlike the service, which deletes a chain
   item's document and proof once no app may read it in full, the switch keeps every
   document and decides at each read which show (`Readers`). Every answer is the same, since

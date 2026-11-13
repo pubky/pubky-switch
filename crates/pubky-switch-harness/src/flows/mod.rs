@@ -34,6 +34,7 @@ mod restore;
 mod retries;
 mod revocations;
 mod superseded;
+mod sweeps;
 mod upload;
 mod waiting;
 mod watching;
@@ -44,7 +45,7 @@ use std::pin::Pin;
 use pubky_switch::http::route::Call;
 
 pub use admission::{deny_list, invite_code};
-pub use awaiting::awaiting_key;
+pub use awaiting::{awaiting_current_key, awaiting_key};
 pub use claim::claim;
 pub use collections::two_collections;
 pub use connect::{
@@ -83,6 +84,7 @@ pub use retries::{
 };
 pub use revocations::{departure_time, revocation_cleanup, revocation_times, revocation_unread};
 pub use superseded::superseded_writes_read_late;
+pub use sweeps::{deleted_key_forgotten, invite_codes_swept};
 pub use upload::{
     recovery_upload_claim, recovery_upload_deny_only, recovery_upload_records,
     recovery_upload_refused, recovery_upload_slots_before_the_loss,
@@ -146,6 +148,12 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("records, superseded writes read late", |world| {
         Box::pin(superseded_writes_read_late(world))
     }),
+    ("records, a deleted key forgotten", |world| {
+        Box::pin(deleted_key_forgotten(world))
+    }),
+    ("invite code, spent and expired codes swept", |world| {
+        Box::pin(invite_codes_swept(world))
+    }),
     ("erasure", |world| Box::pin(erasure(world))),
     ("erasure, answer lost", |world| {
         Box::pin(erasure_answer_lost(world))
@@ -166,6 +174,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("own record", |world| Box::pin(own_record(world))),
     ("third epoch", |world| Box::pin(third_epoch(world))),
     ("awaiting a key", |world| Box::pin(awaiting_key(world))),
+    ("awaiting a key, the current epoch's", |world| {
+        Box::pin(awaiting_current_key(world))
+    }),
     ("third epoch, three readers", |world| {
         Box::pin(epochs_three_readers(world))
     }),
