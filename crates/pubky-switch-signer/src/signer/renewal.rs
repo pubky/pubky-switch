@@ -826,7 +826,7 @@ impl Signer {
     ///   can't be done now takes a place in it, so nothing holds the rest back for good: an
     ///   app that hasn't joined or is being cut off isn't due for renewal, a full-bundle
     ///   request that can't be answered is passed over, and a deletion or a check the
-    ///   Homeserver fails goes behind the others, as does an app whose automatic renewal the
+    ///   Homeserver fails goes behind the others, as does an app whose renewal the
     ///   switch refused. Every owed deletion's grant reminder is raised at once, whether or not
     ///   its record goes in this run. The removals aren't capped: they are one version,
     ///   whatever the number of apps removed, and one `POST /revoke` for each revocation
@@ -969,7 +969,7 @@ impl Signer {
     ///   concerns one app only doesn't hold back the others.
     /// - [`Alert::ClockOff`] clears itself at the first run that finds the clocks agreeing.
     /// - At most four are renewed in one call, the soonest to expire first, an app whose
-    ///   automatic renewal the switch refused behind the others; the others are renewed at
+    ///   renewal the switch refused, automatic or the user's, behind the others; the rest at
     ///   the next run, which half a lifetime leaves ample time for. Outside a run the call
     ///   has a budget of its own, which the steps each renewal runs again share
     ///   ([`Signer::run_due`]).
@@ -1098,13 +1098,14 @@ impl Signer {
             self.commit(state, None).await?;
         }
         // The soonest to expire first, as many as the run's budget renews: the rest are due at
-        // the next. Only apps that can be renewed are due, and an app whose automatic renewal
-        // the switch refused goes behind the others, so none holds a place for good.
+        // the next. Only apps that can be renewed are due, and an app whose renewal the switch
+        // refused, automatic or the user's own, goes behind the others, so none holds a place
+        // for good.
         let refused = |app: &[u8; 16]| {
-            self.state.alerts.iter().any(|alert| {
-                matches!(alert, Alert::RenewalRefused { app_id, by_user: false, .. }
-                    if app_id == app)
-            })
+            self.state
+                .alerts
+                .iter()
+                .any(|alert| matches!(alert, Alert::RenewalRefused { app_id, .. } if app_id == app))
         };
         due.sort_by_key(|(app_id, _, expires_at)| (refused(app_id), *expires_at));
         let allowed = self.allowance().renewals;

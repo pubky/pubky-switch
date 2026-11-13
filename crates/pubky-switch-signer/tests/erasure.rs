@@ -1704,9 +1704,6 @@ async fn test_erasure_in_doubt_ending_erased_raises_no_account_not_hosted() {
     assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
 }
 
-/// `world`'s env, whose transport answers `GET /apps` number `nth`, counted from 1, with an
-/// unsigned answer of `status`, as an intermediary could, and passes everything else to the
-/// switch. Returns the env and the transport, which keeps every request.
 /// An environment whose every `GET /apps` gets an unsigned answer with the status the
 /// returned cell holds, while it holds one; the switch answers the rest.
 fn apps_answers(
@@ -1739,6 +1736,9 @@ fn apps_answers(
     (env, transport, unsigned)
 }
 
+/// `world`'s env, whose transport answers `GET /apps` number `nth`, counted from 1, with an
+/// unsigned answer of `status`, as an intermediary could, and passes everything else to the
+/// switch. Returns the env and the transport, which keeps every request.
 fn nth_apps_answer(
     world: &World,
     store: Arc<MemoryStore>,
