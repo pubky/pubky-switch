@@ -814,12 +814,11 @@ async fn test_feed_401_from_the_page_check_counts_as_a_failed_authentication() {
             .expect("hex"),
     )
     .expect("hex");
-    let phone_bytes = hex::decode(
-        app(&keys, "phone")["app_id_bytes_hex"]
-            .as_str()
-            .expect("hex"),
+    // The phone's record, as the store keeps a signed document.
+    let phone_record = serde_json::to_vec(
+        &named(&vectors("documents.json")["documents"], "phone app record")["signed"],
     )
-    .expect("hex");
+    .expect("record");
     // The key the request verified with is no longer the app's by the next snapshot: the
     // record held for it carries another app's key. The page is refused 401, without a
     // head, and the 401 counts.
@@ -828,15 +827,12 @@ async fn test_feed_401_from_the_page_check_counts_as_a_failed_authentication() {
         let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
             .await
             .expect("conn");
-        sqlx::query(
-            "UPDATE apps SET record = (SELECT record FROM apps WHERE app_id = $2), \
-             receive_key = NULL WHERE app_id = $1",
-        )
-        .bind(wallet_bytes.as_slice())
-        .bind(phone_bytes.as_slice())
-        .execute(&mut conn)
-        .await
-        .expect("update");
+        sqlx::query("UPDATE apps SET record = $2, receive_key = NULL WHERE app_id = $1")
+            .bind(wallet_bytes.as_slice())
+            .bind(phone_record.as_slice())
+            .execute(&mut conn)
+            .await
+            .expect("update");
     });
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
