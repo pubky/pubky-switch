@@ -38,13 +38,14 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct PushConfig {
     /// Take push registrations (`PUT /v1/{id}/push`); off, every one is answered `400`, as
-    /// a service that sends no pushes answers (Switch wire 8.1).
+    /// a service that sends no pushes answers (Switch wire 8.1). Off by default, since no
+    /// push is sent yet.
     pub enabled: bool,
 }
 
 impl Default for PushConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: false }
     }
 }
 
@@ -168,6 +169,10 @@ mod tests {
         let config = Config::from_toml("").expect("empty config");
         assert_eq!(config, Config::default());
         assert!(config.trusted_time.required);
+        // No push is sent yet, so registrations are off unless the operator turns them on.
+        assert!(!config.push.enabled);
+        let on = Config::from_toml("[push]\nenabled = true\n").expect("push on");
+        assert!(on.push.enabled);
     }
 
     #[test]

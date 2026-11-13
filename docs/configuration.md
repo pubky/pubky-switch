@@ -57,7 +57,7 @@ The API listener.
 
 A request's network source, which the failed-authentication and public-read limits count by, is an IPv4 address or an IPv6 /64 (Switch wire 7.2). Behind a trusted proxy it is the nearest address in the header that isn't a trusted proxy; otherwise it is the connection's peer.
 
-Served so far: `POST /v1/enroll`; `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`; `POST /v1/{id}/ops`; `GET /v1/{id}/feed`; `GET /v1/{id}/claims/{key}`; `GET /v1/{id}/apps` and `POST /v1/{id}/apps/{app_id}/revoke`; `PUT /v1/{id}/peers`; `POST /v1/{id}/inbox`; `GET /v1/{id}/directory`; `GET` and `POST /v1/{id}/apps/{app_id}/keys`; `POST /v1/{id}/apps/{app_id}/leave`; `GET /v1/{id}/allow`; `GET /v1/{id}/records/{key}` and `GET /v1/{id}/records`; `PUT` and `GET /v1/{id}/handover`; `POST /v1/{id}/erase`; `PUT /v1/{id}/push`, which keeps registrations but sends nothing: no webhook reaches a relay until push delivery is served, so a registered app gets no push yet. Every other call is answered `503 unavailable` until its endpoint lands. `GET /v1/{id}/apps` answers `recovery: null` until recovery is served.
+Served so far: `POST /v1/enroll`; `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`; `POST /v1/{id}/ops`; `GET /v1/{id}/feed`; `GET /v1/{id}/claims/{key}`; `GET /v1/{id}/apps` and `POST /v1/{id}/apps/{app_id}/revoke`; `PUT /v1/{id}/peers`; `POST /v1/{id}/inbox`; `GET /v1/{id}/directory`; `GET` and `POST /v1/{id}/apps/{app_id}/keys`; `POST /v1/{id}/apps/{app_id}/leave`; `GET /v1/{id}/allow`; `GET /v1/{id}/records/{key}` and `GET /v1/{id}/records`; `PUT` and `GET /v1/{id}/handover`; `POST /v1/{id}/erase`; `PUT /v1/{id}/push`, which keeps registrations but sends nothing: no webhook reaches a relay until push delivery is served, so it is off by default (`push.enabled`), answering `400` as a service that sends no pushes, and a service that turns it on gives registered apps no push yet. Every other call is answered `503 unavailable` until its endpoint lands. `GET /v1/{id}/apps` answers `recovery: null` until recovery is served.
 
 ### `[log]`
 
@@ -166,7 +166,7 @@ Push (Switch wire 8).
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` | take push registrations (`PUT /v1/{id}/push`); off, every one is answered `400`, as a service that sends no pushes answers (Switch wire 8.1) |
+| `enabled` | `false` | take push registrations (`PUT /v1/{id}/push`); off, every one is answered `400`, as a service that sends no pushes answers (Switch wire 8.1). Off by default while no push is sent, so a service that can't deliver says so |
 
 The service keeps each own app's registration: its relay URL, at most 8 handles and a push key the service mints for it. Nothing is sent to a relay yet. The relay URL must be `https://` on port 443 without user info, and its host must resolve only to public addresses, which the service checks with its system resolver at each registration, within 5 seconds; delivery will check the host again at each connection. Neither relay URLs, handles nor keys are logged.
 

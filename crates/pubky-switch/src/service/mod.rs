@@ -299,13 +299,14 @@ impl Service {
             erasure_sweeps: KeyedWindows::default(),
             changes: ChangeHub::new(),
             entry_ids: Arc::new(random_entry_id),
-            push_enabled: true,
+            push_enabled: false,
             resolver: push::system_resolver(),
         }
     }
 
     /// The service with push registrations on or off (`push.enabled`, Switch wire 8.1): off,
-    /// `PUT /push` is `400`, as at a service that sends no pushes.
+    /// the default while no push is sent, `PUT /push` is `400`, as at a service that sends
+    /// no pushes.
     #[must_use]
     pub fn with_push(mut self, enabled: bool) -> Self {
         self.push_enabled = enabled;

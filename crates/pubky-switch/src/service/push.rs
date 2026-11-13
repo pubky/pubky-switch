@@ -9,7 +9,7 @@
 //!   the relay URL, `https://` on port 443 without user info, whose host must resolve only to
 //!   public addresses, the checks switch origins take (wire 7.1, 8.2). Delivery will resolve
 //!   and check the host again at each connection. A service that sends no pushes
-//!   (`push.enabled` off) answers every registration `400`. A start that will need a new push
+//!   (`push.enabled` off, the default while nothing is sent) answers every registration `400`. A start that will need a new push
 //!   key, by the registration read without the lock, has its key minted here: owed deleting
 //!   first, then generated in the key store under its row's lock (`store::push`).
 //! - **Under the lock**, after the caller's checks (a removed or not current app is refused

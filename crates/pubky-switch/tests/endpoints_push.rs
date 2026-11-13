@@ -166,6 +166,7 @@ fn service_on(replay: &Replay, keys: Arc<Recording>) -> Service {
         replay.time.clone(),
         pubky_switch::limits::Limits::default(),
     )
+    .with_push(true)
     .with_resolver(resolver())
 }
 
