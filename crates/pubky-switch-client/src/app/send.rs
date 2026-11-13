@@ -113,6 +113,18 @@ fn given_up_key(msg_id: &str) -> String {
     format!("{GIVEN_UP_PREFIX}{msg_id}")
 }
 
+/// Whether the app gave up the delivery of `msg_id` and its mark still stands at `now`
+/// ([`note_given_up`]): such a message isn't queued again, by [`App::queue_stored`] or by a
+/// kept batch that settles after the give-up.
+pub(crate) async fn given_up(
+    reader: &super::state::Reader,
+    msg_id: &str,
+    now: u64,
+) -> Result<bool, AppError> {
+    let until: Option<u64> = reader.get(&given_up_key(msg_id)).await?;
+    Ok(until.is_some_and(|until| now <= until))
+}
+
 /// Note in `tx` that the delivery of `msg_id` was given up at `now`, in the commit that
 /// gives it up and tells the protocol: [`App::queue_stored`] refuses the message from then
 /// until [`SENT_RETENTION_MS`] later, past which its replay deadline refuses it anyway, so
@@ -818,8 +830,11 @@ impl App {
     ///   protocol then.
     /// - [`WontDeliver::TooLarge`]: its outbox record is over the store's sizes.
     ///
-    /// So for one message the call never leads to a second [`AppEvent::MessageUndelivered`],
-    /// nor to one with `resend: false` once this app had a copy of it accepted.
+    /// So for one message, within one store, the call never leads to a second
+    /// [`AppEvent::MessageUndelivered`], nor to one with `resend: false` once this app had a
+    /// copy of it accepted. A backup carries neither the sent messages nor the give-up
+    /// marks, so a restored app may queue again a message given up or accepted before the
+    /// backup: within its window it goes again, and the recipient drops it as a duplicate.
     ///
     /// # Errors
     ///
@@ -835,8 +850,7 @@ impl App {
                 return Ok(item.msg_id);
             }
             let refused = |why| Err(AppError::Refused(Refusal::WontDeliver(why)));
-            let given_up: Option<u64> = self.reader().get(&given_up_key(&item.msg_id)).await?;
-            if given_up.is_some_and(|until| self.now() <= until) {
+            if given_up(&self.reader(), &item.msg_id, self.now()).await? {
                 return refused(WontDeliver::GivenUp);
             }
             if let Some(until_ms) = item.replay_until_ms
@@ -981,7 +995,10 @@ impl App {
 
     /// Send again a message sent in the last 30 days: the same signed plaintext, and so the
     /// same `msg_id`, sealed to the recipient's current keys (Switch spec 11). It adds no
-    /// conversation entry and writes no record.
+    /// conversation entry and writes no record. A re-send goes only within 30 days of the
+    /// message's first acceptance, and by its replay deadline when it has one; past it the
+    /// re-send is given up ([`AppEvent::MessageUndelivered`] with `resend: true`), and the
+    /// call still returns the earlier acceptance ([`Delivery::Accepted`]).
     ///
     /// # Errors
     ///
@@ -1011,9 +1028,20 @@ impl App {
         let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
             return Ok(false);
         };
-        if item.accepted_at_ms.is_some() && !item.resend {
+        if let Some(accepted) = item.accepted_at_ms
+            && !item.resend
+        {
             item.resend = true;
             item.sealed = None;
+            // A re-send goes only while the recipient keeps the processed pair, 30 days from
+            // the first acceptance (Switch spec 11).
+            item.replay_until_ms = [
+                item.replay_until_ms,
+                Some(accepted.saturating_add(SENT_RETENTION_MS)),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             self.save_item(&item).await?;
         }
         Ok(true)
@@ -1043,7 +1071,15 @@ impl App {
             undeliverable_last_ms: None,
             undeliverable_tries: 0,
             resend_queued: true,
-            replay_until_ms: sent.replay_until_ms,
+            // Only while the recipient keeps the processed pair: 30 days from the first
+            // acceptance, and by the deadline the message came with (Switch spec 11).
+            replay_until_ms: [
+                sent.replay_until_ms,
+                Some(sent.first_ms.saturating_add(SENT_RETENTION_MS)),
+            ]
+            .into_iter()
+            .flatten()
+            .min(),
             record_batch: None,
         };
         let mut tx = self.tx()?;

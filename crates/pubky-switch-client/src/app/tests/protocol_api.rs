@@ -2471,6 +2471,185 @@ async fn test_queue_stored_copy_notifies_and_adds_the_conversation_entry() {
     assert_eq!(entries, 1, "the conversation entry its kind needs");
 }
 
+/// A copy given up within its window because its try is too large for the store is
+/// refused by its mark, not queued again.
+#[tokio::test]
+async fn test_queue_stored_after_a_too_large_give_up_is_refused() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, store) = wallet_on_a_fault_store(&p, &protocol).await;
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    let msg_id = wallet.queue_stored(signed.plaintext()).await.unwrap();
+    store.refuse_puts_as_too_large_once(format!("out/{msg_id}").as_bytes());
+    wallet.take_events();
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![msg_id.clone()], "{report:?}");
+    assert_eq!(undelivered(&wallet.take_events(), &msg_id), vec![false]);
+    let error = wallet.queue_stored(signed.plaintext()).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Refused(Refusal::WontDeliver(WontDeliver::GivenUp))
+        ),
+        "{error:?}"
+    );
+    // A message whose own record doesn't fit: refused, nothing written, nothing told.
+    store.refuse_puts_as_too_large(Some(b"out/"));
+    let fresh = wallet.sign_message(Pair::note(&p.bob, "fresh")).unwrap();
+    let error = wallet.queue_stored(fresh.plaintext()).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Refused(Refusal::WontDeliver(WontDeliver::TooLarge))
+        ),
+        "{error:?}"
+    );
+    store.refuse_puts_as_too_large(None);
+    assert_eq!(wallet.delivery(fresh.msg_id()).await.unwrap(), None);
+    assert!(undelivered(&wallet.take_events(), fresh.msg_id()).is_empty());
+}
+
+/// A message a restore left out of its outbox is refused by its mark.
+#[tokio::test]
+async fn test_queue_stored_left_out_by_a_restore_is_refused() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let text = "x".repeat(40_000);
+    let mut last = None;
+    for _ in 0..260 {
+        let signed = wallet.sign_message(Pair::note(&p.bob, &text)).unwrap();
+        last = Some(signed.plaintext().clone());
+        wallet.queue_signed(signed).await.unwrap();
+        p.clock.advance_ms(1);
+    }
+    let last = last.unwrap();
+    let msg_id = Message::parse(last.json(), &[]).unwrap().msg_id;
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    assert_eq!(restored.delivery(&msg_id).await.unwrap(), None);
+    let error = restored.queue_stored(&last).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Refused(Refusal::WontDeliver(WontDeliver::GivenUp))
+        ),
+        "{error:?}"
+    );
+}
+
+/// On the device that keeps the batch, a copy given up at its deadline, then the kept batch
+/// settling: the message isn't queued again, and doesn't go.
+#[tokio::test]
+async fn test_queue_stored_given_up_then_its_kept_batch_settles_queues_nothing() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let shop = p.join(&p.bob, "shop", &protocol).await;
+    let alice = p.alice.identity().public();
+    let start = p.clock.now_ms();
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    p.clock.advance_ms(120 * MINUTE);
+    let target = RecordTarget::new(items(), &signed.hash());
+    let entry = wallet
+        .record_op(&target, Some(&stored_value(&signed)), vec![])
+        .await
+        .unwrap();
+    p.alice
+        .switch()
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let error = wallet
+        .submit_batch(OpBatch::new().entry(entry).queue(signed.clone()))
+        .await
+        .unwrap_err();
+    assert!(error.kept_batch().is_some(), "{error:?}");
+    let msg_id = wallet.queue_stored(signed.plaintext()).await.unwrap();
+    p.clock.set_ms(start + SENT_RETENTION_MS);
+    for _ in 0..6 {
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after: 0,
+        });
+    }
+    wallet.take_events();
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![msg_id.clone()], "{report:?}");
+    assert_eq!(undelivered(&wallet.take_events(), &msg_id), vec![false]);
+    p.alice.switch().lock().faults.clear();
+    let mut shop = shop;
+    shop.invite(&alice).await.unwrap();
+    let report = wallet.flush_outbox().await.unwrap();
+    let events = wallet.take_events();
+    let accepted = events
+        .iter()
+        .any(|e| matches!(e, AppEvent::MessageAccepted { msg_id: m, .. } if *m == msg_id));
+    assert!(
+        !accepted && p.bob.switch().entries_from(&alice) == 0,
+        "given up, and not delivered {} after the message was signed: {report:?}",
+        p.clock.now_ms() - start
+    );
+}
+
+/// A plain message's re-send queued 29 days after its first acceptance, and kept from going
+/// by the network, is given up 30 days after it, not delivered at 40.
+#[tokio::test]
+async fn test_resend_past_30_days_from_first_acceptance_is_given_up() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+    let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    let Delivery::Accepted { accepted_at_ms } = delivery else {
+        panic!("{delivery:?}");
+    };
+    p.clock.set_ms(accepted_at_ms + 29 * DAY_MS);
+    for _ in 0..4 {
+        p.bob.switch().fail_next(Fault::Unreachable {
+            path: "inbox".into(),
+            after: 0,
+        });
+    }
+    let delivery = wallet.resend(&msg_id).await.unwrap();
+    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    p.bob.switch().lock().faults.clear();
+    p.clock.set_ms(accepted_at_ms + 40 * DAY_MS);
+    wallet.take_events();
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(
+        p.bob.switch().entries_from(&alice),
+        1,
+        "not re-sent 40 days after its first acceptance"
+    );
+    assert_eq!(undelivered(&wallet.take_events(), &msg_id), vec![true]);
+}
+
+#[tokio::test]
+async fn test_queue_stored_give_up_mark_is_pruned_after_its_month() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let _shop = p.join(&p.bob, "shop", &protocol).await;
+    let signed = wallet.sign_message(Pair::note(&p.bob, "old")).unwrap();
+    p.clock.advance_ms(25 * DAY_MS);
+    wallet.queue_stored(signed.plaintext()).await.unwrap();
+    p.clock.advance_ms(5 * DAY_MS);
+    wallet.flush_outbox().await.unwrap();
+    let marks = |app: &App| {
+        let app = app.reader();
+        async move { app.scan_raw("outgone/").await.unwrap().len() }
+    };
+    assert_eq!(marks(&wallet).await, 1);
+    p.clock.advance_ms(SENT_RETENTION_MS - MINUTE);
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(marks(&wallet).await, 1, "kept its month");
+    p.clock.advance_ms(2 * MINUTE);
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(marks(&wallet).await, 0, "pruned after it");
+}
+
 /// One run of the scenario of a message signed, its record written from its hash in the
 /// batch that queues it, then delivered. Returns at the first error, as a process that
 /// died.
