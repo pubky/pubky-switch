@@ -1077,3 +1077,91 @@ async fn test_upload_divergence_is_delivered_until_acknowledged_after_its_flag_c
     let mut app = load().await.unwrap();
     assert!(divergent_ids(&app.take_events(), key).is_empty());
 }
+
+#[tokio::test]
+async fn test_upload_divergence_is_told_again_after_a_restore_from_a_backup() {
+    // A backup carries neither the mark nor the duty event: the listing the restore owes
+    // reads the record again, and a view still divergent raises the event again, under an
+    // ID of the new store.
+    let store = Arc::new(MemoryStore::new());
+    let w = World::new();
+    let router = super::moves::Router::of(&w);
+    let protocol = Arc::new(super::moves::LossProtocol::default());
+    let (mut app, key) = holding_a_record(&w, &router, &store, &protocol).await;
+    w.switch
+        .make_divergent(app_keys("phone").app_id_bytes(), key, [1; 32])
+        .unwrap();
+    let report = app.receive(None).await.unwrap();
+    let first = divergent_ids(&report.events, key);
+    assert_eq!(first.len(), 1, "{:?}", report.events);
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    let fresh = Arc::new(MemoryStore::new());
+    let mut restored = App::restore(
+        router.env(&w, Arc::clone(&fresh) as Arc<dyn StateStore>),
+        Arc::clone(&protocol) as Arc<dyn crate::app::Protocol>,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let mut told = divergent_ids(&restored.take_events(), key);
+    for _ in 0..4 {
+        let report = restored.receive(None).await.unwrap();
+        told.extend(divergent_ids(&report.events, key));
+        if !restored.listing_owed().await.unwrap() {
+            break;
+        }
+    }
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_ne!(told, first, "an ID of the new store");
+    assert!(
+        restored
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .divergent
+    );
+    assert_eq!(restored.unacknowledged_events().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_upload_divergence_is_told_to_each_app_that_holds_the_record() {
+    // Two own apps hold the record, each on its own store: each keeps its own duty event,
+    // and one acknowledging leaves the other's.
+    let w = World::new();
+    let router = super::moves::Router::of(&w);
+    let protocol = Arc::new(super::moves::LossProtocol::default());
+    let wallet_store = Arc::new(MemoryStore::new());
+    let (mut wallet, key) = holding_a_record(&w, &router, &wallet_store, &protocol).await;
+    let spec = AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL);
+    let request = w.signer.approve(&app_keys("phone"), &spec).unwrap();
+    let mut phone = App::join(
+        router.env(&w, Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        Arc::clone(&protocol) as Arc<dyn crate::app::Protocol>,
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    for _ in 0..3 {
+        phone.receive(None).await.unwrap();
+        if !phone.listing_owed().await.unwrap() {
+            break;
+        }
+    }
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+    w.switch
+        .make_divergent(app_keys("tablet").app_id_bytes(), key, [1; 32])
+        .unwrap();
+    let at_wallet = divergent_ids(&wallet.receive(None).await.unwrap().events, key);
+    let at_phone = divergent_ids(&phone.receive(None).await.unwrap().events, key);
+    assert_eq!((at_wallet.len(), at_phone.len()), (1, 1));
+    wallet.ack_events(at_wallet[0]).await.unwrap();
+    assert!(divergent_ids(&wallet.unacknowledged_events().await.unwrap(), key).is_empty());
+    assert_eq!(
+        divergent_ids(&phone.unacknowledged_events().await.unwrap(), key),
+        at_phone
+    );
+}
