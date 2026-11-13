@@ -95,16 +95,12 @@ async fn test_feed_vectors_page_after_the_registration() {
             .cloned()
             .unwrap_or_else(|| panic!("no item {seq}"))
     };
-    // The entry at seq 5 comes with the inbox; the rest as http.json has it, but for seq 6.
+    // The entry at seq 5 comes with the inbox; the rest as http.json has it. The record's
+    // create at seq 6, superseded by the update at seq 8, shows as its stub (Switch wire 7.5,
+    // 9.1), in the vector as here.
     assert_eq!(seqs(&page), vec![6, 7, 8, 9]);
-    // The record's create at seq 6, superseded by the update at seq 8, shows as its stub
-    // (Switch wire 7.5, 9.1). http.json's page shows it in full, against that text, and is
-    // to be corrected; then this page is compared whole.
-    assert_eq!(
-        item_at(&page, 6),
-        json!({ "type": "stub", "seq": 6, "stub": item_at(&expected_page, 6)["stub"] })
-    );
-    for seq in [7, 8, 9] {
+    assert_eq!(item_at(&page, 6)["type"], "stub");
+    for seq in [6, 7, 8, 9] {
         assert_eq!(
             item_at(&page, seq),
             item_at(&expected_page, seq),
@@ -119,14 +115,15 @@ async fn test_feed_vectors_page_after_the_registration() {
         expected["headers"]["switch-head"].as_str(),
         "Switch-Head"
     );
-    // As bytes too, in the member order of the vector: each of seqs 7, 8 and 9, and the
-    // members after the items, appear in the vector's body exactly as this page writes
-    // them. The whole body differs only by the entry at seq 5 and the stub at seq 6.
+    // As bytes too, in the member order of the vector: each of seqs 6 to 9, and the members
+    // after the items, appear in the vector's body exactly as this page writes them. The
+    // whole body differs only by the entry at seq 5.
     let text = String::from_utf8(answer.body.clone()).expect("utf-8");
-    for seq in [7, 8, 9] {
-        let start = text
-            .find(&format!("{{\"type\":\"chain\",\"seq\":{seq},"))
+    for seq in [6, 7, 8, 9] {
+        let at = text
+            .find(&format!(",\"seq\":{seq},"))
             .unwrap_or_else(|| panic!("seq {seq}"));
+        let start = text[..at].rfind("{\"type\":").expect("item start");
         let end = text[start..]
             .find(",{\"type\":")
             .or_else(|| text[start..].find("],\"next\""))

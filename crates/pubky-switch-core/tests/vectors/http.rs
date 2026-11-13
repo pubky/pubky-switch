@@ -155,12 +155,52 @@ fn conditional_erasures(keys: &Keys) {
     generated("http.json", &generated_cases);
 }
 
+/// The page `body` with each record write that a later write of the same key in the page
+/// supersedes shown as its stub (Switch wire 7.5, "Feed items and visibility"): the item
+/// `{"type":"stub","seq":<seq>,"stub":<its stub>}`, the stub's bytes as the page held them.
+fn superseded_as_stubs(body: &str) -> String {
+    let page: Value = serde_json::from_str(body).unwrap();
+    let writes: Vec<(u64, String)> = arr(&page, "items")
+        .iter()
+        .filter(|item| item["type"] == "chain" && item["item_type"] == "op")
+        .filter_map(|item| {
+            let op: Value = serde_json::from_slice(&b64(st(&item["item"], "body"))).unwrap();
+            (op["op"] == "record.put")
+                .then(|| (item["seq"].as_u64().unwrap(), st(&op, "key").to_owned()))
+        })
+        .collect();
+    let mut out = body.to_owned();
+    for (seq, key) in &writes {
+        if !writes.iter().any(|(later, k)| later > seq && k == key) {
+            continue;
+        }
+        let start = out
+            .find(&format!("{{\"type\":\"chain\",\"seq\":{seq},"))
+            .unwrap();
+        let end = start
+            + out[start..]
+                .find(",{\"type\":")
+                .or_else(|| out[start..].find("],\"next\""))
+                .unwrap();
+        let item = &out[start..end];
+        let stub_at = item.find("\"stub\":").unwrap() + "\"stub\":".len();
+        let stub_end = item.find(",\"item_type\":").unwrap();
+        let stub_item = format!(
+            "{{\"type\":\"stub\",\"seq\":{seq},\"stub\":{}}}",
+            &item[stub_at..stub_end]
+        );
+        out.replace_range(start..end, &stub_item);
+    }
+    out
+}
+
 /// The `cursor` of the two feed pages (Switch wire 7.4.4), which `pubky-switch-core` added to
 /// the prototype's pages (README "How the files were generated"): alice's wallet after `1:4`,
 /// before its first cursor move, holds 0, and the long-poll's page at `1:41` an app whose
-/// cursor is at the head. Each page holds the member before its `head`, and its answer is
-/// signed again with her account's fixed service key, at the page's own request signature and
-/// server time.
+/// cursor is at the head. Each page holds the member before its `head`, and a record write
+/// that a later write in the page supersedes shows as its stub ([`superseded_as_stubs`]).
+/// Its answer is signed again with her account's fixed service key, at the page's own request
+/// signature and server time.
 fn feed_page_cursors(keys: &Keys) {
     use pubky_switch_core::enc;
     let alice_id = enc::pubky_id(&keys.identity("alice"));
@@ -189,6 +229,7 @@ fn feed_page_cursors(keys: &Keys) {
             }
             None => held.to_owned(),
         };
+        let page = superseded_as_stubs(&page);
         let at = page.rfind("\"head\":{").unwrap();
         let body = format!("{}\"cursor\":{cursor},{}", &page[..at], &page[at..]);
         let request_signature = b64n::<64>(st(&case, "request_signature"));
