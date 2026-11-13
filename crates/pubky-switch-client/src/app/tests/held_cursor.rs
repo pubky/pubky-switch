@@ -87,17 +87,6 @@ async fn test_held_cursor_ahead_of_an_app_sharing_its_cursor_is_unknown() {
 }
 
 #[tokio::test]
-async fn test_held_cursor_not_reported_is_unknown() {
-    // Switch wire 7.4.4: a page without `cursor`, from a service of an earlier version,
-    // is no report.
-    let w = World::new();
-    let mut app = w.join("wallet").await;
-    w.switch.serve_feed_without_cursor(true);
-    let report = app.receive(None).await.unwrap();
-    assert_eq!(report.held_cursor, Some(HeldCursor::Unknown));
-}
-
-#[tokio::test]
 async fn test_held_cursor_restore_with_nothing_passed_since_is_clean() {
     // Switch spec 12.4 "The held cursor": the backup's position, the first page from the
     // current service read before any move, the restored key current.
@@ -388,24 +377,6 @@ async fn test_held_cursor_restore_writing_before_a_page_is_unknown() {
         .put_record(&target, &super::shared_flows::value(&["a"]), vec![])
         .await
         .unwrap();
-    restored.receive(None).await.unwrap();
-    assert_eq!(restored.restore_held_cursor(), Some(HeldCursor::Unknown));
-}
-
-#[tokio::test]
-async fn test_held_cursor_restore_not_reported_is_unknown() {
-    // Switch spec 12.4 condition 1: the first page carries `cursor`.
-    let w = World::new();
-    let mut app = w.join("wallet").await;
-    app.receive(None).await.unwrap();
-    app.flush_cursor().await.unwrap();
-    let backup = app.backup().await.unwrap();
-    w.switch.serve_feed_without_cursor(true);
-    let mut restored = restored(&w, &backup).await;
-    restored.receive(None).await.unwrap();
-    assert_eq!(restored.restore_held_cursor(), Some(HeldCursor::Unknown));
-    // A later page that reports it doesn't make the restore clean.
-    w.switch.serve_feed_without_cursor(false);
     restored.receive(None).await.unwrap();
     assert_eq!(restored.restore_held_cursor(), Some(HeldCursor::Unknown));
 }

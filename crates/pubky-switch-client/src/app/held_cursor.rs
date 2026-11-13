@@ -14,8 +14,8 @@
 //!   12.4 "The held cursor" that the client can check holds (`App::restore_held_cursor`).
 //!
 //! Only a position of the current sequence compares: one whose generation is above the
-//! newest own `identity.json`'s `recovery_from`, or any while that is null. A page without
-//! `cursor`, from a service of an earlier version, is no report.
+//! newest own `identity.json`'s `recovery_from`, or any while that is null. Every page
+//! carries `cursor`: one without it is malformed, and the read fails.
 //!
 //! - **`hcur`**: the restore's check, the backup's position and, once the first page was
 //!   read, its verdict, kept until the next restore. An app whose devices don't share its
@@ -50,7 +50,7 @@ pub enum HeldCursor {
         /// The `seq` of the app's position it was compared with.
         position: u64,
     },
-    /// Nothing to tell: no report, a position a provider loss ended, an app whose devices
+    /// Nothing to tell: a position a provider loss ended, an app whose devices
     /// share its cursor reported ahead, or, at a restore, a condition the client checks
     /// that didn't hold.
     Unknown,
@@ -108,8 +108,9 @@ impl App {
     ///
     /// [`HeldCursor::Clean`] needs, of the eight conditions, the ones the client checks: the
     /// first page from the current service, read once the newest `identity.json` was
-    /// confirmed and the app followed it, not a frozen service's, carried `cursor` under a
-    /// verified response signature, before any cursor move of the app was sent (1); the
+    /// confirmed and the app followed it, not a frozen service's, was read whole under a
+    /// verified response signature (a page without `cursor` is refused, and the read
+    /// fails), before any cursor move of the app was sent (1); the
     /// backup's position is of the current sequence, judged again at every call, so a loss
     /// followed later reads [`HeldCursor::Unknown`] (2); the position compared is the
     /// backup's committed one (3, by construction); the report is at or behind it (4); the
@@ -155,16 +156,15 @@ impl App {
     /// the restore's check as the page settles it.
     pub(crate) async fn compare_held_cursor(
         &mut self,
-        reported: Option<u64>,
+        reported: u64,
     ) -> Result<Compared, AppError> {
         let shared = self.state.device.multi_device;
-        let judge = |held: Option<u64>, position: u64, current: bool| match held {
+        let judge = |held: u64, position: u64, current: bool| match held {
             _ if !current => HeldCursor::Unknown,
-            None => HeldCursor::Unknown,
-            Some(held) if held <= position => HeldCursor::Clean,
+            held if held <= position => HeldCursor::Clean,
             // Another device's move is ordinary for an app whose devices share its cursor.
-            Some(_) if shared => HeldCursor::Unknown,
-            Some(held) => HeldCursor::Ahead { held, position },
+            _ if shared => HeldCursor::Unknown,
+            held => HeldCursor::Ahead { held, position },
         };
         let generation = self.state.cursor.generation;
         let current = self.current_sequence(generation);

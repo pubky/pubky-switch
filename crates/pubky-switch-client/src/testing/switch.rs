@@ -358,9 +358,6 @@ pub(crate) struct Inner {
     /// `None`: a lower bound gives pages of items the reader isn't shown, with `more`
     /// (Switch wire 7.4.4).
     pub(crate) max_page_scan: Option<usize>,
-    /// Feed pages leave out `cursor`, as a service of an earlier version's do (Switch
-    /// wire 7.4.4).
-    pub(crate) omit_cursor: bool,
     /// The bodies of the requests an `Unreachable` fault failed.
     pub(crate) unreached: Vec<Vec<u8>>,
     /// The peer copies of other identities' `identity.json` (Switch wire 7.4.5).
@@ -468,7 +465,6 @@ impl Inner {
             feed_limit: None,
             max_page_bytes: MAX_PAGE_BYTES,
             max_page_scan: None,
-            omit_cursor: false,
             unreached: Vec::new(),
             peers: HashMap::new(),
             appended: HashMap::new(),
@@ -1494,12 +1490,6 @@ impl ScriptedSwitch {
         self.lock().keep_passed = true;
     }
 
-    /// Serve feed pages without `cursor`, as a service of an earlier version does (Switch
-    /// wire 7.4.4), or with it again.
-    pub fn serve_feed_without_cursor(&self, without: bool) {
-        self.lock().omit_cursor = without;
-    }
-
     /// Set the cursor the switch holds for `app`, as another instance of the app moving it
     /// would (Switch spec 8.3).
     pub fn set_held_cursor(&self, app: &[u8; 16], seq: u64) {
@@ -2486,11 +2476,6 @@ impl Inner {
         });
         if let Some(checkpoint) = &self.checkpoint {
             page["checkpoint"] = checkpoint.to_value();
-        }
-        if self.omit_cursor
-            && let Some(page) = page.as_object_mut()
-        {
-            page.remove("cursor");
         }
         if let Some(freeze) = &self.frozen
             && self.freeze_in_feed

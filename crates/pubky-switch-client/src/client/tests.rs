@@ -907,7 +907,7 @@ fn feed_page_with(items: Value) -> Result<FeedPage, ClientError> {
         },
     );
     let value = json!({ "items": items, "next": "1:9", "scanned_through": 9, "more": false,
-                        "head": head.to_value() });
+                        "cursor": 0, "head": head.to_value() });
     FeedPage::read(
         Obj::of(&value, "a feed page").unwrap(),
         &identity().public(),
