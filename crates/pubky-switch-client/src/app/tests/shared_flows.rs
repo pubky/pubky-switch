@@ -8874,3 +8874,111 @@ async fn test_records_own_write_read_in_the_feed_first_marks_b_before_and_after_
     assert!(!held.flagged);
     assert!(wallet.flagged_writes().await.unwrap().is_empty());
 }
+
+/// Device A of the wallet holds device B's `["a", "x", "y"]` unopened, sealed at data epoch
+/// 2, its mark still `["a", "x"]`; the phone holds B's write. Returns A, the phone, the
+/// target and the key.
+async fn second_device_write_unopened(s: &Setup) -> (App, App, RecordTarget, [u8; 32]) {
+    let mut a = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    a.set_multi_device(true).await.unwrap();
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a", "x"]), vec![])
+        .await
+        .unwrap();
+    a.receive(None).await.unwrap();
+    let key = a.record_key(&target).unwrap();
+    let backup = a.backup().await.unwrap();
+    let mut b = App::restore(
+        s.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    b.receive(None).await.unwrap();
+    b.end_reconcile(crate::app::UserConfirmed::new())
+        .await
+        .unwrap();
+    rotate_data_epoch(s, &[&a, &phone]);
+    b.put_record(&target, &value(&["a", "x", "y"]), vec![])
+        .await
+        .unwrap();
+    assert_eq!(b.data_epoch(), 2);
+    let read = a.read_record(&target).await.unwrap().unwrap();
+    assert!(
+        matches!(
+            read.content,
+            RecordContent::Unreadable(Unopened::KeyNotHeld { .. })
+        ),
+        "{:?}",
+        read.content
+    );
+    assert_eq!(
+        ids(a.record_seen(&key).await.unwrap().as_deref()),
+        ["a", "x"]
+    );
+    phone.receive(None).await.unwrap();
+    let at_phone = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(at_phone.content.value()), ["a", "x", "y"]);
+    (a, phone, target, key)
+}
+
+/// Once A reads on and takes the epoch's key, B's write opens: A's mark is what B wrote,
+/// and the phone's later write that drops y is flagged.
+#[tokio::test]
+async fn test_records_second_device_write_reopened_with_its_key_marks_its_value() {
+    let s = Setup::new();
+    let (mut a, mut phone, target, key) = second_device_write_unopened(&s).await;
+    a.receive(None).await.unwrap();
+    let held = a.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["a", "x", "y"]);
+    assert_eq!(
+        ids(a.record_seen(&key).await.unwrap().as_deref()),
+        ["a", "x", "y"],
+        "the mark once the record reopens"
+    );
+    phone
+        .put_record(&target, &value(&["a", "x"]), vec![])
+        .await
+        .unwrap();
+    let report = a.receive(None).await.unwrap();
+    assert!(
+        flagged_by(&report.events, &key, phone.app_id()),
+        "{:?}",
+        report.events
+    );
+    let held = a.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["a", "x", "y"], "not taken");
+}
+
+/// The same when A takes the key in a write of its own elsewhere (`409 stale_epoch`): the
+/// key fetch reopens the record there (`reopen_unreadable`), with no read of its feed.
+#[tokio::test]
+async fn test_records_second_device_write_reopened_by_a_key_fetch_marks_its_value() {
+    let s = Setup::new();
+    let (mut a, mut phone, target, key) = second_device_write_unopened(&s).await;
+    a.put_record(&s.target("n2"), &value(&["z"]), vec![])
+        .await
+        .unwrap();
+    assert_eq!(a.data_epoch(), 2, "the key taken by the write");
+    let held = a.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["a", "x", "y"], "reopened");
+    assert_eq!(
+        ids(a.record_seen(&key).await.unwrap().as_deref()),
+        ["a", "x", "y"],
+        "the mark once the record reopens"
+    );
+    phone
+        .put_record(&target, &value(&["a", "x"]), vec![])
+        .await
+        .unwrap();
+    let report = a.receive(None).await.unwrap();
+    assert!(
+        flagged_by(&report.events, &key, phone.app_id()),
+        "{:?}",
+        report.events
+    );
+}
