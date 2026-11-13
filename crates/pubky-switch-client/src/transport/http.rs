@@ -29,11 +29,14 @@ use super::{BoxFuture, Header, Request, Response, Transport, TransportError};
 /// key bundle parts (7.4.11, 7.4.12), a claim's entries (7.4.8), the admission lists
 /// (7.4.6), a batch of operations whose body passes a mebibyte (6.4), an append, whose
 /// `409 stale_key` carries the directory (7.6), a recovery upload (7.4.14), the handover
-/// (7.4.17), an enrollment (7.4.1), and a move's export and import (10.2 to 10.4). Every
-/// other call gets [`HttpConfig::request_timeout_ms`]: the time sample a write takes
-/// first, a feed read of one item with no wait, and a smaller batch among them, so an
-/// ordinary write is two short calls. At the limits some long calls carry tens of megabytes: a
-/// host on a slow network raises the settings.
+/// (7.4.17), an enrollment (7.4.1), and a move's export and import (10.2 to 10.4). A batch
+/// of at most a mebibyte gets [`HttpConfig::request_timeout_ms`] and a share of what the
+/// long timeout adds to it, in proportion to its body: about the short timeout for a batch
+/// of a few KiB, the long one for a batch of a mebibyte. So a slow uplink that sends a
+/// mebibyte within the long timeout's extra time sends every smaller batch too. Every
+/// other call gets [`HttpConfig::request_timeout_ms`], the time sample a write takes first
+/// among them: a feed read of one item with no wait. At the limits some long calls carry
+/// tens of megabytes: a host on a slow network raises the settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HttpConfig {
@@ -109,6 +112,32 @@ pub struct HttpTransport {
 /// The body size past which a batch of operations gets the long timeout.
 const LONG_BODY_BYTES: usize = 1 << 20;
 
+/// The timeout of `request` ([`HttpConfig`]): `long` for a long call, `short` for a short
+/// one, and for a batch of operations of at most [`LONG_BODY_BYTES`] `short` and the share
+/// of `long - short` its body is of [`LONG_BODY_BYTES`].
+fn call_timeout(request: &Request, short: Duration, long: Duration) -> Duration {
+    if is_long_call(request) {
+        return long;
+    }
+    let path = request
+        .path_and_query
+        .split_once('?')
+        .map_or(request.path_and_query.as_str(), |(path, _)| path);
+    let batch = request.method == "POST"
+        && path
+            .strip_prefix("/v1/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(_, rest)| rest == "ops");
+    if !batch {
+        return short;
+    }
+    let extra = long.saturating_sub(short).as_millis() * request.body.len() as u128
+        / LONG_BODY_BYTES as u128;
+    short.saturating_add(Duration::from_millis(
+        u64::try_from(extra).unwrap_or(u64::MAX),
+    ))
+}
+
 /// Whether `request` is a call whose request or answer can pass a mebibyte, or the feed's
 /// long poll ([`HttpConfig`]): judged by its method, its path after `/v1/{id}/` and, for a
 /// feed read, its query.
@@ -130,9 +159,11 @@ fn is_long_call(request: &Request) -> bool {
     };
     match request.method.as_str() {
         // A feed read of one item with no wait, the time sample a write takes first, is
-        // short. Its page runs to the end of a batch whose items it starts (Switch wire
-        // 7.4.4), so it may carry up to about 5 MiB, under the short timeout all the same:
-        // a write's time sample at the end of the feed meets no batch.
+        // short. It reads after the cursor, and its page runs to the end of a batch whose
+        // items it starts (Switch wire 7.4.4): while the cursor is behind, at a batch of
+        // many items, the page may carry up to about 5 MiB under the short timeout. On a
+        // slow link that sample can time out; the write then fails before its own batch
+        // is sent, as its error says, until a read moves the cursor on.
         "GET" if rest == "feed" => {
             let mut params = query.split('&');
             params.clone().any(|param| param.starts_with("wait="))
@@ -146,9 +177,10 @@ fn is_long_call(request: &Request) -> bool {
                 || rest.starts_with("claims/")
                 || (rest.starts_with("apps/") && rest.ends_with("/keys"))
         }
-        // A batch's items take up to 5 MiB: one whose body passes a mebibyte is long, a
-        // smaller one short, its answer proofs and a head, or a `409 conflict` with one
-        // record's view (under 1 MiB). An append's `409 stale_key` carries the directory,
+        // A batch's items take up to 5 MiB: one whose body passes a mebibyte is long. A
+        // smaller one's answer is its proofs and a head, or a `409 conflict` with one
+        // record's view (under 1 MiB), and its timeout grows with its body
+        // (`call_timeout`). An append's `409 stale_key` carries the directory,
         // and an import's start its manifest.
         "POST" if rest == "ops" => request.body.len() > LONG_BODY_BYTES,
         "POST" => matches!(rest, "inbox" | "recovery/upload" | "import"),
@@ -238,11 +270,7 @@ impl HttpTransport {
         };
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|_| TransportError::InvalidRequest("the method".into()))?;
-        let timeout = if is_long_call(&request) {
-            self.long_timeout
-        } else {
-            self.request_timeout
-        };
+        let timeout = call_timeout(&request, self.request_timeout, self.long_timeout);
         let mut call = self.client.request(method, url).timeout(timeout);
         for Header { name, value } in &request.headers {
             let name = HeaderName::from_bytes(name.as_bytes())
@@ -536,6 +564,22 @@ mod tests {
         };
         assert!(!is_long_call(&batch(LONG_BODY_BYTES)));
         assert!(is_long_call(&batch(LONG_BODY_BYTES + 1)));
+        // A smaller one's timeout grows with its body, from the short to the long one.
+        let (short, long) = (Duration::from_secs(10), Duration::from_secs(40));
+        let timeout = |request: &Request| call_timeout(request, short, long);
+        assert_eq!(timeout(&batch(0)), short);
+        assert_eq!(
+            timeout(&batch(LONG_BODY_BYTES / 2)),
+            Duration::from_secs(25)
+        );
+        assert_eq!(timeout(&batch(LONG_BODY_BYTES)), long);
+        assert_eq!(timeout(&batch(LONG_BODY_BYTES + 1)), long);
+        assert!(timeout(&batch(4 << 10)) < Duration::from_millis(10_200));
+        let other = Request {
+            body: vec![b'x'; LONG_BODY_BYTES / 2],
+            ..call("POST", "/v1/x/apps/a/leave")
+        };
+        assert_eq!(timeout(&other), short);
         // The time sample, as a write sends it.
         let sample = crate::client::answers::FeedQuery {
             after: Some(pubky_switch_core::ops::Position {
