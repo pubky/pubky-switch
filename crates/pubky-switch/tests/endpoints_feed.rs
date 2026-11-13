@@ -1079,3 +1079,58 @@ async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
     assert!(mark.seq < 10, "the mark didn't move: {mark:?}");
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_feed_held_read_ends_when_its_connection_closes() {
+    // A client that drops a held read closes its connection: the service drops the read
+    // with it, and nothing waits on the account any more.
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let service = replay.restarted_with(Limits::default());
+    let changes = service.changes();
+    let router = pubky_switch::http::router(std::sync::Arc::new(service), Default::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(pubky_switch::http::serve(listener, router, async {
+        let _ = stopped.await;
+    }));
+    let path = format!("/v1/{}/feed?after=1:9&wait=20", alice_id());
+    let request = app_request(
+        app(&vectors("keys.json"), "wallet"),
+        "GET",
+        &path,
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let mut raw = format!("GET {path} HTTP/1.1\r\nhost: switch.example\r\n");
+    for (name, value) in &request.headers {
+        raw.push_str(&format!(
+            "{name}: {}\r\n",
+            value.to_str().expect("a text header")
+        ));
+    }
+    raw.push_str("\r\n");
+    let mut connection = std::net::TcpStream::connect(address).expect("connect");
+    std::io::Write::write_all(&mut connection, raw.as_bytes()).expect("send");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while changes.waiting() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the read is held");
+    drop(connection);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while changes.waiting() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the held read ends with its connection, well before its wait");
+    let _ = stop.send(());
+    server.await.expect("server").expect("served");
+    replay.db.drop_database().await.expect("drop");
+}

@@ -6843,6 +6843,81 @@ async fn test_records_key_on_the_same_page_as_the_unreadable_write_opens_it() {
     );
 }
 
+/// A listing stopped on the read's page budget has listed the family `sample.items` to its
+/// end under the kiosk sub-scope and stopped inside `sample.big`. A renewal that adds the
+/// till sub-scope is taken before the next read, from the Homeserver. The till record of
+/// `sample.items` came as a stub in the feed, so only a listing brings it: the renewal owes
+/// a listing from the beginning, the family included.
+#[tokio::test]
+async fn test_records_renewal_widening_a_listing_under_way_lists_from_the_beginning() {
+    renewal_widening_a_listing(true).await;
+}
+
+/// The same with the listing made in one read: the widening owes a listing of its own.
+#[tokio::test]
+async fn test_records_renewal_widening_after_a_whole_listing_lists_again() {
+    renewal_widening_a_listing(false).await;
+}
+
+async fn renewal_widening_a_listing(split: bool) {
+    let s = Setup::new();
+    let family = Collection::with_sub_scopes("sample.items", Policy::new("scope-a", &["scope-a"]));
+    let big = Collection::with_sub_scopes("sample.big", Policy::new("scope-a", &["scope-a"]));
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone(), big.clone()]);
+    let mut wallet = join_scoped(&s, "wallet", &["scope-a:kiosk"]).await;
+    let mut phone = s.join("phone").await;
+    let till = RecordTarget::new(family.sub_scope("till").unwrap(), b"t1");
+    phone
+        .put_record(&till, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&till).unwrap();
+    for n in 0..6 {
+        let target = RecordTarget::new(big.sub_scope("kiosk").unwrap(), format!("b{n}").as_bytes());
+        phone
+            .put_record(&target, &value(&["b"]), vec![])
+            .await
+            .unwrap();
+    }
+    wallet.receive(None).await.unwrap();
+    s.w.clock.advance_ms(3_000);
+    wallet.receive(None).await.unwrap();
+    assert!(!wallet.listing_owed().await.unwrap());
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+    // The renewal is stored at the switch: the wallet sees it in its feed and keeps it.
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-a:kiosk", "scope-a:till"]);
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cert().hash(), earlier.hash());
+    // A missed item owes a listing; with one record a page, the family's one page, then
+    // three of the six of `sample.big`.
+    if split {
+        s.w.switch.lock().max_page_bytes = 1;
+    }
+    s.w.switch.push_missed(1, START, START);
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(report.more, split, "{:?}", report.events);
+    assert_eq!(wallet.listing_owed().await.unwrap(), split);
+    // The document listing the renewal, taken from the Homeserver before the next read.
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    wallet.refresh_identity().await.unwrap();
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    assert!(wallet.listing_owed().await.unwrap());
+    store_parts_for(&s, &renewed);
+    for _ in 0..8 {
+        let report = wallet.receive(None).await.unwrap();
+        if !report.more && !wallet.listing_owed().await.unwrap() {
+            break;
+        }
+    }
+    assert!(!wallet.listing_owed().await.unwrap(), "the listing ended");
+    assert!(
+        wallet.shared_record(&key).await.unwrap().is_some(),
+        "the till record of the family listed before the renewal is listed"
+    );
+}
+
 /// A record change whose delivery failed goes to the switch at the next read, before the
 /// feed, also in a read whose owed listing waits for a scope key: senders reading the
 /// directory see the new record without waiting for the key.
@@ -7083,4 +7158,81 @@ async fn test_records_listing_waiting_for_a_key_reports_a_failed_publication_onc
         .filter(|e| matches!(e, AppEvent::RecordPublishFailed { .. }))
         .count();
     assert_eq!(failed, 1, "{:?}", report.events);
+}
+
+/// An owed publication goes at a read whose owed listing goes on at the next read, as at one
+/// whose listing waits for a key: that read reads no feed and hands nothing over, and makes
+/// one publication attempt.
+#[tokio::test]
+async fn test_records_listing_that_goes_on_still_publishes_what_is_owed_once_a_read() {
+    let s = Setup::new();
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let config = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let mut app = App::join(s.env(), s.protocol.clone(), config, request)
+        .await
+        .unwrap();
+    let me = app.app_id();
+    let path = pubky_switch_core::records::app_record_path(&me);
+    // Fourteen records, one a listing page: a listing takes four reads.
+    for n in 0..14 {
+        let target = RecordTarget::new(items(), format!("n{n}").as_bytes());
+        app.put_record(&target, &value(&["a"]), vec![])
+            .await
+            .unwrap();
+    }
+    app.receive(None).await.unwrap();
+    s.w.clock.advance_ms(3_000);
+    app.receive(None).await.unwrap();
+    s.w.switch.lock().max_page_bytes = 1;
+    s.w.switch.push_missed(1, START, START);
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (_, note) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "behind it" }),
+            &[me],
+        )
+        .unwrap();
+    assert!(app.receive(None).await.unwrap().more);
+    assert!(app.listing_owed().await.unwrap());
+    // A record change the switch accepts and the Homeserver doesn't take: owed.
+    s.w.clock.advance_ms(1_000);
+    s.w.homeserver.fail_writes(1, false);
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap();
+    assert!(app.state.pending_publish.is_some());
+    app.take_events();
+    let accepted = app.record().clone();
+    // The Homeserver down: the read tries once, and reports it once.
+    s.w.homeserver.set_down(true);
+    let report = app.receive(None).await.unwrap();
+    assert!(report.more, "{:?}", report.events);
+    let failed = report
+        .events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::RecordPublishFailed { .. }))
+        .count();
+    assert_eq!(failed, 1, "{:?}", report.events);
+    assert_eq!(handed(&s, &note.msg_id), 0);
+    // Back up: the next read, its listing still going on, publishes.
+    s.w.homeserver.set_down(false);
+    let report = app.receive(None).await.unwrap();
+    assert!(report.more, "{:?}", report.events);
+    assert_eq!(
+        s.w.homeserver.file(s.w.alice.public(), &path),
+        Some(serde_json::to_vec(&accepted).unwrap())
+    );
+    assert_eq!(handed(&s, &note.msg_id), 0);
+    // The listing ends, and the entry behind the item is handed over.
+    let report = app.receive(None).await.unwrap();
+    assert!(!report.more, "{:?}", report.events);
+    assert_eq!(handed(&s, &note.msg_id), 1);
 }

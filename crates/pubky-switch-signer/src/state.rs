@@ -405,6 +405,11 @@ pub(crate) struct SignerState {
     /// taken, by this install or another, or the account one the enrollment made.
     #[serde(default)]
     pub(crate) recovery_serving: Option<Service>,
+    /// The later step of [`crate::Signer::run_due`] the next run starts from: the one a run
+    /// whose time passed didn't start, so each comes in turn whatever the device clock does
+    /// (design note, section 4.5). Zero, the first, otherwise.
+    #[serde(default)]
+    pub(crate) due_from: u8,
     /// The recovery's version that a service took names another install: a restore's, from
     /// a backup written mid-recovery. This install signs the next version naming itself, as
     /// a restore does (Switch wire 3.13).
@@ -621,6 +626,7 @@ impl SignerState {
             recovery_origin: None,
             recovery_services: Vec::new(),
             recovery_serving: None,
+            due_from: 0,
             owes_own_version: false,
             admission_owed: false,
         }

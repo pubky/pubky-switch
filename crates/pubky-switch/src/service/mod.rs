@@ -75,6 +75,10 @@ const ERASURE_SWEEPS_PER_MIN: u32 = 6;
 /// step 4); the rest go with the next requests.
 const DUE_CLAIMS_PER_REQUEST: u64 = 64;
 
+/// How many of the documents chained before superseded documents were deleted one request
+/// checks at most (Switch wire 7.5); the rest go with the next requests.
+const OLD_DOCUMENTS_PER_REQUEST: u64 = 64;
+
 /// The service.
 pub struct Service {
     origin: String,
@@ -806,14 +810,18 @@ impl Service {
             }
         };
         // Step 4, with trusted time only, for a caller that has verified: a bounded batch of
-        // the claims whose time has passed goes, by the time base (Switch wire 7.3). It comes
-        // before the endpoint, so a refusal doesn't undo it; an unauthenticated request, or
-        // the public read, pays for none of it. A claim a request reads or writes goes when
-        // it is due, whatever the batch reached.
+        // the claims whose time has passed goes, by the time base (Switch wire 7.3), and a
+        // bounded batch of the documents chained before superseded documents were deleted
+        // is checked (Switch wire 7.5). It comes before the endpoint, so a refusal doesn't
+        // undo it; an unauthenticated request, or the public read, pays for none of it. A
+        // claim a request reads or writes goes when it is due, whatever the batch reached.
         if let (Some(base), Some(_)) = (due, caller)
-            && let Err(error) = txn
-                .delete_due_claims(base, self.limits.max_claim_age_ms, DUE_CLAIMS_PER_REQUEST)
-                .await
+            && let Err(error) = async {
+                txn.delete_due_claims(base, self.limits.max_claim_age_ms, DUE_CLAIMS_PER_REQUEST)
+                    .await?;
+                txn.check_old_documents(OLD_DOCUMENTS_PER_REQUEST).await
+            }
+            .await
         {
             let _ = store_error(&error);
             let error = ApiError::unavailable("7.6: a temporary failure");
