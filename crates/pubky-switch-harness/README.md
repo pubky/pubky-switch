@@ -121,6 +121,11 @@ The flows send every call the service serves, each at both switches. What they l
   request queues; a request an invite code's first admitted append answers; one to a
   frozen account; and a `POST /connect` from an own app or from the signer.
 - **Longer lives:** a renewal that adds a scope, and a claim that runs out by time.
+- **A key fetched for a waiting entry.** In `awaiting a key, the current epoch's` the
+  restored app fetches its bundle and asks for a full one before it reads its feed, and
+  the entry that then waits asks for nothing. A fetch that an entry's own step starts
+  takes an app that learns of an epoch without having been sent its part, which no honest
+  signer produces: the client's tests script it.
 - **More of the sweeps** (Switch wire 9.1). The `deleted key forgotten` and `codes swept`
   flows look a step after what frees a key or spends a code, where both switches have
   swept: the service sweeps before the first request a minute on from a caller that has
@@ -185,7 +190,7 @@ Each flow's run against the service makes one test database and drops it, also w
 test panics; the flows run one after another. Each run is on a thread of its own with 16 MiB
 of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flow used
 1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
-that ran the flows had less left. Seventy-nine flows take about three minutes in a
+that ran the flows had less left. Eighty-one flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.
 

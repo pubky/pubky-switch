@@ -45,7 +45,7 @@ use std::pin::Pin;
 use pubky_switch::http::route::Call;
 
 pub use admission::{deny_list, invite_code};
-pub use awaiting::awaiting_key;
+pub use awaiting::{awaiting_current_key, awaiting_key};
 pub use claim::claim;
 pub use collections::two_collections;
 pub use connect::{
@@ -174,6 +174,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("own record", |world| Box::pin(own_record(world))),
     ("third epoch", |world| Box::pin(third_epoch(world))),
     ("awaiting a key", |world| Box::pin(awaiting_key(world))),
+    ("awaiting a key, the current epoch's", |world| {
+        Box::pin(awaiting_current_key(world))
+    }),
     ("third epoch, three readers", |world| {
         Box::pin(epochs_three_readers(world))
     }),
