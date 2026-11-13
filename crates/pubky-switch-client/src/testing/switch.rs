@@ -1510,6 +1510,49 @@ impl ScriptedSwitch {
         self.lock().uploads_per_app_per_hour = uploads;
     }
 
+    /// Make record `key`, one the switch holds, divergent, as a recovery upload with a
+    /// conflicting write of it does (Switch spec 12.6, wire 7.4.14), without the provider
+    /// loss and the signed upload: the
+    /// switch keeps `doc_hash` among the record's divergent uploads, so every view of the
+    /// record shows it `divergent` until a newer write, and chains an `upload` transition by
+    /// `by` that lists the key as divergent and merges nothing, so an app that holds the
+    /// record reads it again at its next read and raises
+    /// [`crate::app::AppEvent::RecordDivergent`]. For a protocol's tests of what it does with
+    /// a divergent record.
+    ///
+    /// # Errors
+    ///
+    /// [`ScriptError::Missing`] for a key the switch holds no record at: a service keeps no
+    /// divergent uploads for a key it lacks, and fills it instead. Otherwise as
+    /// [`ScriptedSwitch::signer_op`].
+    pub fn make_divergent(
+        &self,
+        by: [u8; 16],
+        key: [u8; 32],
+        doc_hash: [u8; 32],
+    ) -> Result<(), ScriptError> {
+        let mut inner = self.lock();
+        if !inner.shared.records.contains_key(&key) {
+            return Err(ScriptError::Missing("no record at the key".into()));
+        }
+        let kept = inner.shared.divergent.entry(key).or_default();
+        if !kept.contains(&doc_hash) {
+            kept.push(doc_hash);
+        }
+        let changes = UploadChanges {
+            divergent: std::collections::BTreeSet::from([key]),
+            ..UploadChanges::default()
+        };
+        let at = inner.now();
+        inner.service_transition(ServiceTransition::Upload {
+            by,
+            changes: changes.to_value(),
+            proofs: 0,
+            at,
+        })?;
+        Ok(())
+    }
+
     /// A `missed` item whose times don't parse, as a faulty service may write one (Switch
     /// wire 7.4.4). Returns its `seq`.
     pub fn push_missed_unparsable(&self, entries: u64) -> u64 {

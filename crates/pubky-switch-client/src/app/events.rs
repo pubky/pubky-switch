@@ -11,7 +11,8 @@
 //! "Kept batches"); a kept batch dropped at a provider change and each `attempt` in it
 //! (Switch spec 12.5 "Kept batches", 12.6 step 5); a kept batch refused for good, with its
 //! local writes and outbox messages (Switch spec 6.4); a message deleted from the outbox
-//! undelivered (Switch spec 11), or the record write a sent message named given up; the
+//! undelivered (Switch spec 11), or the record write a sent message named given up; a
+//! shared record a view first shows divergent after a provider loss (Switch spec 12.6); the
 //! account taken as erased (Switch spec 12.7). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
 //! the two. It is reported once that commit is done, or, for a commit whose answer can't
@@ -25,9 +26,11 @@
 //!
 //! Nothing in the app bounds the stored duty events: only the host's acknowledgements
 //! remove them, apart from an [`AppEvent::AccountGone`] the account's return no longer
-//! makes true ([`AppEvent::AccountBack`]). Each is written once, for one entry stored for good, one kept batch or
-//! `attempt` dropped, or one outbox message given up, so they grow with those facts, and
-//! without limit for a host that never acknowledges. The app sets no cap, since a cap would
+//! makes true ([`AppEvent::AccountBack`]). Each is written once, for one entry stored for
+//! good, one kept batch or `attempt` dropped, one outbox message given up, or one record
+//! whose views turned divergent ([`AppEvent::RecordDivergent`]: each time a held record's
+//! views go from not divergent to divergent, which the switch's views drive), so they grow
+//! with those facts, and without limit for a host that never acknowledges. The app sets no cap, since a cap would
 //! have to lose a duty event or stop the work that makes them: reading the feed, which never
 //! stalls (Switch spec 8.2), giving up an undeliverable message (Switch spec 11), or
 //! following a provider change (Switch spec 12.5, 12.6). A host acknowledges each duty
@@ -730,10 +733,23 @@ pub enum AppEvent {
     },
     /// Uploads after a provider loss conflict with the current write of a record the app
     /// holds (Switch spec 12.6): raised once per change, when a view first shows it so, not
-    /// again while it stays so. [`super::SharedRecord::divergent`] is the durable truth: the
-    /// event lives in memory only, so one raised in the commit that writes the flag is lost
-    /// if the app stops before its host takes the report, while the flag stays.
+    /// again while it stays so, short of a restore (below). A duty event, kept in the commit that writes the flag
+    /// ([`super::SharedRecord::divergent`]): delivered until acknowledged, also after a crash
+    /// before the host took the report, and after the flag was cleared since, by a newer
+    /// write in the same read or a later one. The flag says whether the record is divergent
+    /// now; the event, that it was. A restore, in place or from a backup, replaces the marks:
+    /// the listing it owes reads the records again, and a view that still shows a record
+    /// divergent raises the event again, with a new ID. A restore in place also keeps the
+    /// unacknowledged ones, so one divergence may come with two IDs.
+    ///
+    /// Delivery is at least once, and one divergence may carry two IDs: a protocol goes by
+    /// the record key and the record's current flag, not by the event ID. The event has no
+    /// order against the informational events of the same commit, such as the
+    /// [`AppEvent::RecordChanged`] of a newer write that already cleared the flag: read
+    /// [`super::SharedRecord::divergent`] for the record's state now.
     RecordDivergent {
+        /// The duty event's ID.
+        id: EventId,
         /// The record key.
         key: [u8; 32],
     },
@@ -791,6 +807,7 @@ impl AppEvent {
             | Self::MessageUndelivered { id, .. }
             | Self::RecordJobDropped { id, .. }
             | Self::RecordUncheckable { id, .. }
+            | Self::RecordDivergent { id, .. }
             | Self::LocalWritesRefused { id, .. }
             | Self::AccountGone { id } => Some(*id),
             _ => None,
@@ -956,6 +973,10 @@ pub(crate) enum Duty {
         owed_calls: u64,
     },
     AccountGone,
+    RecordDivergent {
+        #[serde(with = "serde_b64")]
+        key: [u8; 32],
+    },
 }
 
 impl Duty {
@@ -1082,6 +1103,7 @@ impl Duty {
                 version: pubky_switch_core::ops::RecordVersion::new(generation, version),
                 mark_bytes,
             },
+            Self::RecordDivergent { key } => AppEvent::RecordDivergent { id, key },
             Self::RestoreLeftBehind {
                 duty_events,
                 owed_calls,
