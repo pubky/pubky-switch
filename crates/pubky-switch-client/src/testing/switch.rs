@@ -2457,11 +2457,15 @@ impl Inner {
         if !truncated {
             last = last.max(self.seq);
         }
+        // The `seq` of the reader's own cursor, 0 before its first move, as the service
+        // reports it (Switch spec 8.3, wire 7.4.4).
+        let cursor = self.apps.get(&app).map_or(0, |held| held.cursor);
         let mut page = json!({
             "items": items,
             "next": format!("{}:{last}", self.tip.generation),
             "scanned_through": last,
             "more": truncated,
+            "cursor": cursor,
             "head": self.head().to_value(),
         });
         if let Some(checkpoint) = &self.checkpoint {
