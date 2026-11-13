@@ -663,7 +663,7 @@ async fn test_peers_certificate_checks_in_order() {
             &replay
                 .service
                 .handle(send(
-                    "cap certificate, extension scope ext:paykit-cap",
+                    "cap certificate, extension scope tasks_ext:tasks-cap",
                     "cap",
                     ms(&at)
                 ))

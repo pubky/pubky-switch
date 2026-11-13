@@ -95,20 +95,32 @@ fn stored_messages() -> Vec<([u8; 32], [u8; 64], Vec<u8>)> {
             continue;
         }
         let value: Value = serde_json::from_str(text).unwrap();
-        for member in value.as_object().unwrap().values() {
-            let Some(plaintext) = member.get("plaintext").filter(|p| p.is_object()) else {
-                continue;
-            };
-            let json = b64(st(plaintext, "json"));
-            let message: Value = serde_json::from_slice(&json).unwrap();
-            out.push((
-                pubky(st(&message, "to")),
-                b64n::<64>(st(plaintext, "signature")),
-                json,
-            ));
-        }
+        stored_in(&value, &mut out);
     }
     out
+}
+
+/// Every stored message a record value holds, at any depth: a member `plaintext` that is an
+/// object with the message's `json` and `signature`.
+fn stored_in(value: &Value, out: &mut Vec<([u8; 32], [u8; 64], Vec<u8>)>) {
+    match value {
+        Value::Object(members) => {
+            if let Some(plaintext) = members.get("plaintext").filter(|p| p.is_object()) {
+                let json = b64(st(plaintext, "json"));
+                let message: Value = serde_json::from_slice(&json).unwrap();
+                out.push((
+                    pubky(st(&message, "to")),
+                    b64n::<64>(st(plaintext, "signature")),
+                    json,
+                ));
+            }
+            for member in members.values() {
+                stored_in(member, out);
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| stored_in(item, out)),
+        _ => {}
+    }
 }
 
 fn header_of(r: &Value, name: &str) -> Option<String> {

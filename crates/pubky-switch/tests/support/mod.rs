@@ -28,8 +28,8 @@ use pubky_switch_core::{
 };
 use serde_json::Value;
 
-/// The seed of the vectors' operator key.
-const OPERATOR_SEED_HEX: &str = "a7ded4a83952cd27b38c2535a2b439e7fff263ae42740790f69e5bc4a1364c8c";
+/// The seed label of the vectors' operator key.
+const OPERATOR_SEED_LABEL: &str = "service/operator";
 
 pub const ORIGIN: &str = "https://inbox.example";
 
@@ -177,7 +177,7 @@ fn replay_on(
         .expect("the service key");
     // The vectors' operator key: the seed of label `service/operator`, by the seed rule of
     // `spec/vectors/README.md`.
-    let operator = hex32(&Value::String(OPERATOR_SEED_HEX.into()));
+    let operator = seed(OPERATOR_SEED_LABEL);
     let key_dir = tempfile::tempdir().expect("key dir");
     let store = FileKeyStore::open(key_dir.path()).expect("key store");
     let keys = Arc::new(FixedKeys::new(
@@ -712,7 +712,7 @@ pub async fn replay_chain_through_revoke(replay: &Replay) {
 /// The public key of the vectors' operator key, which signs answers the service can't tie
 /// to an account.
 pub fn operator_public() -> [u8; 32] {
-    ed25519_dalek::SigningKey::from_bytes(&hex32(&Value::String(OPERATOR_SEED_HEX.into())))
+    ed25519_dalek::SigningKey::from_bytes(&seed(OPERATOR_SEED_LABEL))
         .verifying_key()
         .to_bytes()
 }

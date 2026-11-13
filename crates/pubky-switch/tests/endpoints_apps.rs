@@ -115,7 +115,7 @@ async fn test_apps_after_the_chain() {
     assert_eq!(apps["recovery"], Value::Null);
     // The record's write and the live claim's attempt keep proofs of generation 1.
     assert_eq!(apps["proof_generations"], json!([1]));
-    // The three apps version 3 lists, by App ID bytes: phone, executor, wallet.
+    // The three apps version 3 lists, in the order of their App ID bytes.
     let order: Vec<&str> = apps["apps"]
         .as_array()
         .expect("apps")
@@ -124,7 +124,13 @@ async fn test_apps_after_the_chain() {
         .collect();
     let keys = vectors("keys.json");
     let id = |name: &str| app(&keys, name)["app_id"].as_str().expect("id").to_string();
-    assert_eq!(order, vec![id("phone"), id("executor"), id("wallet")]);
+    let mut listed = ["wallet", "phone", "executor"].map(|name| {
+        let bytes =
+            hex::decode(app(&keys, name)["app_id_bytes_hex"].as_str().expect("hex")).expect("hex");
+        (bytes, id(name))
+    });
+    listed.sort();
+    assert_eq!(order, listed.map(|(_, id)| id).to_vec());
 
     let wallet = status(&apps, "wallet");
     let op = SignedOp::peek(

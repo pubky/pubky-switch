@@ -1066,7 +1066,7 @@ mod tests {
     /// live claim's attempt at seq 7, and the wallet's record from seq 3.
     fn current_at_nine() -> CurrentDocs {
         let mut current = CurrentDocs::default();
-        current.records.insert(8, "pay".into());
+        current.records.insert(8, "tasks".into());
         current.claim_entries.insert(7);
         let op = SignedOp::peek(row(3).item.as_ref().expect("item")).expect("op");
         let (OpKind::AppPut { record }, Some(app)) = (&op.body().kind, op.body().app_id) else {
@@ -1096,7 +1096,7 @@ mod tests {
     #[test]
     fn test_feed_visibility_by_scope_and_permission() {
         let current = current_at_nine();
-        let all = reader(&["pay"], &[Permission::ClaimsRead, Permission::ListsRead]);
+        let all = reader(&["tasks"], &[Permission::ClaimsRead, Permission::ListsRead]);
         // The create at seq 6 is superseded by the update at seq 8: a stub (Switch wire 7.5).
         assert_eq!(
             shown(&all, &current),
@@ -1112,7 +1112,7 @@ mod tests {
             ]
         );
         // Without the record's read scope, or claims.read: their items are stubs.
-        let neither = reader(&["allowance"], &[]);
+        let neither = reader(&["tasks_share"], &[]);
         assert_eq!(
             shown(&neither, &current),
             vec![
@@ -1127,7 +1127,7 @@ mod tests {
             ]
         );
         // A scope's parent name holds its sub-scopes, not the reverse (Switch wire 3.1).
-        let sub = reader(&["pay:shop"], &[Permission::ClaimsRead]);
+        let sub = reader(&["tasks:team1"], &[Permission::ClaimsRead]);
         assert!(!matches!(
             shows(&row(8), &sub, &current).expect("shows"),
             Shown::Full { .. }
@@ -1137,10 +1137,10 @@ mod tests {
     #[test]
     fn test_feed_visibility_of_superseded_and_deleted_documents() {
         let mut current = current_at_nine();
-        let all = reader(&["pay"], &[Permission::ClaimsRead]);
+        let all = reader(&["tasks"], &[Permission::ClaimsRead]);
         // The record's delete at seq 10 supersedes the update at seq 8.
         current.records.clear();
-        current.records.insert(10, "pay".into());
+        current.records.insert(10, "tasks".into());
         assert_eq!(shows(&row(8), &all, &current).expect("shows"), Shown::Stub);
         assert!(matches!(
             shows(&row(10), &all, &current).expect("shows"),
@@ -1206,9 +1206,9 @@ mod tests {
     fn test_feed_visibility_of_the_lists() {
         use pubky_switch_core::ops::{AllowKind, InviteCodePut, InviteContext};
         let current = CurrentDocs::default();
-        let none = reader(&["pay"], &[]);
-        let lists = reader(&["pay"], &[Permission::ListsRead]);
-        let adder = reader(&["pay"], &[Permission::ConversationAdd]);
+        let none = reader(&["tasks"], &[]);
+        let lists = reader(&["tasks"], &[Permission::ListsRead]);
+        let adder = reader(&["tasks"], &[Permission::ConversationAdd]);
         for kind in [
             OpKind::AllowPut {
                 pubky: [1; 32],
@@ -1292,10 +1292,10 @@ mod tests {
     #[test]
     fn test_feed_visibility_of_key_bundles_and_renewed_certificates() {
         use pubky_switch_core::ops::KeyBundlePut;
-        let target = reader(&["pay"], &[]);
+        let target = reader(&["tasks"], &[]);
         let other = reader_keyed(
             [9; 32],
-            &["pay"],
+            &["tasks"],
             &[Permission::ClaimsRead, Permission::ListsRead],
         );
         let part =
@@ -1353,14 +1353,14 @@ mod tests {
         // the most permitted one and a key bundle's target among them, in each state below.
         use pubky_switch_core::ops::KeyBundlePut;
         let all = reader(
-            &["pay", "allowance"],
+            &["tasks", "tasks_share"],
             &[
                 Permission::ClaimsRead,
                 Permission::ListsRead,
                 Permission::ConversationAdd,
             ],
         );
-        let target = reader_keyed([9; 32], &["pay"], &[]);
+        let target = reader_keyed([9; 32], &["tasks"], &[]);
         let readers = [&all, &target];
         let part =
             pubky_switch_core::records::seal_bundle_parts(&alice_key(), &target, 1, 1, &|_| true)
@@ -1391,7 +1391,7 @@ mod tests {
         let mut states = vec![current_at_nine()];
         let mut later = current_at_nine();
         later.records.clear();
-        later.records.insert(10, "pay".into());
+        later.records.insert(10, "tasks".into());
         later.claim_entries.clear();
         for docs in later.apps.values_mut() {
             docs.record = Some(SignedDoc::from_parts(b"{}", &[0; 64]));
@@ -1438,7 +1438,7 @@ mod tests {
 
     #[test]
     fn test_feed_reader_takes_a_reducing_renewal_in_the_snapshot() {
-        // The wallet's renewal, which drops manage_contacts, lands during a wait: the next
+        // The wallet's renewal, which drops tasks_people_admin, lands during a wait: the next
         // page reads with the renewed certificate, the one the wallet is checked against now.
         let alice = alice_key();
         let op = SignedOp::peek(row(3).item.as_ref().expect("item")).expect("op");
@@ -1467,7 +1467,10 @@ mod tests {
             full_requested_ms: None,
             full_completed_seq: None,
         });
-        snapshot.current.records.insert(8, "manage_contacts".into());
+        snapshot
+            .current
+            .records
+            .insert(8, "tasks_people_admin".into());
         let mut builder = PageBuilder::with(
             Reader::Checked {
                 identity_key: alice.public(),
@@ -1533,7 +1536,7 @@ mod tests {
 
     /// The seqs of the page `reader` reads of `chain.json` from `snapshot`.
     fn page(snapshot: &FeedSnapshot, limit: usize, budget: usize) -> (Vec<u64>, u64, bool) {
-        let reader = reader(&["pay"], &[Permission::ClaimsRead]);
+        let reader = reader(&["tasks"], &[Permission::ClaimsRead]);
         let mut builder = PageBuilder::new(reader, limit, budget);
         assert!(builder.begin(snapshot));
         for row in rows()

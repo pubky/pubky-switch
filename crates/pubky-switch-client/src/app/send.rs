@@ -173,7 +173,7 @@ impl std::fmt::Debug for RecordJob {
 pub struct OutgoingMessage {
     /// The recipient identity.
     pub to: [u8; 32],
-    /// The kind, `<protocol>.<name>`.
+    /// The kind, `<prefix>.<name>`.
     pub kind: String,
     /// The hashes of the messages it refers to.
     pub refs: Vec<[u8; 32]>,

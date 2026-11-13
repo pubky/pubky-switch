@@ -21,9 +21,9 @@ pub enum CheckFailure {
 /// the certificate verifies for `identity` (1); it names `app_id` when the caller names one,
 /// and `signing_key` is the key the request, message or record is checked with (2); and it
 /// hasn't expired at `at`, the service's time for a request, the entry's `accepted_at` for a
-/// message, the reader's clock for sending or paying (3). With `at` `None` check 3 is left to
-/// the caller, as the service does for an app of another identity, which it checks after
-/// check 4 ([`AppCert::expired_at`]).
+/// message, the reader's clock for sending or for acting on a record (3). With `at` `None`
+/// check 3 is left to the caller, as the service does for an app of another identity, which
+/// it checks after check 4 ([`AppCert::expired_at`]).
 ///
 /// Check 4, the request's, message's or record's own signature, comes next and is the
 /// caller's; check 5 is [`IdentityDoc::standing`] and check 6 [`super::AppRecord::carries`].
