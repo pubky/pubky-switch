@@ -86,7 +86,7 @@ impl Replay {
     /// directory, as after a restart: nothing it held in memory is kept.
     pub fn restarted(&self) -> Service {
         let store = FileKeyStore::open(self._key_dir.path()).expect("key store");
-        let operator = hex32(&Value::String(OPERATOR_SEED_HEX.into()));
+        let operator = seed(OPERATOR_SEED_LABEL);
         Service::new(
             ORIGIN.into(),
             self.db.store().clone(),
