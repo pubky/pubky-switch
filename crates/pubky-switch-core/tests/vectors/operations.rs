@@ -323,13 +323,13 @@ fn check_invite_context(keys: &Keys, v: &Value, identity: &[u8; 32]) {
         .find(|o| st(o, "name") == "invite_code.put")
         .unwrap();
     let text = st(based_on, "body");
-    let context = r#""context":{"order":"order-1042"}"#;
+    let context = r#""context":{"board":"home"}"#;
     assert!(text.contains(context));
-    let compact = format!(r#"{{"order":"{}"}}"#, "x".repeat(988));
+    let compact = format!(r#"{{"board":"{}"}}"#, "x".repeat(988));
     assert_eq!(compact.len(), 1000);
     let case = |name: &str, written: usize, expect: Value| {
         let padded = format!(
-            r#"{{{}"order":"{}"}}"#,
+            r#"{{{}"board":"{}"}}"#,
             " ".repeat(written - 1000),
             "x".repeat(988)
         );

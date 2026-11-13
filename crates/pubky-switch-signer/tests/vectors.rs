@@ -69,8 +69,45 @@ fn http_body(list: &str, name: &str) -> Vec<u8> {
     }
 }
 
-/// The protocol of the vectors' apps: the first of the spec's reserved protocols, with its
-/// scope roots; keyed are the scopes the vectors give keys for (scope keys, sub-scope keys,
+/// The vectors' protocol, as the files give it: its name, the one member of the wallet app
+/// record's `protocols`, and its scope roots, the names of every scope the vector certificates
+/// hold.
+fn vector_protocol() -> (String, Vec<String>) {
+    let documents = load("documents.json");
+    let documents = documents["documents"].as_array().unwrap();
+    let body = |name: &str| -> Vec<Value> {
+        documents
+            .iter()
+            .filter(|d| text(d, "name").contains(name))
+            .map(|d| serde_json::from_str(text(d, "body")).unwrap())
+            .collect()
+    };
+    let record = body("wallet app record").remove(0);
+    let protocols = record["protocols"].as_object().unwrap();
+    assert_eq!(
+        protocols.len(),
+        1,
+        "the vectors' apps belong to one protocol"
+    );
+    let name = protocols.keys().next().unwrap().clone();
+    let mut roots: Vec<String> = body("certificate")
+        .iter()
+        .flat_map(|cert| cert["scopes"].as_array().unwrap().clone())
+        .map(|scope| {
+            let scope = scope.as_str().unwrap();
+            scope
+                .split_once(':')
+                .map_or(scope, |(root, _)| root)
+                .to_owned()
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    (name, roots)
+}
+
+/// The protocol of the vectors' apps, with the name and scope roots the files give it
+/// (`vector_protocol`); keyed are the scopes the vectors give keys for (scope keys, sub-scope keys,
 /// the key bundles' keys and the reduction's removed scope). Read from the spec's files, so
 /// the test names no protocol of its own.
 struct VectorScopes {
@@ -81,11 +118,7 @@ struct VectorScopes {
 
 impl VectorScopes {
     fn new() -> Self {
-        let own = pubky_switch_core::scopes::reserved()
-            .unwrap()
-            .first()
-            .unwrap()
-            .clone();
+        let (name, roots) = vector_protocol();
         let keys = load("keys.json");
         let envelopes = load("envelopes.json");
         let mut keyed: Vec<String> = keys["scope_keys"]
@@ -103,11 +136,7 @@ impl VectorScopes {
             }
         }
         keyed.push(text(&envelopes["reduction_key_bundle"], "removed_scope").to_owned());
-        Self {
-            name: own.name,
-            roots: own.roots,
-            keyed,
-        }
+        Self { name, roots, keyed }
     }
 }
 
