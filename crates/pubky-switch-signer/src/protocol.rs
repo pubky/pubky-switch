@@ -1076,7 +1076,7 @@ mod roots {
             Protocols::new(vec![Arc::new(Claims("chat", root))]).unwrap();
         }
         // Another root, even with only this protocol installed (Switch wire 3.1 "Scope roots").
-        for root in ["request", "chatter", "chat_", "cha", "other_chat"] {
+        for root in ["tasks", "chatter", "chat_", "cha", "other_chat"] {
             let error = Protocols::new(vec![Arc::new(Claims("chat", root))]).unwrap_err();
             assert_eq!(
                 error,
