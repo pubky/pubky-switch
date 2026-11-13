@@ -65,6 +65,14 @@ pub fn read_enrollment(
     })
 }
 
+/// Why an enrollment created no account.
+enum Uncreated {
+    /// The erasure ledger couldn't be read: nothing was committed.
+    LedgerUnread,
+    /// The database failed or refused the creation.
+    Store(crate::store::StoreError),
+}
+
 impl Service {
     /// `POST /v1/enroll`, from the signer. Errors before an account exists are signed with
     /// the operator key; the answer with the key it names, without a head.
@@ -173,6 +181,18 @@ impl Service {
     ) -> Result<(ServiceKey, u64, AnnouncedLimits), ApiError> {
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         let enrollment_hash = enrollment.signed().doc_hash().map_err(|_| unavailable())?;
+        // An account a restored database brought back after its erasure goes first, so the
+        // enrollment makes a new account and answers nothing from the old one (Switch spec
+        // 6.5).
+        if let Some(found) = self
+            .store
+            .lookup(identity_text)
+            .await
+            .map_err(|e| store_error(&e))?
+        {
+            self.erase_if_restored(identity_text, found.created_at_ms)
+                .await?;
+        }
         // An account that doesn't exist yet is made, then answered like any other.
         if self
             .store
@@ -205,10 +225,30 @@ impl Service {
                     revoked_apps,
                     enrollment_hash,
                 };
-                let created = store.create_account(&account).await;
+                // Created after every erasure of the identity, so it is never taken for one a
+                // restored database brought back (Switch spec 6.5): the database's owed
+                // erasure is read after the insert, then the ledger, in that order
+                // (`store::account::begin_create`). A ledger that can't be read creates
+                // nothing.
+                let created = match store.begin_create(&account).await {
+                    Ok(Some(creation)) => match keys.erasure(&account.id).await {
+                        Ok(ledger) => creation
+                            .commit(ledger)
+                            .await
+                            .map(Some)
+                            .map_err(Uncreated::Store),
+                        Err(failure) => {
+                            tracing::error!(%failure, "reading the erasure ledger");
+                            Err(Uncreated::LedgerUnread)
+                        }
+                    },
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(Uncreated::Store(error)),
+                };
                 let unnamed = match &created {
-                    Ok(created) => !created,
-                    Err(error) => error.is_refused(),
+                    Ok(created) => created.is_none(),
+                    Err(Uncreated::LedgerUnread) => true,
+                    Err(Uncreated::Store(error)) => error.is_refused(),
                 };
                 if unnamed && let Err(failure) = keys.delete(&key.id).await {
                     tracing::warn!(%failure, "dropping an unused service key");
@@ -219,10 +259,14 @@ impl Service {
             .flatten()
             .ok_or_else(unavailable)?;
             let (key, created) = made;
-            if created.map_err(|e| store_error(&e))? {
-                return Ok((key, base_ms, limits));
+            match created {
+                // Answered at the time it was created, which may be past `base_ms`.
+                Ok(Some(created_at_ms)) => return Ok((key, created_at_ms, limits)),
+                // Another enrollment made the account first: its key answers.
+                Ok(None) => {}
+                Err(Uncreated::LedgerUnread) => return Err(unavailable()),
+                Err(Uncreated::Store(error)) => return Err(store_error(&error)),
             }
-            // Another enrollment made the account first: its key answers.
         }
         let mut txn = self
             .store

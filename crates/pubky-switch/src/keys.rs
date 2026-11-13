@@ -45,6 +45,10 @@ pub struct KeysConfig {
     /// The directory of the file key store. Required to run the service. Put it on a disk
     /// that database backups don't cover, and back it up on its own.
     pub path: Option<PathBuf>,
+    /// How many days the operator keeps database backups: the erasure ledger keeps each
+    /// erasure that long, so a database restored from any kept backup erases the account
+    /// again (Switch spec 6.5). Unset, the ledger keeps every erasure for good.
+    pub backup_retention_days: Option<u64>,
 }
 
 /// The readiness check of the file key store: its directories are there and readable.
@@ -245,8 +249,18 @@ pub trait KeyStore: Send + Sync {
     /// Record that `identity`'s account was erased at `erased_at_ms`.
     fn record_erasure<'a>(&'a self, identity: &'a str, erased_at_ms: u64) -> KeyFuture<'a, ()>;
 
-    /// When `identity`'s account was last erased, if ever.
+    /// When `identity`'s account was last erased, if ever; never for an identity the ledger
+    /// can't hold, which [`KeyStore::record_erasure`] refuses. Every call to an account
+    /// asks, so it must be cheap: a store that caches the ledger holds at least what the
+    /// ledger holds.
     fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>>;
+
+    /// Every erasure the ledger holds: each identity, with the time of its latest erasure.
+    fn erasures(&self) -> KeyFuture<'_, Vec<(String, u64)>>;
+
+    /// Forget the erasures recorded before `before_ms`, whose accounts no database backup
+    /// the operator keeps can hold any more (Switch spec 6.5); the number forgotten.
+    fn forget_erasures_before(&self, before_ms: u64) -> KeyFuture<'_, usize>;
 }
 
 /// A service key's signer: it signs `lp(label, fields...)` under a Switch label, for the
@@ -352,6 +366,10 @@ struct Inner {
     root: PathBuf,
     keys: Mutex<HashMap<KeyId, Arc<SigningKey>>>,
     marks: Mutex<HashMap<KeyId, Option<Mark>>>,
+    /// The erasure ledger, read whole from its files at open, so a request's check needs no
+    /// file read. It holds at least what the files hold: an erasure goes in before its file
+    /// is written, and leaves only once its file's removal is durable.
+    ledger: Mutex<HashMap<String, u64>>,
     /// Held around every read-check-write of a mark, a deletion and an erasure record,
     /// inside the blocking task that does it. A caller that stops waiting can't release it
     /// early: the task runs to its end, so writes land in the order they were checked.
@@ -384,11 +402,13 @@ impl FileKeyStore {
         for dir in ["keys", "marks", "erasures"] {
             create_private_dir(&root.join(dir))?;
         }
+        let ledger = read_ledger(&root.join("erasures"))?;
         Ok(Self {
             inner: Arc::new(Inner {
                 root,
                 keys: Mutex::new(HashMap::new()),
                 marks: Mutex::new(HashMap::new()),
+                ledger: Mutex::new(ledger),
                 writes: Mutex::new(()),
                 #[cfg(test)]
                 pause: Mutex::new(None),
@@ -412,12 +432,7 @@ impl Inner {
     }
 
     fn erasure_path(&self, identity: &str) -> Result<PathBuf, KeyStoreError> {
-        if identity.is_empty()
-            || identity.len() > MAX_IDENTITY_LEN
-            || !identity
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        {
+        if !is_ledger_name(identity) {
             return Err(KeyStoreError::InvalidId);
         }
         Ok(self.root.join("erasures").join(identity))
@@ -560,10 +575,48 @@ impl Inner {
     fn record_erasure_sync(&self, identity: &str, erased_at_ms: u64) -> Result<(), KeyStoreError> {
         let path = self.erasure_path(identity)?;
         let _writes = self.writes.lock();
-        if Self::read_erasure(&path)?.is_some_and(|recorded| recorded >= erased_at_ms) {
+        let recorded = Self::read_erasure(&path)?;
+        // The ledger in memory takes the erasure first, so it holds at least what the files
+        // hold, also when a write lands its file and then fails: on that side it only erases.
+        let latest = recorded.map_or(erased_at_ms, |recorded| recorded.max(erased_at_ms));
+        {
+            let mut ledger = self.ledger.lock();
+            let held = ledger.entry(identity.to_string()).or_insert(latest);
+            *held = (*held).max(latest);
+        }
+        if recorded.is_some_and(|recorded| recorded >= erased_at_ms) {
             return Ok(());
         }
         write_atomic(&path, erased_at_ms.to_string().as_bytes(), false)
+    }
+
+    /// Remove the ledger's files of erasures before `before_ms`, each removal durable before
+    /// its entry leaves the ledger in memory.
+    fn forget_erasures_sync(&self, before_ms: u64) -> Result<usize, KeyStoreError> {
+        let _writes = self.writes.lock();
+        let old: Vec<String> = self
+            .ledger
+            .lock()
+            .iter()
+            .filter(|(_, at)| **at < before_ms)
+            .map(|(identity, _)| identity.clone())
+            .collect();
+        let dir = self.root.join("erasures");
+        for identity in &old {
+            match fs::remove_file(dir.join(identity)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !old.is_empty() {
+            sync_dir(&dir)?;
+            let mut ledger = self.ledger.lock();
+            for identity in &old {
+                ledger.remove(identity);
+            }
+        }
+        Ok(old.len())
     }
 
     fn delete_sync(&self, id: &KeyId) -> Result<(), KeyStoreError> {
@@ -663,9 +716,65 @@ impl KeyStore for FileKeyStore {
     }
 
     fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>> {
-        let path = self.inner.erasure_path(identity);
-        Box::pin(blocking(move || Inner::read_erasure(&path?)))
+        // A name the ledger can't hold was never recorded: no erasure.
+        let found = self.inner.ledger.lock().get(identity).copied();
+        Box::pin(std::future::ready(Ok(found)))
     }
+
+    fn erasures(&self) -> KeyFuture<'_, Vec<(String, u64)>> {
+        let mut all: Vec<(String, u64)> = self
+            .inner
+            .ledger
+            .lock()
+            .iter()
+            .map(|(identity, at)| (identity.clone(), *at))
+            .collect();
+        all.sort_unstable();
+        Box::pin(std::future::ready(Ok(all)))
+    }
+
+    fn forget_erasures_before(&self, before_ms: u64) -> KeyFuture<'_, usize> {
+        let store = self.inner.clone();
+        Box::pin(blocking(move || store.forget_erasures_sync(before_ms)))
+    }
+}
+
+/// Whether `name` may name an identity in the erasure ledger: a Pubky ID's characters, at
+/// most [`MAX_IDENTITY_LEN`]. A write's temporary file, which starts with a dot, never does.
+fn is_ledger_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_IDENTITY_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// The erasure ledger in `dir`: every file an identity names, with its time. A write's
+/// temporary file, left by a crash, isn't an entry; any other file that doesn't read is
+/// refused, so a ledger that can't be read whole stops the store from opening.
+fn read_ledger(dir: &Path) -> Result<HashMap<String, u64>, KeyStoreError> {
+    let mut ledger = HashMap::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(KeyStoreError::Corrupt(
+                "erasure: a file name isn't UTF-8".into(),
+            ));
+        };
+        if name.starts_with('.') && name.ends_with(".tmp") {
+            continue;
+        }
+        if !is_ledger_name(name) {
+            return Err(KeyStoreError::Corrupt(format!(
+                "erasure: {name} names no identity"
+            )));
+        }
+        if let Some(at) = Inner::read_erasure(&entry.path())? {
+            ledger.insert(name.to_string(), at);
+        }
+    }
+    Ok(ledger)
 }
 
 /// Create `dir` and its parents, readable by the owner only.
@@ -823,6 +932,14 @@ impl KeyStore for FixedKeys {
 
     fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>> {
         self.store.erasure(identity)
+    }
+
+    fn erasures(&self) -> KeyFuture<'_, Vec<(String, u64)>> {
+        self.store.erasures()
+    }
+
+    fn forget_erasures_before(&self, before_ms: u64) -> KeyFuture<'_, usize> {
+        self.store.forget_erasures_before(before_ms)
     }
 }
 
@@ -1166,6 +1283,87 @@ mod tests {
         assert!(matches!(
             store.record_erasure("../keys/x", 1).await,
             Err(KeyStoreError::InvalidId)
+        ));
+        assert_eq!(store.erasure("../keys/x").await.expect("read"), None);
+    }
+
+    #[tokio::test]
+    async fn test_key_store_erasure_ledger_lists_and_forgets_before_a_time() {
+        let (dir, store) = open();
+        for (identity, at) in [("aaa", 1_000), ("bbb", 2_000), ("ccc", 3_000)] {
+            store.record_erasure(identity, at).await.expect("record");
+        }
+        assert_eq!(
+            store.erasures().await.expect("list"),
+            vec![
+                ("aaa".to_string(), 1_000),
+                ("bbb".to_string(), 2_000),
+                ("ccc".to_string(), 3_000)
+            ]
+        );
+        // Before 2,000: only the first goes; one at the time stays.
+        assert_eq!(
+            store.forget_erasures_before(2_000).await.expect("forget"),
+            1
+        );
+        assert_eq!(store.erasure("aaa").await.expect("read"), None);
+        assert_eq!(store.erasure("bbb").await.expect("read"), Some(2_000));
+        // The removal is durable: a reopened store reads the same ledger.
+        let store = FileKeyStore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            store.erasures().await.expect("list"),
+            vec![("bbb".to_string(), 2_000), ("ccc".to_string(), 3_000)]
+        );
+        assert_eq!(store.forget_erasures_before(0).await.expect("forget"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_key_store_erasure_ledger_holds_an_erasure_its_file_already_records() {
+        // A write whose rename landed but whose directory sync failed leaves the file in
+        // place and the record refused; the retry finds the file and must still put the
+        // erasure in the ledger the checks read (Switch spec 6.5).
+        let (dir, store) = open();
+        fs::write(dir.path().join("erasures").join("aaa"), "1000").expect("landed");
+        store.record_erasure("aaa", 1_000).await.expect("record");
+        assert_eq!(store.erasure("aaa").await.expect("read"), Some(1_000));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_erasure_ledger_skips_a_write_left_by_a_crash() {
+        let (dir, store) = open();
+        store.record_erasure("aaa", 1_000).await.expect("record");
+        drop(store);
+        // A write's temporary file, as a crash before its rename leaves it.
+        fs::write(
+            dir.path()
+                .join("erasures")
+                .join(".bbb.0011223344556677.tmp"),
+            "2000",
+        )
+        .expect("temp");
+        let store = FileKeyStore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            store.erasures().await.expect("list"),
+            vec![("aaa".to_string(), 1_000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_key_store_erasure_ledger_that_doesnt_read_refuses_to_open() {
+        let (dir, store) = open();
+        store.record_erasure("aaa", 1_000).await.expect("record");
+        drop(store);
+        let ledger = dir.path().join("erasures");
+        fs::write(ledger.join("aaa"), "not a time").expect("corrupt");
+        assert!(matches!(
+            FileKeyStore::open(dir.path()),
+            Err(KeyStoreError::Corrupt(_))
+        ));
+        fs::write(ledger.join("aaa"), "1000").expect("fixed");
+        fs::write(ledger.join("Not-An-Identity"), "1000").expect("stray");
+        assert!(matches!(
+            FileKeyStore::open(dir.path()),
+            Err(KeyStoreError::Corrupt(_))
         ));
     }
 
