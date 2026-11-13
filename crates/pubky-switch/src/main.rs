@@ -141,18 +141,21 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let api = match config.server.origin.clone() {
         Some(origin) => {
             // Keys an erasure left owed, by a key store failure or a crash, go first (Switch
-            // wire 7.4.16).
+            // wire 7.4.16), then accounts a restored database brought back after their
+            // erasure (spec 6.5), before the API listener takes a request.
             let service = Arc::new(
-                Service::start(
+                Service::new(
                     origin.clone(),
                     store.clone(),
                     Arc::new(keys.clone()),
                     time.clone(),
                     config.limits.clone(),
                 )
-                .await
                 .with_push(config.push.enabled)
-                .with_push_concurrency(config.push.concurrency),
+                .with_push_concurrency(config.push.concurrency)
+                .with_backup_retention_days(config.keys.backup_retention_days)
+                .started()
+                .await,
             );
             // Webhooks queued by any instance are sent by one of them (Switch wire 8.2).
             if config.push.enabled {

@@ -121,6 +121,14 @@ impl KeyStore for Recording {
     fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>> {
         self.inner.erasure(identity)
     }
+
+    fn erasures(&self) -> KeyFuture<'_, Vec<(String, u64)>> {
+        self.inner.erasures()
+    }
+
+    fn forget_erasures_before(&self, before_ms: u64) -> KeyFuture<'_, usize> {
+        self.inner.forget_erasures_before(before_ms)
+    }
 }
 
 impl Recording {

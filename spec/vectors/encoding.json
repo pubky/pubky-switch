@@ -44,12 +44,12 @@
         "hex": "fbff"
       },
       {
-        "base64url": "pPT38gX0Fch3FmrxJFm7Uw",
-        "hex": "a4f4f7f205f415c877166af12459bb53"
+        "base64url": "3ktBQOF5FlaCTasJB68CFg",
+        "hex": "de4b4140e1791656824dab0907af0216"
       },
       {
-        "base64url": "-lKi_JWHgjy6TjTVZGVbF8gyZ5DzBZRpQwgTmQRLdlk",
-        "hex": "fa52a2fc9587823cba4e34d564655b17c8326790f305946943081399044b7659"
+        "base64url": "z1Q5i7niThQqUjRLkzrpnQic8u74TpwUioKDvngg0g8",
+        "hex": "cf54398bb9e24e142a52344b933ae99d089cf2eef84e9c148a8283be7820d20f"
       }
     ]
   },
@@ -79,28 +79,28 @@
       ]
     },
     {
-      "key_material_hex": "0000002085ded45b33a1d5ceb07fc225b0e3de51b45da473b7fa5753d3541d18ad4c5028",
+      "key_material_hex": "00000020b39254fdd251c3f6f276d439d46963bbd15dea44c648b191d23dad1e90dc6b74",
       "label": "pubky-switch/v1/kid",
-      "output_hex": "0429c61a6abc9ab8d8a370367652396861dd73a100c3ff67af72a12274bb76ea",
+      "output_hex": "534b56c08c5d1b2941893dc3d7c97546f105a30a06b45e9693d5c68fadd09c0b",
       "parts_hex": [
-        "85ded45b33a1d5ceb07fc225b0e3de51b45da473b7fa5753d3541d18ad4c5028"
+        "b39254fdd251c3f6f276d439d46963bbd15dea44c648b191d23dad1e90dc6b74"
       ]
     },
     {
-      "key_material_hex": "0000002020fcc15627fafa927c17abdafda79e0f9a7132052808ece1957bcc7cdc11994c",
+      "key_material_hex": "000000209d5801d56c78bc6b8fb566ef2046be176a9850c2c4340fdf4ca0f81900e2be11",
       "label": "pubky-switch/v1/key-commit",
-      "output_hex": "b380b6d70ffea33bfc052d7cf2f86078c5f0b0138feed0ddba37e2a30b63d1d4",
+      "output_hex": "a53bff8d5b31443fae932aed3124a2096d1249e88a461bb2acf5ff26ace95bf8",
       "parts_hex": [
-        "20fcc15627fafa927c17abdafda79e0f9a7132052808ece1957bcc7cdc11994c"
+        "9d5801d56c78bc6b8fb566ef2046be176a9850c2c4340fdf4ca0f81900e2be11"
       ]
     },
     {
-      "key_material_hex": "0000000e70617965725f616374697669747900000020f149881e9fb5b6c16f5a70fdae005551024ff70895b7fd499d5e368921b52f0c",
+      "key_material_hex": "0000000a7461736b5f6974656d73000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3",
       "label": "pubky-switch/v1/collection",
-      "output_hex": "b7e61f1123c82fd2fdb9513663a21f3ab1e7198dde120ef8a3ace8b8aba9a9d2",
+      "output_hex": "ad38590c0bf514744c222527e92f21ec704717ffa04e5980d77702f15f8faee8",
       "parts_hex": [
-        "70617965725f6163746976697479",
-        "f149881e9fb5b6c16f5a70fdae005551024ff70895b7fd499d5e368921b52f0c"
+        "7461736b5f6974656d73",
+        "3832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3"
       ]
     }
   ],
@@ -147,17 +147,17 @@
       "valid": true
     },
     {
-      "json": "{\"v\":1,\"kind\":\"paykit.payment_request\",\"body\":{\"metadata\":{\"rate\":1.5e2}}}",
+      "json": "{\"v\":1,\"kind\":\"tasks.assignment\",\"body\":{\"metadata\":{\"rate\":1.5e2}}}",
       "read_as": "message",
       "valid": true
     },
     {
-      "json": "{\"v\":1,\"kind\":\"paykit.payment_proof\",\"body\":{\"proof\":{\"type\":\"x\",\"amount_msat\":1e30}}}",
+      "json": "{\"v\":1,\"kind\":\"tasks.done\",\"body\":{\"proof\":{\"type\":\"x\",\"score\":1e30}}}",
       "read_as": "message",
       "valid": true
     },
     {
-      "json": "{\"v\":1,\"kind\":\"paykit.payment_request\",\"body\":{\"proof\":{\"rate\":1.5}}}",
+      "json": "{\"v\":1,\"kind\":\"tasks.assignment\",\"body\":{\"proof\":{\"rate\":1.5}}}",
       "read_as": "message",
       "valid": false
     },
@@ -205,10 +205,10 @@
       ]
     },
     {
-      "output_hex": "000000137075626b792d7377697463682f76312f6b69640000002085ded45b33a1d5ceb07fc225b0e3de51b45da473b7fa5753d3541d18ad4c5028",
+      "output_hex": "000000137075626b792d7377697463682f76312f6b696400000020b39254fdd251c3f6f276d439d46963bbd15dea44c648b191d23dad1e90dc6b74",
       "parts_hex": [
         "7075626b792d7377697463682f76312f6b6964",
-        "85ded45b33a1d5ceb07fc225b0e3de51b45da473b7fa5753d3541d18ad4c5028"
+        "b39254fdd251c3f6f276d439d46963bbd15dea44c648b191d23dad1e90dc6b74"
       ]
     }
   ],
@@ -334,33 +334,33 @@
     "invalid": [
       {
         "why": "51 characters",
-        "zbase32": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhg"
+        "zbase32": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5b"
       },
       {
         "why": "'l' is not in the alphabet",
-        "zbase32": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgl"
+        "zbase32": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bl"
       },
       {
         "why": "non-zero trailing bit",
-        "zbase32": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgb"
+        "zbase32": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bb"
       },
       {
         "why": "upper case",
-        "zbase32": "6FRAO8W9SS5CN544QD64HYNIKRBR97AE1S5941C7MA5E1EPIFHGY"
+        "zbase32": "8Y3QY4G9Q7Y9OWND18HSKDOXDXZUEUTIU3F391RNNUXZNXMQP5BO"
       }
     ],
     "valid": [
       {
-        "hex": "f149881e9fb5b6c16f5a70fdae005551024ff70895b7fd499d5e368921b52f0c",
-        "zbase32": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy"
+        "hex": "3832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3",
+        "zbase32": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo"
       },
       {
-        "hex": "eb74516b4e85b8ca18a21df66247a5002f24018e00e6f1b90786cf02c820bc07",
-        "zbase32": "7p4fn44qoshcwgfndz5grt7fyyz1eycqyduxdqe8o58of1byzodo"
+        "hex": "d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535",
+        "zbase32": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o"
       },
       {
-        "hex": "a2125cf446275d5ba139442a91678ed3",
-        "zbase32": "wejf37ngr7qizej3eoijn3hq4c"
+        "hex": "a1f0b8ac52cafcdd86825a7f44242ed3",
+        "zbase32": "w8amtmn13m6p5bwnmj9wejbq4c"
       }
     ]
   }

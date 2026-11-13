@@ -100,6 +100,7 @@ pub(crate) mod key {
     pub(crate) const JOIN: &str = "join";
     pub(crate) const ALARM: &str = "alarm";
     pub(crate) const RESTORE: &str = "restore";
+    pub(crate) const RESTORE_CURSOR: &str = "hcur";
     pub(crate) const LEAVE: &str = "leave";
     pub(crate) const SERVICE_TIME: &str = "service_time";
     pub(crate) const PENDING_EFFECT: &str = "pending/effect";
@@ -630,6 +631,9 @@ pub(crate) struct RestoreState {
     pub(crate) own_key_n: Option<u64>,
     /// Reconcile mode: no new attempts until the protocol's reconciliation ends it.
     pub(crate) reconcile: bool,
+    /// Whether the key check found the restored receive key the current one, set with
+    /// `key_checked`; `None` before it.
+    pub(crate) key_current: Option<bool>,
 }
 
 /// `leave`: a leave in progress or done (Switch spec 12.3). Each call's mode decides how

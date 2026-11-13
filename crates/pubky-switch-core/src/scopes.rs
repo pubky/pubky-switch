@@ -10,10 +10,6 @@
 
 use crate::error::{Result, invalid};
 
-mod reserved;
-
-pub use reserved::{ReservedProtocol, reserved};
-
 /// The most scopes one certificate holds (Switch wire 3.1, "Scope names").
 pub const MAX_SCOPES: usize = 32;
 

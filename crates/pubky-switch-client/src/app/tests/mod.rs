@@ -5,6 +5,7 @@ mod awaiting_key;
 mod feed_wait;
 mod flows;
 mod forget;
+mod held_cursor;
 mod held_reads;
 mod kept_status;
 mod moves;

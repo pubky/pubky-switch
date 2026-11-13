@@ -71,16 +71,18 @@ pub fn new_msg_id() -> Result<String> {
     Ok(out)
 }
 
-/// Check a message kind's form: `<protocol>.<name>`, both parts non-empty (Switch wire 5.1).
-/// Which kinds exist is the protocol's; recipients drop kinds they don't know.
+/// Check a message kind's form: `<prefix>.<name>`, both parts non-empty (Switch wire 5.1).
+/// The prefix is its protocol's name or an extension of it (Switch wire 3.1, "Kind
+/// prefixes"), which the switch doesn't check; which kinds exist is the protocol's, and
+/// recipients drop kinds they don't know.
 ///
 /// # Errors
 ///
-/// [`Error::Invalid`] for a kind without a protocol or a name.
+/// [`Error::Invalid`] for a kind without a prefix or a name.
 pub fn check_kind(kind: &str) -> Result<()> {
     match kind.split_once('.') {
         Some((protocol, name)) if !protocol.is_empty() && !name.is_empty() => Ok(()),
-        _ => invalid("Switch wire 5.1: a kind isn't <protocol>.<name>"),
+        _ => invalid("Switch wire 5.1: a kind isn't <prefix>.<name>"),
     }
 }
 
@@ -100,7 +102,7 @@ pub struct Sender {
 /// signed are kept in its [`MessagePlaintext`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct Message {
-    /// The kind, `<protocol>.<name>`.
+    /// The kind, `<prefix>.<name>`.
     pub kind: String,
     /// The message ID, a lower-case UUID v4; with the sender identity, the deduplication
     /// key (Switch spec 11).
@@ -164,7 +166,7 @@ impl Message {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for a kind that isn't `<protocol>.<name>`; [`Error::Crypto`] if the
+    /// [`Error::Invalid`] for a kind that isn't `<prefix>.<name>`; [`Error::Crypto`] if the
     /// random generator fails.
     pub fn new(
         kind: &str,
@@ -187,7 +189,7 @@ impl Message {
     }
 
     /// Read a message's JSON strictly and check its common fields (Switch wire 1.1, 5.1): `v`
-    /// is 1, `kind` is `<protocol>.<name>`, `msg_id` a lower-case UUID v4, `created_at` a
+    /// is 1, `kind` is `<prefix>.<name>`, `msg_id` a lower-case UUID v4, `created_at` a
     /// time, `from` a Pubky ID and an App ID, `to` a Pubky ID, each of `refs` 32 bytes and
     /// `body` an object. `opaque` names the opaque members of the protocol's bodies.
     ///

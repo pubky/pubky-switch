@@ -6085,3 +6085,87 @@ async fn test_deny_list_gap_told_after_an_older_owed_change() {
         "{log:?}"
     );
 }
+
+#[tokio::test]
+async fn test_deny_list_owed_call_past_a_held_entry_keeps_the_entry() {
+    // A note held for two reads, then a missed item whose call fails once: the call is owed
+    // past the held note. The note is still handed once the protocol takes it, the cursor
+    // never passing it before.
+    let w = World::new();
+    let kinds = Arc::new(KindsProtocol::default());
+    let mut reader = join_with(
+        &w,
+        "reader",
+        &[Permission::ListsRead, Permission::ConversationAdd],
+        Arc::new(MemoryStore::new()),
+        Arc::clone(&kinds) as Arc<dyn Protocol>,
+    )
+    .await;
+    reader.receive(None).await.unwrap();
+    *kinds.retries.lock().unwrap() = 2;
+    let note = w.note(reader.app_id(), "held").0;
+    let now = w.clock.now_ms();
+    let missed = w.switch.push_missed(2, now, now);
+    *kinds.sample.failing.lock().unwrap() = 1;
+    for _ in 0..6 {
+        let _ = reader.receive(None).await;
+    }
+    let log = kinds.log.lock().unwrap().clone();
+    assert!(
+        log.contains(&("message", note)),
+        "note {note}, missed {missed}, cursor {:?}, log {log:?}",
+        reader.cursor()
+    );
+}
+
+#[tokio::test]
+async fn test_deny_list_gap_answered_unavailable_waits_for_the_list() {
+    // The lists read for a gap answered `503 unavailable` for now: the gap waits for an
+    // answer that gives the list, rather than going without it.
+    let w = World::new();
+    w.switch.set_retention(Some(crate::testing::Retention {
+        checkpoint_behind: 3,
+        ..crate::testing::Retention::default()
+    }));
+    let mut wallet = join_with(
+        &w,
+        "wallet",
+        &[Permission::ListsRead, Permission::ListsManage],
+        Arc::new(MemoryStore::new()),
+        Arc::new(SampleProtocol::default()) as Arc<dyn Protocol>,
+    )
+    .await;
+    wallet.receive(None).await.unwrap();
+    let backup = wallet.backup().await.unwrap();
+    for i in 1..=5u8 {
+        wallet.deny(&[i; 32]).await.unwrap();
+    }
+    w.note(wallet.app_id(), "past");
+    wallet.receive(None).await.unwrap();
+    wallet.deny(&[0xee; 32]).await.unwrap();
+    assert!(w.switch.retained().1 > 0, "nothing dropped");
+    drop(wallet);
+    let protocol = Arc::new(SampleProtocol::default());
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    // The first read meets the gap and notes it; the next reads the lists for it.
+    let _ = restored.receive(None).await;
+    w.switch.fail_next(Fault::Error {
+        path: "/allow".into(),
+        code: ErrorCode::Unavailable,
+        current: serde_json::Value::Null,
+    });
+    for _ in 0..3 {
+        let _ = restored.receive(None).await;
+    }
+    let gaps = protocol.deny_gaps.lock().unwrap().clone();
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert!(gaps[0].list_read, "{gaps:?}");
+    assert!(gaps[0].denied.contains(&[1; 32]), "{gaps:?}");
+}

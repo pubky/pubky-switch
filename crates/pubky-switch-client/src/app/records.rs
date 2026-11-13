@@ -799,8 +799,9 @@ enum Refused {
     /// A write at the key read, its version plausible, that the app doesn't take on the
     /// service's word only: a missing date, or the certificate the service chose. It names
     /// nobody, but its version is followed, so the app's next write builds on it and puts
-    /// back what it trusts, as over a flagged write (Switch spec 8.2).
-    Unnamed,
+    /// back what it trusts, as over a flagged write (Switch spec 8.2). `version` is the one
+    /// step 6 checked: a proof's when one gives it, else the view's.
+    Unnamed { version: RecordVersion },
     /// A write without a record view, that no certificate the app holds authorizes, while
     /// the newest own `identity.json` names a certificate of the writer in force at its
     /// time that the app doesn't hold: the record's view decides (Switch wire 6.2
@@ -1626,9 +1627,9 @@ impl App {
                 };
                 self.flag_write(shown, writer, reason, deleted, tx).await?;
             }
-            Err(Refused::Unnamed) => {
+            Err(Refused::Unnamed { version: checked }) => {
                 let deleted = writes_a_delete(evidence.op);
-                self.follow_write(&shown_key, version, deleted, false, tx)
+                self.follow_write(&shown_key, checked, deleted, false, tx)
                     .await?;
             }
             Err(Refused::Ignored | Refused::Unheld(_)) => {}
@@ -1842,10 +1843,11 @@ impl App {
         // writable, as one taken from a recovery upload under a renewal closed since; else
         // ignored.
         let unnamed = || -> Result<Result<Accepted, Refused>, AppError> {
-            Ok(Err(if plausible {
-                Refused::Unnamed
-            } else {
-                Refused::Ignored
+            Ok(Err(match shown.filter(|_| plausible) {
+                Some(checked) => Refused::Unnamed {
+                    version: checked.version,
+                },
+                None => Refused::Ignored,
             }))
         };
         // Step 4: standing at the write's time, of a certificate of the writer that counts

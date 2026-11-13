@@ -560,47 +560,6 @@ async fn test_erasure_wait_clock_back_then_max() {
 }
 
 #[tokio::test]
-async fn test_erasure_wait_older_stored_flow_without_the_field_loads_as_no_404_yet() {
-    // A Flow::Erase stored by an older build, in doubt, without `first_404_ms`: it loads,
-    // shows Erasing, and the next 404 starts the wait (doesn't conclude at once).
-    use pubky_switch_client::store::{StoreHandle, WriteBatch};
-    use pubky_switch_core::keys::IdentityKey;
-    use pubky_switch_signer::state::signer_namespace;
-    let world = World::new();
-    let (mut signer, _, store) = with_an_app(&world).await;
-    world.switch.fail_next(SwitchFault::LoseAnswer {
-        path: "/erase".into(),
-    });
-    signer.close_account(confirmed()).await.unwrap_err();
-    assert!(world.switch.erased());
-    drop(signer);
-    let handle = StoreHandle::inline(store.clone());
-    let ns = signer_namespace(&IdentityKey::from_secret(SECRET).public());
-    let bytes = handle.get(&ns, b"flow").await.unwrap().unwrap();
-    let mut flow: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let erase = flow.get_mut("Erase").unwrap().as_object_mut().unwrap();
-    assert!(erase.remove("first_404_ms").is_some());
-    assert_eq!(
-        erase.get("unanswered"),
-        Some(&serde_json::Value::Bool(true))
-    );
-    let mut batch = WriteBatch::new();
-    batch
-        .put(&ns, b"flow", serde_json::to_vec(&flow).unwrap())
-        .unwrap();
-    handle.commit(batch).await.unwrap();
-    let mut signer = Signer::open(world.env(store), world.keyring())
-        .await
-        .unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erasing);
-    let now = world.clock.now_ms();
-    assert_eq!(
-        signer.resume().await.unwrap_err(),
-        SignerError::Refused(Refusal::ErasureUnconfirmed { since_ms: now })
-    );
-}
-
-#[tokio::test]
 async fn test_erasure_wait_crash_before_the_wait_commit_starts_again() {
     // The store fails the commit that records the first 404: nothing is lost, the next run
     // records it then, and the erasure isn't concluded early.

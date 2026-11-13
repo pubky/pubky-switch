@@ -146,6 +146,10 @@ pub struct ReceiveReport {
     /// locally that a read didn't retry don't set it: they are retried at the next read
     /// whenever it comes. The host calls [`App::receive`] again without waiting.
     pub more: bool,
+    /// What the cursor the service holds said beside the furthest position the app
+    /// committed or sent, the worst of the read's pages (Switch spec 8.3); `None` when the
+    /// read read no page.
+    pub held_cursor: Option<super::HeldCursor>,
 }
 
 /// How far an item lets the cursor go.
@@ -381,6 +385,9 @@ struct Read {
     /// A call of this page the protocol didn't take, or a deny list gap it noted: the page
     /// stops after its item, so nothing later is handed before it (Switch spec 8.3).
     held_after: bool,
+    /// The restore's check of the held cursor as this page settled it, taken once the
+    /// page's commit is done.
+    restore_cursor: Option<super::held_cursor::RestoreCursor>,
 }
 
 /// How a page of the feed ended, when the read didn't stop on it.
@@ -405,6 +412,7 @@ impl Read {
             pairs: HashMap::new(),
             list_first: false,
             held_after: false,
+            restore_cursor: None,
         }
     }
 
@@ -569,6 +577,7 @@ impl App {
         budget: &super::CallBudget,
     ) -> Result<ReceiveReport, AppError> {
         self.reads_begun = self.reads_begun.wrapping_add(1);
+        self.held_cursor_read = None;
         // Where a wait for the feed starts once this read is done ([`App::feed_wait`]): set
         // again by a read that gets that far.
         self.next_wait = super::wait::NextWait::Cursor;
@@ -686,6 +695,8 @@ impl App {
         let waits_for_key = listing == Listing::WaitsForKey;
         let unfinished = listing == Listing::Unfinished;
         let mut listed = listing == Listing::Listed;
+        // A listing this read made before any item covers a gap ahead its first page shows.
+        self.listed_before_items = listed;
         // The reopening a key taken owes, a failure's from before included, before anything
         // is handed over that may read the records it opens; only an alarm it raises fails
         // the read.
@@ -773,10 +784,11 @@ impl App {
                 let result = self.client.feed(query).await;
                 let page = self.take(result).await?;
                 let scanned = page.scanned_through;
-                match self
+                let ended = self
                     .process_page(page, after, &mut blocked, Some(budget))
-                    .await?
-                {
+                    .await;
+                self.listed_before_items = false;
+                match ended? {
                     Some(PageEnd::Read { more: true }) => {
                         after = after.max(scanned).max(self.state.cursor.seq);
                     }
@@ -885,6 +897,7 @@ impl App {
                 })
         };
         report.cursor = self.cursor();
+        report.held_cursor = self.held_cursor_read.take();
         Ok(report)
     }
 
@@ -983,8 +996,30 @@ impl App {
             self.note_freeze(freeze).await?;
             return Ok(None);
         }
+        // The cursor the service holds, before anything of the page is processed, and not
+        // a frozen service's (Switch spec 8.3, 12.4).
+        let compared = self.compare_held_cursor(page.cursor).await?;
         let mut stopped = None;
         let mut list_through = None;
+        if let Some(check) = compared.restore {
+            read.tx.put(key::RESTORE_CURSOR, &check)?;
+            read.restore_cursor = Some(check);
+        }
+        if let Some((held, position)) = compared.gap {
+            // The gap ahead is handled as a `missed` item at the page's start: the
+            // protocol is handed it, and a listing is owed, made before any item of the
+            // page, unless this read made one before any item, as after a restore (Switch
+            // spec 8.3 "Ahead", 12.4 condition 4).
+            let listed = self.listed_before_items;
+            self.hand_held_gap(held, position, !listed, &mut read)?;
+            if !listed {
+                list_through = Some(start);
+            }
+            // The gap's call failed: owed, and nothing of the page is handed before it.
+            if read.held_after {
+                stopped = Some(start.saturating_add(1));
+            }
+        }
         // The last item processed, and where the call's time budget stopped the page.
         let mut processed: Option<u64> = None;
         let mut budget_through = None;
@@ -1000,6 +1035,9 @@ impl App {
         // the commit that passes it.
         let mut stub_noted = !self.state.cert.has_permission(Permission::ClaimsRead);
         for item in &page.items {
+            if stopped.is_some() {
+                break;
+            }
             let seq = item.seq();
             if seq <= start {
                 continue;
@@ -1010,10 +1048,13 @@ impl App {
             if let Some(ahead) = self.owed_ahead
                 && seq >= ahead
             {
-                if seq == ahead {
+                // Never past an entry held behind it: the cursor stays before that entry,
+                // and the call waits until the cursor gets there.
+                let passes = seq == ahead && read.blocked.is_none_or(|b| seq < b);
+                if passes {
                     self.pass(seq, item, &mut read)?;
                 }
-                stopped = Some(seq.saturating_add(u64::from(seq == ahead)));
+                stopped = Some(seq.saturating_add(u64::from(passes)));
                 break;
             }
             if list_through.is_some() && !matches!(item, FeedItem::Missed { .. }) {
@@ -1163,7 +1204,11 @@ impl App {
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
         }
-        self.commit(read.tx).await
+        self.commit(read.tx).await?;
+        if let Some(check) = read.restore_cursor {
+            self.state.restore_cursor = Some(check);
+        }
+        Ok(())
     }
 
     /// An item the cursor passes: its acceptance time becomes the cursor's.
@@ -2709,6 +2754,48 @@ impl App {
 
     /// The earliest acceptance time the app asks a re-send for: its cursor's, less the
     /// clock tolerance (Switch spec 8.2).
+    /// A gap the cursor the service holds shows ahead of the app's position, handled as a
+    /// `missed` item is (Switch spec 8.3 "Ahead"): entries after `position` that an instance
+    /// of the app passed, which the service may have deleted. The protocol is handed the
+    /// range accepted from the cursor's time, less the clock tolerance, with no end and no
+    /// count (`entries` 0), and, with `list`, a listing is owed; once for each higher report
+    /// (`hgap`).
+    fn hand_held_gap(
+        &mut self,
+        held: u64,
+        position: u64,
+        list: bool,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        let missed = MissedEntries {
+            seq: held,
+            entries: 0,
+            accepted_from_ms: self.resend_floor(),
+            accepted_until_ms: u64::MAX,
+        };
+        let call = OwedCall::Missed {
+            seq: held,
+            entries: 0,
+            accepted_from_ms: missed.accepted_from_ms,
+            accepted_until_ms: missed.accepted_until_ms,
+        };
+        // Owed at the compared position, at or before the cursor, so the queue makes it
+        // before anything after the gap (Switch spec 8.3).
+        match self.protocol.missed(&missed) {
+            Ok(writes) if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES => {
+                self.local_writes_refused(position, call, read)?;
+            }
+            Ok(writes) => read.tx.local(&writes)?,
+            Err(_) => self.owe(position, call, read)?,
+        }
+        self.gap_handed(held, &mut read.tx)?;
+        if list {
+            super::records::owe_listing(&mut read.tx)?;
+            read.list_first = true;
+        }
+        Ok(())
+    }
+
     fn resend_floor(&self) -> u64 {
         self.state.cursor.time_ms.saturating_sub(CLOCK_TOLERANCE_MS)
     }
@@ -2831,8 +2918,9 @@ impl App {
     /// (Switch spec 8.3): the lists are read (`GET /allow`) for it, however long the copy
     /// of the lists waits after one too large for a commit, and the gap is told with the
     /// deny list they give, in a commit of its own. The copy of the lists is then replaced
-    /// from the same answer, best effort. A read that fails for now leaves the gap owed;
-    /// an answer that can't be read tells the gap without the list (`list_read` false).
+    /// from the same answer, best effort. A read that fails or is refused leaves the gap
+    /// owed and the read held; only an answer that verifies but can't be read tells the gap
+    /// without the list (`list_read` false).
     /// Whether a gap is still owed.
     async fn tell_deny_gap_if_owed(&mut self) -> Result<bool, AppError> {
         if !self.state.cert.has_permission(Permission::ListsRead) {
@@ -2844,9 +2932,15 @@ impl App {
         let result = self.client.allow().await;
         let list = match self.take(result).await {
             Ok(list) => Some(list),
-            Err(AppError::Transport(_)) => return Ok(true),
+            // An answer that verifies but doesn't read: the gap is told without the list.
+            Err(
+                AppError::Switch(crate::error::ClientError::InvalidResponse(_))
+                | AppError::InvalidData(_),
+            ) => None,
             Err(error @ (AppError::Alarm(_) | AppError::Store(_))) => return Err(error),
-            Err(_) => None,
+            // A failure or a refusal, `503 unavailable` or `429` among them: the gap stays
+            // owed, and the read holds.
+            Err(_) => return Ok(true),
         };
         let gap = super::protocol::DenyListGap {
             generation,
@@ -2929,18 +3023,27 @@ impl App {
                 });
             }
         }
-        let signed = certs.iter().any(|cert| {
+        let verifies = |cert: &&pubky_switch_core::records::AppCert| {
             cert.app_id() == writer
-                && cert.has_permission(Permission::ListsManage)
                 && SignedOp::verify(doc, &cert.signing_key(), &identity, Some(&writer)).is_ok()
-        });
-        if !signed {
+        };
+        let Some(signer) = certs
+            .iter()
+            .filter(verifies)
+            .find(|cert| cert.has_permission(Permission::ListsManage))
+        else {
+            // Signed with the writer's key, but under no certificate held that holds
+            // `lists.manage`: it may have been made under an earlier one the app doesn't
+            // hold, so it is a gap, not a refusal.
+            if certs.iter().any(|cert| verifies(&cert)) {
+                return Ok(DenyCheck::Unverifiable);
+            }
             return Ok(DenyCheck::NotGenuine(
-                "Switch wire 6.2: not signed by an app holding lists.manage",
+                "Switch wire 6.2: not signed by an app of the identity",
             ));
-        }
+        };
         if let pubky_switch_core::records::Standing::Removed { distrust_from } =
-            self.state.own_doc.standing(&writer, &certs[0].hash())
+            self.state.own_doc.standing(&writer, &signer.hash())
             && at_ms > distrust_from
         {
             return Ok(DenyCheck::NotGenuine(

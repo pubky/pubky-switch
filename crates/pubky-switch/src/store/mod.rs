@@ -51,7 +51,9 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
-pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount, Savepoint};
+pub use account::{
+    AccountHead, AccountTxn, CommitError, Committed, Creation, NewAccount, Savepoint,
+};
 pub use allow::{AllowEntry, AllowInvite};
 pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
 pub use chain::NewChainItem;
@@ -420,10 +422,21 @@ impl Store {
         Ok(())
     }
 
-    /// Create an account. Returns `false`, changing nothing, when one exists for the
-    /// identity already.
+    /// Insert an account, to commit with [`Creation::commit`] once its identity's
+    /// ledger entry is read: `None`, changing nothing, when one exists for the identity
+    /// already.
+    pub async fn begin_create(&self, account: &NewAccount) -> Result<Option<Creation>, StoreError> {
+        account::begin_create(&self.pool, account).await
+    }
+
+    /// For tests: create an account with no erasure ledger to read; `false`, changing
+    /// nothing, when one exists. The service creates through [`Store::begin_create`].
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn create_account(&self, account: &NewAccount) -> Result<bool, StoreError> {
-        account::create(&self.pool, account).await
+        match self.begin_create(account).await? {
+            Some(creation) => creation.commit(None).await.map(|_| true),
+            None => Ok(false),
+        }
     }
 
     /// The key store entries erasures still owe deleting, oldest first (Switch wire 7.4.16).
@@ -462,11 +475,13 @@ impl Store {
     /// Look account `id` up without taking its lock: its service key and the service time
     /// it last committed, for the checks that come before the lock (Switch wire 7.2 Order).
     pub async fn lookup(&self, id: &str) -> Result<Option<FoundAccount>, StoreError> {
-        let row = sqlx::query("SELECT service_key, stamped_time_ms FROM accounts WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(StoreError::from_db)?;
+        let row = sqlx::query(
+            "SELECT service_key, stamped_time_ms, created_at_ms FROM accounts WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StoreError::from_db)?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -475,7 +490,42 @@ impl Store {
             service_key: crate::keys::KeyId::parse(&service_key)
                 .map_err(|_| StoreError::Corrupt("service_key"))?,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
+            created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
         }))
+    }
+
+    /// Of `erased`, identities with the time of an erasure the key store's ledger holds,
+    /// those whose account here was created at or before that time: accounts a database
+    /// restored from a backup brought back, to erase again before they serve (Switch spec
+    /// 6.5). An account created after its identity's erasure is a new one and isn't listed.
+    pub async fn restored_erased(
+        &self,
+        erased: &[(String, u64)],
+    ) -> Result<Vec<(String, u64)>, StoreError> {
+        let mut ids = Vec::with_capacity(erased.len());
+        let mut times = Vec::with_capacity(erased.len());
+        for (id, at) in erased {
+            ids.push(id.clone());
+            times.push(to_db(*at, "erased_at_ms")?);
+        }
+        let rows = sqlx::query(
+            "SELECT a.id, e.erased_at_ms FROM accounts a \
+             JOIN unnest($1::TEXT[], $2::BIGINT[]) AS e(id, erased_at_ms) ON e.id = a.id \
+             WHERE a.created_at_ms <= e.erased_at_ms ORDER BY a.id",
+        )
+        .bind(&ids)
+        .bind(&times)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::from_db)?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("id")?,
+                    from_db(row.try_get("erased_at_ms")?, "erased_at_ms")?,
+                ))
+            })
+            .collect()
     }
 
     /// The app row account `id` holds for `app_id`, read without the account's lock, for
@@ -646,6 +696,8 @@ pub struct FoundAccount {
     pub service_key: crate::keys::KeyId,
     /// The service time it last committed.
     pub stamped_time_ms: u64,
+    /// When it was created, in service time.
+    pub created_at_ms: u64,
 }
 
 /// The readiness check of the database: a round trip on a pooled connection.

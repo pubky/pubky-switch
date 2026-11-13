@@ -5,6 +5,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
+#[path = "common/vector_protocol.rs"]
+mod vector_protocol;
 
 use std::sync::{Arc, Mutex};
 
@@ -69,8 +71,8 @@ fn http_body(list: &str, name: &str) -> Vec<u8> {
     }
 }
 
-/// The protocol of the vectors' apps: the first of the spec's reserved protocols, with its
-/// scope roots; keyed are the scopes the vectors give keys for (scope keys, sub-scope keys,
+/// The protocol of the vectors' apps, with the name and scope roots the files give it
+/// (`vector_protocol`); keyed are the scopes the vectors give keys for (scope keys, sub-scope keys,
 /// the key bundles' keys and the reduction's removed scope). Read from the spec's files, so
 /// the test names no protocol of its own.
 struct VectorScopes {
@@ -81,11 +83,7 @@ struct VectorScopes {
 
 impl VectorScopes {
     fn new() -> Self {
-        let own = pubky_switch_core::scopes::reserved()
-            .unwrap()
-            .first()
-            .unwrap()
-            .clone();
+        let (name, roots) = vector_protocol::vector_protocol(&load("documents.json"));
         let keys = load("keys.json");
         let envelopes = load("envelopes.json");
         let mut keyed: Vec<String> = keys["scope_keys"]
@@ -103,11 +101,7 @@ impl VectorScopes {
             }
         }
         keyed.push(text(&envelopes["reduction_key_bundle"], "removed_scope").to_owned());
-        Self {
-            name: own.name,
-            roots: own.roots,
-            keyed,
-        }
+        Self { name, roots, keyed }
     }
 }
 
