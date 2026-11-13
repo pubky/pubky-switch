@@ -595,6 +595,15 @@ impl App {
 
     /// Whether the app runs on several devices sharing its keys (Switch spec 3.1).
     ///
+    /// Its devices share its cursor at the switch, so another device may move it past stubs
+    /// that the switch then drops honestly behind a checkpoint. A multi-device app therefore
+    /// takes no rollback evidence from stubs missing between its position and a checkpoint:
+    /// not from a verified item under 30 days old, nor from a held head or own write
+    /// (Switch wire 7.4.4). A device behind such a checkpoint continues from it in reconcile
+    /// mode ([`App::reconcile_mode`]); its host reconciles its state with the other devices'
+    /// and then calls [`App::end_reconcile`], and until then the app makes no new attempt,
+    /// a payment's included ([`App::may_attempt`]).
+    ///
     /// # Errors
     ///
     /// A store failure.

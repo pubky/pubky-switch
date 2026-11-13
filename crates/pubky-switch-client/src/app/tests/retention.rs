@@ -400,3 +400,80 @@ async fn test_retention_a_look_that_ends_inside_a_batch_still_signs() {
     assert_eq!(checkpoint.map(|c| c.seq), Some(seqs[first - 1]));
     assert_eq!(dropped, seqs[first - 1]);
 }
+
+/// Two devices of the wallet sharing its cursor: `a` joined, `b` its second device from
+/// `a`'s backup, with `b`'s own cursor move read since, so it holds evidence as any app
+/// does. `b` then stops, and `a` reads and writes on until the stubs after `b`'s position
+/// are dropped behind a checkpoint, under 30 days old, which `a`'s cursor passed. `b` is
+/// a device of an app whose devices share the cursor when `multi_device`.
+async fn device_left_behind(multi_device: bool) -> (World, App, App) {
+    let w = World::new();
+    w.switch.set_retention(retention(3));
+    let mut a = writer(&w, "wallet").await;
+    a.set_multi_device(true).await.unwrap();
+    read_a_note(&w, &mut [&mut a]).await;
+    let backup = a.backup().await.unwrap();
+    let mut b = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    b.end_reconcile(crate::app::UserConfirmed::new())
+        .await
+        .unwrap();
+    b.set_multi_device(multi_device).await.unwrap();
+    read_a_note(&w, &mut [&mut b]).await;
+    b.receive(None).await.unwrap();
+    let b_at = w.switch.lock().apps[&b.app_id()].cursor;
+    write(&mut a, 5).await;
+    read_a_note(&w, &mut [&mut a]).await;
+    write(&mut a, 1).await;
+    let (checkpoint, dropped) = w.switch.retained();
+    assert!(
+        checkpoint.is_some() && dropped > b_at,
+        "dropped past b's position"
+    );
+    (w, a, b)
+}
+
+#[tokio::test]
+async fn test_retention_a_device_behind_its_apps_shared_cursor_reconciles() {
+    // The other device moved the shared cursor past the stubs, so their absence is no
+    // evidence: the device behind continues from the checkpoint in reconcile mode, raises
+    // no rollback, and catches up once reconciled (Switch wire 7.4.4).
+    let (w, mut a, mut b) = device_left_behind(true).await;
+    b.receive(None).await.unwrap();
+    assert_eq!(b.alarm(), None);
+    assert!(b.reconcile_mode());
+    b.end_reconcile(crate::app::UserConfirmed::new())
+        .await
+        .unwrap();
+    write(&mut a, 2).await;
+    b.receive(None).await.unwrap();
+    assert_eq!(b.alarm(), None);
+    assert_eq!(
+        b.cursor().seq,
+        w.switch.lock().tip.seq,
+        "caught up to the head"
+    );
+    assert!(!a.reconcile_mode());
+    a.receive(None).await.unwrap();
+    assert_eq!(a.alarm(), None);
+}
+
+#[tokio::test]
+async fn test_retention_a_single_device_app_behind_dropped_stubs_still_raises_a_rollback() {
+    // The same position for an app on one device: its cursor is its own, so the service
+    // rule keeps the stubs from its position while they are under 30 days old, and their
+    // absence is a rollback (Switch wire 7.4.4).
+    let (_w, _a, mut b) = device_left_behind(false).await;
+    assert!(b.receive(None).await.is_err());
+    assert!(
+        matches!(b.alarm(), Some(crate::app::Alarm::Rollback { .. })),
+        "{:?}",
+        b.alarm()
+    );
+}
