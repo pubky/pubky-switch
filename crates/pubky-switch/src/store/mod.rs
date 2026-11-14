@@ -597,10 +597,20 @@ impl Store {
     /// `lock_timeout_ms` for the lock ([`StoreError::LockTimeout`]).
     pub async fn begin(&self, id: &str) -> Result<Option<AccountTxn>, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::from_db)?;
-        // `SET LOCAL` takes no bind parameters; the value is a number we format.
-        tx.execute(format!("SET LOCAL lock_timeout = {}", self.lock_timeout_ms).as_str())
-            .await
-            .map_err(StoreError::from_db)?;
+        // READ COMMITTED whatever the pool's default: the statement that takes the lock
+        // waits for the request ahead and then reads what it committed, where a snapshot
+        // taken before the wait would fail the request instead (Switch spec 6.5, order per
+        // account). `SET` takes no bind parameters; the value is a number we format.
+        tx.execute(
+            format!(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
+                 SET LOCAL lock_timeout = {}",
+                self.lock_timeout_ms
+            )
+            .as_str(),
+        )
+        .await
+        .map_err(StoreError::from_db)?;
         AccountTxn::lock(tx, id).await
     }
 
