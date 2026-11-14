@@ -3640,6 +3640,49 @@ fn test_app_config_keeps_the_spec_bounds() {
 }
 
 #[tokio::test]
+async fn test_app_store_of_another_schema_version_fails_to_load_and_stays() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    w.note(me, "one");
+    app.receive(None).await.unwrap();
+    let ns = app.ns.clone();
+    // Every value of the app's own, under another version.
+    let other = crate::app::SCHEMA_VERSION + 1;
+    let mut batch = crate::store::WriteBatch::new();
+    for (key, bytes) in app.reader().scan_raw("").await.unwrap() {
+        if key.starts_with("p/") {
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if value.get("v") == Some(&json!(crate::app::SCHEMA_VERSION)) {
+            value["v"] = json!(other);
+            batch
+                .put(
+                    &ns,
+                    key.as_bytes().to_vec(),
+                    serde_json::to_vec(&value).unwrap(),
+                )
+                .unwrap();
+        }
+    }
+    app.env.store.commit(batch).await.unwrap();
+    let before = app.reader().scan_raw("").await.unwrap();
+    let reader = app.reader();
+    drop(app);
+    let loaded = App::load(w.env(), w.protocol.clone(), World::config(), me).await;
+    assert!(
+        matches!(loaded, Err(AppError::Store(crate::StoreError::Corrupt))),
+        "{:?}",
+        loaded.map(|_| ())
+    );
+    // Refused, it writes nothing.
+    assert_eq!(reader.scan_raw("").await.unwrap(), before);
+}
+
+#[tokio::test]
 async fn test_app_backup_refuses_another_schema_or_bytes() {
     let w = World::new();
     let app = w.join("wallet").await;

@@ -541,8 +541,8 @@ pub struct MissedEntries {
     pub accepted_from_ms: u64,
     /// The item's last acceptance time, `accepted_until` (Switch wire 7.5), raised to
     /// `accepted_from_ms` when it is earlier. The service writes it, and the app can't
-    /// check it. For a gap ahead of the cursor the service holds, no end is known: it is
-    /// `u64::MAX`.
+    /// check it. For a gap the service's cursor shows ahead of the app's position
+    /// (Switch spec 8.3), no end is known: it is `u64::MAX`.
     pub accepted_until_ms: u64,
 }
 

@@ -1311,8 +1311,9 @@ impl App {
         Ok(())
     }
 
-    /// Put the outbox in `backup`, as `reader` holds it (Switch spec 11): every message the app still owes a job, so a restore delivers what was
-    /// queued before the backup with the same `msg_id` and bytes.
+    /// Put the outbox in `backup`, as `reader` holds it (Switch spec 11): every message the
+    /// app still owes a job, so a restore delivers what was queued before the backup with
+    /// the same `msg_id` and bytes.
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
         let carried = send::carried_outbox(reader).await?;
         backup.outbox = carried.items;

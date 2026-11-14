@@ -441,7 +441,8 @@ async fn test_unverified_bound_applies_at_a_read_to_entries_stored_before_in_ste
     let mut app = wallet(&w, w.env_on(Arc::clone(&counting) as Arc<dyn StateStore>)).await;
     w.homeserver.set_down(true);
     let h = peer(&w, "honest");
-    // 200 of one sender, as a build before the bounds left them: 136 over.
+    // 200 of one sender, as one read stores them before the next read's bounds apply: 136
+    // over.
     let now = w.clock.now_ms();
     let entries: Vec<ParkedEntry> = (0..200u64)
         .map(|n| entry_of(&w, &h, 1_000 + n, now + n, ParkReason::Unverifiable))
