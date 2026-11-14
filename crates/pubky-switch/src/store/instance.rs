@@ -73,7 +73,7 @@ impl InstanceLock {
     /// ended, or one that doesn't answer within `every`, took the lock with it: it is taken
     /// again on a new connection, each try bounded by `every` too. Returns once another
     /// process holds it, or once the lock was neither confirmed nor taken again for
-    /// [`UNCONFIRMED_CHECKS`] checks in a row, so the caller stops serving: two processes
+    /// three checks in a row, so the caller stops serving: two processes
     /// never serve the database at once for longer than those checks take.
     pub async fn keep(mut self, every: Duration) -> InstanceLockLost {
         let mut unconfirmed = 0;
