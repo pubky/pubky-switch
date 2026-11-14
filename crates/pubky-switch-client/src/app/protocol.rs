@@ -778,7 +778,7 @@ pub trait Protocol: Send + Sync {
     /// whose writer the directory no longer lists, a join, a renewal that adds `lists.read`
     /// and every [`super::App::allow_list`]: whenever the app's copy of
     /// the lists is taken whole from a list read, the protocol is given that list as a gap.
-    /// The writes are committed on their own, with the gap marked told; the copy of the
+    /// The writes are committed on their own, with the owed gap deleted; the copy of the
     /// lists is then replaced from the same answer in a commit of its own, best effort,
     /// which lists too large for one commit leave as it was, not known complete.
     ///
