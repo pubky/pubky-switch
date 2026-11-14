@@ -739,7 +739,7 @@ impl StateStore for FailingDelete {
     }
 
     fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), StoreError> {
-        let deletes = batch.writes.iter().any(|write| {
+        let deletes = batch.writes().iter().any(|write| {
             matches!(write, crate::store::Write::Delete { key, .. } if key.starts_with(self.prefix))
         });
         if deletes && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {

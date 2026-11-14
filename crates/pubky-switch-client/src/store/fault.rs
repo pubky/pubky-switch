@@ -168,7 +168,7 @@ impl StateStore for FaultStore {
         self.check_running()?;
         if let Ok(mut failing) = self.failing_put.lock()
             && let Some(prefix) = failing.as_ref()
-            && batch.writes.iter().any(|write| {
+            && batch.writes().iter().any(|write| {
                 matches!(write, super::Write::Put { key, .. } if key.starts_with(prefix.as_slice()))
             })
         {
@@ -177,7 +177,7 @@ impl StateStore for FaultStore {
         }
         if let Ok(mut too_large) = self.too_large.lock()
             && let Some((prefix, size, times)) = too_large.as_mut()
-            && batch.writes.iter().any(|write| {
+            && batch.writes().iter().any(|write| {
                 matches!(write, super::Write::Put { key, value, .. }
                     if key.starts_with(prefix.as_slice()) && value.len() > *size)
             })

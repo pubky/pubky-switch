@@ -113,7 +113,7 @@ impl StateStore for Counting {
 
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
         let parked = batch
-            .writes
+            .writes()
             .iter()
             .filter(
                 |write| matches!(write, Write::Delete { key, .. } if key.starts_with(b"parked/")),

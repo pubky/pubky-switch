@@ -122,15 +122,13 @@ impl StoreHandle {
             .await
     }
 
-    /// [`StateStore::commit`], after checking the batch against the working sizes, so an
-    /// oversized batch never reaches the host.
+    /// [`StateStore::commit`]. The batch is within the working sizes, which its methods
+    /// keep ([`WriteBatch`]).
     ///
     /// # Errors
     ///
-    /// [`StoreError::TooLarge`] for an oversized batch, with nothing applied; otherwise as
-    /// [`StateStore::commit`].
+    /// As [`StateStore::commit`].
     pub async fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
-        batch.check_size().map_err(StoreError::from)?;
         self.run(move |store| store.commit(batch)).await
     }
 }
@@ -138,7 +136,7 @@ impl StoreHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{MAX_VALUE_BYTES, MemoryStore, Write};
+    use crate::store::{BatchError, MAX_VALUE_BYTES, MemoryStore};
 
     async fn round_trip(handle: &StoreHandle) {
         let mut batch = WriteBatch::new();
@@ -150,19 +148,20 @@ mod tests {
         assert_eq!(found, vec![(b"b".to_vec(), b"2".to_vec())]);
     }
 
-    async fn refuses_oversized(handle: &StoreHandle) {
+    async fn keeps_an_oversized_write_out(handle: &StoreHandle) {
         let size = usize::try_from(MAX_VALUE_BYTES).unwrap();
         let mut batch = WriteBatch::new();
-        batch.writes.push(Write::Put {
-            ns: "ns".into(),
-            key: b"big".to_vec(),
-            value: vec![0; size + 1],
-        });
+        batch.put("ns", b"small".to_vec(), b"1".to_vec()).unwrap();
         assert!(matches!(
-            handle.commit(batch).await,
-            Err(StoreError::TooLarge { .. })
+            batch.put("ns", b"big".to_vec(), vec![0; size + 1]),
+            Err(BatchError::ValueTooLarge { .. })
         ));
+        handle.commit(batch).await.unwrap();
         assert_eq!(handle.get("ns", b"big").await.unwrap(), None);
+        assert_eq!(
+            handle.get("ns", b"small").await.unwrap(),
+            Some(b"1".to_vec())
+        );
     }
 
     #[tokio::test]
@@ -170,7 +169,7 @@ mod tests {
         let handle = StoreHandle::inline(Arc::new(MemoryStore::new()));
         assert!(!handle.runs_blocking());
         round_trip(&handle).await;
-        refuses_oversized(&handle).await;
+        keeps_an_oversized_write_out(&handle).await;
     }
 
     #[cfg(feature = "tokio")]
@@ -180,7 +179,7 @@ mod tests {
         assert!(handle.runs_blocking());
         assert!(StoreHandle::new(Arc::new(MemoryStore::new())).runs_blocking());
         round_trip(&handle).await;
-        refuses_oversized(&handle).await;
+        keeps_an_oversized_write_out(&handle).await;
     }
 
     #[cfg(not(feature = "tokio"))]

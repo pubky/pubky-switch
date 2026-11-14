@@ -232,7 +232,7 @@ pub trait StateStore: Send + Sync {
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError>;
 }
 
-pub struct WriteBatch { pub writes: Vec<Write> }
+pub struct WriteBatch { /* the writes, read with writes() and into_writes() */ }
 
 pub enum Write {
     Put { ns: String, key: Vec<u8>, value: Vec<u8> },

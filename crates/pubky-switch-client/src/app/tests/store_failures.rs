@@ -1980,7 +1980,7 @@ impl StateStore for DutyCounting {
 
     fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), StoreError> {
         let kept = batch
-            .writes
+            .writes()
             .iter()
             .filter(|write| {
                 matches!(write, crate::store::Write::Put { key, .. } if key.starts_with(b"duty/"))
