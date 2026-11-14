@@ -417,6 +417,15 @@ impl<'a> ReceiveContext<'a> {
         self.state.service_time.map(|time| time.highest_ms)
     }
 
+    /// Compare two feed positions in feed order, as [`super::App::received_order`] does.
+    pub fn received_order(
+        &self,
+        a: super::FeedPosition,
+        b: super::FeedPosition,
+    ) -> std::cmp::Ordering {
+        super::feed::received_order(self.state, a, b)
+    }
+
     /// `blind(input)` under the identity's naming key (Switch wire 1.5), as
     /// [`super::App::blind`]: what a protocol derives its shared keys from, such as the claim
     /// key of an obligation a message names (Switch spec 10.2, 13.3). The naming key itself

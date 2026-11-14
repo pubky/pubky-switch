@@ -2829,6 +2829,7 @@ pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
         "sentt/",
         "outgone/",
         "outhold/",
+        "outheld/",
         "invite/",
         "opq/",
         "kb/",
@@ -2889,7 +2890,7 @@ fn store_corrupt() -> AppError {
 }
 
 /// A protocol's rule, cut to [`MAX_REGRESSION_REASON_BYTES`] at a character boundary.
-fn cut_reason(mut reason: String) -> String {
+pub(crate) fn cut_reason(mut reason: String) -> String {
     if reason.len() > MAX_REGRESSION_REASON_BYTES {
         let mut end = MAX_REGRESSION_REASON_BYTES;
         while !reason.is_char_boundary(end) {

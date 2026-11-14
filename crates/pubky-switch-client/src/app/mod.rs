@@ -85,11 +85,11 @@ pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PEEK_PAGES, PeekReport, Peeked};
 pub use protocol::{
-    DenyListChange, DenyListGap, Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS,
-    MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES,
-    MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer,
-    RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, WriteBase,
-    decode_local_state, encode_local_state, local_writes_bytes,
+    DenyListChange, DenyListGap, Effect, FeedPosition, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite,
+    MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES,
+    MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ,
+    Protocol, ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason,
+    StoreFailure, WriteBase, decode_local_state, encode_local_state, local_writes_bytes,
 };
 pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
@@ -427,6 +427,10 @@ pub struct AppBackup {
     /// a restore holds them too, so it delivers none of their messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     held_counterparties: Vec<String>,
+    /// The messages of `outbox` the app holds ([`App::hold_message`]), by `msg_id`: a
+    /// restore holds them too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    held_messages: Vec<String>,
     /// The expiry each protocol asked of the app's record (`rexp`), by name, `None` for
     /// none: a restore keeps them, so the record's next `expires_at` is still the earliest
     /// of them. Absent while no protocol asked for one.
@@ -1390,6 +1394,7 @@ impl App {
             outbox: Vec::new(),
             outbox_left_out: Vec::new(),
             held_counterparties: Vec::new(),
+            held_messages: Vec::new(),
             record_expiries: Vec::new(),
             layers: Vec::new(),
             beyond_cursor: None,
@@ -1420,6 +1425,20 @@ impl App {
                 .map_err(|_| AppError::InvalidData("a backup's held counterparty".into()))?;
             send::put_hold(tx, &pubky)?;
         }
+        // Each held message is one of the outbox the backup carries, its delivery owed: no
+        // writer carries the hold of another.
+        for msg_id in &backup.held_messages {
+            if !backup
+                .outbox
+                .iter()
+                .any(|item| item.msg_id() == msg_id && item.delivery_pending())
+            {
+                return Err(AppError::InvalidData(
+                    "a backup's held message isn't one of its outbox owed a delivery".into(),
+                ));
+            }
+            send::put_message_hold(tx, msg_id)?;
+        }
         let now = self.now();
         for (msg_id, resend) in &backup.outbox_left_out {
             send::note_given_up(tx, msg_id, now)?;
@@ -1440,6 +1459,11 @@ impl App {
     /// The expiries the protocols asked of the record go with it.
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
         let carried = send::carried_outbox(reader).await?;
+        backup.held_messages = send::held_messages_of(reader, self.now())
+            .await?
+            .into_iter()
+            .filter(|msg_id| carried.items.iter().any(|item| item.msg_id() == msg_id))
+            .collect();
         backup.outbox = carried.items;
         backup.outbox_left_out = carried.left_out;
         backup.held_counterparties = reader
@@ -1991,6 +2015,7 @@ impl App {
                 .into_iter()
                 .map(|(rest, _)| rest)
                 .collect();
+            let old_message_holds = send::held_messages_of(&old, env.clock.now_ms()).await?;
             // No local ID is given out twice: past the backup's counter, the counter of the
             // store restored in place, every ID a carried duty event names, and every entry
             // the backup brings back.
@@ -2066,6 +2091,9 @@ impl App {
                     if let Ok(pubky) = pubky_switch_core::enc::unb64_array::<32>(rest) {
                         send::put_hold(&mut tx, &pubky)?;
                     }
+                }
+                for msg_id in &old_message_holds {
+                    send::put_message_hold(&mut tx, msg_id)?;
                 }
                 tx.local(&layer_writes)?;
                 tx.put(key::PROTOCOLS, &protocols_names)?;
@@ -2734,6 +2762,11 @@ impl App {
     ) -> Result<(), AppError> {
         let n = self.state.next_duty;
         let next = n.checked_add(1).ok_or_else(corrupt)?;
+        // A message's hold ends in the commit that tells it undelivered: its delivery is no
+        // longer owed (`App::hold_message`).
+        if let events::Duty::MessageUndelivered { msg_id, .. } = &duty {
+            send::end_message_hold(tx, msg_id)?;
+        }
         let kept = events::KeptDuty { to, duty };
         tx.put(&key::duty(n), &kept)?;
         tx.put(key::DUTY_NEXT, &next)?;
@@ -3309,6 +3342,46 @@ impl App {
             self.reload = false;
         }
         Ok(())
+    }
+
+    /// Raise the rollback alarm on a protocol's evidence ([`Alarm::Rollback`], Switch spec
+    /// 10.1): for a protocol that finds, in what the service signed for its own data, that
+    /// the service went back on it or contradicts itself, such as a shared record write
+    /// that breaks a rule only the service's state could break. The app keeps the alarm and
+    /// stops, as for one it found itself: every later call is refused until the user
+    /// resolves it, by moving to another provider or declaring a provider loss.
+    ///
+    /// `reason` names the rule broken, without content: it is kept and shown, cut to
+    /// [`MAX_REGRESSION_REASON_BYTES`], 256 bytes, at a character boundary. Returns the
+    /// alarm the app holds: this one, kept and told ([`AppEvent::Alarm`]) in the commit that
+    /// raises it, or the alarm it held already, which stays as it was. A protocol that finds
+    /// the evidence in a receive step answers it so the read doesn't pass the entry, and the
+    /// host raises it after the read returns.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Left`] for an app that left; a store failure, after which the app holds
+    /// no alarm and the host raises it again.
+    pub async fn raise_rollback(&mut self, reason: impl Into<String>) -> Result<Alarm, AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            if let Some(held) = &self.state.alarm {
+                return Ok(held.clone());
+            }
+            if self.state.leave.is_some() {
+                return Err(Refusal::Left.into());
+            }
+            let alarm = Alarm::Rollback {
+                reason: records::cut_reason(reason.into()),
+            };
+            let mut tx = self.tx()?;
+            tx.put(key::ALARM, &alarm)?;
+            self.commit(tx).await?;
+            self.state.alarm = Some(alarm.clone());
+            self.events.push(AppEvent::Alarm(alarm.clone()));
+            Ok(alarm)
+        })
+        .await
     }
 
     /// Raise an alarm: keep it, stop, and return it as the error.
