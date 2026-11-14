@@ -33,6 +33,7 @@ fn request(method: &str, origin: &str, path: &str, body: Vec<u8>) -> Request {
         path_and_query: path.into(),
         headers: Vec::new(),
         body,
+        timeout: pubky_switch_client::transport::TimeoutClass::default(),
     }
 }
 

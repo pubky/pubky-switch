@@ -1533,6 +1533,7 @@ impl App {
     ) -> Result<Step, AppError> {
         let mut message = ReceivedMessage {
             seq: entry.seq,
+            generation: entry.generation,
             sender: entry.sender,
             accepted_at_ms: entry.accepted_at_ms,
             message: received.message.clone(),
@@ -1566,7 +1567,7 @@ impl App {
                     read.tx.pending_local(),
                     read.tx.pending_writes(),
                 );
-                let outcome = protocol.receive_with(&message, &mut cx);
+                let outcome = protocol.receive(&message, &mut cx);
                 (outcome, cx.into_writes())
             };
             let mut effect = match outcome {
@@ -1912,7 +1913,8 @@ impl App {
             Some(entry.seq)
         };
         // Kept at a service time verified in this call ([`App::kept_stamp`]): the feed read
-        // brought one, a retry of an entry stored locally may come before it.
+        // brought one; a retry of an entry stored locally may come before it, and reads
+        // one, so an effect is never kept while the service can't be reached.
         self.fresh_service_time().await?;
         let batch = self.sign_ops(effect.ops, cursor_to)?;
         let pending = PendingEffect {

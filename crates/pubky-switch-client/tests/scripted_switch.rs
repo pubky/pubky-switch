@@ -384,6 +384,7 @@ fn waiting_read(s: &Setup, app: &App, wait: &str) -> Request {
             &pubky_switch_core::enc::zbase32_encode(&app.app_id()),
         )],
         body: Vec::new(),
+        timeout: pubky_switch_client::transport::TimeoutClass::default(),
     }
 }
 
@@ -551,6 +552,7 @@ async fn feed_past(s: &Setup, app: &App, after: u64) -> (Vec<String>, serde_json
             &pubky_switch_core::enc::zbase32_encode(&app.app_id()),
         )],
         body: Vec::new(),
+        timeout: pubky_switch_client::transport::TimeoutClass::default(),
     };
     let answer = s.alice.switch().transport().send(request).await.unwrap();
     assert_eq!(answer.status, 200);
@@ -698,6 +700,7 @@ async fn test_testing_upload_in_neither_stage_is_404() {
             &pubky_switch_core::enc::zbase32_encode(&app.app_id()),
         )],
         body: b"not json".to_vec(),
+        timeout: pubky_switch_client::transport::TimeoutClass::default(),
     };
     // Before the body is read.
     let answer = s.alice.switch().handle(&request).unwrap();
@@ -773,6 +776,7 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_operators_404() {
         path_and_query: format!("/v1/{}/erase", s.alice.identity().key().id()),
         headers: Vec::new(),
         body: pubky_switch_core::http::erase_body(&switch.service_key(), None),
+        timeout: pubky_switch_client::transport::TimeoutClass::default(),
     };
     let erased = switch.transport().send(erase).await.unwrap();
     assert_eq!(erased.status, 200);
@@ -924,6 +928,7 @@ async fn test_testing_waiting_read_of_a_gone_account_or_app_is_answered_at_once(
         path_and_query: format!("/v1/{}/erase", s.alice.identity().key().id()),
         headers: Vec::new(),
         body: pubky_switch_core::http::erase_body(&switch.service_key(), None),
+        timeout: pubky_switch_client::transport::TimeoutClass::default(),
     };
     assert_eq!(switch.transport().send(erase).await.unwrap().status, 200);
     let mut read = transport.send(request);

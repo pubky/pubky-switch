@@ -26,7 +26,7 @@
 //!   at most eight for a record, and followed.
 //! - **A write replaces the one held** only if it is newer by the core's rule
 //!   ([`WriteVersion::replaces`]), and only if the protocol finds it doesn't go back on what
-//!   the app has seen there ([`super::Protocol::record_regression_on`]). A write refused that
+//!   the app has seen there ([`super::Protocol::record_regression`]). A write refused that
 //!   way is flagged, its content not acted on, but its version followed, so the app's next
 //!   write builds on it and puts back the content it trusts (Switch spec 8.2).
 //! - **Listing** runs at join, after a restore, after a `missed` item, and after a certificate
@@ -2327,7 +2327,7 @@ impl App {
         let own = own || accepted.writer == self.state.meta.app_id;
         if !own
             && let Some(mark) = &seen
-            && let Some(reason) = self.protocol.record_regression_on(
+            && let Some(reason) = self.protocol.record_regression(
                 &accepted.collection.name,
                 &mark.mark,
                 new_value,
@@ -2608,15 +2608,16 @@ impl App {
     /// message's record job waits the same way.
     ///
     /// **Worst case.** At most four tries, a further one only while the call's time budget
-    /// isn't spent ([`super::AppConfig::call_budget_ms`], 20 s by default). The call takes
-    /// one time sample and sends at most one kept batch again in all
+    /// isn't spent ([`super::AppConfig::call_budget_ms`], 20 s by default). The call reads
+    /// the service time at most once and sends at most one kept batch again in all
     /// ([`App::submit_batch`]): the first try sends at most four requests, those two, its
     /// own batch and, after a conflict, a read of the record; a further try two, its batch
-    /// and that read. So with batches of a few KiB it ends within about 40 s at the default
-    /// timeouts, whether the first try took them or a further one began just inside the
-    /// budget; a larger batch's send has a longer timeout
-    /// ([`crate::transport::HttpConfig`]), and the cases [`App::submit_batch`] names add
-    /// their requests.
+    /// and that read. A batch that writes a record and a read of a record have the long
+    /// timeout (40 s by default, [`crate::transport::HttpConfig`]), since a record's view
+    /// can near a mebibyte: on a switch that answers nothing in time the call ends within
+    /// about 130 s at the default timeouts, the first try's four requests, and within
+    /// about 100 s when a further try began just inside the budget; the cases
+    /// [`App::submit_batch`] names add their requests.
     ///
     /// # Errors
     ///

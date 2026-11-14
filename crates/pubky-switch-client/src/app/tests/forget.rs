@@ -44,7 +44,7 @@ impl Protocol for Evicting {
     fn backup_name(&self) -> Option<String> {
         Some("sample".into())
     }
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         if let Some(evict) = message.message.body.get("evict").and_then(Value::as_str) {
             let pad = message.message.body.get("pad").and_then(Value::as_u64);
             if let Some(pad) = pad {
@@ -62,7 +62,7 @@ impl Protocol for Evicting {
                 Ok(forgot) => forgot,
                 Err(error) if pad.is_some() => {
                     self.refused.lock().unwrap().push(error);
-                    return self.sample.receive(message);
+                    return self.sample.receive(message, cx);
                 }
                 Err(error) => {
                     return Outcome::Drop {
@@ -87,7 +87,7 @@ impl Protocol for Evicting {
                 };
             }
         }
-        self.sample.receive(message)
+        self.sample.receive(message, cx)
     }
     fn resend_needed(&self, n: &ResendNeeded) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(n)

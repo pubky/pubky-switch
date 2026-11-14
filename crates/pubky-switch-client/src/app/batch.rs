@@ -32,7 +32,7 @@ use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use super::claims::ObligationDeadline;
-use super::error::{KeptAhead, Refusal, RefusalPlace, refused_at, refused_for_good};
+use super::error::{KeptAhead, Refusal, RefusalPlace, never_left, refused_at, refused_for_good};
 use super::events::AppEvent;
 use super::kept::{Ended, KeptBatchDrop, index_kept};
 use super::protocol::{LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
@@ -327,11 +327,16 @@ impl App {
     /// send), and is then dropped and reported; the write fails meanwhile with
     /// [`AppError::Ahead`], keeping nothing of its own.
     ///
-    /// So a write sends at most three requests to the switch: a time sample, the kept batch
-    /// and its own batch. The time sample has the short timeout (10 s by default), and each
-    /// batch the short timeout and a share of the long one in proportion to its body
-    /// ([`crate::transport::HttpConfig`]): a write of batches of a few KiB ends within about
-    /// 30 s at the default timeouts, one of batches near a mebibyte within about 90 s. A
+    /// So a write sends at most three requests to the switch: a read of the service time,
+    /// the kept batch and its own batch. The read is of a feed page with no items, and is
+    /// made only when a batch is kept to send again, or when the app holds no recent
+    /// service time of the current key, under a day old, to stamp its own batch with: most
+    /// writes send their batch alone. The read has the
+    /// short timeout (10 s by default), a batch that writes no shared record the short
+    /// timeout and a share of the long one in proportion to its body, and one that writes
+    /// a shared record the long one (40 s), since its refusal can carry the record's view
+    /// ([`crate::transport::HttpConfig`]): a write of small batches without a record ends
+    /// within about 30 s at the default timeouts, one of record writes within about 90 s. A
     /// kept batch signed for a generation before a move and answered `409 stale_generation`
     /// is signed again and sent once more, a fourth request; a `409 stale_epoch` of the own
     /// batch adds the newer `identity.json`, the key bundle and one more send.
@@ -369,9 +374,9 @@ impl App {
     /// batch's order.
     ///
     /// `again` for a further try within one call ([`App::update_record`]): the service time
-    /// the first try took still counts, and no kept batch is sent again, so the call takes
-    /// one time sample and resends at most one kept batch in all. With batches kept, this
-    /// one is kept behind them.
+    /// the first try took still counts, and no kept batch is sent again, so the call reads
+    /// the service time at most once and resends at most one kept batch in all. With
+    /// batches kept, this one is kept behind them.
     pub(crate) async fn submit_checked(
         &mut self,
         batch: OpBatch,
@@ -1073,9 +1078,9 @@ impl App {
     /// Send a kept batch and commit its outcome. A refusal for good drops it; any other
     /// failure keeps it, to be sent again with the same bytes (Switch wire 2.1, 6.4).
     /// `resent` for a batch that may have been sent before: one refused before the batch ID
-    /// lookup stays kept ([`RefusalPlace`]). A batch's first send is stamped first, at a
-    /// service time verified in this call, committed before the request leaves; a call
-    /// that can't verify one leaves it kept and unsent.
+    /// lookup stays kept ([`RefusalPlace`]). A batch's first send is stamped first
+    /// ([`App::kept_stamp`]), committed before the request leaves; a call that needs to
+    /// read a service time for the stamp and can't leaves it kept and unsent.
     fn run_pending<'a>(
         &'a mut self,
         id: &'a [u8; 16],
@@ -1095,8 +1100,10 @@ impl App {
         resent: bool,
     ) -> Result<Submitted, AppError> {
         let stamped;
-        let pending = if pending.kept_ms.is_none() {
-            self.fresh_service_time().await?;
+        let unsent = pending;
+        let first_send = pending.kept_ms.is_none();
+        let pending = if first_send {
+            self.stamp_service_time().await?;
             stamped = PendingBatch {
                 kept_ms: Some(self.kept_stamp()),
                 ..pending.clone()
@@ -1112,6 +1119,14 @@ impl App {
             Ok(submitted) => submitted,
             Err(error) => {
                 self.note_kept_rate_limited(&error);
+                // A first send the transport never carried leaves a batch never sent: its
+                // stamp is taken back, so it has no window and is never ambiguous. A crash
+                // before this commit leaves it stamped, as one that may have been sent.
+                if first_send && never_left(&error) {
+                    let mut tx = self.tx()?;
+                    tx.put(&pending_key(id), unsent)?;
+                    self.commit(tx).await?;
+                }
                 // A first send's refusal is its caller's; one sent again is dropped and
                 // reported by its caller, in one commit.
                 if let Some(code) = refused_for_good(&error).filter(|_| !resent) {

@@ -11,6 +11,7 @@ use pubky_switch_core::ops::{
 use super::read::{self, Obj};
 use super::{Auth, Body, Credentials, DynSigner, SwitchClient, verify_head};
 use crate::error::ClientError;
+use crate::transport::TimeoutClass;
 
 /// A batch for `POST /v1/{id}/ops` (Switch wire 6.4): its signed operations, its cursor move
 /// and the exact request body.
@@ -91,6 +92,22 @@ impl Batch {
         self.cursor
     }
 
+    /// How long the batch's call may take: a batch that writes a shared record may be
+    /// answered `409 conflict` with the record's view, up to about a mebibyte (Switch wire
+    /// 7.6, 7.1 "Answer sizes"), on its first send and on every resend of the same bytes;
+    /// any other batch's answer is small.
+    pub(crate) fn timeout(&self) -> TimeoutClass {
+        let writes_a_record = self
+            .ops
+            .iter()
+            .any(|op| matches!(op.body().kind, OpKind::RecordPut(_)));
+        if writes_a_record {
+            TimeoutClass::Bulk
+        } else {
+            TimeoutClass::Ordinary
+        }
+    }
+
     /// The exact request body.
     pub fn body(&self) -> &[u8] {
         &self.body
@@ -118,9 +135,10 @@ impl SwitchClient {
     ///
     /// # Errors
     ///
-    /// [`ClientError::Usage`] for the next service's credentials, or at another identity's
-    /// account; [`ClientError::Core`] when the generator fails or an operation can't be
-    /// signed; otherwise as [`Batch::new`].
+    /// [`ClientError::Usage`] for the next service's credentials or the signer's request-only
+    /// credential ([`Credentials::SignerRequests`]), or at another identity's account;
+    /// [`ClientError::Core`] when the generator fails or an operation can't be signed;
+    /// otherwise as [`Batch::new`].
     pub fn sign_batch(
         &self,
         generation: u64,
@@ -170,6 +188,7 @@ impl SwitchClient {
                     "the next service writes no operations".into(),
                 ));
             }
+            Credentials::SignerRequests { .. } => return Err(super::request_only()),
         };
         Batch::new(signed, cursor)
     }
@@ -204,7 +223,10 @@ impl SwitchClient {
                 &self.path("ops"),
                 batch.body.clone(),
                 Body::Json,
-                Auth::default(),
+                Auth {
+                    timeout: batch.timeout(),
+                    ..Auth::default()
+                },
             )
             .await?;
         let (value, what) =

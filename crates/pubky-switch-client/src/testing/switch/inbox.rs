@@ -618,6 +618,7 @@ mod tests {
                 value: cert.signed().compact(),
             }],
             body: b"{}".to_vec(),
+            timeout: crate::transport::TimeoutClass::default(),
         }
     }
 
@@ -1012,6 +1013,7 @@ mod tests {
                 path_and_query: format!("/{rest}"),
                 headers: Vec::new(),
                 body: Vec::new(),
+                timeout: crate::transport::TimeoutClass::default(),
             };
             let (status, body) = inner.route_shared(&request, None, &rest).unwrap();
             assert_eq!(

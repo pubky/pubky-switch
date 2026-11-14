@@ -64,6 +64,27 @@ fn signer() -> Credentials {
     }
 }
 
+/// The identity key behind a request-only interface, as the signer's request credential
+/// holds it.
+struct RequestsOnly(IdentityKey);
+
+impl pubky_switch_core::signing::SignsRequests for RequestsOnly {
+    fn public_key(&self) -> [u8; 32] {
+        self.0.public()
+    }
+
+    fn sign_request_fields(&self, fields: &[&[u8]]) -> [u8; 64] {
+        self.0.sign(pubky_switch_core::labels::sig::HTTP, fields)
+    }
+}
+
+fn signer_requests() -> Credentials {
+    Credentials::SignerRequests {
+        identity: identity().public(),
+        key: Arc::new(RequestsOnly(identity())),
+    }
+}
+
 fn app() -> Credentials {
     Credentials::App {
         identity: identity().public(),
@@ -718,11 +739,62 @@ fn test_credentials_must_match_their_keys() {
     assert!(matches!(new(wrong_app), Err(ClientError::Usage(_))));
     assert!(new(app()).is_ok());
     assert!(new(signer()).is_ok());
+    assert!(new(signer_requests()).is_ok());
+    let wrong_requests = Credentials::SignerRequests {
+        identity: [1; 32],
+        key: Arc::new(RequestsOnly(identity())),
+    };
+    assert!(matches!(new(wrong_requests), Err(ClientError::Usage(_))));
+}
+
+#[test]
+fn test_signer_requests_credential_signs_a_request_that_verifies() {
+    let transport = fixed(service_key(), 200, json!({}));
+    let requests = client_with(
+        signer_requests(),
+        Some(service_public()),
+        Arc::clone(&transport),
+    );
+    requests.signer_only().unwrap();
+    let signed = requests
+        .sign_request("GET", "/v1/x/apps", Vec::new(), None)
+        .unwrap();
+    let signature = signed.signature.unwrap();
+    let target = http::RequestTarget {
+        method: "GET",
+        path_and_query: "/v1/x/apps",
+        body: &[],
+        origin: ORIGIN,
+    };
+    let headers = http::RequestHeaders {
+        timestamp: pubky_switch_core::time::rfc3339_seconds(NOW),
+        identity: pubky_id(&identity().public()),
+        ..http::RequestHeaders::default()
+    };
+    http::verify_request(&identity().public(), &target, &headers, &signature).unwrap();
+    // The same request, headers and signature as the signer's full credential gives.
+    let full = client_with(signer(), Some(service_public()), transport);
+    assert_eq!(
+        full.sign_request("GET", "/v1/x/apps", Vec::new(), None)
+            .unwrap(),
+        signed
+    );
+}
+
+#[test]
+fn test_signer_requests_credential_signs_no_batch() {
+    let transport = fixed(service_key(), 200, json!({}));
+    let requests = client_with(signer_requests(), Some(service_public()), transport);
+    let refused = requests.sign_batch(1, two_lists(), None).unwrap_err();
+    assert!(
+        matches!(&refused, ClientError::Usage(why) if why.contains("requests only")),
+        "{refused:?}"
+    );
 }
 
 #[test]
 fn test_credentials_debug_shows_no_key() {
-    let text = format!("{:?} {:?}", signer(), app());
+    let text = format!("{:?} {:?} {:?}", signer(), signer_requests(), app());
     assert!(text.contains(&pubky_id(&identity().public())), "{text}");
     for secret in [[1u8; 32], [2; 32], [3; 32]] {
         assert!(!text.contains(&b64(&secret)), "{text}");
@@ -1097,4 +1169,84 @@ async fn test_last_server_time_follows_checked_answers_only() {
     assert!(client.allow().await.is_err());
     assert_eq!(client.last_server_time(), None);
     assert_eq!(client.latest_server_time(), None);
+}
+
+/// A batch of one shared record write.
+fn record_write() -> Vec<(Vec<Condition>, OpKind)> {
+    use pubky_switch_core::ident::{Policy, collection_id};
+    use pubky_switch_core::ops::{RecordPut, RecordVersion};
+    use pubky_switch_core::sealed::SealedValue;
+    let identity = identity().public();
+    let policy = Policy::new("sample", &["sample"]);
+    let key = [2; 32];
+    let put = RecordPut {
+        key,
+        collection: collection_id("sample.items", &identity),
+        policy,
+        expected_version: RecordVersion::new(1, 4),
+        value_sealed: SealedValue::seal(&[3; 32], &identity, 1, "sample", &key, b"{}").unwrap(),
+        id_inputs: None,
+    };
+    vec![(Vec::new(), OpKind::RecordPut(put))]
+}
+
+#[tokio::test]
+async fn test_calls_pick_their_timeout_class() {
+    // A switch whose answers don't read: every call fails, after its request went.
+    let transport = fixed(service_key(), 200, json!({}));
+    let client = client_with(app(), Some(service_public()), Arc::clone(&transport));
+    // The class of the `n`th request, which the call just made must have sent.
+    let class = |n: usize| {
+        let sent = transport.requests();
+        assert_eq!(sent.len(), n, "the call sent no request");
+        sent[n - 1].timeout
+    };
+    let feed = |limit, wait| answers::FeedQuery {
+        after: None,
+        limit,
+        wait,
+    };
+    // A feed page with no items, the read of the service time, is small.
+    let _ = client.feed(feed(Some(0), None)).await;
+    assert_eq!(class(1), TimeoutClass::Ordinary);
+    // A page is bulk, and a long poll carries its wait.
+    let _ = client.feed(feed(Some(100), None)).await;
+    assert_eq!(class(2), TimeoutClass::Bulk);
+    let _ = client.feed(feed(None, Some(0))).await;
+    assert_eq!(class(3), TimeoutClass::Bulk);
+    let _ = client.feed(feed(Some(1), Some(25))).await;
+    assert_eq!(class(4), TimeoutClass::LongPoll { wait_s: 25 });
+    // Listings, a record's view and an append are bulk.
+    let _ = client.directory(None).await;
+    assert_eq!(class(5), TimeoutClass::Bulk);
+    let _ = client.allow().await;
+    assert_eq!(class(6), TimeoutClass::Bulk);
+    let _ = client.record(&[1; 32]).await;
+    assert_eq!(class(7), TimeoutClass::Bulk);
+    let _ = client.claim(&[1; 32]).await;
+    assert_eq!(class(8), TimeoutClass::Bulk);
+    let _ = client.append(vec![0; 16], 1, None).await;
+    assert_eq!(class(9), TimeoutClass::Bulk);
+    // A small write and the public read are ordinary.
+    let _ = client.connect().await;
+    assert_eq!(class(10), TimeoutClass::Ordinary);
+    let _ = client.public_identity().await;
+    assert_eq!(class(11), TimeoutClass::Ordinary);
+    // A batch that writes no shared record is ordinary.
+    let lists = client.sign_batch(1, two_lists(), None).unwrap();
+    let _ = client.submit(&lists).await;
+    assert_eq!(class(12), TimeoutClass::Ordinary);
+    // One that writes a shared record is bulk, on its first send and read back from its
+    // kept body for a resend: its refusal can carry the record's view.
+    let record = client.sign_batch(1, record_write(), None).unwrap();
+    let _ = client.submit(&record).await;
+    assert_eq!(class(13), TimeoutClass::Bulk);
+    let kept = Batch::from_body(record.body().to_vec()).unwrap();
+    let _ = client.submit(&kept).await;
+    assert_eq!(class(14), TimeoutClass::Bulk);
+    // A request signed for the caller to send is ordinary until the caller says otherwise.
+    let signed = client
+        .sign_request("GET", "/v1/x/feed", Vec::new(), None)
+        .unwrap();
+    assert_eq!(signed.request.timeout, TimeoutClass::Ordinary);
 }

@@ -214,6 +214,7 @@ impl App {
         }
         let message = ReceivedMessage {
             seq: entry.seq,
+            generation: self.state.cursor.generation,
             sender: entry.sender,
             accepted_at_ms: entry.accepted_at,
             message: received.message,

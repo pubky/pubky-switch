@@ -60,7 +60,7 @@ impl IdentityKeyring {
 
     pub(crate) fn install(vault, identity, secret) -> Result<Self, KeyError>; // a received key
     pub(crate) fn signing_key(&self, passed: GatePassed) -> Result<SigningKey, KeyError>; // the gate's alone
-    pub(crate) fn request_signer(&self) -> Result<Arc<dyn Signs + Send + Sync>, KeyError>; // Switch-Signature only
+    pub(crate) fn request_signer(&self) -> Result<Arc<dyn SignsRequests + Send + Sync>, KeyError>; // Switch-Signature only
     pub(crate) fn open_backup(&self, backup: &SignerBackup) -> Result<Option<SignerRecords>, KeyError>;
     pub(crate) fn destroy(&self) -> Result<(), KeyError>;
 }
@@ -232,7 +232,7 @@ pub trait StateStore: Send + Sync {
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError>;
 }
 
-pub struct WriteBatch { pub writes: Vec<Write> }
+pub struct WriteBatch { /* the writes, read with writes() and into_writes() */ }
 
 pub enum Write {
     Put { ns: String, key: Vec<u8>, value: Vec<u8> },

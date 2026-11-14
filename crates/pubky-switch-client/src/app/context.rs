@@ -92,7 +92,7 @@ pub enum ClaimFetch {
 }
 
 /// What a protocol's receive step can read and add to the effect's batch
-/// ([`super::Protocol::receive_with`]). Reads come from the app's store, and from the
+/// ([`super::Protocol::receive`]). Reads come from the app's store, and from the
 /// switch through [`super::Outcome::Need`]; writes go into the batch that carries the cursor
 /// move, at most 7 operations beside it (Switch wire 6.4).
 pub struct ReceiveContext<'a> {

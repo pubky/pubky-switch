@@ -18,6 +18,7 @@ use serde_json::{Map, Value, json};
 
 use super::read::{self, Obj};
 use crate::error::ClientError;
+use crate::transport::TimeoutClass;
 
 fn bad(what: &str) -> ClientError {
     ClientError::InvalidResponse(what.to_owned())
@@ -64,7 +65,8 @@ impl AppendAnswer {
 pub struct FeedQuery {
     /// The position the page starts after.
     pub after: Option<Position>,
-    /// Items per page, 1 to 500.
+    /// Items per page, 0 to 500. A page of 0 shows no item and moves no position: the
+    /// read of the signed service time, the head and the cursor (Switch wire 7.4.4).
     pub limit: Option<u32>,
     /// Long-poll seconds, at most 25.
     pub wait: Option<u32>,
@@ -88,6 +90,16 @@ impl FeedQuery {
             "feed".to_owned()
         } else {
             format!("feed?{}", query.join("&"))
+        }
+    }
+
+    /// How long the read may take: the long poll's wait and a page, a page, or, for a page
+    /// with no items, a small answer.
+    pub(crate) fn timeout(&self) -> TimeoutClass {
+        match (self.wait, self.limit) {
+            (Some(wait_s), _) if wait_s > 0 => TimeoutClass::LongPoll { wait_s },
+            (_, Some(0)) => TimeoutClass::Ordinary,
+            _ => TimeoutClass::Bulk,
         }
     }
 }

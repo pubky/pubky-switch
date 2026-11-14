@@ -160,8 +160,10 @@ pub enum WontDeliver {
 pub struct KeptAhead {
     /// The oldest kept batch's ID ([`super::App::kept_batch`]).
     pub batch_id: [u8; 16],
-    /// When its first send left, service time in Unix milliseconds; `None` while it was
-    /// never sent.
+    /// The time its first send was stamped at, service time in Unix milliseconds: at or
+    /// before the send, and up to about a day before it, since a first send is stamped at a
+    /// held service time while one under a day old is held (Switch spec 12.5 "Kept
+    /// batches"). `None` while it was never sent.
     pub kept_since_ms: Option<u64>,
     /// When its answer window ends; `None` while it was never sent, which has no window.
     pub answer_until_ms: Option<u64>,
@@ -235,7 +237,7 @@ pub enum AppError {
     #[error(transparent)]
     Store(StoreError),
     /// The protocol's own store failed in a callback the app must make, such as
-    /// [`super::Protocol::provider_lost_with`]: the step waits, and the next call makes the
+    /// [`super::Protocol::provider_lost`]: the step waits, and the next call makes the
     /// callback again. The app's store didn't fail.
     #[error("the protocol's store failed: {}", .0.error())]
     Protocol(super::protocol::StoreFailure),
@@ -436,6 +438,16 @@ pub(crate) fn refusal_place(code: ErrorCode) -> RefusalPlace {
 /// The place of an error that refuses a batch for good; `None` for any other error.
 pub(crate) fn refused_at(error: &AppError) -> Option<RefusalPlace> {
     refused_for_good(error).map(refusal_place)
+}
+
+/// Whether `error` says the request never left: the transport made no connection, or
+/// refused the origin ([`TransportError::Connect`], [`TransportError::Refused`]). Any other
+/// failure may have reached the switch.
+pub(crate) fn never_left(error: &AppError) -> bool {
+    matches!(
+        error.unkept(),
+        AppError::Transport(TransportError::Connect(_) | TransportError::Refused(_))
+    )
 }
 
 /// Whether the switch refused these exact bytes for good, so that sending them again can't

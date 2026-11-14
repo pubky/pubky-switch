@@ -182,26 +182,16 @@ impl std::fmt::Debug for Write {
 ///
 /// Build one with [`WriteBatch::new`] and its methods, which count the batch's size and
 /// refuse a write that would take it over the working sizes, so the host never sees an
-/// oversized batch. They keep a running total, so building a batch costs time linear in its
-/// writes.
-#[derive(Clone, Debug, Default)]
+/// oversized batch: every value is at most [`MAX_VALUE_BYTES`] and the whole at most
+/// [`MAX_BATCH_BYTES`]. They keep a running total, so building a batch costs time linear in
+/// its writes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteBatch {
-    /// The writes, in order.
-    pub writes: Vec<Write>,
-    /// The number of writes the methods counted and their size: the running total. When
-    /// `writes` has another length, it was changed by hand and the size is counted again;
-    /// [`WriteBatch::check_size`], which the store handle runs before every commit, always
-    /// counts it again.
-    counted: (usize, u64),
+    /// The writes, in order. Only the methods add to them.
+    writes: Vec<Write>,
+    /// The size of `writes`, the running total the methods keep.
+    size: u64,
 }
-
-impl PartialEq for WriteBatch {
-    fn eq(&self, other: &Self) -> bool {
-        self.writes == other.writes
-    }
-}
-
-impl Eq for WriteBatch {}
 
 impl WriteBatch {
     /// An empty batch.
@@ -209,44 +199,24 @@ impl WriteBatch {
         Self::default()
     }
 
+    /// The batch's writes, in order.
+    pub fn writes(&self) -> &[Write] {
+        &self.writes
+    }
+
+    /// The batch's writes, in order, taken out of it: what a store applies at commit.
+    pub fn into_writes(self) -> Vec<Write> {
+        self.writes
+    }
+
     /// The batch's size: the sum of [`Write::size`] over its writes.
     pub fn size(&self) -> u64 {
-        self.writes
-            .iter()
-            .fold(0u64, |total, write| total.saturating_add(write.size()))
+        self.size
     }
 
     /// Whether the batch has no writes.
     pub fn is_empty(&self) -> bool {
         self.writes.is_empty()
-    }
-
-    /// Check that the batch is within the working sizes: every value at most
-    /// [`MAX_VALUE_BYTES`] and the whole at most [`MAX_BATCH_BYTES`].
-    ///
-    /// # Errors
-    ///
-    /// [`BatchError::ValueTooLarge`] or [`BatchError::BatchTooLarge`].
-    pub fn check_size(&self) -> Result<(), BatchError> {
-        for write in &self.writes {
-            if let Write::Put { value, .. } = write {
-                let size = u64::try_from(value.len()).unwrap_or(u64::MAX);
-                if size > MAX_VALUE_BYTES {
-                    return Err(BatchError::ValueTooLarge {
-                        size,
-                        cap: MAX_VALUE_BYTES,
-                    });
-                }
-            }
-        }
-        let size = self.size();
-        if size > MAX_BATCH_BYTES {
-            return Err(BatchError::BatchTooLarge {
-                size,
-                cap: MAX_BATCH_BYTES,
-            });
-        }
-        Ok(())
     }
 
     fn push(&mut self, write: Write) -> Result<&mut Self, BatchError> {
@@ -259,12 +229,7 @@ impl WriteBatch {
                 });
             }
         }
-        let held = if self.counted.0 == self.writes.len() {
-            self.counted.1
-        } else {
-            self.size()
-        };
-        let size = held.saturating_add(write.size());
+        let size = self.size.saturating_add(write.size());
         if size > MAX_BATCH_BYTES {
             return Err(BatchError::BatchTooLarge {
                 size,
@@ -272,7 +237,7 @@ impl WriteBatch {
             });
         }
         self.writes.push(write);
-        self.counted = (self.writes.len(), size);
+        self.size = size;
         Ok(self)
     }
 
@@ -349,8 +314,7 @@ mod tests {
         batch.delete("ns", b"k".to_vec()).unwrap();
         batch.delete_prefix("ns", Vec::new()).unwrap();
         assert_eq!(batch.size(), (2 + 3 + 10) + (2 + 1) + 2);
-        assert_eq!(batch.writes.len(), 3);
-        batch.check_size().unwrap();
+        assert_eq!(batch.writes().len(), 3);
     }
 
     #[test]
@@ -363,7 +327,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, BatchError::ValueTooLarge { .. }));
         // The refused write isn't added.
-        assert_eq!(batch.writes.len(), 1);
+        assert_eq!(batch.writes().len(), 1);
     }
 
     #[test]
@@ -375,39 +339,30 @@ mod tests {
         assert_eq!(batch.size(), MAX_BATCH_BYTES);
         let error = batch.delete("a", b"3".to_vec()).unwrap_err();
         assert!(matches!(error, BatchError::BatchTooLarge { .. }));
-        assert_eq!(batch.writes.len(), 2);
-        // A batch built by hand past the cap is caught by the check.
-        let mut by_hand = batch.clone();
-        by_hand.writes.push(Write::Delete {
-            ns: "a".into(),
-            key: b"3".to_vec(),
-        });
-        assert!(matches!(
-            by_hand.check_size(),
-            Err(BatchError::BatchTooLarge { .. })
-        ));
+        assert_eq!(batch.writes().len(), 2);
+        assert_eq!(batch.size(), MAX_BATCH_BYTES);
     }
 
     #[test]
-    fn test_write_batch_running_total_follows_hand_changes() {
+    fn test_write_batch_running_total_counts_every_write() {
         let mut batch = WriteBatch::new();
         for n in 0..2_000u32 {
             batch.delete("ns", n.to_be_bytes().to_vec()).unwrap();
         }
         assert_eq!(batch.size(), 2_000 * (2 + 4));
-        // A write added by hand is counted before the next one the methods add.
         let size = usize::try_from(MAX_VALUE_BYTES).unwrap();
-        batch.writes.push(Write::Put {
-            ns: "ns".into(),
-            key: b"k".to_vec(),
-            value: vec![0; size],
-        });
+        batch.put("ns", b"k".to_vec(), vec![0; size]).unwrap();
         let error = batch.put("ns", b"k".to_vec(), vec![0; size]).unwrap_err();
         assert!(matches!(error, BatchError::BatchTooLarge { .. }));
-        // Equality looks at the writes only.
-        let mut other = WriteBatch::new();
-        other.writes = batch.writes.clone();
-        assert_eq!(other, batch);
+        let counted = batch.size();
+        let writes = batch.clone().into_writes();
+        assert_eq!(writes.len(), 2_001);
+        assert_eq!(
+            counted,
+            writes.iter().map(Write::size).sum::<u64>(),
+            "the running total is the sum over the writes"
+        );
+        assert_eq!(batch.writes(), writes.as_slice());
     }
 
     #[test]

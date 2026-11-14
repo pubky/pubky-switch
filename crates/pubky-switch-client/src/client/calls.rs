@@ -22,6 +22,7 @@ use super::answers::{
 use super::read::{self, Obj};
 use super::{Auth, Body, CheckedResponse, SwitchClient, check_response, verify_head};
 use crate::error::ClientError;
+use crate::transport::TimeoutClass;
 
 /// What the proofs of a write answer must show (Switch wire 6.5).
 enum Expect<'a> {
@@ -40,13 +41,16 @@ impl SwitchClient {
         self.pinned_key().ok_or(ClientError::Unpinned)
     }
 
-    async fn get(&self, rest: &str) -> Result<CheckedResponse, ClientError> {
+    async fn get(&self, rest: &str, timeout: TimeoutClass) -> Result<CheckedResponse, ClientError> {
         self.call(
             "GET",
             &self.path(rest),
             Vec::new(),
             Body::Empty,
-            Auth::default(),
+            Auth {
+                timeout,
+                ..Auth::default()
+            },
         )
         .await
     }
@@ -67,8 +71,13 @@ impl SwitchClient {
         method: &str,
         rest: &str,
         body: Vec<u8>,
+        timeout: TimeoutClass,
     ) -> Result<CheckedResponse, ClientError> {
-        self.call(method, &self.path(rest), body, Body::Json, Auth::default())
+        let auth = Auth {
+            timeout,
+            ..Auth::default()
+        };
+        self.call(method, &self.path(rest), body, Body::Json, auth)
             .await
     }
 
@@ -165,7 +174,11 @@ impl SwitchClient {
         let body = json!({ "enrollment": enrollment.signed() })
             .to_string()
             .into_bytes();
-        let signed = self.build("POST", "/v1/enroll", body, Body::Json, Auth::default())?;
+        let auth = Auth {
+            timeout: TimeoutClass::Bulk,
+            ..Auth::default()
+        };
+        let signed = self.build("POST", "/v1/enroll", body, Body::Json, auth)?;
         let signature = signed.signature;
         let response = self.transport().send(signed.request).await?;
         let status = response.status;
@@ -263,6 +276,7 @@ impl SwitchClient {
                 Body::Octets,
                 Auth {
                     invite_code,
+                    timeout: TimeoutClass::Bulk,
                     ..Auth::default()
                 },
             )
@@ -279,7 +293,7 @@ impl SwitchClient {
     ///
     /// As every call.
     pub async fn feed(&self, query: FeedQuery) -> Result<FeedPage, ClientError> {
-        let checked = self.get(&query.path()).await?;
+        let checked = self.get(&query.path(), query.timeout()).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::FeedPage, "Switch wire 7.4.4: a feed page")?;
         let page = FeedPage::read(Obj::of(&value, what)?, &self.account())?;
@@ -327,7 +341,7 @@ impl SwitchClient {
     ///
     /// As every call.
     pub async fn allow(&self) -> Result<AllowList, ClientError> {
-        let checked = self.get("allow").await?;
+        let checked = self.get("allow", TimeoutClass::Bulk).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::AllowList, "Switch wire 7.4.6: an allow list")?;
         AllowList::read(Obj::of(&value, what)?)
@@ -351,7 +365,7 @@ impl SwitchClient {
     ///
     /// As every call.
     pub async fn connect_requests(&self) -> Result<ConnectList, ClientError> {
-        let checked = self.get("connect").await?;
+        let checked = self.get("connect", TimeoutClass::Ordinary).await?;
         let (value, what) = Self::json_answer(
             &checked,
             Doc::Plain,
@@ -382,7 +396,9 @@ impl SwitchClient {
     ///
     /// As every call; `404` when the service holds nothing for the claim key.
     pub async fn claim(&self, claim_key: &[u8; 32]) -> Result<ClaimAnswer, ClientError> {
-        let checked = self.get(&format!("claims/{}", b64(claim_key))).await?;
+        let checked = self
+            .get(&format!("claims/{}", b64(claim_key)), TimeoutClass::Bulk)
+            .await?;
         let (value, what) = Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.8: a claim")?;
         ClaimAnswer::read(Obj::of(&value, what)?)
     }
@@ -394,7 +410,9 @@ impl SwitchClient {
     ///
     /// As every call; `404` for an unknown or forgotten key.
     pub async fn record(&self, key: &[u8; 32]) -> Result<SharedRecordView, ClientError> {
-        let checked = self.get(&format!("records/{}", b64(key))).await?;
+        let checked = self
+            .get(&format!("records/{}", b64(key)), TimeoutClass::Bulk)
+            .await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record view")?;
         SharedRecordView::read(Obj::of(&value, what)?)
@@ -418,7 +436,7 @@ impl SwitchClient {
         if let Some(limit) = limit {
             rest.push_str(&format!("&limit={limit}"));
         }
-        let checked = self.get(&rest).await?;
+        let checked = self.get(&rest, TimeoutClass::Bulk).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record page")?;
         RecordPage::read(Obj::of(&value, what)?)
@@ -440,6 +458,7 @@ impl SwitchClient {
                 Body::Empty,
                 Auth {
                     invite_code,
+                    timeout: TimeoutClass::Bulk,
                     ..Auth::default()
                 },
             )
@@ -457,7 +476,9 @@ impl SwitchClient {
     /// `404` when the service holds no part.
     pub async fn keys(&self) -> Result<KeysAnswer, ClientError> {
         let app = Self::app_segment(&self.own_app_id()?);
-        let checked = self.get(&format!("apps/{app}/keys")).await?;
+        let checked = self
+            .get(&format!("apps/{app}/keys"), TimeoutClass::Bulk)
+            .await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.11: a keys answer")?;
         KeysAnswer::read(Obj::of(&value, what)?)
@@ -485,7 +506,9 @@ impl SwitchClient {
     ///
     /// As every call; `409 conflict` carries the current push key.
     pub async fn put_push(&self, setting: &PushSetting) -> Result<PushAnswer, ClientError> {
-        let checked = self.send_json("PUT", "push", setting.to_json()).await?;
+        let checked = self
+            .send_json("PUT", "push", setting.to_json(), TimeoutClass::Ordinary)
+            .await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 8.1: a push answer")?;
         PushAnswer::read(Obj::of(&value, what)?)
@@ -510,7 +533,7 @@ impl SwitchClient {
     /// As every call.
     pub async fn apps(&self) -> Result<AppsAnswer, ClientError> {
         self.signer_only()?;
-        let checked = self.get("apps").await?;
+        let checked = self.get("apps", TimeoutClass::Bulk).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.12: an apps answer")?;
         AppsAnswer::read(Obj::of(&value, what)?, checked.server_time_ms)
@@ -539,7 +562,9 @@ impl SwitchClient {
         self.signer_only()?;
         let body = serde_json::to_vec(freeze.signed())
             .map_err(|_| ClientError::Usage("the freeze can't be written".into()))?;
-        let checked = self.send_json("POST", "freeze", body).await?;
+        let checked = self
+            .send_json("POST", "freeze", body, TimeoutClass::Ordinary)
+            .await?;
         self.write_answer(&checked, Expect::Transition("freeze".into()))
     }
 
@@ -560,7 +585,9 @@ impl SwitchClient {
         }
         let body = serde_json::to_vec(unfreeze)
             .map_err(|_| ClientError::Usage("the unfreeze can't be written".into()))?;
-        let checked = self.send_json("POST", "unfreeze", body).await?;
+        let checked = self
+            .send_json("POST", "unfreeze", body, TimeoutClass::Ordinary)
+            .await?;
         self.write_answer(&checked, Expect::Transition("unfreeze".into()))
     }
 
@@ -582,7 +609,9 @@ impl SwitchClient {
         }
         let body = serde_json::to_vec(unfreeze)
             .map_err(|_| ClientError::Usage("the unfreeze can't be written".into()))?;
-        let checked = self.send_json("POST", "unfreeze", body).await?;
+        let checked = self
+            .send_json("POST", "unfreeze", body, TimeoutClass::Ordinary)
+            .await?;
         let answer: DiscardAnswer = parse_json(&checked.body).map_err(|_| {
             ClientError::InvalidResponse("Switch wire 3.6: a discard answer doesn't read".into())
         })?;
@@ -598,7 +627,7 @@ impl SwitchClient {
     /// As every call; [`ClientError::Core`] for a manifest that doesn't verify.
     pub async fn export(&self) -> Result<Manifest, ClientError> {
         self.signer_only()?;
-        let checked = self.get("export").await?;
+        let checked = self.get("export", TimeoutClass::Bulk).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 10.3: an export answer")?;
         let signed = Obj::of(&value, what)?.doc("manifest")?;
@@ -621,7 +650,9 @@ impl SwitchClient {
             ));
         }
         let id = Self::segment(chunk_id)?;
-        let checked = self.get(&format!("export/chunks/{id}")).await?;
+        let checked = self
+            .get(&format!("export/chunks/{id}"), TimeoutClass::Bulk)
+            .await?;
         let answer = ChunkAnswer::parse(&checked.body).map_err(|_| {
             ClientError::InvalidResponse("Switch wire 10.3: a chunk answer doesn't read".into())
         })?;
@@ -640,7 +671,9 @@ impl SwitchClient {
     /// As every call.
     pub async fn import_start(&self, start: &ImportStart) -> Result<ImportStatus, ClientError> {
         self.signer_only()?;
-        let checked = self.send_json("POST", "import", start.to_json()).await?;
+        let checked = self
+            .send_json("POST", "import", start.to_json(), TimeoutClass::Bulk)
+            .await?;
         ImportStatus::parse(&checked.body).map_err(|_| {
             ClientError::InvalidResponse("Switch wire 10.4: an import status doesn't read".into())
         })
@@ -661,7 +694,12 @@ impl SwitchClient {
         self.signer_only()?;
         let id = Self::segment(chunk_id)?;
         let checked = self
-            .send_json("PUT", &format!("import/chunks/{id}"), chunk)
+            .send_json(
+                "PUT",
+                &format!("import/chunks/{id}"),
+                chunk,
+                TimeoutClass::Bulk,
+            )
             .await?;
         ImportStatus::parse(&checked.body).map_err(|_| {
             ClientError::InvalidResponse("Switch wire 10.4: an import status doesn't read".into())
@@ -683,7 +721,9 @@ impl SwitchClient {
             manifest: *manifest_hash,
         }
         .to_json();
-        let checked = self.send_json("POST", "import/activate", body).await?;
+        let checked = self
+            .send_json("POST", "import/activate", body, TimeoutClass::Bulk)
+            .await?;
         let answer = ActivateAnswer::parse(&checked.body).map_err(|_| {
             ClientError::InvalidResponse(
                 "Switch wire 10.5: an activation answer doesn't read".into(),
@@ -728,6 +768,7 @@ impl SwitchClient {
                 Body::Json,
                 Auth {
                     with_cert: staged,
+                    timeout: TimeoutClass::Bulk,
                     ..Auth::default()
                 },
             )
@@ -802,7 +843,9 @@ impl SwitchClient {
     pub async fn erase(&self, identity_hash: Option<[u8; 32]>) -> Result<(), ClientError> {
         self.signer_only()?;
         let body = erase_body(&self.key()?, identity_hash.as_ref());
-        let checked = self.send_json("POST", "erase", body).await?;
+        let checked = self
+            .send_json("POST", "erase", body, TimeoutClass::Ordinary)
+            .await?;
         let (value, what) = Self::json_answer(
             &checked,
             Doc::Plain,
@@ -828,7 +871,9 @@ impl SwitchClient {
         stored: &StoredHandover,
     ) -> Result<HandoverStored, ClientError> {
         self.signer_only()?;
-        let checked = self.send_json("PUT", "handover", stored.to_json()?).await?;
+        let checked = self
+            .send_json("PUT", "handover", stored.to_json()?, TimeoutClass::Bulk)
+            .await?;
         let (value, what) = Self::json_answer(
             &checked,
             Doc::Plain,
@@ -843,7 +888,7 @@ impl SwitchClient {
     ///
     /// As every call; `404` when none is held for the caller.
     pub async fn get_handover(&self) -> Result<StoredHandover, ClientError> {
-        let checked = self.get("handover").await?;
+        let checked = self.get("handover", TimeoutClass::Bulk).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.17: a hand-over")?;
         StoredHandover::read(Obj::of(&value, what)?)

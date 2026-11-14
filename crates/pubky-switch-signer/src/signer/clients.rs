@@ -106,7 +106,11 @@ impl RequestClient {
         target: &Target<'_>,
         keyring: &IdentityKeyring,
     ) -> Result<Self> {
-        Ok(Self(client(env, target, keyring.request_signer()?)?))
+        let credentials = Credentials::SignerRequests {
+            identity: target.identity,
+            key: keyring.request_signer()?,
+        };
+        Ok(Self(client_with(env, target, credentials)?))
     }
 
     /// `GET /apps` (Switch wire 7.4.12).

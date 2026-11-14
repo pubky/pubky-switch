@@ -16,10 +16,12 @@ mod passed;
 mod protocol_api;
 mod protocol_reads;
 mod push;
+mod received_position;
 mod retention;
 mod send_futures;
 mod sender_document;
 mod sender_key;
+mod service_time;
 mod shared_flows;
 mod store_failures;
 mod unverified;
@@ -142,7 +144,11 @@ impl Protocol for SampleProtocol {
         }
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        _: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
         let Some(text) = message.message.body.get("text").and_then(Value::as_str) else {
             return Outcome::Drop {
                 reason: "sample: body.text isn't text".into(),

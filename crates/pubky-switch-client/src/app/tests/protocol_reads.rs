@@ -129,7 +129,7 @@ impl Protocol for ReadsProtocol {
         Ok(())
     }
 
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         let mode = *self.mode.lock().unwrap();
         let claim_key = cx.blind(OBLIGATION);
         let fetched = cx.switch_claim(&claim_key).cloned();
@@ -169,12 +169,7 @@ impl Protocol for ReadsProtocol {
     }
 
     /// No message goes while the protocol's local state holds `mute`.
-    fn sends_to_with(
-        &self,
-        _message: &Message,
-        _recipient: &AppRecord,
-        view: &LocalView<'_>,
-    ) -> bool {
+    fn sends_to(&self, _message: &Message, _recipient: &AppRecord, view: &LocalView<'_>) -> bool {
         view.local_get(b"mute").unwrap().is_none()
     }
 }
@@ -1230,7 +1225,7 @@ fn test_may_act_follows_the_rule_of_the_switch_copy() {
 // The protocol's other callbacks read its local state (`LocalView`)
 
 #[tokio::test]
-async fn test_sends_to_with_reads_the_local_state() {
+async fn test_sends_to_reads_the_local_state() {
     let p = Pair::new();
     let protocol = ReadsProtocol::new(Mode::Settle);
     let mut wallet = p

@@ -1083,7 +1083,7 @@ impl App {
                 store.as_ref(),
                 &self.ns,
             );
-            if !self.protocol.sends_to_with(message, &record, &view) {
+            if !self.protocol.sends_to(message, &record, &view) {
                 continue;
             }
             let checked = match &app.receive_key {

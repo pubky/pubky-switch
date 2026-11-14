@@ -74,10 +74,9 @@ impl StateStore for MemoryStore {
     }
 
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
-        batch.check_size().map_err(StoreError::from)?;
         let mut entries = self.lock();
         let mut next = entries.clone();
-        for write in batch.writes {
+        for write in batch.into_writes() {
             match write {
                 Write::Put { ns, key, value } => {
                     next.entry(ns).or_default().insert(key, value);
@@ -103,7 +102,6 @@ impl StateStore for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MAX_VALUE_BYTES;
 
     fn batch(f: impl FnOnce(&mut WriteBatch)) -> WriteBatch {
         let mut batch = WriteBatch::new();
@@ -125,26 +123,6 @@ mod tests {
         assert_eq!(store.get("ns", b"a").unwrap(), Some(b"2".to_vec()));
         assert_eq!(store.get("ns", b"b").unwrap(), None);
         assert_eq!(store.get("other", b"a").unwrap(), None);
-    }
-
-    #[test]
-    fn test_memory_store_refuses_an_oversized_batch_whole() {
-        let store = MemoryStore::new();
-        let size = usize::try_from(MAX_VALUE_BYTES).unwrap();
-        let mut oversized = WriteBatch::new();
-        oversized.put("ns", b"a".to_vec(), b"1".to_vec()).unwrap();
-        // Built by hand, past the builder's check.
-        oversized.writes.push(Write::Put {
-            ns: "ns".into(),
-            key: b"b".to_vec(),
-            value: vec![0; size + 1],
-        });
-        assert!(matches!(
-            store.commit(oversized),
-            Err(StoreError::TooLarge { .. })
-        ));
-        // Atomic: nothing of it was applied.
-        assert_eq!(store.get("ns", b"a").unwrap(), None);
     }
 
     #[test]

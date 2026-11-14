@@ -102,7 +102,7 @@ impl Protocol for FlakyProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         *self.calls.lock().unwrap() += 1;
         let flaky = message.message.body.get("text").and_then(Value::as_str) == Some(FLAKY);
         if flaky && self.mode == Mode::AfterNeed {
@@ -142,7 +142,7 @@ impl Protocol for FlakyProtocol {
             };
         }
         drop(fails);
-        self.sample.receive(message)
+        self.sample.receive(message, cx)
     }
 
     /// Backs up its whole local state, as the default hooks write and read it.
@@ -1472,7 +1472,7 @@ impl Protocol for CounterProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         let count = match cx.local_get(COUNT) {
             Ok(value) => count_of(value),
             Err(error) => {
@@ -1970,7 +1970,7 @@ impl StateStore for DutyCounting {
 
     fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), StoreError> {
         let kept = batch
-            .writes
+            .writes()
             .iter()
             .filter(|write| {
                 matches!(write, crate::store::Write::Put { key, .. } if key.starts_with(b"duty/"))
