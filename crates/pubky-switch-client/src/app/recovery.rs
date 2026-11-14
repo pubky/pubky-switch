@@ -646,7 +646,7 @@ impl App {
                         store.as_ref(),
                         &self.ns,
                     );
-                    self.protocol.provider_lost_with(&loss.view(), &view)
+                    self.protocol.provider_lost(&loss.view(), &view)
                 }
                 // The step stays `Resend` in the record: the next call asks again.
                 .map_err(AppError::Protocol)?;

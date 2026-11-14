@@ -142,7 +142,11 @@ impl Protocol for SampleProtocol {
         }
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        _: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
         let Some(text) = message.message.body.get("text").and_then(Value::as_str) else {
             return Outcome::Drop {
                 reason: "sample: body.text isn't text".into(),

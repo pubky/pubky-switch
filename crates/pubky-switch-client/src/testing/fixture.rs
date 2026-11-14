@@ -407,7 +407,11 @@ impl Protocol for TestProtocol {
         Ok(())
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        _: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
         lock(&self.received).push(message.clone());
         Outcome::Apply(Effect::default())
     }

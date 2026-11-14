@@ -94,11 +94,15 @@ impl Protocol for ParkingProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
         self.released.lock().unwrap().push(message.released);
         let mode = *self.mode.lock().unwrap();
         match mode {
-            Mode::Plain => self.sample.receive(message),
+            Mode::Plain => self.sample.receive(message, cx),
             Mode::Wide => {
                 self.sample.received.lock().unwrap().push((
                     message.seq,
@@ -117,7 +121,7 @@ impl Protocol for ParkingProtocol {
             Mode::DeclineReleased if message.released => Outcome::Drop {
                 reason: "sample: it may have been applied".into(),
             },
-            Mode::DeclineReleased => self.sample.receive(message),
+            Mode::DeclineReleased => self.sample.receive(message, cx),
             Mode::RetryFirstStoredRun => {
                 if message.parked {
                     let mut runs = self.stored_runs.lock().unwrap();
@@ -126,7 +130,7 @@ impl Protocol for ParkingProtocol {
                         return Outcome::Retry(StoreError::Unavailable.into());
                     }
                 }
-                self.sample.receive(message)
+                self.sample.receive(message, cx)
             }
         }
     }

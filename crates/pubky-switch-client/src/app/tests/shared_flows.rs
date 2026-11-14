@@ -98,8 +98,12 @@ impl Protocol for ItemsProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
-        self.sample.receive(message)
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
+        self.sample.receive(message, cx)
     }
 
     fn resend_needed(
@@ -140,18 +144,14 @@ impl Protocol for ItemsProtocol {
         Some(mark)
     }
 
-    fn record_regression_on(
+    fn record_regression(
         &self,
-        collection: &str,
+        _: &str,
         seen: &[u8],
         value: Option<&[u8]>,
         base: WriteBase,
     ) -> Option<String> {
         self.bases.lock().unwrap().push(base);
-        self.record_regression(collection, seen, value)
-    }
-
-    fn record_regression(&self, _: &str, seen: &[u8], value: Option<&[u8]>) -> Option<String> {
         let Some(value) = value else {
             return self
                 .deletes_regress
@@ -7360,7 +7360,7 @@ impl Protocol for SharedReader {
         self.items.check_body(message)
     }
 
-    fn receive_with(
+    fn receive(
         &self,
         message: &ReceivedMessage,
         cx: &mut crate::app::ReceiveContext<'_>,

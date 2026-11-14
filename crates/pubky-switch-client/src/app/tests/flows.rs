@@ -2506,20 +2506,20 @@ impl Protocol for LifecycleProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive_with(
+    fn receive(
         &self,
         message: &crate::app::ReceivedMessage,
         cx: &mut crate::app::ReceiveContext<'_>,
     ) -> crate::app::Outcome {
         if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
-            return self.sample.receive(message);
+            return self.sample.receive(message, cx);
         }
         if self.in_context {
             let answer = cx.op(Vec::new(), self.extra.clone());
             self.answers.lock().unwrap().push(answer.is_ok());
-            return self.sample.receive(message);
+            return self.sample.receive(message, cx);
         }
-        match self.sample.receive(message) {
+        match self.sample.receive(message, cx) {
             crate::app::Outcome::Apply(mut effect) => {
                 effect.ops.push((Vec::new(), self.extra.clone()));
                 crate::app::Outcome::Apply(effect)
@@ -4429,7 +4429,11 @@ impl Protocol for WideProtocol {
         self.0.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        _: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
         let ops = (0..8u8)
             .map(|n| (Vec::new(), OpKind::DenyPut { pubky: [n; 32] }))
             .collect();
@@ -4540,9 +4544,20 @@ impl Protocol for BigProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
         if message.message.body.get("text").and_then(Value::as_str) != Some("big") {
-            return self.sample.receive(message);
+            return self.sample.receive(message, cx);
+        }
+        if self.via_context {
+            for write in self.writes() {
+                let added = cx.local(write).map_err(|error| error.to_string());
+                self.added.lock().unwrap().push(added);
+            }
+            return Outcome::Apply(Effect::default());
         }
         let ops = if self.ops {
             vec![(
@@ -4559,22 +4574,6 @@ impl Protocol for BigProtocol {
             ops,
             local: self.writes(),
         })
-    }
-
-    fn receive_with(
-        &self,
-        message: &ReceivedMessage,
-        cx: &mut crate::app::ReceiveContext<'_>,
-    ) -> Outcome {
-        let big = message.message.body.get("text").and_then(Value::as_str) == Some("big");
-        if !self.via_context || !big {
-            return self.receive(message);
-        }
-        for write in self.writes() {
-            let added = cx.local(write).map_err(|error| error.to_string());
-            self.added.lock().unwrap().push(added);
-        }
-        Outcome::Apply(Effect::default())
     }
 
     fn resend_needed(
@@ -4908,7 +4907,11 @@ impl Protocol for FillProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
         let text = message
             .message
             .body
@@ -4928,7 +4931,7 @@ impl Protocol for FillProtocol {
                 })
                 .collect()
         } else {
-            return self.sample.receive(message);
+            return self.sample.receive(message, cx);
         };
         Outcome::Apply(Effect {
             ops: Vec::new(),
@@ -5471,9 +5474,13 @@ impl Protocol for OrderedProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &crate::app::ReceivedMessage) -> crate::app::Outcome {
+    fn receive(
+        &self,
+        message: &crate::app::ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> crate::app::Outcome {
         self.log.lock().unwrap().push(("message", message.seq));
-        self.sample.receive(message)
+        self.sample.receive(message, cx)
     }
 
     fn resend_needed(
@@ -5707,7 +5714,11 @@ impl Protocol for KindsProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &crate::app::ReceivedMessage) -> crate::app::Outcome {
+    fn receive(
+        &self,
+        message: &crate::app::ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> crate::app::Outcome {
         {
             let mut retries = self.retries.lock().unwrap();
             if *retries > 0 {
@@ -5718,7 +5729,7 @@ impl Protocol for KindsProtocol {
             }
         }
         self.log.lock().unwrap().push(("message", message.seq));
-        self.sample.receive(message)
+        self.sample.receive(message, cx)
     }
 
     fn resend_needed(

@@ -70,7 +70,7 @@ impl Protocol for EpochNotes {
         }
     }
 
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         let msg_id = message.message.msg_id.clone();
         if let Ok(mut runs) = self.runs.lock() {
             runs.push(msg_id.clone());

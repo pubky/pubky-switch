@@ -126,8 +126,12 @@ impl Protocol for LossProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
-        self.sample.receive(message)
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
+        self.sample.receive(message, cx)
     }
 
     fn resend_needed(
@@ -141,7 +145,11 @@ impl Protocol for LossProtocol {
         self.sample.missed(missed)
     }
 
-    fn provider_lost(&self, loss: &ProviderLoss) -> Result<LossActions, crate::app::StoreFailure> {
+    fn provider_lost(
+        &self,
+        loss: &ProviderLoss,
+        _: &crate::app::LocalView<'_>,
+    ) -> Result<LossActions, crate::app::StoreFailure> {
         {
             let mut failing = self.failing.lock().unwrap();
             if *failing > 0 {
@@ -3866,8 +3874,12 @@ impl Protocol for AttemptingProtocol {
         self.0.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
-        match self.0.receive(message) {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
+        match self.0.receive(message, cx) {
             Outcome::Apply(mut effect) => {
                 effect.ops.push((
                     Vec::new(),

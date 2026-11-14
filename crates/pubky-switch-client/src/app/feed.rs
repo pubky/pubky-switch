@@ -1557,7 +1557,7 @@ impl App {
                     read.tx.pending_local(),
                     read.tx.pending_writes(),
                 );
-                let outcome = protocol.receive_with(&message, &mut cx);
+                let outcome = protocol.receive(&message, &mut cx);
                 (outcome, cx.into_writes())
             };
             let mut effect = match outcome {

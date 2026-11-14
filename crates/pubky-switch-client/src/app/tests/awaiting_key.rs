@@ -97,7 +97,7 @@ impl Protocol for Keyed {
         self.items.check_body(message)
     }
 
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         let msg_id = message.message.msg_id.clone();
         self.runs.lock().unwrap().push(msg_id.clone());
         {
@@ -1048,7 +1048,7 @@ impl Protocol for Unkeyed {
         self.items.check_body(message)
     }
 
-    fn receive_with(&self, _: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+    fn receive(&self, _: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         *self.runs.lock().unwrap() += 1;
         let data_epoch = self.epoch.unwrap_or(cx.data_epoch());
         if !cx.holds_scope_key("scope-z", data_epoch) {
