@@ -63,7 +63,7 @@ impl crate::admin::ReadinessCheck for KeyStoreReadiness {
     fn check(&self) -> crate::admin::CheckFuture<'_> {
         let root = self.0.root().to_path_buf();
         Box::pin(async move {
-            for dir in ["keys", "marks", "erasures"] {
+            for dir in DIRS {
                 fs::read_dir(root.join(dir))
                     .map_err(|_| format!("the key store's {dir} directory isn't readable"))?;
             }
@@ -352,7 +352,11 @@ pub fn sign_checkpoint(
 /// - `erasures/<identity>`: the time of the identity's erasure, in Unix milliseconds.
 ///
 /// Every file is written to a temporary file, synced, renamed into place and its directory
-/// synced, so a crash leaves the old content or the new, never a mix. Put the directory on
+/// synced, so a crash leaves the old content or the new, never a mix. A write that fails may
+/// have landed its rename without the directory sync, so nothing the store reads from a file
+/// counts as written before a directory sync covers it: a retry that finds its file in place
+/// repeats the sync before it reports success, and the store syncs its directories when it
+/// opens, before it reads them. Put the directory on
 /// a disk that database backups don't cover, and back it up on its own: losing it loses
 /// every account's service key.
 ///
@@ -374,9 +378,68 @@ struct Inner {
     /// inside the blocking task that does it. A caller that stops waiting can't release it
     /// early: the task runs to its end, so writes land in the order they were checked.
     writes: Mutex<()>,
+    /// The operator key, once a directory sync covers the `operator` file that names it.
+    operator: Mutex<Option<Arc<SigningKey>>>,
     /// Pauses a mark write before it lands, for tests.
     #[cfg(test)]
     pause: Mutex<Option<PauseGate>>,
+    /// Fails directory syncs and tracks what a crash would undo, for tests.
+    #[cfg(test)]
+    faults: Arc<Mutex<Faults>>,
+}
+
+/// The directories under the store's root.
+const DIRS: [&str; 3] = ["keys", "marks", "erasures"];
+
+/// Directory syncs that fail on request, and a model of a crash: every rename and removal
+/// no directory sync covers yet, which a crash may undo.
+#[cfg(test)]
+#[derive(Default)]
+struct Faults {
+    /// How many of a directory's next syncs fail.
+    failing: HashMap<PathBuf, usize>,
+    /// Each rename or removal not yet covered by a sync of its directory, with the content
+    /// the file had before it, if it existed.
+    unsynced: Vec<(PathBuf, Option<Vec<u8>>)>,
+}
+
+#[cfg(test)]
+impl Faults {
+    /// Fail the next `times` syncs of `dir`.
+    fn fail_sync(&mut self, dir: &Path, times: usize) {
+        self.failing.insert(dir.to_path_buf(), times);
+    }
+
+    /// Whether this sync of `dir` fails.
+    fn fails(&mut self, dir: &Path) -> bool {
+        match self.failing.get_mut(dir) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A rename onto `path` or its removal landed: `before` is what the file held.
+    fn changed(&mut self, path: &Path, before: Option<Vec<u8>>) {
+        self.unsynced.push((path.to_path_buf(), before));
+    }
+
+    /// A sync of `dir` succeeded: a crash no longer undoes the changes in it.
+    fn synced(&mut self, dir: &Path) {
+        self.unsynced.retain(|(path, _)| path.parent() != Some(dir));
+    }
+
+    /// Crash: undo every change no directory sync covers, newest first.
+    fn crash(&mut self) {
+        while let Some((path, before)) = self.unsynced.pop() {
+            match before {
+                Some(bytes) => fs::write(&path, bytes).expect("restore"),
+                None => fs::remove_file(&path).expect("remove"),
+            }
+        }
+    }
 }
 
 /// Pauses the mark write for `seq` once: it says so on `paused`, then waits on `release`.
@@ -398,21 +461,37 @@ impl std::fmt::Debug for FileKeyStore {
 impl FileKeyStore {
     /// Open the key store at `root`, creating its directories if they don't exist.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, KeyStoreError> {
-        let root = root.into();
-        for dir in ["keys", "marks", "erasures"] {
-            create_private_dir(&root.join(dir))?;
+        Self::start(Inner::new(root.into()))
+    }
+
+    /// Open the key store at `root` with `faults`, which outlive it: a test's next store on
+    /// the same directory takes them over, as the next process takes over the disk.
+    #[cfg(test)]
+    fn open_with_faults(
+        root: impl Into<PathBuf>,
+        faults: Arc<Mutex<Faults>>,
+    ) -> Result<Self, KeyStoreError> {
+        let mut inner = Inner::new(root.into());
+        inner.faults = faults;
+        Self::start(inner)
+    }
+
+    fn start(inner: Inner) -> Result<Self, KeyStoreError> {
+        for dir in DIRS {
+            create_private_dir(&inner.root.join(dir))?;
         }
-        let ledger = read_ledger(&root.join("erasures"))?;
+        // An earlier process may have landed a rename or a removal and stopped before its
+        // directory sync, or failed it: the file is there to read, and a crash could still
+        // undo it. Sync every directory before reading any, so a mark this store compares a
+        // head with, an erasure it holds and the operator file are all durable.
+        for dir in DIRS {
+            inner.sync_dir(&inner.root.join(dir))?;
+        }
+        inner.sync_dir(&inner.root)?;
+        let ledger = read_ledger(&inner.root.join("erasures"))?;
+        *inner.ledger.lock() = ledger;
         Ok(Self {
-            inner: Arc::new(Inner {
-                root,
-                keys: Mutex::new(HashMap::new()),
-                marks: Mutex::new(HashMap::new()),
-                ledger: Mutex::new(ledger),
-                writes: Mutex::new(()),
-                #[cfg(test)]
-                pause: Mutex::new(None),
-            }),
+            inner: Arc::new(inner),
         })
     }
 
@@ -423,6 +502,72 @@ impl FileKeyStore {
 }
 
 impl Inner {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            keys: Mutex::new(HashMap::new()),
+            marks: Mutex::new(HashMap::new()),
+            ledger: Mutex::new(HashMap::new()),
+            writes: Mutex::new(()),
+            operator: Mutex::new(None),
+            #[cfg(test)]
+            pause: Mutex::new(None),
+            #[cfg(test)]
+            faults: Arc::default(),
+        }
+    }
+
+    /// Sync `dir`, so a rename or a removal in it is durable.
+    fn sync_dir(&self, dir: &Path) -> Result<(), KeyStoreError> {
+        #[cfg(test)]
+        if self.faults.lock().fails(dir) {
+            return Err(std::io::Error::other("injected directory sync failure").into());
+        }
+        sync_dir(dir)?;
+        #[cfg(test)]
+        self.faults.lock().synced(dir);
+        Ok(())
+    }
+
+    /// Write `bytes` to `path` atomically and durably: a temporary file in the same
+    /// directory, synced, renamed into place, then the directory synced. `exclusive` refuses
+    /// to replace an existing file. On a failure the rename may have landed without the
+    /// directory sync: whoever then finds the file in place syncs the directory before
+    /// counting it as written.
+    fn write_atomic(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        exclusive: bool,
+    ) -> Result<(), KeyStoreError> {
+        let dir = path
+            .parent()
+            .ok_or_else(|| KeyStoreError::Io(std::io::Error::other("path without a directory")))?;
+        #[cfg(test)]
+        let before = fs::read(path).ok();
+        rename_into_place(dir, path, bytes, exclusive)?;
+        #[cfg(test)]
+        self.faults.lock().changed(path, before);
+        self.sync_dir(dir)
+    }
+
+    /// Remove the file at `path`, if it is there. The removal is durable once its directory
+    /// is synced, which the caller does also when the file was already gone: an earlier
+    /// removal may have landed without its sync.
+    fn remove_file(&self, path: &Path) -> Result<(), KeyStoreError> {
+        #[cfg(test)]
+        let before = fs::read(path).ok();
+        match fs::remove_file(path) {
+            Ok(()) => {
+                #[cfg(test)]
+                self.faults.lock().changed(path, before);
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn key_path(&self, id: &KeyId) -> PathBuf {
         self.root.join("keys").join(id.as_str())
     }
@@ -484,7 +629,7 @@ impl Inner {
     fn generate_as_sync(&self, id: KeyId) -> Result<ServiceKey, KeyStoreError> {
         let mut seed = Zeroizing::new([0u8; 32]);
         getrandom::fill(seed.as_mut()).map_err(|_| KeyStoreError::Random)?;
-        write_atomic(&self.key_path(&id), seed.as_ref(), true)?;
+        self.write_atomic(&self.key_path(&id), seed.as_ref(), true)?;
         let key = SigningKey::from_bytes(&seed);
         let public = key.verifying_key().to_bytes();
         self.keys.lock().insert(id.clone(), Arc::new(key));
@@ -493,18 +638,33 @@ impl Inner {
 
     /// The operator key, made on first use: `operator` holds its ID.
     fn operator_sync(&self) -> Result<Arc<SigningKey>, KeyStoreError> {
+        if let Some(key) = self.operator.lock().clone() {
+            return Ok(key);
+        }
         let path = self.root.join("operator");
         let _writes = self.writes.lock();
+        if let Some(key) = self.operator.lock().clone() {
+            return Ok(key);
+        }
         let id = match fs::read_to_string(&path) {
-            Ok(text) => KeyId::parse(text.trim())?,
+            Ok(text) => {
+                let id = KeyId::parse(text.trim())?;
+                // The file may be one whose rename landed and whose directory sync then
+                // failed. Sync again before the key signs anything, so a crash can't drop
+                // the file and have another key take its place.
+                self.sync_dir(&self.root)?;
+                id
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let key = self.generate_sync()?;
-                write_atomic(&path, key.id.as_str().as_bytes(), true)?;
+                self.write_atomic(&path, key.id.as_str().as_bytes(), true)?;
                 key.id
             }
             Err(error) => return Err(error.into()),
         };
-        self.load_key(&id)
+        let key = self.load_key(&id)?;
+        *self.operator.lock() = Some(key.clone());
+        Ok(key)
     }
 
     /// Keep `seed` as a new key, for tests that need the vectors' fixed keys.
@@ -513,7 +673,7 @@ impl Inner {
         let mut raw = [0u8; 16];
         getrandom::fill(&mut raw).map_err(|_| KeyStoreError::Random)?;
         let id = KeyId(hex::encode(raw));
-        write_atomic(&self.key_path(&id), seed, true)?;
+        self.write_atomic(&self.key_path(&id), seed, true)?;
         let key = SigningKey::from_bytes(seed);
         let public = key.verifying_key().to_bytes();
         self.keys.lock().insert(id.clone(), Arc::new(key));
@@ -534,7 +694,7 @@ impl Inner {
                 self.pause_before_write(head.seq);
                 let bytes = serde_json::to_vec(&head)
                     .map_err(|error| KeyStoreError::Corrupt(error.to_string()))?;
-                write_atomic(&self.mark_path(id), &bytes, false)?;
+                self.write_atomic(&self.mark_path(id), &bytes, false)?;
                 self.marks.lock().insert(id.clone(), Some(head));
                 Ok(check)
             }
@@ -585,9 +745,13 @@ impl Inner {
             *held = (*held).max(latest);
         }
         if recorded.is_some_and(|recorded| recorded >= erased_at_ms) {
-            return Ok(());
+            // The file may be one whose rename landed and whose directory sync then failed:
+            // the erasure isn't recorded until a sync covers it. The caller drops its duty
+            // to record on this answer, and a crash would then lose the entry the restore
+            // protection reads (Switch spec 6.5).
+            return self.sync_dir(&self.root.join("erasures"));
         }
-        write_atomic(&path, erased_at_ms.to_string().as_bytes(), false)
+        self.write_atomic(&path, erased_at_ms.to_string().as_bytes(), false)
     }
 
     /// Remove the ledger's files of erasures before `before_ms`, each removal durable before
@@ -603,14 +767,10 @@ impl Inner {
             .collect();
         let dir = self.root.join("erasures");
         for identity in &old {
-            match fs::remove_file(dir.join(identity)) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+            self.remove_file(&dir.join(identity))?;
         }
         if !old.is_empty() {
-            sync_dir(&dir)?;
+            self.sync_dir(&dir)?;
             let mut ledger = self.ledger.lock();
             for identity in &old {
                 ledger.remove(identity);
@@ -624,13 +784,9 @@ impl Inner {
         // The key goes first: a key whose mark is gone could sign behind it, while a mark
         // without its key signs nothing.
         for path in [self.key_path(id), self.mark_path(id)] {
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+            self.remove_file(&path)?;
             if let Some(dir) = path.parent() {
-                sync_dir(dir)?;
+                self.sync_dir(dir)?;
             }
         }
         self.keys.lock().remove(id);
@@ -788,13 +944,15 @@ fn create_private_dir(dir: &Path) -> Result<(), KeyStoreError> {
     Ok(())
 }
 
-/// Write `bytes` to `path` atomically and durably: a temporary file in the same directory,
-/// synced, renamed into place, then the directory synced. `exclusive` refuses to replace an
-/// existing file.
-fn write_atomic(path: &Path, bytes: &[u8], exclusive: bool) -> Result<(), KeyStoreError> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| KeyStoreError::Io(std::io::Error::other("path without a directory")))?;
+/// Write `bytes` to a temporary file in `dir`, sync it and rename it to `path`, a file in
+/// `dir`. `exclusive` refuses to replace an existing file. The rename isn't durable until
+/// `dir` is synced.
+fn rename_into_place(
+    dir: &Path,
+    path: &Path,
+    bytes: &[u8],
+    exclusive: bool,
+) -> Result<(), KeyStoreError> {
     if exclusive && path.exists() {
         return Err(KeyStoreError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -820,7 +978,7 @@ fn write_atomic(path: &Path, bytes: &[u8], exclusive: bool) -> Result<(), KeySto
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temp, path)?;
-        sync_dir(dir)
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -1326,6 +1484,195 @@ mod tests {
         fs::write(dir.path().join("erasures").join("aaa"), "1000").expect("landed");
         store.record_erasure("aaa", 1_000).await.expect("record");
         assert_eq!(store.erasure("aaa").await.expect("read"), Some(1_000));
+    }
+
+    /// A store with faults to inject, which a later store on the same directory takes over.
+    fn open_faulty() -> (tempfile::TempDir, FileKeyStore, Arc<Mutex<Faults>>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let faults = Arc::new(Mutex::new(Faults::default()));
+        let store = FileKeyStore::open_with_faults(dir.path(), faults.clone()).expect("open");
+        (dir, store, faults)
+    }
+
+    /// The machine crashes, losing what no directory sync covers, and a new process opens
+    /// the store.
+    fn crash_and_reopen(dir: &tempfile::TempDir, faults: &Arc<Mutex<Faults>>) -> FileKeyStore {
+        faults.lock().crash();
+        FileKeyStore::open_with_faults(dir.path(), faults.clone()).expect("reopen")
+    }
+
+    #[tokio::test]
+    async fn test_key_store_erasure_retry_syncs_the_directory_before_it_is_recorded() {
+        // The rename lands and the directory sync fails: the record is refused. Its retry
+        // finds the file in place and must sync the directory before it reports the erasure
+        // recorded, or a crash loses an entry the caller no longer owes (Switch spec 6.5).
+        let (dir, store, faults) = open_faulty();
+        let erasures = dir.path().join("erasures");
+        faults.lock().fail_sync(&erasures, 1);
+        assert!(matches!(
+            store.record_erasure("aaa", 1_000).await,
+            Err(KeyStoreError::Io(_))
+        ));
+        assert!(erasures.join("aaa").exists(), "the rename landed");
+        // The ledger in memory holds it meanwhile: on that side it only erases.
+        assert_eq!(store.erasure("aaa").await.expect("read"), Some(1_000));
+        store.record_erasure("aaa", 1_000).await.expect("retry");
+        let store = crash_and_reopen(&dir, &faults);
+        assert_eq!(store.erasure("aaa").await.expect("read"), Some(1_000));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_erasure_retry_is_refused_while_the_directory_sync_fails() {
+        let (dir, store, faults) = open_faulty();
+        let erasures = dir.path().join("erasures");
+        faults.lock().fail_sync(&erasures, 2);
+        for _ in 0..2 {
+            assert!(matches!(
+                store.record_erasure("aaa", 1_000).await,
+                Err(KeyStoreError::Io(_))
+            ));
+        }
+        // Nothing reported it recorded, and the crash loses it.
+        let store = crash_and_reopen(&dir, &faults);
+        assert_eq!(store.erasure("aaa").await.expect("read"), None);
+        store.record_erasure("aaa", 1_000).await.expect("record");
+        let store = crash_and_reopen(&dir, &faults);
+        assert_eq!(store.erasure("aaa").await.expect("read"), Some(1_000));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_older_erasure_after_an_unsynced_newer_one_syncs_the_directory() {
+        // The same retry, asked with an older time: the file already holds a newer erasure,
+        // nothing is written, and the directory is still synced.
+        let (dir, store, faults) = open_faulty();
+        faults.lock().fail_sync(&dir.path().join("erasures"), 1);
+        assert!(store.record_erasure("aaa", 2_000).await.is_err());
+        store.record_erasure("aaa", 1_000).await.expect("older");
+        let store = crash_and_reopen(&dir, &faults);
+        assert_eq!(store.erasure("aaa").await.expect("read"), Some(2_000));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_forget_erasures_retry_syncs_the_directory() {
+        let (dir, store, faults) = open_faulty();
+        store.record_erasure("aaa", 1_000).await.expect("record");
+        faults.lock().fail_sync(&dir.path().join("erasures"), 1);
+        assert!(store.forget_erasures_before(2_000).await.is_err());
+        // The removal isn't durable: the ledger still holds the erasure.
+        assert_eq!(store.erasure("aaa").await.expect("read"), Some(1_000));
+        assert_eq!(store.forget_erasures_before(2_000).await.expect("retry"), 1);
+        assert_eq!(store.erasure("aaa").await.expect("read"), None);
+        let store = crash_and_reopen(&dir, &faults);
+        assert_eq!(store.erasure("aaa").await.expect("read"), None);
+    }
+
+    #[tokio::test]
+    async fn test_key_store_mark_left_unsynced_is_synced_before_the_next_process_reads_it() {
+        // A mark's rename lands, its directory sync fails and the process stops. The next
+        // process reads the new mark from the file; an advance to the same head then writes
+        // nothing, so the open itself must have made the mark durable, or a crash takes the
+        // key's mark back behind a head it signed (Switch spec 6.5).
+        let (dir, store, faults) = open_faulty();
+        let key = store.generate().await.expect("generate");
+        store
+            .advance_mark(&key.id, mark(1, 1))
+            .await
+            .expect("first");
+        faults.lock().fail_sync(&dir.path().join("marks"), 1);
+        assert!(matches!(
+            store.advance_mark(&key.id, mark(2, 2)).await,
+            Err(KeyStoreError::Io(_))
+        ));
+        // The same process still holds the mark it last wrote durably.
+        assert_eq!(store.mark(&key.id).await.expect("mark"), Some(mark(1, 1)));
+        drop(store);
+        let store = FileKeyStore::open_with_faults(dir.path(), faults.clone()).expect("restart");
+        assert_eq!(store.mark(&key.id).await.expect("mark"), Some(mark(2, 2)));
+        assert_eq!(
+            store.advance_mark(&key.id, mark(2, 2)).await.expect("same"),
+            MarkCheck::Current
+        );
+        let store = crash_and_reopen(&dir, &faults);
+        assert_eq!(store.mark(&key.id).await.expect("mark"), Some(mark(2, 2)));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_mark_retry_in_the_same_process_writes_again() {
+        let (dir, store, faults) = open_faulty();
+        let key = store.generate().await.expect("generate");
+        faults.lock().fail_sync(&dir.path().join("marks"), 1);
+        assert!(store.advance_mark(&key.id, mark(1, 1)).await.is_err());
+        store
+            .advance_mark(&key.id, mark(1, 1))
+            .await
+            .expect("retry");
+        let store = crash_and_reopen(&dir, &faults);
+        assert_eq!(store.mark(&key.id).await.expect("mark"), Some(mark(1, 1)));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_operator_retry_syncs_the_directory_before_the_key_signs() {
+        // The `operator` file's rename lands and the root's sync fails. The retry finds the
+        // file and must sync the root before it hands out the key, or a crash drops the file
+        // and another key takes its place.
+        let (dir, store, faults) = open_faulty();
+        faults.lock().fail_sync(dir.path(), 1);
+        assert!(matches!(store.operator().await, Err(KeyStoreError::Io(_))));
+        assert!(dir.path().join("operator").exists(), "the rename landed");
+        let first = store.operator().await.expect("retry").public_key();
+        let store = crash_and_reopen(&dir, &faults);
+        assert_eq!(
+            store.operator().await.expect("operator").public_key(),
+            first
+        );
+    }
+
+    #[tokio::test]
+    async fn test_key_store_operator_retry_is_refused_while_the_directory_sync_fails() {
+        let (dir, store, faults) = open_faulty();
+        faults.lock().fail_sync(dir.path(), 2);
+        assert!(store.operator().await.is_err());
+        assert!(store.operator().await.is_err());
+        store.operator().await.expect("operator");
+    }
+
+    #[tokio::test]
+    async fn test_key_store_generate_as_refuses_the_id_of_an_unsynced_key() {
+        // A key whose rename landed without the directory sync is never handed out: the
+        // write is refused, and so is a retry under the same ID.
+        let (dir, store, faults) = open_faulty();
+        let id = KeyId::random().expect("id");
+        faults.lock().fail_sync(&dir.path().join("keys"), 1);
+        assert!(store.generate_as(&id).await.is_err());
+        assert!(store.generate_as(&id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_key_store_delete_retry_syncs_the_directory() {
+        let (dir, store, faults) = open_faulty();
+        let key = store.generate().await.expect("generate");
+        faults.lock().fail_sync(&dir.path().join("keys"), 1);
+        assert!(store.delete(&key.id).await.is_err());
+        store.delete(&key.id).await.expect("retry");
+        let store = crash_and_reopen(&dir, &faults);
+        assert!(matches!(
+            store.public_key(&key.id).await,
+            Err(KeyStoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_open_fails_when_a_directory_sync_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for failing in [dir.path().to_path_buf(), dir.path().join("marks")] {
+            let faults = Arc::new(Mutex::new(Faults::default()));
+            faults.lock().fail_sync(&failing, 1);
+            assert!(matches!(
+                FileKeyStore::open_with_faults(dir.path(), faults),
+                Err(KeyStoreError::Io(_))
+            ));
+        }
+        FileKeyStore::open(dir.path()).expect("open");
     }
 
     #[tokio::test]
