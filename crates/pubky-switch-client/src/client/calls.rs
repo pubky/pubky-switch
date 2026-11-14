@@ -722,7 +722,7 @@ impl SwitchClient {
         }
         .to_json();
         let checked = self
-            .send_json("POST", "import/activate", body, TimeoutClass::Ordinary)
+            .send_json("POST", "import/activate", body, TimeoutClass::Bulk)
             .await?;
         let answer = ActivateAnswer::parse(&checked.body).map_err(|_| {
             ClientError::InvalidResponse(

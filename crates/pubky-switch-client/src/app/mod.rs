@@ -2947,6 +2947,9 @@ impl App {
 
     /// The certificate changed: requests present the new one from now on.
     pub(crate) fn rebuild_client(&mut self) -> Result<(), AppError> {
+        // A time an answer of the client before brought may be of another service: the
+        // next stamp or window reads one from this client's service.
+        self.time_fresh_at = None;
         self.client = Self::client_for(
             &self.env,
             &self.state.meta,

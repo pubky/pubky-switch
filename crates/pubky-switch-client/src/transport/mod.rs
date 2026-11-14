@@ -61,6 +61,7 @@ pub fn header_value<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
 /// call it makes ([`Request::timeout`]), from the call itself, never from its path; a
 /// transport gives each class a timeout (`HttpConfig` for the HTTPS transport).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TimeoutClass {
     /// A small request with a small answer: a write of a document or a setting, a read of
     /// one small value, the read of the signed service time (a feed page with no items,

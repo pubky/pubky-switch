@@ -257,8 +257,7 @@ impl App {
 
     /// A verified service time to stamp a first send with ([`App::kept_stamp`]). None is
     /// read when the app holds one of the current service key that is recent by the device
-    /// clock ([`RECENT_SERVICE_TIME_MS`]), or when the device clock is behind it, since the
-    /// stamp is then the device clock's whatever a read brings.
+    /// clock ([`RECENT_SERVICE_TIME_MS`]).
     ///
     /// The stamp must be at or before the time the service applies the batch, so that the
     /// kept copy's window never outlasts the service's memory of the batch ID
@@ -267,7 +266,11 @@ impl App {
     /// highest time the app verified with that key, fresh or not. The age of the held time
     /// only bounds how much sooner than needed the window ends. Without such a time (none
     /// held, one of another key, or an older one) the app reads one
-    /// ([`App::fresh_service_time`]).
+    /// ([`App::fresh_service_time`]); a time an answer of the same call brought counts,
+    /// and a change of service starts the call's count again. A service whose stamped time
+    /// went back below the held time breaks that rule: the batch then goes once at a stamp
+    /// later than its apply time, and its answer raises the alarm that stops the app
+    /// ([`super::Alarm::ServiceTimeBackwards`]).
     ///
     /// # Errors
     ///

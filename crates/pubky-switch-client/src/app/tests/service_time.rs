@@ -153,3 +153,22 @@ async fn test_service_time_read_for_a_kept_batch_is_a_page_with_no_items() {
     assert!(router.log()[from].contains("/feed"), "{:?}", router.log());
     assert!(app.kept_batches().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn test_service_time_brought_before_a_change_of_service_isnt_fresh_after_it() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    app.receive(None).await.unwrap();
+    // A time an answer of this call brought counts for the call.
+    let from = router.log().len();
+    app.fresh_service_time().await.unwrap();
+    assert_eq!(feed_reads(&router, from), Vec::<String>::new());
+    // Once the client is built again, as for another service, it is read again.
+    app.rebuild_client().unwrap();
+    let from = router.log().len();
+    app.fresh_service_time().await.unwrap();
+    let reads = feed_reads(&router, from);
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert!(reads[0].ends_with("limit=0"), "{reads:?}");
+}

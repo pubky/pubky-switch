@@ -1811,10 +1811,6 @@ fn conversations_for(w: &World, pubky: [u8; 32]) -> usize {
 /// A write while the service can't be reached: kept, never sent.
 async fn write_offline(w: &World, app: &mut App) {
     w.switch.fail_next(Fault::Unreachable {
-        path: "feed".into(),
-        after: 0,
-    });
-    w.switch.fail_next(Fault::Unreachable {
         path: "ops".into(),
         after: 0,
     });

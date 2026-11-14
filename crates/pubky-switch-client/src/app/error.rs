@@ -438,13 +438,6 @@ pub(crate) fn refused_at(error: &AppError) -> Option<RefusalPlace> {
     refused_for_good(error).map(refusal_place)
 }
 
-/// Whether the switch refused these exact bytes for good, so that sending them again can't
-/// pass (Switch spec 6.4): the Retry column says "No", or allows the call only once it is
-/// built again (after re-reading, with the key bundle, signed again or sealed again). Every
-/// other failure may pass with the same bytes later: `429`, `503`, `401 stale_timestamp`
-/// (the request is signed again, the body isn't), `409 identity_needed`, `410 moved`, a
-/// transport failure, or an answer whose signature didn't verify or that didn't read, which
-/// may not be the service's (Switch wire 2.1, 7.1).
 /// Whether `error` says the request never left: the transport made no connection, or
 /// refused the origin ([`TransportError::Connect`], [`TransportError::Refused`]). Any other
 /// failure may have reached the switch.
@@ -455,6 +448,13 @@ pub(crate) fn never_left(error: &AppError) -> bool {
     )
 }
 
+/// Whether the switch refused these exact bytes for good, so that sending them again can't
+/// pass (Switch spec 6.4): the Retry column says "No", or allows the call only once it is
+/// built again (after re-reading, with the key bundle, signed again or sealed again). Every
+/// other failure may pass with the same bytes later: `429`, `503`, `401 stale_timestamp`
+/// (the request is signed again, the body isn't), `409 identity_needed`, `410 moved`, a
+/// transport failure, or an answer whose signature didn't verify or that didn't read, which
+/// may not be the service's (Switch wire 2.1, 7.1).
 pub(crate) fn refused_for_good(error: &AppError) -> Option<ErrorCode> {
     let AppError::Switch(ClientError::Switch { code, .. }) = error else {
         return None;

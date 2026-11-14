@@ -788,7 +788,8 @@ async fn upload(
         "/v1/{}/recovery/upload",
         pubky_switch_core::enc::pubky_id(&client.account())
     );
-    let signed = client.sign_request("POST", &path, body.as_bytes().to_vec(), None)?;
+    let mut signed = client.sign_request("POST", &path, body.as_bytes().to_vec(), None)?;
+    signed.request.timeout = pubky_switch_client::transport::TimeoutClass::Bulk;
     let answered = client.send(signed).await;
     world.outcome(
         name,
