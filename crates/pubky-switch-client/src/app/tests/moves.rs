@@ -90,6 +90,8 @@ impl Router {
 /// entry after one.
 #[derive(Default)]
 pub(crate) struct LossProtocol {
+    /// Its name; `sample` when `None`.
+    pub(crate) name: Option<&'static str>,
     pub(crate) sample: SampleProtocol,
     pub(crate) losses: Mutex<Vec<ProviderLoss>>,
     pub(crate) counterparties: Vec<[u8; 32]>,
@@ -103,7 +105,7 @@ pub(crate) struct LossProtocol {
 
 impl Protocol for LossProtocol {
     fn name(&self) -> String {
-        "sample".into()
+        self.name.unwrap_or("sample").into()
     }
 
     fn collections(&self) -> Vec<Collection> {
@@ -111,7 +113,11 @@ impl Protocol for LossProtocol {
     }
 
     fn has_keys(&self, scope: &str) -> bool {
-        self.sample.has_keys(scope)
+        // A protocol of another name has keys for the scope of its name.
+        match self.name {
+            Some(name) => scope == name,
+            None => self.sample.has_keys(scope),
+        }
     }
 
     fn sent_between_own_apps(&self, kind: &str) -> bool {
@@ -283,7 +289,7 @@ pub(crate) fn note_at(w: &World, switch: &ScriptedSwitch, to: [u8; 16], text: &s
         .0
 }
 
-fn conversations_at(switch: &ScriptedSwitch) -> usize {
+pub(crate) fn conversations_at(switch: &ScriptedSwitch) -> usize {
     switch
         .applied()
         .iter()
@@ -1094,6 +1100,9 @@ pub(crate) struct Lost {
     pub(crate) w: World,
     pub(crate) router: Router,
     pub(crate) protocol: Arc<LossProtocol>,
+    /// The protocols registered beside [`Lost::protocol`], each holding the scope of its
+    /// name.
+    pub(crate) others: Vec<Arc<LossProtocol>>,
     pub(crate) next: Arc<ScriptedSwitch>,
     carol: [u8; 32],
     dave: [u8; 32],
@@ -1136,20 +1145,43 @@ pub(crate) async fn lost_world_with(
     record: bool,
     lists: bool,
 ) -> Lost {
+    lost_world_beside(store, permissions, record, lists, Vec::new()).await
+}
+
+/// [`lost_world_with`], with `others` registered beside the sample protocol, the app's
+/// certificate holding the scope of each one's name.
+pub(crate) async fn lost_world_beside(
+    store: Arc<dyn StateStore>,
+    permissions: &[Permission],
+    record: bool,
+    lists: bool,
+    others: Vec<Arc<LossProtocol>>,
+) -> Lost {
     let w = World::new();
     let router = Router::of(&w);
     let protocol = Arc::new(LossProtocol {
         counterparties: vec![w.bob.public()],
         ..LossProtocol::default()
     });
-    let mut app = join_on(
-        &w,
-        &router,
-        store,
-        Arc::clone(&protocol) as Arc<dyn Protocol>,
-        permissions,
+    let names: Vec<String> = others.iter().map(|other| other.name()).collect();
+    let scopes: Vec<&str> = std::iter::once("sample-a")
+        .chain(names.iter().map(String::as_str))
+        .collect();
+    let request = w
+        .signer
+        .approve(
+            &app_keys("wallet"),
+            &AppSpec::new(&scopes).with_permissions(permissions),
+        )
+        .unwrap();
+    let mut app = App::join(
+        router.env(&w, store),
+        loss_set(&protocol, &others),
+        World::config(),
+        request,
     )
-    .await;
+    .await
+    .unwrap();
     if record {
         let target = crate::app::RecordTarget::new(super::shared_flows::items(), b"key");
         let value = super::shared_flows::value(&["a"]);
@@ -1200,11 +1232,23 @@ pub(crate) async fn lost_world_with(
         w,
         router,
         protocol,
+        others,
         next,
         carol,
         dave,
         note_at_ms,
     }
+}
+
+/// `protocol` and `others`, in that order.
+fn loss_set(protocol: &Arc<LossProtocol>, others: &[Arc<LossProtocol>]) -> crate::app::ProtocolSet {
+    crate::app::ProtocolSet::new(
+        std::iter::once(protocol)
+            .chain(others)
+            .map(|one| Arc::clone(one) as Arc<dyn Protocol>)
+            .collect(),
+    )
+    .unwrap()
 }
 
 /// The follow: the own identity.json from the Homeserver, then a read. Returns the app and
@@ -1215,7 +1259,7 @@ pub(crate) async fn follow_loss(
 ) -> Result<(App, Vec<AppEvent>), AppError> {
     let mut app = App::load(
         lost.router.env(&lost.w, store),
-        Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+        loss_set(&lost.protocol, &lost.others),
         World::config(),
         app_keys("wallet").app_id_bytes(),
     )

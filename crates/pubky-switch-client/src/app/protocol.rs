@@ -848,7 +848,9 @@ pub trait Protocol: Send + Sync {
     /// counterparties whose conversation entries the app adds back, at most
     /// [`MAX_LOSS_CONVERSATIONS`]: how many past it were left out is kept with the loss
     /// ([`super::RecoveryInfo::conversations_left_out`]). The app commits the local writes
-    /// once, with that step; a crash before that commit calls it again. Writes over
+    /// once, with the protocol's name as asked; a crash before that commit calls it again.
+    /// Each protocol of the app is asked in registration order, its answer committed on its
+    /// own, and the counterparties all of them name are added back together. Writes over
     /// [`MAX_STEP_LOCAL_BYTES`] aren't committed and the loss goes on, with
     /// [`super::AppEvent::LocalWritesRefused`]. `view` reads the protocol's local state,
     /// read-only, such as to find the counterparties of its unfinished activity; a protocol
@@ -859,7 +861,7 @@ pub trait Protocol: Send + Sync {
     /// A [`StoreFailure`] when the protocol can't build its actions now, such as when its own
     /// state can't be read. The recovery stays at this step, which its record keeps, and the
     /// app's call fails with [`super::AppError::Protocol`], apart from the app's own store
-    /// failing; the next call asks again.
+    /// failing; the next call asks again, the protocols that answered before it not.
     fn provider_lost(
         &self,
         loss: &ProviderLoss,

@@ -1000,3 +1000,113 @@ async fn test_protocol_set_may_send_hold_is_no_try_when_the_recipient_refuses() 
     assert!(!untried(&wallet.delivery(&refused).await.unwrap()));
     assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
 }
+
+/// The conversation entries `switch` applied, by counterparty.
+fn conversations_added(switch: &crate::testing::ScriptedSwitch) -> Vec<[u8; 32]> {
+    let mut added: Vec<[u8; 32]> = switch
+        .applied()
+        .iter()
+        .filter_map(|op| match op.body().kind {
+            OpKind::AllowPut {
+                pubky,
+                kind: AllowKind::Conversation,
+            } => Some(pubky),
+            _ => None,
+        })
+        .collect();
+    added.sort();
+    added
+}
+
+/// carol's identity.
+fn carol() -> [u8; 32] {
+    pubky_switch_core::keys::IdentityKey::from_secret(seed("carol/identity")).public()
+}
+
+/// A provider loss of an app running the sample protocol and `chat`, which names carol and
+/// fails its next `failing` loss calls; the app's store.
+async fn lost_beside(
+    failing: u32,
+) -> (
+    super::moves::Lost,
+    Arc<super::moves::LossProtocol>,
+    Arc<dyn StateStore>,
+) {
+    let chat = Arc::new(super::moves::LossProtocol {
+        name: Some("chat"),
+        counterparties: vec![carol()],
+        failing: Mutex::new(failing),
+        ..super::moves::LossProtocol::default()
+    });
+    let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
+    let lost = super::moves::lost_world_beside(
+        Arc::clone(&store),
+        &[
+            Permission::ListsRead,
+            Permission::ListsManage,
+            Permission::ConversationAdd,
+        ],
+        false,
+        true,
+        vec![Arc::clone(&chat)],
+    )
+    .await;
+    (lost, chat, store)
+}
+
+/// Both protocols' writes landed once each, under their own prefixes, and both their
+/// counterparties were added back.
+async fn both_answered(lost: &super::moves::Lost, app: &App) {
+    for name in ["sample", "chat"] {
+        assert_eq!(
+            app.protocol_get(name, b"lost/1").await.unwrap(),
+            Some(b"1".to_vec()),
+            "{name}"
+        );
+    }
+    let mut both = vec![lost.w.bob.public(), carol()];
+    both.sort();
+    assert_eq!(conversations_added(&lost.next), both);
+}
+
+#[tokio::test]
+async fn test_protocol_set_provider_loss_asks_each_protocol_once_and_merges_conversations() {
+    let (lost, chat, store) = lost_beside(0).await;
+    let (app, events) = super::moves::follow_loss(&lost, store).await.unwrap();
+    assert!(super::moves::has(&events, |e| matches!(
+        e,
+        AppEvent::ProviderRecovered { generation: 2 }
+    )));
+    // Each protocol was asked once, with the same loss.
+    let sample = lost.protocol.losses.lock().unwrap().clone();
+    assert_eq!(sample.len(), 1);
+    assert_eq!(*chat.losses.lock().unwrap(), sample);
+    both_answered(&lost, &app).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_provider_loss_call_one_protocol_fails_is_made_again_for_it_alone() {
+    let (lost, chat, store) = lost_beside(1).await;
+    // `chat` fails its call: the recovery stops at the step, with the protocol's error, and
+    // `sample`'s answer, asked first, is committed.
+    let first = super::moves::follow_loss(&lost, Arc::clone(&store)).await;
+    assert!(
+        matches!(&first, Err(AppError::Protocol(failure))
+            if *failure.error() == StoreError::Unavailable),
+        "{:?}",
+        first.map(|_| ())
+    );
+    assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);
+    assert!(chat.losses.lock().unwrap().is_empty());
+    assert!(conversations_added(&lost.next).is_empty());
+    // The next call asks `chat` alone; the recovery goes on, with both answers.
+    let (app, events) = super::moves::follow_loss(&lost, store).await.unwrap();
+    assert!(super::moves::has(&events, |e| matches!(
+        e,
+        AppEvent::ProviderRecovered { generation: 2 }
+    )));
+    let sample = lost.protocol.losses.lock().unwrap().clone();
+    assert_eq!(sample.len(), 1, "`sample` isn't asked twice");
+    assert_eq!(*chat.losses.lock().unwrap(), sample);
+    both_answered(&lost, &app).await;
+}
