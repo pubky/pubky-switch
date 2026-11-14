@@ -653,8 +653,13 @@ pub struct DenyListGap {
 ///   state alone.
 /// - **What carries no kind**, such as [`Protocol::resend_needed`], [`Protocol::missed`],
 ///   the deny list calls and [`Protocol::provider_lost`], is handed to every protocol, and
-///   each protocol's failure is owed to it alone.
-/// - **Duty events** name the protocols they are for ([`super::App::ack_events_for`]).
+///   each protocol's failure is owed to it alone. Until it takes a re-send or missed call
+///   it owes, it is handed nothing later, its records' writes wait with its entries, and a
+///   deny list gap waits for every protocol; a call every protocol owes stops the read, as
+///   with one protocol.
+/// - **Duty events** name the protocols they are for ([`super::App::ack_events_for`]): the
+///   protocol of the kind, collection, stored entry or kept batch they name, every protocol
+///   otherwise.
 ///
 /// # Callbacks and the store
 ///
@@ -869,10 +874,14 @@ pub trait Protocol: Send + Sync {
     /// whose writer the directory no longer lists, a join, a renewal that adds `lists.read`
     /// and every [`super::App::allow_list`]: whenever the app's copy of
     /// the lists is taken whole from a list read, every protocol is given that list as a
-    /// gap. Each protocol's writes are committed on their own, with that protocol taken out
-    /// of those the gap is owed to; once the last is told, the copy of the lists is
-    /// replaced from the same answer in a commit of its own, best effort, which lists too
-    /// large for one commit leave as it was, not known complete.
+    /// gap. It is told to every protocol in turn, and all their writes go in one commit:
+    /// when every protocol took it, that commit deletes the gap, and the copy of the lists
+    /// is then replaced from the same answer in a commit of its own, best effort, which
+    /// lists too large for one commit leave as it was, not known complete. When one fails,
+    /// the writes of those that took it are committed with the gap still owed to every
+    /// protocol, so a later read tells it to each again, with the list the copy is then
+    /// taken from, and the read holds meanwhile. A gap waits, and the read holds, while a
+    /// protocol owes a call from before it.
     ///
     /// A gap may be told again at the same position, each time with the full list, which
     /// sets the same state: every gap noted is told to every protocol, one that took an

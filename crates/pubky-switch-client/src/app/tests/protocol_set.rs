@@ -59,6 +59,8 @@ struct Named {
     asked_send: Mutex<Vec<String>>,
     /// The `seq` of each feed item it took, a message or a missed item, in the order taken.
     taken: Mutex<Vec<u64>>,
+    /// Its collections.
+    collections: Vec<crate::app::Collection>,
 }
 
 fn named(name: &str) -> Named {
@@ -78,6 +80,10 @@ fn count_down(counter: &Mutex<u32>) -> bool {
 impl Protocol for Named {
     fn name(&self) -> String {
         self.name.clone()
+    }
+
+    fn collections(&self) -> Vec<crate::app::Collection> {
+        self.collections.clone()
     }
 
     fn has_keys(&self, scope: &str) -> bool {
@@ -1787,4 +1793,250 @@ async fn test_protocol_set_duty_event_of_no_registered_protocol_fails_the_load()
     assert_eq!(restored.event_owners(dropped).unwrap(), ["tasks"]);
     drop(restored);
     p.load(me).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_protocol_set_restore_in_place_owes_a_call_only_the_store_holds_to_every_protocol() {
+    // `tasks` takes a missed call after the backup and `chat` fails it; the restore in place
+    // puts `tasks`'s layer back without the call's writes, so the call the store carries is
+    // owed to both, and each takes it.
+    let p = Pair::with(
+        named("tasks"),
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("chat")
+        },
+    );
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    let backup = app.backup_layered().await.unwrap();
+    let now = p.w.clock.now_ms();
+    let seq = p.w.switch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert!(p.chat.missed.lock().unwrap().is_empty());
+    drop(app);
+    p.tasks.missed.lock().unwrap().clear();
+    *p.chat.failing_missed.lock().unwrap() = 0;
+    let mut restored = App::restore(p.env(), p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    read(&mut restored, 4).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert_eq!(*p.chat.missed.lock().unwrap(), [seq]);
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_protocol_set_fresh_restore_hands_a_call_after_the_backup_to_every_protocol() {
+    // The same call, restored on another store: the feed reads its item again and hands it
+    // to both.
+    let p = Pair::with(
+        named("tasks"),
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("chat")
+        },
+    );
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    let backup = app.backup_layered().await.unwrap();
+    let now = p.w.clock.now_ms();
+    let seq = p.w.switch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    drop(app);
+    p.tasks.missed.lock().unwrap().clear();
+    *p.chat.failing_missed.lock().unwrap() = 0;
+    let env =
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>);
+    let mut restored = App::restore(env, p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    read(&mut restored, 4).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert_eq!(*p.chat.missed.lock().unwrap(), [seq]);
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_protocol_set_gap_waits_behind_a_call_one_protocol_owes() {
+    // `tasks` owes a missed call it keeps failing: a gap noted after it isn't told to any
+    // protocol, and the read holds; once `tasks` takes the call, the gap follows it.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let seq = p.w.switch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    p.tasks.gaps.lock().unwrap().clear();
+    p.chat.gaps.lock().unwrap().clear();
+    app.allow_list().await.unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped, "{report:?}");
+    assert!(p.tasks.gaps.lock().unwrap().is_empty());
+    assert!(p.chat.gaps.lock().unwrap().is_empty());
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    read(&mut app, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 1);
+    assert_eq!(p.chat.gaps.lock().unwrap().len(), 1);
+}
+
+/// `tasks` alone, with `lists.read`.
+async fn solo(p: &Pair) -> App {
+    let all: Vec<Permission> = Permission::ALL
+        .iter()
+        .copied()
+        .filter(|q| *q == Permission::ConversationAdd || *q == Permission::ListsRead)
+        .collect();
+    let request =
+        p.w.signer
+            .approve(
+                &app_keys("wallet"),
+                &AppSpec::new(&["tasks"]).with_permissions(&all),
+            )
+            .unwrap();
+    App::join(
+        p.env(),
+        Arc::clone(&p.tasks) as Arc<dyn Protocol>,
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_protocol_set_single_protocol_failing_a_call_stops_the_read() {
+    // With one protocol a call it fails stops the read, and a gap noted after it waits.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = solo(&p).await;
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let seq = p.w.switch.push_missed(1, now, now);
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped, "{report:?}");
+    p.tasks.gaps.lock().unwrap().clear();
+    app.allow_list().await.unwrap();
+    p.send(me, "tasks.item");
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped, "{report:?}");
+    assert!(p.tasks.gaps.lock().unwrap().is_empty());
+    assert!(kinds(&p.tasks).is_empty());
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    read(&mut app, 2).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 1);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_write_waits_behind_a_call_its_protocol_owes() {
+    // `tasks` owes a missed call it keeps failing: a write of its record isn't judged for
+    // it yet, so the cursor stays before the write while `chat` takes its later entry; once
+    // `tasks` takes the call, the cursor passes both.
+    let list = crate::app::Collection::new(
+        "tasks.list",
+        pubky_switch_core::ident::Policy::new("tasks", &["tasks"]),
+    );
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            collections: vec![list.clone()],
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let missed = p.w.switch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    assert!(p.tasks.missed.lock().unwrap().is_empty());
+    let target = crate::app::RecordTarget::new(list, b"key");
+    app.put_record(&target, b"{}", vec![]).await.unwrap();
+    let later = p.send(me, "chat.item");
+    read(&mut app, 2).await;
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    assert!(app.cursor().seq < later, "{:?}", app.cursor());
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    read(&mut app, 2).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [missed]);
+    assert!(app.cursor().seq >= later, "{:?}", app.cursor());
+    assert_eq!(kinds(&p.chat), ["chat.item"], "handed once");
+}
+
+#[tokio::test]
+async fn test_protocol_set_undelivered_message_is_told_to_its_kinds_protocol_only() {
+    // A message given up is a duty event of the protocol of its kind alone.
+    let (p, _tasks, _chat, mut wallet, _shop) = senders().await;
+    let to = p.bob.identity().public();
+    let queued = wallet
+        .queue(OutgoingMessage::new(
+            to,
+            "chat.item",
+            serde_json::Map::new(),
+        ))
+        .await
+        .unwrap();
+    wallet.take_events();
+    assert_eq!(
+        wallet.withdraw_queued(&to).await.unwrap(),
+        vec![queued.clone()]
+    );
+    let events = wallet.take_events();
+    let told: Vec<&AppEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::MessageUndelivered { msg_id, .. } if *msg_id == queued))
+        .collect();
+    assert_eq!(told.len(), 1);
+    let id = told[0].id().unwrap();
+    assert_eq!(wallet.event_owners(id), Some(&["chat".to_string()][..]));
+    assert!(!wallet.event_is_for(told[0], "tasks"));
+}
+
+#[tokio::test]
+async fn test_protocol_set_call_every_protocol_owes_stops_the_read() {
+    // Both protocols fail the missed call: nothing can be handed to either, so the page
+    // stops after it and every later read holds until one takes it.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("tasks")
+        },
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("chat")
+        },
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let seq = p.w.switch.push_missed(1, now, now);
+    assert!(app.receive(None).await.unwrap().stopped);
+    p.send(me, "chat.item");
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert!(kinds(&p.chat).is_empty());
+    *p.chat.failing_missed.lock().unwrap() = 0;
+    read(&mut app, 2).await;
+    assert_eq!(*p.chat.missed.lock().unwrap(), [seq]);
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    assert!(p.tasks.missed.lock().unwrap().is_empty());
 }

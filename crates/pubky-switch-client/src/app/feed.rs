@@ -793,9 +793,10 @@ impl App {
             let calls_held = self.owed_known == Some(true);
             calls_held || self.tell_deny_gap_if_owed().await?
         };
-        // A call a protocol still owes holds that protocol alone, and counts as a read held
-        // for the host's notice; only a deny list change or gap stops the read.
-        if owed_held || !self.owing.is_empty() {
+        // A call a protocol still owes holds that protocol, and counts as a read held for the
+        // host's notice; a deny list change or gap, or a call every protocol owes, stops the
+        // read.
+        if owed_held || (!waits_for_key && !unfinished && !self.owing.is_empty()) {
             self.owed_held_reads = self.owed_held_reads.saturating_add(1);
             if self.owed_held_reads >= RETRY_EVENT_READS {
                 self.events.push(AppEvent::OwedCallHeld {
@@ -3042,6 +3043,12 @@ impl App {
         if owed.to.is_empty() {
             return Err(AppError::Store(crate::error::StoreError::Corrupt));
         }
+        // A gap goes to every protocol after what each owes from before it: while one owes a
+        // call it failed, the gap waits, and the read holds for every protocol, as for a deny
+        // list change one of them can't take yet (Switch spec 8.3).
+        if owed.to.iter().any(|name| self.owing.contains(name)) {
+            return Ok(true);
+        }
         let (generation, seq) = (owed.generation, owed.seq);
         let result = self.client.allow().await;
         let list = match self.take(result).await {
@@ -3285,15 +3292,18 @@ impl App {
         call: OwedCall,
         read: &mut Read,
     ) -> Result<(), AppError> {
-        if call.is_deny() {
-            read.held_after = true;
-            self.owed_known = Some(true);
-        }
         if self.owed_held_reads == 0 {
             // The first of the reads that end with a call owed.
             self.owed_held_reads = 1;
         }
         self.owing.extend(to.iter().cloned());
+        // A deny list change, or a call every protocol now owes, stops the page after its
+        // item: nothing later is handed to any protocol before it, and with one protocol a
+        // call it fails stops the read.
+        if call.is_deny() || self.all_owing() {
+            read.held_after = true;
+            self.owed_known = Some(true);
+        }
         read.tx.put(
             &key::owed(self.state.cursor.generation, seq),
             &Owed { to, call },
@@ -3337,6 +3347,18 @@ impl App {
     /// ([`super::Protocol::provider_lost`]) rather than keep it.
     pub fn received_order(&self, a: FeedPosition, b: FeedPosition) -> std::cmp::Ordering {
         received_order(&self.state, a, b)
+    }
+
+    /// Whether the owed call stored under `stored` (`owed/<generation>/<seq>`) is at a
+    /// position past `cursor` in feed order ([`App::feed_order`]); a key of no other form
+    /// isn't.
+    pub(crate) fn owed_after(&self, stored: &str, cursor: super::state::Cursor) -> bool {
+        stored
+            .strip_prefix(key::OWED_PREFIX)
+            .and_then(|rest| owed_place(rest).ok())
+            .is_some_and(|(generation, seq)| {
+                self.feed_order(generation, seq) > self.feed_order(cursor.generation, cursor.seq)
+            })
     }
 
     /// Whether positions of the two generations are of one sequence, as far as the app
@@ -3559,7 +3581,9 @@ impl App {
                 tx.put(&at, &Owed { to: left, call })?;
             }
             self.commit(tx).await?;
-            if failed_deny {
+            // A deny list change one failed, or a call that leaves every protocol owing:
+            // nothing later is made for any, as with one protocol.
+            if failed_deny || self.every_blocked(&blocked) {
                 held = true;
                 break;
             }
@@ -3567,6 +3591,20 @@ impl App {
         self.owed_known = Some(held);
         self.owing = blocked;
         Ok(())
+    }
+
+    /// Whether every registered protocol is in `blocked`: owes a call it failed.
+    fn every_blocked(&self, blocked: &std::collections::BTreeSet<String>) -> bool {
+        self.protocols
+            .iter()
+            .all(|registered| blocked.contains(&registered.name))
+    }
+
+    /// Whether every registered protocol owes a call it hasn't taken yet ([`App::owe`]).
+    fn all_owing(&self) -> bool {
+        self.protocols
+            .iter()
+            .all(|registered| self.owing.contains(&registered.name))
     }
 
     fn handle_unreadable(
@@ -3713,6 +3751,20 @@ impl App {
                     } if *target_app_id == me && body.app_id.is_none() => {
                         self.note_renewal(cert, &mut read.tx)?;
                         Ok(Step::Pass)
+                    }
+                    // A record write is judged and marked for the protocol of its collection:
+                    // not past a call that protocol owes. It is held, as that protocol's
+                    // entries are, the cursor staying before it, and judged once the protocol
+                    // took what it owes; so is one whose protocol the app can't tell while
+                    // any protocol owes (Switch spec 8.3).
+                    OpKind::RecordPut(put)
+                        if !self.owing.is_empty()
+                            && self
+                                .record_protocol(&put.key)
+                                .await?
+                                .is_none_or(|name| self.owing.contains(&name)) =>
+                    {
+                        Ok(Step::Hold)
                     }
                     OpKind::RecordPut(_)
                     | OpKind::Claim(_)

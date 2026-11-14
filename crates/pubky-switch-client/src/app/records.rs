@@ -2381,8 +2381,10 @@ impl App {
                 if own {
                     tx.delete(&seen_key(&key))?;
                 }
-                self.keep_duty(
+                let to = self.owners_of_collection(&accepted.collection.name);
+                self.keep_duty_for(
                     tx,
+                    to,
                     Duty::RecordUncheckable {
                         key,
                         writer: accepted.writer,
@@ -2692,6 +2694,21 @@ impl App {
             OpKind::AppPut { record } => self.feed_app_record(record, tx),
             _ => self.feed_list_change(item, tx),
         }
+    }
+
+    /// The protocol whose collection holds the record at `key`, as far as the app knows: the
+    /// collection of the record it holds, or the one it noted for a record it creates;
+    /// `None` when it knows neither, or no registered protocol owns the collection.
+    pub(crate) async fn record_protocol(&self, key: &[u8; 32]) -> Result<Option<String>, AppError> {
+        let collection = match self.held_record(key).await? {
+            Some(held) => Some(held.collection),
+            None => self.reader().get::<String>(&pending_name_key(key)).await?,
+        };
+        Ok(collection.and_then(|name| {
+            self.protocols
+                .of_collection(&name)
+                .map(|registered| registered.name.clone())
+        }))
     }
 
     /// Remember the collection name of a record the app creates, until its write is

@@ -793,8 +793,7 @@ async fn test_missed_entries_last_time_unparsable_asks_for_nothing() {
 #[tokio::test]
 async fn test_app_owed_call_failing_for_good_holds_the_later_ones() {
     // Switch spec 8.3: every notice the protocol can't take yet is kept in feed order, and
-    // the read hands the protocol nothing after it, without stopping: the protocol's later
-    // calls are owed behind it. The host is told after a few reads.
+    // the read hands nothing after it. The host is told after a few reads.
     let w = World::new();
     let mut app = w.join("wallet").await;
     w.note(app.app_id(), "first");
@@ -803,13 +802,13 @@ async fn test_app_owed_call_failing_for_good_holds_the_later_ones() {
     let stuck = w.switch.push_missed(1, now - HOUR, now);
     w.protocol.failing_missed.lock().unwrap().push(stuck);
     let later = w.switch.push_missed(2, now - HOUR, now);
-    // The first call fails: owed, and the later one owed behind it.
-    assert!(!app.receive(None).await.unwrap().stopped);
-    assert_eq!(app.owed_protocol_calls().await.unwrap(), 2);
+    // The first call fails: owed, and the page stops after it.
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
     let mut events = Vec::new();
     for _ in 0..3 {
         let report = app.receive(None).await.unwrap();
-        assert!(!report.stopped);
+        assert!(report.stopped);
         events.extend(report.events);
     }
     assert!(w.protocol.missed.lock().unwrap().is_empty());

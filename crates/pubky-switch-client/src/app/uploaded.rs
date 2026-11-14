@@ -243,7 +243,12 @@ impl App {
         };
         if divergent && !held {
             tx.put(&mark, &())?;
-            self.keep_duty(tx, Duty::RecordDivergent { key: *key })?;
+            // For the protocol of the record's collection, as far as the app knows it.
+            let to = match self.record_protocol(key).await? {
+                Some(name) => vec![name],
+                None => self.protocols.names(),
+            };
+            self.keep_duty_for(tx, to, Duty::RecordDivergent { key: *key })?;
         } else if !divergent && held {
             tx.delete(&mark)?;
         }

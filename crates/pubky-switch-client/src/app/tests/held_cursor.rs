@@ -548,9 +548,8 @@ async fn test_held_cursor_gap_whose_call_fails_holds_the_page() {
     assert!(passed > position);
     w.switch.set_held_cursor(&me, passed);
     *w.protocol.failing.lock().unwrap() = 1;
-    // The read goes on, but hands the protocol nothing after the gap it owes.
     let held = app.receive(None).await.unwrap();
-    assert!(!held.stopped);
+    assert!(held.stopped);
     let received = || -> Vec<u64> {
         w.protocol
             .received
