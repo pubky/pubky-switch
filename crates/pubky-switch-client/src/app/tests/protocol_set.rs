@@ -1286,3 +1286,42 @@ async fn test_protocol_set_load_refuses_a_certificate_with_a_root_no_protocol_ow
     usage(p.load(id).await, "`news`");
     assert_eq!(p.snapshot(&id), before);
 }
+
+#[tokio::test]
+async fn test_protocol_set_check_8_refuses_a_kind_no_protocol_owns_and_asks_only_the_owner() {
+    use pubky_switch_core::receive::KindRules;
+    let p = Pair::new();
+    let app = p.join().await;
+    let me = app.app_id();
+    let set = p.set();
+    let own = cert_for(&p.w.alice, &app_keys("wallet"), START, &["tasks", "chat"]);
+    let rules = crate::app::protocols::Rules::new(&set, &own, &[]);
+    let message = |kind: &str| {
+        p.w.switch
+            .send(
+                &p.w.bob,
+                &p.w.bob_keys,
+                &p.w.bob_cert,
+                kind,
+                json!({}),
+                &[me],
+            )
+            .unwrap()
+            .1
+    };
+    // A kind no registered protocol owns fails check 8 itself, no protocol asked.
+    let refused = rules.check_scopes(&message("news.item"), &p.w.bob_cert);
+    assert!(
+        matches!(&refused, Err(pubky_switch_core::Error::Invalid(why))
+            if why == crate::app::protocols::NO_OWNER),
+        "{refused:?}"
+    );
+    assert!(p.tasks.checked.lock().unwrap().is_empty());
+    assert!(p.chat.checked.lock().unwrap().is_empty());
+    // An owned kind goes to its owner alone.
+    rules
+        .check_scopes(&message("chat.item"), &p.w.bob_cert)
+        .unwrap();
+    assert_eq!(*p.chat.checked.lock().unwrap(), ["chat.item"]);
+    assert!(p.tasks.checked.lock().unwrap().is_empty());
+}
