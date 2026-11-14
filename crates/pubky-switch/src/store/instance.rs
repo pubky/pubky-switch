@@ -180,14 +180,19 @@ impl Stamp {
 /// Where the keeper reads the time: the system's clocks, or a test's.
 type Clock = std::sync::Arc<dyn Fn() -> Stamp + Send + Sync>;
 
+/// The system's clocks.
+fn system_clock() -> Clock {
+    std::sync::Arc::new(Stamp::now)
+}
+
 /// The database held by this process alone, as long as this lives.
 pub struct InstanceLock {
     conn: Option<PgConnection>,
     /// The backend of the session that holds the lock.
     pid: i32,
     timing: LockTiming,
-    /// When the check that last confirmed the lock was sent, or when the lock was taken: the
-    /// session held the lock at least until then.
+    /// When the check that last confirmed the lock was sent, or when the take that was
+    /// granted the lock asked for it: the session held the lock at least until then.
     confirmed: Stamp,
     clock: Clock,
 }
@@ -216,7 +221,7 @@ impl Store {
     /// session's settings.
     pub async fn hold_instance_lock(&self, timing: LockTiming) -> Result<InstanceLock, StoreError> {
         let options = (*self.pool.connect_options()).clone();
-        let lock = InstanceLock::wait_for(&options, timing).await?;
+        let lock = InstanceLock::wait_for(&options, timing, &system_clock()).await?;
         tracing::info!(
             backend_pid = lock.pid,
             "holding the database's instance lock"
@@ -228,13 +233,17 @@ impl Store {
 impl InstanceLock {
     /// Try the lock on new connections until it is taken, or until [`LockTiming::wait`] has
     /// passed: then what the last try that got an answer found. No try runs past the wait.
-    async fn wait_for(options: &PgConnectOptions, timing: LockTiming) -> Result<Self, StoreError> {
+    async fn wait_for(
+        options: &PgConnectOptions,
+        timing: LockTiming,
+        clock: &Clock,
+    ) -> Result<Self, StoreError> {
         let deadline = Instant::now() + timing.wait();
         let mut last = None;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let bound = timing.every.min(left).max(Duration::from_millis(1));
-            match tokio::time::timeout(bound, Self::take(options, timing)).await {
+            match tokio::time::timeout(bound, Self::take(options, timing, clock)).await {
                 Ok(Ok(lock)) => return Ok(lock),
                 Ok(Err(TakeError::Held(holder))) => {
                     last = Some(StoreError::InUse(holder.describe()));
@@ -251,17 +260,21 @@ impl InstanceLock {
     }
 
     /// One try at the lock, on a new connection.
-    async fn take(options: &PgConnectOptions, timing: LockTiming) -> Result<Self, TakeError> {
+    async fn take(
+        options: &PgConnectOptions,
+        timing: LockTiming,
+        clock: &Clock,
+    ) -> Result<Self, TakeError> {
         let mut conn = PgConnection::connect_with(options)
             .await
             .map_err(StoreError::from)?;
-        match Self::take_on(&mut conn, timing).await {
-            Ok(pid) => Ok(Self {
+        match Self::take_on(&mut conn, timing, clock).await {
+            Ok((pid, asked)) => Ok(Self {
                 conn: Some(conn),
                 pid,
                 timing,
-                confirmed: Stamp::now(),
-                clock: std::sync::Arc::new(Stamp::now),
+                confirmed: asked,
+                clock: clock.clone(),
             }),
             Err(error) => {
                 let _ = conn.close().await;
@@ -270,22 +283,30 @@ impl InstanceLock {
         }
     }
 
-    async fn take_on(conn: &mut PgConnection, timing: LockTiming) -> Result<i32, TakeError> {
+    /// The lock on `conn`'s session: its backend, and when the lock was asked for, which is
+    /// as late as the grant is known to hold.
+    async fn take_on(
+        conn: &mut PgConnection,
+        timing: LockTiming,
+        clock: &Clock,
+    ) -> Result<(i32, Stamp), TakeError> {
         // The settings come first: a session that holds the lock is one the server closes
         // soon after its client is gone.
         conn.execute(timing.session_settings().as_str())
             .await
             .map_err(StoreError::from_db)?;
+        let asked = clock();
         let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(INSTANCE_LOCK_KEY)
             .fetch_one(&mut *conn)
             .await
             .map_err(StoreError::from_db)?;
         if locked {
-            return Ok(sqlx::query_scalar("SELECT pg_backend_pid()")
+            let pid = sqlx::query_scalar("SELECT pg_backend_pid()")
                 .fetch_one(&mut *conn)
                 .await
-                .map_err(StoreError::from_db)?);
+                .map_err(StoreError::from_db)?;
+            return Ok((pid, asked));
         }
         match holder(conn).await? {
             Some(holder) if holder.present => Err(TakeError::Held(holder)),
@@ -324,7 +345,13 @@ impl InstanceLock {
         let every = self.timing.every;
         let overdue = self.timing.overdue();
         loop {
-            tokio::time::sleep(every).await;
+            // Measured before the sleep too: a pause since the lock was asked for, or since
+            // the last confirmed check was sent, stops it at once.
+            let since = self.confirmed.until((self.clock)());
+            if since > overdue {
+                return (InstanceLockLost::Overdue(since), self);
+            }
+            tokio::time::sleep(every.saturating_sub(since)).await;
             let sent = (self.clock)();
             let since = self.confirmed.until(sent);
             let Some(left) = overdue.checked_sub(since) else {
@@ -617,7 +644,7 @@ mod tests {
             return;
         };
         let (options, frozen) = freezing_proxy(&db).await;
-        let held = InstanceLock::wait_for(&options, fast())
+        let held = InstanceLock::wait_for(&options, fast(), &system_clock())
             .await
             .expect("lock");
         let old = held.pid;
@@ -710,7 +737,7 @@ mod tests {
         let options = db.options().clone().host("127.0.0.1").port(port);
         let started = Instant::now();
         assert!(matches!(
-            InstanceLock::wait_for(&options, fast()).await,
+            InstanceLock::wait_for(&options, fast(), &system_clock()).await,
             Err(StoreError::LockUnanswered)
         ));
         let waited = started.elapsed();
@@ -775,6 +802,29 @@ mod tests {
             started.elapsed() < fast().every * 2,
             "at the answer of its first check"
         );
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_store_instance_lock_keeper_stops_after_a_stall_during_the_take() {
+        // The process stalled after the take asked for the lock: the grant holds only as of
+        // the asking, so the keeper stops at its first step, before any sleep.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        // The first reading is the take's asking, the second the keeper's first step.
+        let stall = fast().overdue() + fast().every;
+        let clock = jumping(2, stall, stall);
+        let held =
+            InstanceLock::wait_for(db.store().pool.connect_options().as_ref(), fast(), &clock)
+                .await
+                .expect("lock");
+        let started = Instant::now();
+        let lost = tokio::time::timeout(Duration::from_secs(20), async { held.keep().await.0 })
+            .await
+            .expect("the keeper stops");
+        assert!(matches!(lost, InstanceLockLost::Overdue(_)), "{lost:?}");
+        assert!(started.elapsed() < fast().every, "at its first step");
         db.drop_database().await.expect("drop");
     }
 
