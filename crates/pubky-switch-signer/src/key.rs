@@ -43,7 +43,7 @@ use pubky_switch_core::records::{
     AppCert, IdentityDoc, Limits, RemovedApp, SignerBackup, SignerHandover, SignerRecords,
     StoredPart,
 };
-use pubky_switch_core::signing::Signs;
+use pubky_switch_core::signing::{Signs, SignsRequests};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::signer::gate::GatePassed;
@@ -402,7 +402,7 @@ impl IdentityKeyring {
     /// # Errors
     ///
     /// The errors of [`IdentityKeyring::with_key`].
-    pub(crate) fn request_signer(&self) -> Result<Arc<dyn Signs + Send + Sync>, KeyError> {
+    pub(crate) fn request_signer(&self) -> Result<Arc<dyn SignsRequests + Send + Sync>, KeyError> {
         let secret = self.load()?;
         Ok(Arc::new(RequestSigner(secret.key())))
     }
@@ -618,23 +618,16 @@ impl std::ops::Deref for SigningKey {
 }
 
 /// The identity key behind a request-only credential: it signs `Switch-Signature` (Switch
-/// wire 7.1) and nothing else. Any other label gets an all-zero signature, which no reader
-/// takes (Switch wire 2.1), and fails a debug assertion, so a bug that asks for one shows in
-/// tests.
+/// wire 7.1) and nothing else.
 struct RequestSigner(IdentityKey);
 
-impl Signs for RequestSigner {
+impl SignsRequests for RequestSigner {
     fn public_key(&self) -> [u8; 32] {
         self.0.public()
     }
 
-    fn sign_fields(&self, label: &str, fields: &[&[u8]]) -> [u8; 64] {
-        if label == labels::sig::HTTP {
-            self.0.sign(label, fields)
-        } else {
-            debug_assert!(false, "a request-only key was asked to sign {label}");
-            [0; 64]
-        }
+    fn sign_request_fields(&self, fields: &[&[u8]]) -> [u8; 64] {
+        self.0.sign(labels::sig::HTTP, fields)
     }
 }
 
@@ -1031,19 +1024,24 @@ pub(crate) mod tests {
         let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
         let key = IdentityKey::from_secret([7; 32]);
         let request = keyring.request_signer().unwrap();
+        assert_eq!(request.public_key(), key.public());
         let fields: &[&[u8]] = &[b"request"];
-        assert_eq!(
-            request.sign_fields(labels::sig::HTTP, fields),
-            key.sign(labels::sig::HTTP, fields)
-        );
+        let signature = request.sign_request_fields(fields);
+        assert_eq!(signature, key.sign(labels::sig::HTTP, fields));
+        pubky_switch_core::sig::verify(&key.public(), labels::sig::HTTP, fields, &signature)
+            .unwrap();
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "request-only key"))]
-    fn test_request_signer_signs_nothing_else() {
+    fn test_request_signer_signature_holds_under_no_other_label() {
         let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
+        let key = IdentityKey::from_secret([7; 32]);
         let request = keyring.request_signer().unwrap();
-        // In a release build, an all-zero signature, which no reader takes.
-        assert_eq!(request.sign_fields(labels::sig::OP, &[b"op"]), [0; 64]);
+        let fields: &[&[u8]] = &[b"op"];
+        let signature = request.sign_request_fields(fields);
+        assert!(
+            pubky_switch_core::sig::verify(&key.public(), labels::sig::OP, fields, &signature)
+                .is_err()
+        );
     }
 }

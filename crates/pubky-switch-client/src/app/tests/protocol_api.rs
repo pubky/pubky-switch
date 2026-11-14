@@ -143,11 +143,7 @@ impl Protocol for ApiProtocol {
         }
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
-        self.items.receive(message)
-    }
-
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         let mode = *self.mode.lock().unwrap();
         let msg_id = message.message.msg_id.clone();
         let mut seen = Seen {
@@ -171,7 +167,7 @@ impl Protocol for ApiProtocol {
             }
         }
         let outcome = match mode {
-            Mode::Plain => self.receive(message),
+            Mode::Plain => self.items.receive(message, cx),
             Mode::Record | Mode::RecordTwice | Mode::DropAfterWrite => {
                 let held = cx.record(&inbox()).unwrap();
                 seen.held = held.as_ref().map(|r| r.version);
@@ -259,8 +255,14 @@ impl Protocol for ApiProtocol {
         self.items.record_seen(c, seen, value)
     }
 
-    fn record_regression(&self, c: &str, seen: &[u8], value: Option<&[u8]>) -> Option<String> {
-        self.items.record_regression(c, seen, value)
+    fn record_regression(
+        &self,
+        c: &str,
+        seen: &[u8],
+        value: Option<&[u8]>,
+        base: crate::app::WriteBase,
+    ) -> Option<String> {
+        self.items.record_regression(c, seen, value, base)
     }
 
     fn sent_record(

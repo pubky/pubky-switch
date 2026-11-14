@@ -235,7 +235,7 @@ pub enum AppError {
     #[error(transparent)]
     Store(StoreError),
     /// The protocol's own store failed in a callback the app must make, such as
-    /// [`super::Protocol::provider_lost_with`]: the step waits, and the next call makes the
+    /// [`super::Protocol::provider_lost`]: the step waits, and the next call makes the
     /// callback again. The app's store didn't fail.
     #[error("the protocol's store failed: {}", .0.error())]
     Protocol(super::protocol::StoreFailure),

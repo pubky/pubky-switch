@@ -225,15 +225,8 @@ pub fn check_opened(
     // Checks 4 to 6.
     let sender = VerifiedSender::from_cert(&cert);
     let message = plaintext
-        .check(own_identity, &entry.sender, &sender, rules.opaque_members())
-        .map_err(|e| {
-            let check = match e {
-                Error::Signature(_) => 4,
-                _ if e.to_string().contains("check 6") => 6,
-                _ => 5,
-            };
-            dropped_by(check, e)
-        })?;
+        .check_numbered(own_identity, &entry.sender, &sender, rules.opaque_members())
+        .map_err(|failed| dropped_by(failed.check, failed.error))?;
     if message.is_from_own_app() && !rules.sent_between_own_apps(&message.kind) {
         return Err(dropped(
             6,
@@ -575,6 +568,26 @@ mod tests {
             ..base
         };
         assert_eq!(check_of(run(&w, &entry, held, None).unwrap_err()), 4);
+        // 5: a signed document that isn't a message.
+        let not_message = {
+            let json = b"{\"v\":1}".to_vec();
+            let signature = w
+                .bob_app
+                .sign(crate::labels::sig::MSG, &[&w.alice.public(), &json]);
+            MessagePlaintext::from_parts(w.bob_app.app_id_bytes(), signature, json)
+                .unwrap()
+                .seal(
+                    &w.alice.public(),
+                    &[Recipient::new(w.receive.public)],
+                    false,
+                )
+                .unwrap()
+        };
+        let entry = InboxEntry {
+            envelope: &not_message,
+            ..base
+        };
+        assert_eq!(check_of(run(&w, &entry, held, None).unwrap_err()), 5);
         // 6: from another identity than the certificate's; and an own-app kind its protocol
         // doesn't send.
         let other_from = envelope_from(

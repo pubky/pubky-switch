@@ -29,7 +29,7 @@ use pubky_switch_core::http::{
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::labels;
 use pubky_switch_core::records::{AppCert, ExportTransfer, IdentityDoc};
-use pubky_switch_core::signing::Signs;
+use pubky_switch_core::signing::{Signs, SignsRequests};
 use pubky_switch_core::time::{parse_rfc3339, rfc3339_seconds};
 use serde_json::Value;
 
@@ -57,6 +57,15 @@ pub enum Credentials {
         /// The identity key, behind the signing interface.
         key: Arc<dyn Signs + Send + Sync>,
     },
+    /// The signer, with a credential for requests only: it signs the `Switch-Signature` of a
+    /// request (Switch wire 7.1) and no operation or document, so a client made with it
+    /// reads and delivers what was signed already. It calls as the signer does.
+    SignerRequests {
+        /// The identity.
+        identity: [u8; 32],
+        /// The identity key, behind the request-only signing interface.
+        key: Arc<dyn SignsRequests + Send + Sync>,
+    },
     /// The next service of a cooperative move, fetching export chunks from the old service
     /// under the signer's export transfer (Switch wire 3.11, 7.2).
     NextService {
@@ -82,6 +91,10 @@ impl std::fmt::Debug for Credentials {
                 .debug_struct("Signer")
                 .field("identity", &pubky_id(identity))
                 .finish(),
+            Credentials::SignerRequests { identity, .. } => f
+                .debug_struct("SignerRequests")
+                .field("identity", &pubky_id(identity))
+                .finish(),
             Credentials::NextService { identity, .. } => f
                 .debug_struct("NextService")
                 .field("identity", &pubky_id(identity))
@@ -96,6 +109,7 @@ impl Credentials {
         match self {
             Credentials::App { identity, .. }
             | Credentials::Signer { identity, .. }
+            | Credentials::SignerRequests { identity, .. }
             | Credentials::NextService { identity, .. } => *identity,
         }
     }
@@ -104,7 +118,9 @@ impl Credentials {
     pub fn app_id(&self) -> Option<[u8; 16]> {
         match self {
             Credentials::App { keys, .. } => Some(keys.app_id_bytes()),
-            Credentials::Signer { .. } | Credentials::NextService { .. } => None,
+            Credentials::Signer { .. }
+            | Credentials::SignerRequests { .. }
+            | Credentials::NextService { .. } => None,
         }
     }
 
@@ -117,6 +133,7 @@ impl Credentials {
                 cert,
             } => cert.identity() == *identity && cert.signing_key() == keys.signing_public(),
             Credentials::Signer { identity, key } => key.public_key() == *identity,
+            Credentials::SignerRequests { identity, key } => key.public_key() == *identity,
             Credentials::NextService {
                 identity,
                 key,
@@ -137,15 +154,30 @@ impl Credentials {
         }
     }
 
-    fn sign(&self, label: &str, fields: &[Vec<u8>]) -> [u8; 64] {
+    /// Sign `lp(label, fields...)` with the credential's key.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Usage`] for a label other than the request label with
+    /// [`Credentials::SignerRequests`], which signs requests only.
+    fn sign(&self, label: &str, fields: &[Vec<u8>]) -> Result<[u8; 64], ClientError> {
         let refs: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
         match self {
-            Credentials::App { keys, .. } => keys.sign_fields(label, &refs),
+            Credentials::App { keys, .. } => Ok(keys.sign_fields(label, &refs)),
             Credentials::Signer { key, .. } | Credentials::NextService { key, .. } => {
-                key.sign_fields(label, &refs)
+                Ok(key.sign_fields(label, &refs))
             }
+            Credentials::SignerRequests { key, .. } if label == labels::sig::HTTP => {
+                Ok(key.sign_request_fields(&refs))
+            }
+            Credentials::SignerRequests { .. } => Err(request_only()),
         }
     }
+}
+
+/// The refusal of a signature other than a request's with [`Credentials::SignerRequests`].
+pub(crate) fn request_only() -> ClientError {
+    ClientError::Usage("the request-only credential signs requests only".into())
 }
 
 /// A key behind `dyn Signs`, as a `Sized` signer for the core's generic signing functions.
@@ -537,7 +569,7 @@ impl SwitchClient {
     /// Refuse a call only the signer makes.
     pub(crate) fn signer_only(&self) -> Result<(), ClientError> {
         match self.credentials {
-            Credentials::Signer { .. } => Ok(()),
+            Credentials::Signer { .. } | Credentials::SignerRequests { .. } => Ok(()),
             _ => Err(ClientError::Usage("only the signer makes this call".into())),
         }
     }
@@ -630,7 +662,7 @@ impl SwitchClient {
                 let signature = self.credentials.sign(
                     labels::sig::TRANSFER_REQUEST,
                     &http::transfer_request_fields(&target, &transfer_headers),
-                );
+                )?;
                 headers.push(Header::new(header::IDENTITY, &identity));
                 headers.push(Header::new(header::TRANSFER, &transfer_headers.transfer));
                 signature
@@ -646,11 +678,11 @@ impl SwitchClient {
                 let signature = self.credentials.sign(
                     labels::sig::HTTP,
                     &http::request_fields(&target, &request_headers),
-                );
+                )?;
                 push_request_headers(&mut headers, &request_headers);
                 signature
             }
-            Credentials::Signer { .. } => {
+            Credentials::Signer { .. } | Credentials::SignerRequests { .. } => {
                 let request_headers = RequestHeaders {
                     timestamp: timestamp.clone(),
                     identity: identity.clone(),
@@ -660,7 +692,7 @@ impl SwitchClient {
                 let signature = self.credentials.sign(
                     labels::sig::HTTP,
                     &http::request_fields(&target, &request_headers),
-                );
+                )?;
                 push_request_headers(&mut headers, &request_headers);
                 signature
             }

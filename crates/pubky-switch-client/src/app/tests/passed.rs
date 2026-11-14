@@ -71,7 +71,7 @@ impl Protocol for PassProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         self.calls
             .lock()
             .unwrap()
@@ -86,7 +86,7 @@ impl Protocol for PassProtocol {
             .unwrap();
             return Outcome::Pass;
         }
-        self.sample.receive(message)
+        self.sample.receive(message, cx)
     }
 
     fn resend_needed(

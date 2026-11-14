@@ -8,10 +8,9 @@
 //! The trait is object-safe and takes and returns plain owned types, so a binding can
 //! implement it across a language boundary.
 //!
-//! - **Receiving** ([`Protocol::check_body`], then [`Protocol::receive_with`], or
-//!   [`Protocol::receive`] for a protocol that needs nothing of the app's state): the app
-//!   hands over each message that passed checks 1 to 9. The protocol checks the body (check
-//!   10) on its own, without effects, which is also what a push extension's peek runs; for a
+//! - **Receiving** ([`Protocol::check_body`], then [`Protocol::receive`]): the app hands
+//!   over each message that passed checks 1 to 9. The protocol checks the body (check 10)
+//!   on its own, without effects, which is also what a push extension's peek runs; for a
 //!   body that passes, it adds, through the [`ReceiveContext`], the shared record writes and
 //!   claim entries the app builds and signs for it, all committed in the same batch as the
 //!   cursor move, and the writes of its own local state to commit with the outcome (Switch
@@ -46,7 +45,7 @@ use crate::error::StoreError;
 use crate::store::KeyValue;
 
 /// What a newer write of a record builds on, as the reading app sees it
-/// ([`Protocol::record_regression_on`], Switch spec 8.2, 10.3).
+/// ([`Protocol::record_regression`], Switch spec 8.2, 10.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WriteBase {
@@ -428,7 +427,7 @@ pub enum Outcome {
     },
     /// The step needs these read from the switch first, such as the claim a message gives
     /// evidence for when the app keeps no view of it (Switch spec 10.2). What the context
-    /// added is discarded; the app reads them, then calls [`Protocol::receive_with`] again
+    /// added is discarded; the app reads them, then calls [`Protocol::receive`] again
     /// with them in the context. Reads are bounded: every call for one entry together reads
     /// at most [`MAX_CLAIM_READS`] claims, and a `Need` that names nothing new or goes past
     /// the bound stores the entry locally and passes it
@@ -605,7 +604,7 @@ pub struct DenyListGap {
 ///
 /// Every callback is synchronous and runs on the app's task, in the middle of one of its
 /// calls. A callback may read the host's store synchronously: the receive step through its
-/// [`ReceiveContext`], [`Protocol::sends_to_with`] and [`Protocol::provider_lost_with`]
+/// [`ReceiveContext`], [`Protocol::sends_to`] and [`Protocol::provider_lost`]
 /// through a [`LocalView`], any callback through a handle of its own on the host's store.
 /// No callback writes the store: the app commits the protocol's local state only as the
 /// [`LocalWrite`]s a callback returns, or a batch or [`super::App::protocol_commit`]
@@ -675,7 +674,7 @@ pub trait Protocol: Send + Sync {
 
     /// Check 10 (Switch wire 5.1) of a message that passed checks 1 to 9, with no effect:
     /// the body parses as its kind's body, the members read have their types, and the
-    /// protocol's rules for the kind hold. The app runs it before [`Protocol::receive_with`],
+    /// protocol's rules for the kind hold. The app runs it before [`Protocol::receive`],
     /// and a push extension's peek runs it alone (Switch spec 9 step 5), so it must refuse
     /// every body that the receive step would drop for its shape, and change nothing.
     ///
@@ -685,33 +684,26 @@ pub trait Protocol: Send + Sync {
     /// generic notification for it.
     fn check_body(&self, message: &ReceivedMessage) -> Result<(), String>;
 
-    /// The effect of a message whose body passed [`Protocol::check_body`], for a protocol
-    /// that needs nothing of the app's state: [`Protocol::receive_with`] calls it by default.
-    /// A protocol that implements [`Protocol::receive_with`] need not implement this one; by
-    /// default it drops every message. A step that can't finish because the protocol's
-    /// store or the host failed returns [`Outcome::Retry`], never [`Outcome::Drop`].
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
-        let _ = message;
-        Outcome::Drop {
-            reason: "the protocol takes no messages".into(),
-        }
-    }
-
     /// The effect of a message whose body passed [`Protocol::check_body`], with the app's
     /// state at hand (Switch spec 8.2): `cx` derives record keys and blinded inputs, reads
     /// the writes the app holds and the claims it keeps, and adds record writes and claim
-    /// entries to the effect's batch, which carries the cursor move. What `cx` added goes
-    /// only with [`Outcome::Apply`]; a [`Outcome::Drop`], an [`Outcome::Need`], an
-    /// [`Outcome::Retry`], an [`Outcome::Pass`] or an [`Outcome::AwaitKey`] discards it. After an [`Outcome::Need`] the app reads what it
-    /// names and calls this again, the answers in [`ReceiveContext::switch_claim`]. A read
+    /// entries to the effect's batch, which carries the cursor move. A protocol that needs
+    /// nothing of the app's state ignores `cx`. What `cx` added goes only with
+    /// [`Outcome::Apply`]; a [`Outcome::Drop`], an [`Outcome::Need`], an [`Outcome::Retry`],
+    /// an [`Outcome::Pass`] or an [`Outcome::AwaitKey`] discards it. After an
+    /// [`Outcome::Need`] the app reads what it names and calls this again, the answers in
+    /// [`ReceiveContext::switch_claim`]. A step that can't finish because the protocol's
+    /// store or the host failed returns [`Outcome::Retry`], never [`Outcome::Drop`]: a read
     /// of the context, or of the protocol's own store, that fails with a store error is an
-    /// [`Outcome::Retry`] ([`StoreFailure::try_from`]): the entry is held for a later read,
-    /// or stored locally and tried again at a later read. After `409 conflict` on the batch the
-    /// app reads the records and claims `cx` wrote again and calls this once more, with
-    /// [`ReceivedMessage::conflict`] set. [`Protocol::receive`] by default.
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
-        let _ = cx;
-        self.receive(message)
+    /// [`Outcome::Retry`] ([`StoreFailure::try_from`]), and the entry is held for a later
+    /// read, or stored locally and tried again at a later read. After `409 conflict` on the
+    /// batch the app reads the records and claims `cx` wrote again and calls this once more,
+    /// with [`ReceivedMessage::conflict`] set. By default it drops every message.
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+        let _ = (message, cx);
+        Outcome::Drop {
+            reason: "the protocol takes no messages".into(),
+        }
     }
 
     /// Entries the app can't read: the protocol queues its re-send request and returns the
@@ -792,7 +784,9 @@ pub trait Protocol: Send + Sync {
     /// ([`super::RecoveryInfo::conversations_left_out`]). The app commits the local writes
     /// once, with that step; a crash before that commit calls it again. Writes over
     /// [`MAX_STEP_LOCAL_BYTES`] aren't committed and the loss goes on, with
-    /// [`super::AppEvent::LocalWritesRefused`]. Nothing by default.
+    /// [`super::AppEvent::LocalWritesRefused`]. `view` reads the protocol's local state,
+    /// read-only, such as to find the counterparties of its unfinished activity; a protocol
+    /// that needs none of it ignores it. Nothing by default.
     ///
     /// # Errors
     ///
@@ -800,25 +794,13 @@ pub trait Protocol: Send + Sync {
     /// state can't be read. The recovery stays at this step, which its record keeps, and the
     /// app's call fails with [`super::AppError::Protocol`], apart from the app's own store
     /// failing; the next call asks again.
-    fn provider_lost(&self, loss: &ProviderLoss) -> Result<LossActions, StoreFailure> {
-        let _ = loss;
-        Ok(LossActions::default())
-    }
-
-    /// [`Protocol::provider_lost`], with the protocol's local state at hand, read-only
-    /// (`view`), such as to find the counterparties of its unfinished activity. The app
-    /// calls this one; by default it calls [`Protocol::provider_lost`].
-    ///
-    /// # Errors
-    ///
-    /// As [`Protocol::provider_lost`].
-    fn provider_lost_with(
+    fn provider_lost(
         &self,
         loss: &ProviderLoss,
         view: &LocalView<'_>,
     ) -> Result<LossActions, StoreFailure> {
-        let _ = view;
-        self.provider_lost(loss)
+        let _ = (loss, view);
+        Ok(LossActions::default())
     }
 
     /// Whether a certificate's scopes allow its app to receive `kind`, which a sender checks
@@ -830,23 +812,12 @@ pub trait Protocol: Send + Sync {
     }
 
     /// The protocol's narrower rule for senders (Switch spec 3.4): whether `message` goes to
-    /// the app whose record is `recipient`, beyond its certificate and `accepts`. Every app
-    /// by default.
-    fn sends_to(&self, message: &Message, recipient: &AppRecord) -> bool {
-        let _ = (message, recipient);
+    /// the app whose record is `recipient`, beyond its certificate and `accepts`, with the
+    /// protocol's local state at hand, read-only (`view`); a protocol that needs none of it
+    /// ignores it. Every app by default.
+    fn sends_to(&self, message: &Message, recipient: &AppRecord, view: &LocalView<'_>) -> bool {
+        let _ = (message, recipient, view);
         true
-    }
-
-    /// [`Protocol::sends_to`], with the protocol's local state at hand, read-only (`view`).
-    /// The app calls this one; by default it calls [`Protocol::sends_to`].
-    fn sends_to_with(
-        &self,
-        message: &Message,
-        recipient: &AppRecord,
-        view: &LocalView<'_>,
-    ) -> bool {
-        let _ = view;
-        self.sends_to(message, recipient)
     }
 
     /// Whether a first message of `kind` to a counterparty that isn't a contact adds a
@@ -901,6 +872,14 @@ pub trait Protocol: Send + Sync {
     /// breaks, without content, and the write is flagged and not acted on. `value` is
     /// `None` for a delete or an unreadable value. Never by default.
     ///
+    /// `base` tells what the newer write builds on ([`WriteBase`]): its `expected_version`,
+    /// whether the app holds that version, and the conditions its operation signed. A
+    /// protocol whose rules hold only for a writer that built on the value the app holds,
+    /// such as one that may drop only what it held itself, applies them when `base.held`;
+    /// one whose rule fences a change on a condition, such as a `claim_step` on the claim of
+    /// what the write drops, finds it in `base.conditions`. A protocol whose rules don't
+    /// depend on the base ignores it.
+    ///
     /// The rule is at most [`MAX_REGRESSION_REASON_BYTES`], 256 bytes; a longer one is cut
     /// there, at a character boundary.
     fn record_regression(
@@ -908,30 +887,10 @@ pub trait Protocol: Send + Sync {
         collection: &str,
         seen: &[u8],
         value: Option<&[u8]>,
-    ) -> Option<String> {
-        let _ = (collection, seen, value);
-        None
-    }
-
-    /// [`Protocol::record_regression`], told what the newer write builds on
-    /// ([`WriteBase`]): its `expected_version`, whether the app holds that version, and the
-    /// conditions its operation signed. A protocol whose rules hold only for a writer that
-    /// built on the value the app holds, such as one that may drop only what it held itself,
-    /// applies them when `base.held`; one whose rule fences a change on a condition, such as
-    /// a `claim_step` on the claim of what the write drops, finds it in `base.conditions`.
-    /// The app calls this one; by default it calls [`Protocol::record_regression`], so a
-    /// protocol that implements only that keeps its rules as they are.
-    ///
-    /// The same bound on the rule applies, [`MAX_REGRESSION_REASON_BYTES`].
-    fn record_regression_on(
-        &self,
-        collection: &str,
-        seen: &[u8],
-        value: Option<&[u8]>,
         base: WriteBase,
     ) -> Option<String> {
-        let _ = base;
-        self.record_regression(collection, seen, value)
+        let _ = (collection, seen, value, base);
+        None
     }
 
     /// The name of the layers the protocol adds to app backups ([`ProtocolLayer`]):

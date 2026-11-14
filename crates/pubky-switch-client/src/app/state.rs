@@ -738,7 +738,7 @@ impl Tx {
 
     /// Every write in the batch, not yet committed, in order.
     pub(crate) fn pending_writes(&self) -> &[Write] {
-        &self.batch.writes
+        self.batch.writes()
     }
 
     /// What the batch leaves at `key`, not yet committed: `Some(true)` when its last write
@@ -747,7 +747,7 @@ impl Tx {
     pub(crate) fn pending_state(&self, key: &str) -> Option<bool> {
         let key = key.as_bytes();
         self.batch
-            .writes
+            .writes()
             .iter()
             .rev()
             .find_map(|write| match write {
@@ -770,7 +770,7 @@ impl Tx {
         let start = prefix.len();
         let prefix = prefix.as_bytes();
         let mut keys: std::collections::BTreeSet<&[u8]> = std::collections::BTreeSet::new();
-        for write in &self.batch.writes {
+        for write in self.batch.writes() {
             match write {
                 Write::Put { key, .. } if key.starts_with(prefix) => {
                     keys.insert(key);

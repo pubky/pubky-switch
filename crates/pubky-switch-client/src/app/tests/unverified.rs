@@ -53,9 +53,13 @@ impl Protocol for BackedUp {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
         self.released.lock().unwrap().push(message.released);
-        self.sample.receive(message)
+        self.sample.receive(message, cx)
     }
 
     fn resend_needed(
@@ -109,7 +113,7 @@ impl StateStore for Counting {
 
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
         let parked = batch
-            .writes
+            .writes()
             .iter()
             .filter(
                 |write| matches!(write, Write::Delete { key, .. } if key.starts_with(b"parked/")),
