@@ -178,8 +178,9 @@ impl std::fmt::Debug for Creation {
 }
 
 /// Insert an account unless one exists: `None` if one does. The insert waits for an erasure
-/// of the identity still committing; once it returns, the erasure the database still owes
-/// keys for is read, in the same transaction. The key store's ledger is read after it, by
+/// of the identity still committing, at most `lock_timeout_ms` ([`StoreError::LockTimeout`],
+/// writing nothing); once it returns, the erasure the database still owes keys for is read,
+/// in the same transaction. The key store's ledger is read after it, by
 /// the caller: an erasure's owed rows go only once its ledger entry is recorded, so one of
 /// the two holds every erasure committed before the insert.
 pub(super) async fn begin_create(
@@ -194,7 +195,7 @@ pub(super) async fn begin_create(
         .transpose()?;
     let mut tx = pool.begin().await.map_err(StoreError::from_db)?;
     // READ COMMITTED whatever the pool's default: the read after the insert takes a snapshot
-    // of its own, so it sees an erasure the insert waited for. The numbers are formatted, as
+    // of its own, so it sees an erasure the insert waited for. The number is formatted, as
     // `SET` takes no bind parameters.
     sqlx::Executor::execute(
         &mut *tx,
