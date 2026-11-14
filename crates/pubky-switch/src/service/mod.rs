@@ -56,8 +56,6 @@ pub use webhooks::PushRound;
 #[cfg(any(test, feature = "test-util"))]
 pub use webhooks::RelayRoute;
 
-pub use enroll::announced_limits;
-
 use std::sync::Arc;
 
 use pubky_switch_core::{

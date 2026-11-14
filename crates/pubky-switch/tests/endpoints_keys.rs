@@ -711,6 +711,33 @@ async fn test_keys_a_cursor_move_drops_the_parts_it_passes() {
 }
 
 #[tokio::test]
+async fn test_keys_a_part_passed_before_its_gap_goes_once_the_gap_is_filled() {
+    // The wallet is listed at data epoch 1, where its keys_through starts; the signer moves
+    // the data epoch on to 3 and stores epoch 3's part alone: a gap at epoch 2 below a part
+    // the wallet passes.
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    deliver_next(&replay, &alice_version_3(), ms(&at), |body| {
+        body.data_epoch = 3
+    })
+    .await;
+    // Epoch 3's part (seq 11, after the delivery's), passed: not covered while epoch 2's
+    // keys are missing, so it stays.
+    store_parts(&replay, &[(3, 3)], 60, &at).await;
+    wallet_cursor(&replay, 11, &at).await;
+    assert_eq!(bundle_ranges(&replay, &at).await, json!([[3, 3]]));
+    assert_eq!(keys_through(&replay, &at).await, 1);
+    // Epoch 2's part fills the gap; once the wallet passes it too, both go.
+    store_parts(&replay, &[(2, 2)], 61, &at).await;
+    assert_eq!(bundle_ranges(&replay, &at).await, json!([[2, 2], [3, 3]]));
+    wallet_cursor(&replay, 12, &at).await;
+    assert_eq!(bundle_ranges(&replay, &at).await, json!([]));
+    assert_eq!(keys_through(&replay, &at).await, 3);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_keys_a_cursor_move_keeps_parts_while_a_full_bundle_is_requested() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
@@ -955,4 +982,46 @@ async fn test_keys_replacing_another_part_while_in_force_keeps_the_force_where_i
     );
     replay.db.drop_database().await.expect("drop");
     assert_eq!(at_11, (json!([[1, 1]]), json!(2)));
+}
+
+#[tokio::test]
+async fn test_keys_a_replacement_after_the_force_ended_doesnt_restart_it() {
+    // The wallet is listed at data epoch 1, where its keys_through starts; the signer moves
+    // the data epoch on to 3 (seq 10). The request completes at seq 13 (epoch 3); epoch 2's
+    // part is replaced at seq 14 while in force. The move to 13 ends the force and drops
+    // epoch 1's part; epoch 3's stays, passed above a gap at epoch 2, whose part is unpassed.
+    // Replacing epoch 3's part now (seq 15) doesn't put the request back in force: the move
+    // to 14 drops epoch 2's new part.
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    deliver_next(&replay, &alice_version_3(), ms(&at), |body| {
+        body.data_epoch = 3
+    })
+    .await;
+    let asked = keys_call(&replay, "wallet", "POST", "wallet", Vec::new(), &at).await;
+    assert_eq!(
+        asked.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&asked.body)
+    );
+    store_parts(&replay, &[(1, 1)], 60, &at).await; // seq 11
+    store_parts(&replay, &[(2, 2)], 61, &at).await; // seq 12
+    store_parts(&replay, &[(3, 3)], 62, &at).await; // seq 13, completes
+    store_parts(&replay, &[(2, 2)], 63, &at).await; // seq 14, replaces 12
+    wallet_cursor(&replay, 13, &at).await;
+    let at_13 = (
+        bundle_ranges(&replay, &at).await,
+        keys_through(&replay, &at).await,
+    );
+    store_parts(&replay, &[(3, 4)], 64, &at).await; // seq 15, replaces 13
+    wallet_cursor(&replay, 14, &at).await;
+    let at_14 = (
+        bundle_ranges(&replay, &at).await,
+        keys_through(&replay, &at).await,
+    );
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(at_13, (json!([[2, 2], [3, 3]]), json!(1)));
+    assert_eq!(at_14, (json!([[3, 4]]), json!(2)));
 }
