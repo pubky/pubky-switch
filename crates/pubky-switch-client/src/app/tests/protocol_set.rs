@@ -2010,3 +2010,33 @@ async fn test_protocol_set_undelivered_message_is_told_to_its_kinds_protocol_onl
     assert_eq!(wallet.event_owners(id), Some(&["chat".to_string()][..]));
     assert!(!wallet.event_is_for(told[0], "tasks"));
 }
+
+#[tokio::test]
+async fn test_protocol_set_call_every_protocol_owes_stops_the_read() {
+    // Both protocols fail the missed call: nothing can be handed to either, so the page
+    // stops after it and every later read holds until one takes it.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("tasks")
+        },
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("chat")
+        },
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let seq = p.w.switch.push_missed(1, now, now);
+    assert!(app.receive(None).await.unwrap().stopped);
+    p.send(me, "chat.item");
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert!(kinds(&p.chat).is_empty());
+    *p.chat.failing_missed.lock().unwrap() = 0;
+    read(&mut app, 2).await;
+    assert_eq!(*p.chat.missed.lock().unwrap(), [seq]);
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    assert!(p.tasks.missed.lock().unwrap().is_empty());
+}

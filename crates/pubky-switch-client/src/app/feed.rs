@@ -796,7 +796,7 @@ impl App {
         // A call a protocol still owes holds that protocol, and counts as a read held for the
         // host's notice; a deny list change or gap, or a call every protocol owes, stops the
         // read.
-        if owed_held || !self.owing.is_empty() {
+        if owed_held || (!waits_for_key && !unfinished && !self.owing.is_empty()) {
             self.owed_held_reads = self.owed_held_reads.saturating_add(1);
             if self.owed_held_reads >= RETRY_EVENT_READS {
                 self.events.push(AppEvent::OwedCallHeld {
@@ -3562,21 +3562,23 @@ impl App {
                 tx.put(&at, &Owed { to: left, call })?;
             }
             self.commit(tx).await?;
-            if failed_deny {
+            // A deny list change one failed, or a call that leaves every protocol owing:
+            // nothing later is made for any, as with one protocol.
+            if failed_deny || self.every_blocked(&blocked) {
                 held = true;
                 break;
             }
         }
-        // Every protocol owes a call it failed: nothing can be handed to any, so the read
-        // holds, as it does for one protocol.
-        let every = !blocked.is_empty()
-            && self
-                .protocols
-                .iter()
-                .all(|registered| blocked.contains(&registered.name));
-        self.owed_known = Some(held || every);
+        self.owed_known = Some(held);
         self.owing = blocked;
         Ok(())
+    }
+
+    /// Whether every registered protocol is in `blocked`: owes a call it failed.
+    fn every_blocked(&self, blocked: &std::collections::BTreeSet<String>) -> bool {
+        self.protocols
+            .iter()
+            .all(|registered| blocked.contains(&registered.name))
     }
 
     /// Whether every registered protocol owes a call it hasn't taken yet ([`App::owe`]).

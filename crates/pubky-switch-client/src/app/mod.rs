@@ -2772,8 +2772,6 @@ impl App {
         }
     }
 
-    /// The protocols a duty event is for: the protocol of the kind it names, or of the
-    /// message of the entry stored locally it names; every protocol otherwise.
     /// The protocols a duty event about an item of `kind` is for: the kind's owner, or
     /// every protocol when none owns it.
     pub(crate) fn owners_of_kind(&self, kind: &str) -> Vec<String> {
@@ -2792,6 +2790,8 @@ impl App {
         }
     }
 
+    /// The protocols a duty event is for: the protocol of the kind it names, or of the
+    /// message of the entry stored locally it names; every protocol otherwise.
     fn duty_to(&self, duty: &events::Duty) -> Vec<String> {
         let kind = match duty {
             events::Duty::EffectRefused { kind, .. }
