@@ -430,10 +430,11 @@ pub struct AppBackup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     protocol: Option<LayerOut>,
     /// The re-send and missed-entries calls the protocol was owed when the backup was
-    /// taken (`owed/`), each by its key after the prefix, with its value as stored: their
-    /// items are at or behind the backup's cursor, so the restored feed never shows them
-    /// again. A deny list call is left out: every restore tells the protocol a deny list
-    /// gap at the restored cursor, whose full list covers it.
+    /// taken (`owed/`), each by its key after the prefix, with its value as stored. Most
+    /// are at or behind the backup's cursor, which the restored feed never shows again;
+    /// one may be ahead of it, carried ahead by an earlier restore in place, and waits for
+    /// the feed to reach its item. A deny list call is left out: every restore tells the
+    /// protocol a deny list gap at the restored cursor, whose full list covers it.
     owed: Vec<(String, serde_json::Value)>,
 }
 
@@ -1209,8 +1210,8 @@ impl App {
 
     /// The app's backup (Switch spec 12.4): its keys, certificate and record, scope keys
     /// and naming key, its receive keys and the kids it knows, its cursor and chain view,
-    /// its outbox, and the re-send and missed-entries calls it owes its protocol, whose items
-    /// the cursor passed. The app should take one at every rotation, replacing the previous
+    /// its outbox, and the re-send and missed-entries calls it owes its protocol
+    /// ([`AppBackup`]). The app should take one at every rotation, replacing the previous
     /// one (Switch spec 3.6).
     ///
     /// The outbox goes in whole, but for the messages refused for good: each message with
@@ -1590,12 +1591,13 @@ impl App {
     /// not acknowledged, with their IDs, delivered again as after [`App::load`], and the
     /// protocol calls it couldn't answer, made again by the next read. A backup carries no
     /// duty event, so a restore onto a store without an epoch, on another device or wiped,
-    /// starts a new event epoch ([`EventId`]); it takes the re-send and missed-entries
-    /// calls the backup carries instead ([`App::backup`]), each checked as a carried call
-    /// is, one that isn't whole left behind and counted in
-    /// [`AppEvent::RestoreLeftBehind`]. A restore in place keeps the store's own calls and
-    /// not the backup's: a call leaves the store's queue only in the commit that makes it,
-    /// so the backup's copy of one made since would make it twice. For an app holding `lists.read`, the commit also owes the protocol a
+    /// starts a new event epoch ([`EventId`]). Every restore takes the re-send and
+    /// missed-entries calls the backup carries ([`App::backup`]), each checked as a carried
+    /// call is, one that isn't whole left behind and counted in
+    /// [`AppEvent::RestoreLeftBehind`]. A call the store made after the backup is made
+    /// again: the restore replaces the protocol's state with the backup's layer, or with
+    /// none, which lacks its writes. A restore in place adds the store's own calls, the store's value winning for
+    /// a key both hold. For an app holding `lists.read`, the commit also owes the protocol a
     /// deny list gap at the backup's position, whatever the backup held, told by the next
     /// read with the full list ([`Protocol::deny_list_gap`], Switch spec 8.3).
     ///
@@ -1850,17 +1852,13 @@ impl App {
                 store: env.store.clone(),
             };
             let carried = Self::kept_for_protocol(&old).await?;
-            // A store with an epoch keeps its own queue, and the backup's owed calls are
-            // left: the store is the queue's later history, where a call leaves only in the
-            // commit that makes it, so every call the backup holds is either still owed
-            // there, and carried, or made since, and the backup's copy would make it twice.
-            // A store without one, on another device or wiped, takes the backup's calls,
-            // each checked as a carried one is; one that isn't whole is left behind and
-            // counted.
-            let from_backup = match &carried {
-                Some(_) => (Vec::new(), 0),
-                None => Self::owed_of_backup(backup),
-            };
+            // Every restore takes the backup's owed calls, each checked as a carried one is;
+            // one that isn't whole is left behind and counted. The restore replaces the
+            // protocol's local state with the backup's layer, or with nothing, so a call the
+            // store made after the backup is owed again: its writes are gone with that
+            // state. A restore in place also carries the store's own calls, the store's
+            // value winning for a key both hold.
+            let from_backup = Self::owed_of_backup(backup);
             let carried = carried.unwrap_or_default();
             // A restore in place keeps the store's holds beside the backup's: a hold the host
             // set after the backup still holds (`App::hold_queued`).
@@ -1946,12 +1944,12 @@ impl App {
                 tx.local(&layer_writes)?;
                 // The protocol's layer is its state as committed when the backup was taken,
                 // which may lack a deny list change or gap it was owed then: a backup
-                // carries no owed call, and the feed doesn't hand again what the backup's
-                // cursor passed. So every restore by an app holding `lists.read` notes a gap
-                // in the deny list's history at the restored cursor, in this commit, and the
-                // protocol is told the full list after the carried calls (Switch spec 8.3).
-                // The namespace's delete above takes every `dgap` and `dgapt` the store
-                // held, so no earlier mark skips or moves it.
+                // carries no deny list call and no gap, and the feed doesn't hand again what
+                // the backup's cursor passed. So every restore by an app holding
+                // `lists.read` notes a gap in the deny list's history at the restored
+                // cursor, in this commit, and the protocol is told the full list after the
+                // carried calls (Switch spec 8.3). The namespace's delete above takes every
+                // `dgap` and `dgapt` the store held, so no earlier mark skips or moves it.
                 if app.state.cert.has_permission(Permission::ListsRead) {
                     tx.put(
                         feed::DENY_GAP,
@@ -1965,7 +1963,14 @@ impl App {
                 }
                 carrying = true;
                 for (stored, value) in &carried.values {
-                    tx.put(stored, value)?;
+                    // Written once: a key the backup carried with the same value is in.
+                    let same = from_backup
+                        .0
+                        .iter()
+                        .any(|(key, kept)| key == stored && kept == value);
+                    if !same {
+                        tx.put(stored, value)?;
+                    }
                 }
                 // What didn't read is left behind, and the protocol told how much.
                 let lost_owed = carried.lost_owed.saturating_add(from_backup.1);

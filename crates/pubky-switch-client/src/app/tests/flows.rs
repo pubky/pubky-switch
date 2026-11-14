@@ -8025,9 +8025,10 @@ async fn test_backup_carries_an_owed_resend_call_to_a_fresh_store() {
 }
 
 #[tokio::test]
-async fn test_backup_owed_call_made_since_is_not_made_again_by_a_restore_in_place() {
-    // The call is owed at the backup and made after it: the store restored in place keeps
-    // its own queue, which no longer holds it, so the backup's copy isn't made again.
+async fn test_backup_owed_call_made_since_is_made_again_by_a_restore_in_place() {
+    // The call is owed at the backup and made after it. The restore in place takes the
+    // protocol's state back to the backup's, without the call's writes, and the feed never
+    // shows its item again: the call is made again.
     let w = World::new();
     let store = Arc::new(MemoryStore::new());
     let kinds = Arc::new(KindsProtocol::default());
@@ -8035,9 +8036,96 @@ async fn test_backup_owed_call_made_since_is_not_made_again_by_a_restore_in_plac
     let backup = reader.backup().await.unwrap();
     reader.receive(None).await.unwrap();
     assert_eq!(reader.owed_protocol_calls().await.unwrap(), 0);
+    assert_eq!(*kinds.log.lock().unwrap(), [("missed", seq)]);
     drop(reader);
     let restored = Box::pin(restored_kinds(&w, &store, &kinds, &backup)).await;
+    assert_eq!(
+        *kinds.log.lock().unwrap(),
+        [("missed", seq), ("missed", seq)]
+    );
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_backup_owed_call_restored_in_place_onto_an_older_store_is_made() {
+    // A newer backup owing a call the store never held, its store restored from an older
+    // backup in between: the newer backup's call is made.
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let kinds = Arc::new(KindsProtocol::default());
+    let mut reader = join_with(
+        &w,
+        "reader",
+        &[],
+        Arc::clone(&store),
+        Arc::clone(&kinds) as Arc<dyn Protocol>,
+    )
+    .await;
+    reader.receive(None).await.unwrap();
+    let older = reader.backup().await.unwrap();
+    let now = w.clock.now_ms();
+    w.switch.push_missed(2, now, now);
+    *kinds.sample.failing.lock().unwrap() = 1;
+    reader.receive(None).await.unwrap();
+    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
+    let seq = reader.cursor().seq;
+    let newer = reader.backup().await.unwrap();
+    reader.receive(None).await.unwrap();
+    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 0);
+    drop(reader);
+    // The store goes back to the older backup, with nothing owed, and isn't read.
+    let back = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&kinds) as Arc<dyn Protocol>,
+        World::config(),
+        &older,
+    )
+    .await
+    .unwrap();
+    assert_eq!(back.owed_protocol_calls().await.unwrap(), 0);
+    drop(back);
+    kinds.log.lock().unwrap().clear();
+    let restored = Box::pin(restored_kinds(&w, &store, &kinds, &newer)).await;
     assert_eq!(*kinds.log.lock().unwrap(), [("missed", seq)]);
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_backup_layered_carries_an_owed_call() {
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let protocol = Arc::new(LayeredDenyProtocol::default());
+    let mut reader = join_with(
+        &w,
+        "reader",
+        &[],
+        Arc::clone(&store),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+    )
+    .await;
+    reader.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    w.switch.push_missed(2, now, now);
+    *protocol.sample.failing.lock().unwrap() = 1;
+    reader.receive(None).await.unwrap();
+    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
+    let seq = reader.cursor().seq;
+    let backup = reader.backup_layered().await.unwrap();
+    assert_eq!(backup.owed.len(), 1);
+    drop(reader);
+    protocol.sample.missed.lock().unwrap().clear();
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    restored.receive(None).await.unwrap();
+    let missed = protocol.sample.missed.lock().unwrap().clone();
+    assert_eq!(missed.iter().map(|m| m.seq).collect::<Vec<_>>(), [seq]);
     assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
 }
 
