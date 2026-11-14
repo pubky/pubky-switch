@@ -13,7 +13,7 @@ use futures_util::FutureExt;
 use pubky_switch::http::route::route;
 use pubky_switch_client::transport::{Request, Response};
 use pubky_switch_core::enc::{b64, unb64};
-use pubky_switch_harness::allowed::{ALLOWED, EVERY_FLOW};
+use pubky_switch_harness::allowed::ALLOWED;
 use pubky_switch_harness::compare::{Difference, differences, judge};
 use pubky_switch_harness::flows::{self, CALLS, FLOWS, ORIGIN, flow_of};
 use pubky_switch_harness::{Backend, Comparison, FlowResult, Trace, World, compare_backends, run};
@@ -96,27 +96,11 @@ async fn test_flows_answer_alike_at_the_service_and_the_scripted_switch() {
 fn test_allowed_differences_name_flows_that_exist() {
     for entry in ALLOWED {
         assert!(
-            entry.flow == EVERY_FLOW || FLOWS.iter().any(|(name, _)| *name == entry.flow),
+            FLOWS.iter().any(|(name, _)| *name == entry.flow),
             "the allowed-differences list names a flow that doesn't exist: {}",
             entry.flow
         );
         assert!(!entry.reason.is_empty() && !entry.reference.is_empty());
-    }
-}
-
-/// An entry for every flow, such as the one for member order, shows in one flow at least:
-/// like a flow's own entries, it can't stay in the list once the difference is gone.
-#[tokio::test]
-async fn test_allowed_differences_for_every_flow_show_in_one() {
-    let Some(all) = comparisons().await else {
-        return;
-    };
-    for entry in ALLOWED.iter().filter(|entry| entry.flow == EVERY_FLOW) {
-        let shows = all.iter().any(|(_, comparison)| {
-            let allowed = comparison.verdict.allowed.iter();
-            allowed.into_iter().any(|(_, used)| *used == entry)
-        });
-        assert!(shows, "no flow shows: {} ({})", entry.fact, entry.reason);
     }
 }
 
@@ -409,11 +393,10 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
     }
     let (failures, waiting) = found.into_inner().expect("no panic under the lock");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    // The served calls still waiting for a flow: this list shrinks to nothing as the flows
-    // land, and a call that starts being served must be added to it or given a flow.
+    // A call that starts being served must be given a flow.
     assert_eq!(
         waiting,
-        ["PUT /v1/{id}/push"],
+        Vec::<String>::new(),
         "the served calls no flow sends yet"
     );
 }

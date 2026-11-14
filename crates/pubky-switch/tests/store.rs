@@ -627,350 +627,55 @@ async fn test_store_connect_waits_for_a_late_database() {
     fx.finish().await;
 }
 
-/// A database holding an account from before migration 0002, migrated now.
-#[tokio::test]
-#[allow(clippy::panic)]
-async fn test_store_upgrade_gives_existing_accounts_the_limits_in_force() {
-    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
-    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
-        Ok(db) => db,
-        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
-        Err(error) => panic!("test database: {error}"),
-    };
+/// The migrations a database records as applied: version, checksum, success and when.
+async fn applied_migrations(db: &TestDatabase) -> Vec<(i64, Vec<u8>, bool, String)> {
     let mut conn = PgConnection::connect_with(db.options())
         .await
         .expect("conn");
-    let first = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(MIGRATIONS.iter().take(1).cloned().collect()),
-        ignore_missing: false,
-        locking: true,
-        no_tx: false,
-    };
-    first.run(&mut conn).await.expect("migration 0001");
-    sqlx::query(
-        "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms) \
-         VALUES ('old', $1, 1, 'key', 1)",
-    )
-    .bind([7u8; 32].as_slice())
-    .execute(&mut conn)
-    .await
-    .expect("an account under 0001");
-    // Without the limits in force, the upgrade fails and applies nothing.
-    assert!(MIGRATIONS.run(&mut conn).await.is_err());
-    // A failed run keeps the migrator's lock on its connection.
-    conn.close().await.expect("close");
-    let mut conn = PgConnection::connect_with(db.options())
-        .await
-        .expect("conn");
-    let applied: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
-        .fetch_one(&mut conn)
-        .await
-        .expect("versions");
-    assert_eq!(applied, 1);
-    // With them, the account inherits them.
-    let limits = pubky_switch::limits::Limits {
-        app_limit: 7,
-        ..pubky_switch::limits::Limits::default()
-    };
-    let announced = pubky_switch::service::announced_limits(&limits);
-    db.store().migrate(&announced).await.expect("upgrade");
-    let stored: Vec<u8> =
-        sqlx::query_scalar("SELECT announced_limits FROM accounts WHERE id = 'old'")
-            .fetch_one(&mut conn)
-            .await
-            .expect("limits");
-    assert_eq!(stored, serde_json::to_vec(&announced).expect("json"));
-    conn.close().await.expect("close");
-    db.drop_database().await.expect("drop");
-}
-
-/// Enrollment answers kept before migration 0005: the creating one is found and marked.
-#[tokio::test]
-#[allow(clippy::panic)]
-async fn test_store_upgrade_marks_the_creating_enrollment_answer() {
-    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
-    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
-        Ok(db) => db,
-        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
-        Err(error) => panic!("test database: {error}"),
-    };
-    let mut conn = PgConnection::connect_with(db.options())
-        .await
-        .expect("conn");
-    let before = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(MIGRATIONS.iter().take(4).cloned().collect()),
-        ignore_missing: false,
-        locking: true,
-        no_tx: false,
-    };
-    before
-        .run(&mut conn)
-        .await
-        .expect("migrations 0001 to 0004");
-    for statement in [
-        "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms, \
-         announced_limits) VALUES ('old', '\\x0707070707070707070707070707070707070707070707070707070707070707', \
-         1, 'key', 5, '\\x7b7d')",
-        "INSERT INTO enrollment_answers (account_id, enrollment_hash, service_key, answered_at_ms) \
-         VALUES ('old', '\\x0101010101010101010101010101010101010101010101010101010101010101', 'key', 5), \
-         ('old', '\\x0202020202020202020202020202020202020202020202020202020202020202', 'pending', 9)",
-    ] {
-        sqlx::query(statement)
-            .execute(&mut conn)
-            .await
-            .expect("rows under 0004");
-    }
-    let announced =
-        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
-    db.store().migrate(&announced).await.expect("upgrade");
-    let creating: Vec<(Vec<u8>, bool)> = sqlx::query_as(
-        "SELECT enrollment_hash, creating FROM enrollment_answers ORDER BY enrollment_hash",
+    let applied = sqlx::query_as(
+        "SELECT version, checksum, success, installed_on::text FROM _sqlx_migrations \
+         ORDER BY version",
     )
     .fetch_all(&mut conn)
     .await
-    .expect("answers");
-    assert_eq!(
-        creating.iter().map(|(_, c)| *c).collect::<Vec<_>>(),
-        vec![true, false]
-    );
+    .expect("applied migrations");
     conn.close().await.expect("close");
-    db.drop_database().await.expect("drop");
+    applied
 }
 
-/// A tombstone written before migration 0006: the service learns when it may go from its
-/// state, and deletes it on time.
 #[tokio::test]
-#[allow(clippy::panic)]
-async fn test_store_upgrade_deletes_claims_from_before_0006() {
-    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
-    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
-        Ok(db) => db,
-        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
-        Err(error) => panic!("test database: {error}"),
-    };
-    let mut conn = PgConnection::connect_with(db.options())
-        .await
-        .expect("conn");
-    let before = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(MIGRATIONS.iter().take(5).cloned().collect()),
-        ignore_missing: false,
-        locking: true,
-        no_tx: false,
-    };
-    before
-        .run(&mut conn)
-        .await
-        .expect("migrations 0001 to 0005");
-    let deadline: u64 = 1_767_312_000_000;
-    // A settled claim, compacted, pinned to `deadline`, in the service's encoding.
-    let (attempt, owner) = (vec![8u8; 16], vec![5u8; 16]);
-    let state = serde_json::json!({
-        "step": 2,
-        "attempts": [{
-            "attempt_id": attempt, "owner": owner, "outcome": "done",
-            "opened_at": 1_767_225_600_000u64, "orphan_after": 60,
-            "possibly_duplicate": false, "duplicate": false,
-            "resolved_by": owner, "from_upload": false,
-        }],
-        "current": null, "settled": true, "tombstone": true, "pin": deadline,
-        "divergent": false, "rebuilt": false, "creator": owner,
-        "last_entry": 1_767_225_600_000u64,
-    });
-    sqlx::query(
-        "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms, \
-         announced_limits) VALUES ('old', $1, 1, '00000000000000000000000000000000', 5, \
-         '\\x7b7d')",
-    )
-    .bind([7u8; 32].as_slice())
-    .execute(&mut conn)
-    .await
-    .expect("account");
-    sqlx::query(
-        "INSERT INTO claims (account_id, claim_key, state, creator, tombstone, open_owners) \
-         VALUES ('old', $1, $2, $3, true, '{}')",
-    )
-    .bind([9u8; 32].as_slice())
-    .bind(serde_json::to_vec(&state).expect("state"))
-    .bind([5u8; 16].as_slice())
-    .execute(&mut conn)
-    .await
-    .expect("a claim under 0005");
-    // A failed claim pinned to no deadline, and a row whose state doesn't decode.
-    let last_entry: u64 = 1_767_225_600_000;
-    let failed = serde_json::json!({
-        "step": 2,
-        "attempts": [{
-            "attempt_id": attempt, "owner": owner, "outcome": "failed",
-            "opened_at": last_entry, "orphan_after": 60,
-            "possibly_duplicate": false, "duplicate": false,
-            "resolved_by": owner, "from_upload": false,
-        }],
-        "current": null, "settled": false, "tombstone": false, "pin": "none",
-        "divergent": false, "rebuilt": false, "creator": owner, "last_entry": last_entry,
-    });
-    for (key, state) in [
-        ([10u8; 32], serde_json::to_vec(&failed).expect("state")),
-        ([11u8; 32], b"not a claim".to_vec()),
-    ] {
-        sqlx::query(
-            "INSERT INTO claims (account_id, claim_key, state, creator, tombstone, open_owners) \
-             VALUES ('old', $1, $2, $3, false, '{}')",
-        )
-        .bind(key.as_slice())
-        .bind(state)
-        .bind([5u8; 16].as_slice())
-        .execute(&mut conn)
-        .await
-        .expect("a claim under 0005");
-    }
-    let announced =
-        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
-    db.store().migrate(&announced).await.expect("upgrade");
-    let age = pubky_switch::limits::Limits::default().max_claim_age_ms;
-    let reconciliation = pubky_switch_core::claims::RECONCILIATION_MS;
-    let mut txn = db
+async fn test_store_empty_database_comes_up_at_the_current_schema() {
+    // The fixture's database is created empty and migrated once.
+    let Some(fx) = fixture().await else { return };
+    let applied = applied_migrations(&fx.db).await;
+    let embedded: Vec<(i64, Vec<u8>, bool)> = pubky_switch::store::MIGRATIONS
+        .iter()
+        .map(|migration| (migration.version, migration.checksum.to_vec(), true))
+        .collect();
+    assert!(!embedded.is_empty());
+    let recorded: Vec<(i64, Vec<u8>, bool)> = applied
+        .iter()
+        .map(|(version, checksum, success, _)| (*version, checksum.clone(), *success))
+        .collect();
+    assert_eq!(recorded, embedded);
+    // The schema holds an account, written and read back through the store.
+    let account = fx.account(ID_A).await;
+    let txn = fx
         .store()
-        .begin("old")
+        .begin(ID_A)
         .await
         .expect("begin")
         .expect("account");
-    // Not yet due: it is kept, now with when it may go.
-    let early = deadline + reconciliation - 1;
     assert_eq!(
-        txn.delete_due_claims(early, age, 64).await.expect("delete"),
-        0
-    );
-    // Due: it goes.
-    assert_eq!(
-        txn.delete_due_claims(deadline + reconciliation, age, 64)
-            .await
-            .expect("delete"),
-        1
-    );
-    // The failed claim goes once its last entry is max_claim_age_ms old; the row that
-    // doesn't decode blocks nothing, and stays.
-    assert_eq!(
-        txn.delete_due_claims(last_entry + age - 1, age, 64)
-            .await
-            .expect("delete"),
-        0
-    );
-    assert_eq!(
-        txn.delete_due_claims(last_entry + age, age, 64)
-            .await
-            .expect("delete"),
-        1
-    );
-    assert_eq!(
-        txn.delete_due_claims(u64::MAX >> 12, age, 64)
-            .await
-            .expect("delete"),
-        0
+        (txn.head().id.as_str(), &txn.head().service_key),
+        (ID_A, &account.service_key)
     );
     drop(txn);
-    conn.close().await.expect("close");
-    db.drop_database().await.expect("drop");
-}
-
-/// Chain items written before migration 0008 take their proofs from their batch's record
-/// while it keeps them, by their place in the batch; the others stay without.
-#[tokio::test]
-#[allow(clippy::panic)]
-async fn test_store_upgrade_gives_chain_items_their_batch_proofs() {
-    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
-    use pubky_switch_core::sig::SignedDoc;
-    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
-        Ok(db) => db,
-        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
-        Err(error) => panic!("test database: {error}"),
-    };
-    let mut conn = PgConnection::connect_with(db.options())
-        .await
-        .expect("conn");
-    let before = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(MIGRATIONS.iter().take(7).cloned().collect()),
-        ignore_missing: false,
-        locking: true,
-        no_tx: false,
-    };
-    before
-        .run(&mut conn)
-        .await
-        .expect("migrations 0001 to 0007");
-    sqlx::query(
-        "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms, \
-         announced_limits) VALUES ('old', $1, 1, '00000000000000000000000000000000', 5, \
-         '\\x7b7d')",
-    )
-    .bind([7u8; 32].as_slice())
-    .execute(&mut conn)
-    .await
-    .expect("account");
-    let proof = |n: u8| SignedDoc::from_parts(format!("{{\"proof\":{n}}}").as_bytes(), &[n; 64]);
-    // A batch of seqs 2 and 3 whose proofs are kept, and one at seq 5 whose proofs went.
-    for (id, proofs, first, last) in [
-        (
-            [1u8; 16],
-            Some(serde_json::to_vec(&[proof(2), proof(3)]).expect("proofs")),
-            2i64,
-            3i64,
-        ),
-        ([2u8; 16], None, 5, 5),
-    ] {
-        sqlx::query(
-            "INSERT INTO batches (account_id, batch_id, ops_hash, proofs, at_ms, generation, \
-             first_seq, last_seq) VALUES ('old', $1, $2, $3, 0, 1, $4, $5)",
-        )
-        .bind(id.as_slice())
-        .bind([0u8; 32].as_slice())
-        .bind(proofs)
-        .bind(first)
-        .bind(last)
-        .execute(&mut conn)
-        .await
-        .expect("batch");
-    }
-    for (seq, item_type) in [(1i64, "identity"), (2, "op"), (3, "op"), (5, "op")] {
-        sqlx::query(
-            "INSERT INTO chain_items (account_id, generation, seq, item_type, item_bytes, \
-             envelope, chain_hash, server_time_ms) VALUES ('old', 1, $1, $2, '\\x7b7d', \
-             '\\x7b7d', $3, 0)",
-        )
-        .bind(seq)
-        .bind(item_type)
-        .bind([0u8; 32].as_slice())
-        .execute(&mut conn)
-        .await
-        .expect("chain item");
-    }
-    let announced =
-        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
-    db.store().migrate(&announced).await.expect("upgrade");
-    let rows: Vec<(i64, Option<Vec<u8>>)> =
-        sqlx::query_as("SELECT seq, proof FROM chain_items WHERE account_id = 'old' ORDER BY seq")
-            .fetch_all(&mut conn)
-            .await
-            .expect("rows");
-    let proofs: Vec<(i64, Option<SignedDoc>)> = rows
-        .into_iter()
-        .map(|(seq, proof)| {
-            (
-                seq,
-                proof.map(|bytes| serde_json::from_slice(&bytes).expect("a proof")),
-            )
-        })
-        .collect();
-    assert_eq!(
-        proofs,
-        vec![
-            (1, None),
-            (2, Some(proof(2))),
-            (3, Some(proof(3))),
-            (5, None)
-        ]
-    );
-    drop(conn);
-    db.drop_database().await.expect("drop");
+    // Migrating again changes nothing: no migration runs, and the account stays.
+    fx.store().migrate().await.expect("migrate again");
+    assert_eq!(applied_migrations(&fx.db).await, applied);
+    assert!(fx.store().begin(ID_A).await.expect("begin").is_some());
+    fx.finish().await;
 }
 
 /// A shared record at `key` of `collection` whose `read_scope` is `read_scope`, at version
@@ -1125,75 +830,6 @@ async fn test_store_records_by_key_text_and_read_scope() {
     fx.finish().await;
 }
 
-#[tokio::test]
-#[allow(clippy::panic)]
-async fn test_store_upgrade_gives_records_their_key_text() {
-    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
-    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
-        Ok(db) => db,
-        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
-        Err(error) => panic!("test database: {error}"),
-    };
-    let mut conn = PgConnection::connect_with(db.options())
-        .await
-        .expect("conn");
-    let before = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(
-            MIGRATIONS
-                .iter()
-                .filter(|migration| migration.version < 14)
-                .cloned()
-                .collect(),
-        ),
-        ignore_missing: false,
-        locking: true,
-        no_tx: false,
-    };
-    before.run(&mut conn).await.expect("migrations before 0014");
-    sqlx::query(
-        "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms, \
-         announced_limits) VALUES ('old', $1, 1, '00000000000000000000000000000000', 5, \
-         '\\x7b7d')",
-    )
-    .bind([7u8; 32].as_slice())
-    .execute(&mut conn)
-    .await
-    .expect("account");
-    let keys = [[0xF8u8; 32], [0x00; 32], [0xD0; 32]];
-    for key in &keys {
-        sqlx::query(
-            "INSERT INTO shared_records (account_id, key, collection, read_scope, \
-             write_scopes, generation, version, deleted, value_bytes, writer, cert, op, proof) \
-             VALUES ('old', $1, $2, 'tasks', '{tasks}', 1, 1, false, 0, $3, '\\x7b7d', '\\x7b7d', \
-             '\\x7b7d')",
-        )
-        .bind(key.as_slice())
-        .bind([1u8; 32].as_slice())
-        .bind([3u8; 16].as_slice())
-        .execute(&mut conn)
-        .await
-        .expect("record");
-    }
-    let announced =
-        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
-    db.store().migrate(&announced).await.expect("upgrade");
-    let texts: Vec<String> = sqlx::query_scalar(
-        "SELECT key_text FROM shared_records WHERE account_id = 'old' ORDER BY key_text",
-    )
-    .fetch_all(&mut conn)
-    .await
-    .expect("rows");
-    let mut expected: Vec<String> = keys
-        .iter()
-        .map(|key| pubky_switch_core::enc::b64(key))
-        .collect();
-    expected.sort();
-    assert_eq!(texts, expected);
-    assert_eq!(texts[0].as_bytes()[0], b'-', "'-' sorts first in ASCII");
-    drop(conn);
-    db.drop_database().await.expect("drop");
-}
-
 /// One read of `limit` records of account A's `collection` that the scopes `held` may read.
 async fn read_once(
     fx: &Fixture,
@@ -1301,111 +937,6 @@ async fn test_store_records_page_keeps_key_text_order_under_any_join() {
     assert_eq!(texts.len(), 33);
     assert_eq!(texts, sorted, "key-text order");
     fx.finish().await;
-}
-
-/// A key an erasure owed before migration 0017: it stays an erasure's, whose deletion the
-/// ledger records, not a retired one.
-#[tokio::test]
-#[allow(clippy::panic)]
-async fn test_store_upgrade_keeps_owed_keys_as_erasures() {
-    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
-    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
-        Ok(db) => db,
-        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
-        Err(error) => panic!("test database: {error}"),
-    };
-    let mut conn = PgConnection::connect_with(db.options())
-        .await
-        .expect("conn");
-    let before = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(
-            MIGRATIONS
-                .iter()
-                .take_while(|m| m.version < 17)
-                .cloned()
-                .collect(),
-        ),
-        ignore_missing: false,
-        locking: true,
-        no_tx: false,
-    };
-    before
-        .run(&mut conn)
-        .await
-        .expect("migrations through 0016");
-    sqlx::query(
-        "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ('owed', 'gone', 5)",
-    )
-    .execute(&mut conn)
-    .await
-    .expect("an owed key under 0016");
-    let announced =
-        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
-    db.store().migrate(&announced).await.expect("upgrade");
-    let reason: String = sqlx::query_scalar("SELECT reason FROM erased_keys WHERE key_id = 'owed'")
-        .fetch_one(&mut conn)
-        .await
-        .expect("reason");
-    assert_eq!(reason, "erasure");
-    conn.close().await.expect("close");
-    db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
-async fn test_store_upgrade_applies_0021_after_later_migrations() {
-    // A database made by a service that already ran 0022 and 0025, but not 0021: the
-    // upgrade applies 0021 then, with its column and both indexes.
-    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
-    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
-        Ok(db) => db,
-        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
-        Err(error) => panic!("test database: {error}"),
-    };
-    let mut conn = PgConnection::connect_with(db.options())
-        .await
-        .expect("conn");
-    let without_0021 = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(
-            MIGRATIONS
-                .iter()
-                .filter(|m| m.version != 21)
-                .cloned()
-                .collect(),
-        ),
-        ignore_missing: false,
-        locking: true,
-        no_tx: false,
-    };
-    without_0021
-        .run(&mut conn)
-        .await
-        .expect("every migration but 0021");
-    let applied = |version: i64| {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = $1 AND success)",
-        )
-        .bind(version)
-    };
-    assert!(applied(25).fetch_one(&mut conn).await.expect("0025"));
-    assert!(!applied(21).fetch_one(&mut conn).await.expect("0021"));
-    let announced =
-        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
-    db.store().migrate(&announced).await.expect("upgrade");
-    assert!(applied(21).fetch_one(&mut conn).await.expect("0021"));
-    let indexes: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_indexes \
-         WHERE indexname IN ('shared_records_deleted', 'batches_with_proofs')",
-    )
-    .fetch_one(&mut conn)
-    .await
-    .expect("indexes");
-    assert_eq!(indexes, 2);
-    sqlx::query("SELECT swept_at_ms FROM accounts LIMIT 0")
-        .execute(&mut conn)
-        .await
-        .expect("the column");
-    conn.close().await.expect("close");
-    db.drop_database().await.expect("drop");
 }
 
 /// A record taken from a recovery upload after a provider loss, at `version` of generation 1,
