@@ -38,7 +38,7 @@ The operator listener.
 It serves:
 
 - `GET /health/live`: `200` while the process runs.
-- `GET /health/ready`: `200` when every readiness check passes, `503` otherwise, with a JSON body `{ "ready", "checks", "trusted_time" }`. Missing trusted time is reported, but doesn't make the service unready: it still serves everything that doesn't depend on time.
+- `GET /health/ready`: `200` when every readiness check passes, `503` otherwise, with a JSON body `{ "ready", "checks", "trusted_time" }`. Missing trusted time is reported, but doesn't make the service unready: it still serves everything that doesn't depend on time. With `"trusted_time": false` it refuses, with `503 unavailable`, what does (Switch spec 10.1): a batch whose outcome depends on the service's time, and an append, a directory read or a peer delivery that only an invite code admits. `pubky_switch_time_refusals_total` counts them.
 - `GET /metrics`: metrics in the Prometheus text format.
 
 The listener isn't authenticated. Keep it on a private network.
@@ -150,7 +150,13 @@ The alert clears when the server is verified again. A refused server most often 
 - alert: PubkySwitchNoTrustedTime
   expr: pubky_switch_trusted_time_available == 0
   for: 5m
+- alert: PubkySwitchStateBehindMark
+  expr: increase(pubky_switch_mark_refusals_total[5m]) > 0
+  annotations:
+    summary: "An account's state is behind its service key's mark: committed state was lost"
 ```
+
+The last rule fires on any request refused because an account's state is behind its service key's mark, or beside it (No restore and continue, below). The service also writes an `error` log line with `alert = "behind_mark"`, the account and how its state compares, once for each account while the process runs, for the first 1,024 accounts.
 
 ### `[database]`
 
@@ -199,7 +205,7 @@ The service keeps its state in two places, and they are backed up differently.
 - **Erasure and restores.** An erasure deletes the account's state, its service key and its mark, and records the identity and the erasure's time in the key store's erasure ledger, which database backups don't cover (Switch spec 6.5). A database restored from a backup taken before an erasure brings the account back; the service erases it again before anything is served or signed for it: at start, before the API listener opens, for every identity in the ledger, and at every request to the account, at an enrollment of the identity and before a queued webhook of it is signed, so one restored under a running service goes too. Only an account created at or before the erasure's time is erased again: an enrollment after an erasure creates its account later than every erasure of the identity, the one the database still owes keys for and the one the ledger holds, so a re-enrolled identity keeps its new account, even one enrolled while the erasure was still being recorded. Set `keys.backup_retention_days` to the age of the oldest database backup you keep, with a margin: above the age at which your backup job actually deletes a backup, and counting WAL archives kept for point-in-time recovery as backups. The ledger forgets an erasure that much later, by trusted time, at start and at each erasure; 0 is refused. Keep every backup younger than that, or a restore from an older one serves an erased account again. Unset, the ledger keeps every erasure for good: it then grows by one small file per erased identity, all read when the service starts and held in memory.
   - **An erasure the ledger couldn't record** keeps its key until it is recorded, at the next erasure or start (Switch wire 7.4.16): a database restored in that window serves the account with its key until the signer's retry, which erases it again.
 - **Backing up and restoring the key store.** Its parts are treated differently, so that no restore can quietly undo a mark or an erasure. Restore with the service stopped, and only by merging, never by putting an older copy in place of the directory:
-  - **Keys** (`keys/`, and the `operator` file): back them up, encrypted, often. To restore, copy back a missing key file only if the database or the `operator` file names it; never one neither names any longer, which an erasure or a retirement deleted, and never in place of a file that is there.
+  - **Keys** (`keys/`, and the `operator` file): back them up, encrypted, often. To restore, copy back a missing key file only if the database names it as an account's key or a push registration's, or the `operator` file names it; never one that neither names so any longer, which an erasure or a retirement deleted or still owes deleting, and never in place of a file that is there. A missing `operator` file may be copied back with the key file it names.
   - **The erasure ledger** (`erasures/`): back it up with the keys. An erasure leaves it only by ageing out (`keys.backup_retention_days`). To restore, copy back missing files, never remove one, and where both copies hold a file keep the later time. A ledger restored older forgets erasures, and a database restore could then bring those accounts back into service. The service reads `erasures/` once, when it starts, and refuses to start if a file there doesn't read or names no identity (a stray file such as `.DS_Store` included): move that file out, or fix its content, and start again.
   - **Marks** (`marks/`), the newest head the service signed for each account's state, are never restored from a backup. A restored mark is older than the one it replaces, and an older mark restored together with an older database passes every check: the very rollback the mark is there to catch. `marks/` lies inside `keys.path`, so a snapshot of the key store's volume rolls it back with the keys: mount a volume of its own at `<keys.path>/marks` (or make it a symbolic link to a directory on one) that has no snapshot restore, is replicated synchronously if replicated, and is left out of the key store's backups. Make the service depend on the volume's own mount point: with systemd, name it in `RequiresMountsFor=`, which is `<keys.path>/marks` for a volume mounted there and the link's target when `marks` is a symbolic link (systemd does not follow the link, so `RequiresMountsFor=<keys.path>/marks` does not wait for a volume behind one). Otherwise the service can start without the volume: an unmounted volume then looks like an empty `marks/`, the service takes every account for one with no mark, and so rollback detection is off without any error, and new marks are written under the mount point. The volume's root must be owned by the service's user: the service sets it to mode `0700` when it opens the key store, and refuses to start if it can't. If it is lost, the service can no longer tell those accounts' state from a rollback: treat it as a provider loss for them, whose signers start a new generation (Switch spec 12.6).
 
@@ -226,10 +232,15 @@ Restoring a database backup, failing over to a replica that may lag, or replayin
 
 1. The key's mark stops the affected accounts on their own, and the readiness answer stays up for the others.
 2. Find the accounts whose state is behind their mark; their requests answer `503 unavailable`.
-3. Tell their users, through the signer's operator channel, that a provider loss must be declared. The signer declares it, here or at another service, and the account starts a new generation with a new service key.
+3. Tell their users, by whatever means you reach them outside the service, that a provider loss must be declared. The signer declares it, here or at another service, and the account starts a new generation with a new service key.
 4. Never serve the lost generation again, and never reuse its service key.
 
 Database backups are for disaster recovery only: after a restore, every account whose state went back takes the steps above.
+
+## Known limits
+
+- **The identity document grows with every certificate renewal.** Each renewal adds an entry for the earlier certificate to `identity.json`, and nothing purges a closed entry before its app is removed (Switch spec 19, question 26). The service takes a document only within the 256 KiB body caps of `PUT /identity` and `POST /enroll` (Switch wire 7.1), and a move's enrollment, which carries the document encoded twice, reaches its cap first: with renewal every half lifetime, after about 1.9 years at the 255-app limit and about 17.5 years at 32 apps. A signer warns its user at three quarters of a cap and signs nothing that would pass it, so an identity near the cap has to revoke apps to renew or to move. A handful of apps stays far from it for decades.
+- **A signer hand-over grows with it.** It carries the full certificate, up to 3,599 bytes, for every certificate the document references, the earlier ones of its renewals included (Switch wire 3.12); a signer's backup carries the same (Switch wire 3.13). The largest state the other limits allow fits `max_handover_parts`, 128 envelopes and about 8 MiB (Switch wire 9.2), within the 12 MiB body cap of `PUT /handover`: the service stores one hand-over of up to that size for an account, until the next `identity.json` version it takes.
 
 ## Metrics
 
@@ -244,3 +255,5 @@ Database backups are for disaster recovery only: after a restore, every account 
 | `pubky_switch_roughtime_server_failing_ms{server}` | gauge | how long the server's samples have been failing; 0 when healthy |
 | `pubky_switch_roughtime_server_alert{server}` | gauge | 1 while the server has failed for `alert_after_ms`, 0 otherwise |
 | `pubky_switch_roughtime_alerts_total{server}` | counter | alerts raised for the server |
+| `pubky_switch_time_refusals_total{call}` | counter | requests refused with `503 unavailable` because they depend on the service's time and trusted time is missing (Switch spec 10.1), by call: `ops`, `append`, `directory`, `put_peers` |
+| `pubky_switch_mark_refusals_total{state}` | counter | requests refused because the account's state is `behind` its service key's mark, or beside it (`fork`, `other_generation`); any increase means committed state was lost (No restore and continue, above) |
