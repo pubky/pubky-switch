@@ -178,7 +178,9 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // The database's lock lives with its session: once another session holds it, or it
     // can't be confirmed, this one stops (docs/configuration.md, "Topology").
     tokio::spawn(async move {
-        let lost = instance.keep().await;
+        // Exits still holding the lock, if its session lives: a start elsewhere can't take
+        // it while this process could still answer.
+        let (lost, _held) = instance.keep().await;
         tracing::error!(failure = %lost, "the instance lock: stopping");
         std::process::exit(1);
     });

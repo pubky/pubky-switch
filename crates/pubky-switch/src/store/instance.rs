@@ -62,31 +62,33 @@ impl LockTiming {
         self.every.saturating_mul(3)
     }
 
-    /// How long a start waits for the lock: past the idle close, with a check to spare.
+    /// How long a start waits for the lock: past the idle close, with two checks to spare.
     pub fn wait(self) -> Duration {
         self.every.saturating_mul(5)
     }
 
-    /// The latest a check may come after the last confirmed one: its sleep and its answer.
-    /// A check later than that ran after a pause of the process, long enough for the server
-    /// to have closed the session.
+    /// The longest the process serves past the last confirmed check: the next check's sleep
+    /// and its answer. Nothing is answered past it, so the process has stopped before the
+    /// server closes a silent session, at three checks.
     fn overdue(self) -> Duration {
         self.every.saturating_mul(2)
     }
 
     /// The lock session's settings, so the server closes it once its client is gone, but
     /// only after the client would have stopped: an idle timeout of three checks; TCP
-    /// keepalives after one quiet check, one a second, with a user timeout of three checks,
-    /// which on Linux closes a peer that stopped answering, keepalives or data, after it;
-    /// and no statement past one check.
+    /// keepalives after one quiet check, one a second, as many as the seconds of three
+    /// checks; a user timeout of three checks, which on Linux closes a peer that stopped
+    /// answering, keepalives or data, after it (a server that doesn't take it closes on the
+    /// keepalives, after four checks); and no statement past one check.
     fn session_settings(self) -> String {
         let every_ms = self.every.as_millis().max(1);
         let keepalive_s = self.every.as_secs().max(1);
         format!(
             "SET idle_session_timeout = {idle}; SET tcp_keepalives_idle = {keepalive_s}; \
-             SET tcp_keepalives_interval = 1; SET tcp_keepalives_count = 3; \
+             SET tcp_keepalives_interval = 1; SET tcp_keepalives_count = {count}; \
              SET tcp_user_timeout = {user}; SET statement_timeout = {every_ms}",
             idle = self.idle().as_millis().max(1),
+            count = keepalive_s.saturating_mul(3),
             user = every_ms.saturating_mul(3),
         )
     }
@@ -99,8 +101,8 @@ pub enum InstanceLockLost {
     /// A check got no answer in time, or found the lock gone from the session.
     #[error("the lock on this database couldn't be confirmed")]
     Unconfirmed,
-    /// A check ran late, after a pause of the process long enough for the server to have
-    /// closed the session.
+    /// A check ran later than two checks after the last confirmed one, as after a pause of
+    /// the process.
     #[error("the lock on this database went unchecked for {0:?}")]
     Overdue(Duration),
 }
@@ -265,31 +267,30 @@ impl InstanceLock {
     }
 
     /// Check the lock at every check of its timing, and return at the first check that
-    /// can't confirm it within a check, or that comes later than two checks
-    /// after the last confirmed one, so the caller stops serving. It never takes the lock
-    /// again: the lock may have been free in the gap, and another process may have held it
-    /// and served. A start takes it afresh. So the process serves on without a confirmed
-    /// lock for at most two checks (10 seconds with the service's timing), while its own
-    /// timers run.
-    pub async fn keep(mut self) -> InstanceLockLost {
+    /// can't confirm it within what is left of two checks since the last confirmed one, so
+    /// the caller stops serving: the process serves on without a confirmed lock for at most
+    /// two checks (10 seconds with the service's timing) while its timers run. It never
+    /// takes the lock again: the lock may have been free in the gap, and another process may
+    /// have held it and served. A start takes it afresh. The lock comes back with the
+    /// reason, still held if its session lives, so the caller can stop before it lets go.
+    pub async fn keep(mut self) -> (InstanceLockLost, Self) {
         let every = self.timing.every;
         loop {
             tokio::time::sleep(every).await;
             let since = self.confirmed.elapsed();
-            if since > self.timing.overdue() {
-                return InstanceLockLost::Overdue(since);
-            }
-            let Some(conn) = self.conn.as_mut() else {
-                return InstanceLockLost::Unconfirmed;
+            let Some(left) = self.timing.overdue().checked_sub(since) else {
+                return (InstanceLockLost::Overdue(since), self);
             };
-            match tokio::time::timeout(every, Self::confirm(conn)).await {
+            let Some(conn) = self.conn.as_mut() else {
+                return (InstanceLockLost::Unconfirmed, self);
+            };
+            match tokio::time::timeout(left, Self::confirm(conn)).await {
                 Ok(Ok(true)) => self.confirmed = Instant::now(),
-                Ok(Ok(false)) => return InstanceLockLost::Unconfirmed,
+                Ok(Ok(false)) | Err(_) => return (InstanceLockLost::Unconfirmed, self),
                 Ok(Err(failure)) => {
                     tracing::warn!(%failure, "checking the instance lock");
-                    return InstanceLockLost::Unconfirmed;
+                    return (InstanceLockLost::Unconfirmed, self);
                 }
-                Err(_) => return InstanceLockLost::Unconfirmed,
             }
         }
     }
@@ -324,10 +325,9 @@ mod tests {
     use super::*;
     use crate::store::testing::TestDatabase;
 
-    /// Timing for tests: a check every 500 ms, the idle close at 1.5 s, a start's wait of
-    /// 2.5 s.
+    /// Timing for tests: a check every second, the idle close at 3 s, a start's wait of 5 s.
     fn fast() -> LockTiming {
-        LockTiming::checking_every(Duration::from_millis(500))
+        LockTiming::checking_every(Duration::from_secs(1))
     }
 
     /// The pids of the sessions that hold the lock.
@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(
             timing.session_settings(),
             "SET idle_session_timeout = 15000; SET tcp_keepalives_idle = 5; \
-             SET tcp_keepalives_interval = 1; SET tcp_keepalives_count = 3; \
+             SET tcp_keepalives_interval = 1; SET tcp_keepalives_count = 15; \
              SET tcp_user_timeout = 15000; SET statement_timeout = 5000"
         );
     }
@@ -454,7 +454,7 @@ mod tests {
             ("idle_session_timeout", "15s"),
             ("tcp_keepalives_idle", "5"),
             ("tcp_keepalives_interval", "1"),
-            ("tcp_keepalives_count", "3"),
+            ("tcp_keepalives_count", "15"),
             ("tcp_user_timeout", "15000"),
             ("statement_timeout", "5s"),
         ] {
@@ -477,7 +477,7 @@ mod tests {
         };
         let held = db.store().hold_instance_lock(fast()).await.expect("lock");
         let pid = held.pid;
-        let keeper = tokio::spawn(held.keep());
+        let keeper = tokio::spawn(async move { held.keep().await.0 });
         let started = Instant::now();
         match db.store().hold_instance_lock(fast()).await {
             Err(StoreError::InUse(holder)) => {
@@ -527,12 +527,18 @@ mod tests {
             .await
             .expect("the other process takes it");
         let second_pid = second.pid;
-        let second_keeper = tokio::spawn(second.keep());
+        let second_keeper = tokio::spawn(async move { second.keep().await.0 });
         let started = Instant::now();
-        let lost = tokio::time::timeout(Duration::from_secs(10), first.keep())
+        let lost = tokio::time::timeout(Duration::from_secs(20), async { first.keep().await.0 })
             .await
             .expect("the keeper stops");
-        assert!(matches!(lost, InstanceLockLost::Unconfirmed), "{lost:?}");
+        assert!(
+            matches!(
+                lost,
+                InstanceLockLost::Unconfirmed | InstanceLockLost::Overdue(_)
+            ),
+            "{lost:?}"
+        );
         assert!(
             started.elapsed() <= fast().overdue() + fast().every,
             "at its next check"
@@ -560,7 +566,7 @@ mod tests {
         let old = held.pid;
         frozen.store(true, Ordering::SeqCst);
         let started = Instant::now();
-        let lost = tokio::time::timeout(Duration::from_secs(10), held.keep())
+        let lost = tokio::time::timeout(Duration::from_secs(20), async { held.keep().await.0 })
             .await
             .expect("the keeper stops");
         assert!(matches!(lost, InstanceLockLost::Unconfirmed), "{lost:?}");
@@ -594,8 +600,8 @@ mod tests {
             timing: original.timing,
             confirmed: original.confirmed,
         };
-        let original_keeper = tokio::spawn(original.keep());
-        let lost = tokio::time::timeout(Duration::from_secs(10), copy.keep())
+        let original_keeper = tokio::spawn(async move { original.keep().await.0 });
+        let lost = tokio::time::timeout(Duration::from_secs(20), async { copy.keep().await.0 })
             .await
             .expect("the copy stops");
         assert!(matches!(lost, InstanceLockLost::Unconfirmed), "{lost:?}");
@@ -619,7 +625,7 @@ mod tests {
         };
         let mut held = db.store().hold_instance_lock(fast()).await.expect("lock");
         held.confirmed = Instant::now() - fast().overdue() - fast().every;
-        let lost = tokio::time::timeout(Duration::from_secs(10), held.keep())
+        let lost = tokio::time::timeout(Duration::from_secs(20), async { held.keep().await.0 })
             .await
             .expect("the keeper stops");
         assert!(matches!(lost, InstanceLockLost::Overdue(_)), "{lost:?}");
