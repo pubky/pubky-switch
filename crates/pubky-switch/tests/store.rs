@@ -489,9 +489,10 @@ async fn test_store_serializes_one_account() {
 }
 
 #[tokio::test]
-async fn test_store_serializes_one_account_at_every_isolation_level() {
+async fn test_store_serializes_one_account_under_any_default_isolation() {
     // A request waits for the one ahead of it and then sees its commit, whatever isolation
-    // level the database gives new sessions (Switch spec 6.5).
+    // level the database gives new sessions: the store's connections set their own (Switch
+    // spec 6.5).
     for level in ["repeatable read", "serializable"] {
         let Some(fx) = fixture().await else { return };
         fx.account(ID_A).await;

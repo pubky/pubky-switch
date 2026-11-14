@@ -38,7 +38,9 @@ enum Command {
     /// prints JSON lines, and exits 2 when an account needs attention.
     CheckMarks {
         /// Read this database instead of the configured one, against the same key store.
-        #[arg(long, env = "PUBKY_SWITCH_REPLICA_URL")]
+        /// Prefer the variable when the URL holds a password: a command line is visible to
+        /// other users of the host.
+        #[arg(long, env = "PUBKY_SWITCH_REPLICA_URL", hide_env_values = true)]
         replica: Option<String>,
         /// Report every account, not only those that need attention.
         #[arg(long)]
@@ -164,10 +166,11 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .path
         .clone()
         .ok_or("no key store: set keys.path")?;
-    let keys = FileKeyStore::open(&key_dir)?;
     // One process serves a key store and a database (docs/configuration.md, "Topology"):
-    // a second one refuses to start here, before it migrates or serves anything.
-    let _key_dir_lock = keys.lock_dir()?;
+    // a second one refuses to start here, before it opens the key store, migrates or
+    // serves anything.
+    let _key_dir_lock = FileKeyStore::lock_dir(&key_dir)?;
+    let keys = FileKeyStore::open(&key_dir)?;
     let store = Store::connect(&config.database).await?;
     let instance = store.hold_instance_lock().await?;
     // The database's lock lives with its connection: once another process holds it, after

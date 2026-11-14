@@ -64,7 +64,7 @@ pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
 pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
-pub use instance::InstanceLock;
+pub use instance::{InstanceLock, InstanceLockLost};
 pub use keying::{Keyed, keying_lock_key};
 pub use ops::{
     DivergentUpload, ListName, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry,
@@ -378,7 +378,14 @@ impl Store {
                     let settings = DurabilitySettings::read(conn).await?;
                     settings.check().map_err(|reason| {
                         sqlx::Error::Configuration(StoreError::NotDurable(reason).into())
-                    })
+                    })?;
+                    // READ COMMITTED whatever the database's default: a statement that waits
+                    // for a lock then reads what the holder committed, where a snapshot taken
+                    // before the wait would fail the request instead (Switch spec 6.5, order
+                    // per account).
+                    conn.execute("SET default_transaction_isolation = 'read committed'")
+                        .await?;
+                    Ok(())
                 })
             })
             .connect_with(options.clone())
@@ -598,20 +605,10 @@ impl Store {
     /// `lock_timeout_ms` for the lock ([`StoreError::LockTimeout`]).
     pub async fn begin(&self, id: &str) -> Result<Option<AccountTxn>, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::from_db)?;
-        // READ COMMITTED whatever the pool's default: the statement that takes the lock
-        // waits for the request ahead and then reads what it committed, where a snapshot
-        // taken before the wait would fail the request instead (Switch spec 6.5, order per
-        // account). `SET` takes no bind parameters; the value is a number we format.
-        tx.execute(
-            format!(
-                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
-                 SET LOCAL lock_timeout = {}",
-                self.lock_timeout_ms
-            )
-            .as_str(),
-        )
-        .await
-        .map_err(StoreError::from_db)?;
+        // `SET LOCAL` takes no bind parameters; the value is a number we format.
+        tx.execute(format!("SET LOCAL lock_timeout = {}", self.lock_timeout_ms).as_str())
+            .await
+            .map_err(StoreError::from_db)?;
         AccountTxn::lock(tx, id).await
     }
 
