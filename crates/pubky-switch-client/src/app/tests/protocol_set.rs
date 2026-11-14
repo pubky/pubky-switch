@@ -40,6 +40,10 @@ struct Named {
     huge_missed: bool,
     /// How many of the next deny list change calls fail.
     failing_deny: Mutex<u32>,
+    /// The position of each deny list gap it took, and whether its list was read.
+    gaps: Mutex<Vec<(u64, bool)>>,
+    /// How many of the next deny list gap calls fail.
+    failing_gap: Mutex<u32>,
     /// How many of the next receive steps end in a retry.
     retrying: Mutex<u32>,
     /// Its effects carry a conversation entry for the sender.
@@ -169,6 +173,17 @@ impl Protocol for Named {
             return Err(StoreError::Unavailable.into());
         }
         self.denies.lock().unwrap().push(change.pubky);
+        Ok(Vec::new())
+    }
+
+    fn deny_list_gap(
+        &self,
+        gap: &crate::app::DenyListGap,
+    ) -> Result<Vec<LocalWrite>, StoreFailure> {
+        if count_down(&self.failing_gap) {
+            return Err(StoreError::Unavailable.into());
+        }
+        self.gaps.lock().unwrap().push((gap.seq, gap.list_read));
         Ok(Vec::new())
     }
 
@@ -545,6 +560,102 @@ async fn test_protocol_set_deny_change_one_protocol_fails_stops_the_read_for_all
     assert_eq!(*p.chat.denies.lock().unwrap(), [[7; 32]]);
     assert_eq!(*p.tasks.denies.lock().unwrap(), [[7; 32]]);
     assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+}
+
+#[tokio::test]
+async fn test_protocol_set_restore_gap_is_told_to_each_protocol_once() {
+    // A restore owes every protocol the deny list gap at the restored cursor; one that
+    // fails it is told it again alone, and the read holds for every protocol meanwhile.
+    let p = Pair::new();
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    // The join's gap, the baseline, went to both.
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 1);
+    assert_eq!(p.chat.gaps.lock().unwrap().len(), 1);
+    let backup = app.backup_layered().await.unwrap();
+    let at = app.cursor().seq;
+    drop(app);
+    p.tasks.gaps.lock().unwrap().clear();
+    p.chat.gaps.lock().unwrap().clear();
+    *p.chat.failing_gap.lock().unwrap() = 1;
+    let mut restored = App::restore(p.env(), p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    p.send(me, "tasks.item");
+    let report = restored.receive(None).await.unwrap();
+    assert!(report.stopped, "{report:?}");
+    assert_eq!(*p.tasks.gaps.lock().unwrap(), [(at, true)]);
+    assert!(p.chat.gaps.lock().unwrap().is_empty());
+    assert!(kinds(&p.tasks).is_empty());
+    read(&mut restored, 2).await;
+    assert_eq!(*p.chat.gaps.lock().unwrap(), [(at, true)]);
+    assert_eq!(*p.tasks.gaps.lock().unwrap(), [(at, true)]);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+    assert!(
+        !restored
+            .reader()
+            .exists(crate::app::feed::DENY_GAP)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_gap_noted_again_is_told_to_every_protocol() {
+    // Every gap noted is told to every protocol: one that took a gap still owed to another
+    // is told the later one too.
+    let p = Pair::new();
+    *p.chat.failing_gap.lock().unwrap() = 1;
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped, "{report:?}");
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 1);
+    assert!(p.chat.gaps.lock().unwrap().is_empty());
+    app.allow_list().await.unwrap();
+    read(&mut app, 1).await;
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 2);
+    assert_eq!(p.chat.gaps.lock().unwrap().len(), 1);
+    read(&mut app, 1).await;
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 2);
+    assert_eq!(p.chat.gaps.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_protocol_set_gap_told_without_the_list_is_owed_again_to_each() {
+    // An answer that verifies but can't be read tells the gap without the list: while
+    // another protocol still owes it, the one told is owed it again too, so both get the
+    // list once it reads.
+    let p = Pair::new();
+    *p.chat.failing_gap.lock().unwrap() = 1;
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    p.w.switch.fail_next(Fault::LeaveOut {
+        path: "/allow".into(),
+        member: "deny".into(),
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped, "{report:?}");
+    let told = |protocol: &Named| -> Vec<bool> {
+        protocol
+            .gaps
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, read)| *read)
+            .collect()
+    };
+    assert_eq!(told(&p.tasks), [false]);
+    assert!(told(&p.chat).is_empty());
+    read(&mut app, 2).await;
+    assert_eq!(told(&p.tasks), [false, true]);
+    assert_eq!(told(&p.chat), [true]);
+    assert!(
+        !app.reader()
+            .exists(crate::app::feed::DENY_GAP)
+            .await
+            .unwrap()
+    );
 }
 
 async fn with_state(p: &Pair) -> (App, AppBackup) {

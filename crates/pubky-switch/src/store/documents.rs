@@ -10,8 +10,7 @@
 //! The write paths note the items they may have superseded ([`AccountTxn::note_superseded`],
 //! [`AccountTxn::note_app_documents`]); the transaction deletes, before it commits, those
 //! the feed's own rule ([`super::CurrentDocs::shows_in_full_to_some_app`]) finds no app may
-//! read. Documents chained before this rule are checked at the account's requests, a
-//! bounded number at a time ([`AccountTxn::check_old_documents`]).
+//! read.
 
 use pubky_switch_core::{
     ops::{OpKind, SignedOp},
@@ -19,7 +18,7 @@ use pubky_switch_core::{
 };
 use sqlx::Row;
 
-use super::{AccountTxn, FeedRow, StoreError, from_db, to_db};
+use super::{AccountTxn, FeedRow, StoreError, to_db};
 
 /// The App ID an `app.put` or `cert.put` document concerns, from its signed bytes; `None`
 /// for any other item.
@@ -75,11 +74,11 @@ impl AccountTxn {
     }
 
     /// Of the items at `seqs`, delete the documents no app may read in full any more, and
-    /// their proofs; the others stay. The rows read, to see what stayed.
-    async fn drop_documents_at(&mut self, seqs: &[i64]) -> Result<Vec<FeedRow>, StoreError> {
+    /// their proofs; the others stay.
+    async fn drop_documents_at(&mut self, seqs: &[i64]) -> Result<(), StoreError> {
         let rows = self.chain_rows(seqs).await?;
         if rows.is_empty() {
-            return Ok(rows);
+            return Ok(());
         }
         let head = self.head().clone();
         let generation = to_db(head.generation, "generation")?;
@@ -94,7 +93,7 @@ impl AccountTxn {
                 Ok(current) => current,
                 Err(StoreError::Corrupt(_) | StoreError::OutOfRange(_)) => {
                     tracing::warn!("the current documents don't read; every item keeps its own");
-                    return Ok(rows);
+                    return Ok(());
                 }
                 Err(error) => return Err(error),
             };
@@ -123,10 +122,7 @@ impl AccountTxn {
             .await
             .map_err(StoreError::from_db)?;
         }
-        Ok(rows
-            .into_iter()
-            .filter(|row| to_db(row.seq, "seq").is_ok_and(|seq| !stale.contains(&seq)))
-            .collect())
+        Ok(())
     }
 
     /// Delete, before the commit, the documents this transaction superseded (the module's
@@ -161,57 +157,5 @@ impl AccountTxn {
         seqs.dedup();
         self.drop_documents_at(&seqs).await?;
         Ok(())
-    }
-
-    /// Check at most `bound` of the documents chained before this rule, oldest first:
-    /// delete those no app may read in full any more, and note which app each remaining
-    /// `app.put` and `cert.put` concerns, so a later change finds it. One indexed read of
-    /// the account's row once every one is checked. The number checked.
-    pub async fn check_old_documents(&mut self, bound: u64) -> Result<u64, StoreError> {
-        let id = self.head().id.clone();
-        let row = sqlx::query(
-            "SELECT documents_checked_seq, documents_check_end FROM accounts WHERE id = $1",
-        )
-        .bind(&id)
-        .fetch_one(self.conn())
-        .await
-        .map_err(StoreError::from_db)?;
-        let checked = from_db(
-            row.try_get("documents_checked_seq")?,
-            "documents_checked_seq",
-        )?;
-        let end = from_db(row.try_get("documents_check_end")?, "documents_check_end")?;
-        if checked >= end || bound == 0 {
-            return Ok(0);
-        }
-        let through = checked.saturating_add(bound).min(end);
-        let seqs: Vec<i64> = (checked.saturating_add(1)..=through)
-            .map(|seq| to_db(seq, "seq"))
-            .collect::<Result<_, _>>()?;
-        let kept = self.drop_documents_at(&seqs).await?;
-        let head = self.head().clone();
-        let generation = to_db(head.generation, "generation")?;
-        for row in &kept {
-            if let Some(app) = row.item.as_ref().and_then(doc_app_of) {
-                sqlx::query(
-                    "UPDATE chain_items SET doc_app = $4 \
-                     WHERE account_id = $1 AND generation = $2 AND seq = $3",
-                )
-                .bind(&head.id)
-                .bind(generation)
-                .bind(to_db(row.seq, "seq")?)
-                .bind(app.to_vec())
-                .execute(self.conn())
-                .await
-                .map_err(StoreError::from_db)?;
-            }
-        }
-        sqlx::query("UPDATE accounts SET documents_checked_seq = $2 WHERE id = $1")
-            .bind(&id)
-            .bind(to_db(through, "documents_checked_seq")?)
-            .execute(self.conn())
-            .await
-            .map_err(StoreError::from_db)?;
-        Ok(through - checked)
     }
 }

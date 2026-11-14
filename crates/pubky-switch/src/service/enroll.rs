@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// The limits an enrollment answer announces (Switch wire 3.7).
-pub fn announced_limits(limits: &Limits) -> AnnouncedLimits {
+pub(crate) fn announced_limits(limits: &Limits) -> AnnouncedLimits {
     AnnouncedLimits {
         app_limit: u64::from(limits.app_limit),
         max_envelope: fixed::MAX_ENVELOPE,

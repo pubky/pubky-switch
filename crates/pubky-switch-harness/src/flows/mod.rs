@@ -26,6 +26,7 @@ mod messaging;
 mod own_record;
 mod pages;
 mod protocols;
+mod push;
 mod records;
 mod recovery;
 mod reduction;
@@ -70,6 +71,7 @@ pub use messaging::messaging;
 pub use own_record::own_record;
 pub use pages::pages;
 pub use protocols::two_protocols;
+pub use push::push_registration;
 pub use records::records;
 pub use recovery::{
     provider_loss, provider_loss_in_place, provider_loss_in_place_restored,
@@ -263,6 +265,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("departure, a version delivered meanwhile", |world| {
         Box::pin(departure_time(world))
     }),
+    ("push registration", |world| {
+        Box::pin(push_registration(world))
+    }),
     ("revocation, cleanup and purge", |world| {
         Box::pin(revocation_cleanup(world))
     }),
@@ -325,11 +330,8 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         // A restored app lacks the keys of a part it passed before its loss, which went.
         Call::RequestKeys(_) => Some("restore"),
         Call::PostConnect | Call::GetConnect | Call::DeleteConnect(_) => Some("connect request"),
-        // Served, with no flow: a flow would compare its webhooks, but the scripted switch
-        // sends none (FAKES.md), and a relay a test runs in process has a loopback address,
-        // which delivery refuses outside the service's test-only route. The test of served
-        // calls lists it as waiting.
-        Call::PutPush => None,
+        // The registration only: the scripted switch sends no webhooks (FAKES.md).
+        Call::PutPush => Some("push registration"),
         // Not served yet.
         Call::Freeze
         | Call::Unfreeze

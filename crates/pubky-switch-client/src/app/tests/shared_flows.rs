@@ -3748,9 +3748,11 @@ async fn test_receive_that_fails_reports_its_kept_batch_waiting_in_no_later_read
         path: "ops".into(),
         after: 0,
     });
+    // The kept batch's send first takes a fresh service time, a feed read of one item,
+    // which passes; the read's page then fails.
     s.w.switch.fail_next(Fault::Unreachable {
         path: "feed".into(),
-        after: 0,
+        after: 1,
     });
     assert!(app.receive(None).await.is_err());
     s.w.switch.lock().faults.clear();

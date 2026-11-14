@@ -673,9 +673,10 @@ pub enum AppEvent {
         /// The attempt.
         attempt_id: [u8; 16],
     },
-    /// A restore in place left behind kept duty events and owed protocol calls whose stored
-    /// values didn't read: what they said is lost, and the protocol learns only how many
-    /// (`STATE.md`, "What the app owes its protocol"). A duty event.
+    /// A restore left behind kept duty events and owed protocol calls whose values didn't
+    /// read, the store's at a restore in place, the backup's at every restore, and those
+    /// owed to no protocol it registers: what they said is lost, and the protocol learns
+    /// only how many (`STATE.md`, "What the app owes its protocol"). A duty event.
     #[non_exhaustive]
     RestoreLeftBehind {
         /// The duty event's ID.
