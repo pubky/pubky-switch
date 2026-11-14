@@ -5,11 +5,12 @@
 //! The lock lives with its session. [`InstanceLock::keep`] checks every few seconds that its
 //! session still holds it, and takes it again on a new connection when it doesn't answer, or
 //! when the database ended it at a restart or a failover. A connection that stops answering
-//! may leave its session alive on the server, holding the lock: every lock session of the
-//! process carries the process's own `application_name`, so the process knows such a session
-//! for its own, ends it and takes the lock again, never taking it for another process. It stops serving when another process
-//! holds the lock, and when the lock was neither confirmed nor taken again for three checks
-//! in a row. Every check and every new connection is bounded in time.
+//! may leave its session alive on the server, holding the lock. A session holding the lock
+//! counts as this process's own only when its backend is one the process recorded as it
+//! opened that connection and it carries the process's `application_name`: the process ends
+//! it and takes the lock again. Any other session holding the lock is another process's,
+//! and the process stops serving, as it does when the lock was neither confirmed nor taken
+//! again for three checks in a row. Every check and every new connection is bounded in time.
 
 use std::time::{Duration, Instant};
 
@@ -35,8 +36,8 @@ const SESSION_SETTINGS: &str = "SET tcp_keepalives_idle = 5; SET tcp_keepalives_
 
 /// The session that holds the lock, if any, among those of this key. A column the database
 /// hides from this role reads as null.
-const HOLDER: &str = "SELECT l.pid, a.application_name AS name, a.backend_start::TEXT AS started, \
-     host(a.client_addr) AS addr \
+const HOLDER: &str = "SELECT l.pid, a.pid IS NOT NULL AS present, a.application_name AS name, \
+     a.backend_start::TEXT AS started, host(a.client_addr) AS addr \
      FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid \
      WHERE l.locktype = 'advisory' AND l.granted AND l.classid::BIGINT = $1 \
      AND l.objid::BIGINT = $2 AND l.objsubid = 1 \
@@ -58,6 +59,9 @@ pub enum InstanceLockLost {
 #[derive(Clone, Debug)]
 struct Holder {
     pid: i32,
+    /// Whether its backend still has a status entry: one that ended between the reads of
+    /// the locks and of the sessions has none, and its lock is going.
+    present: bool,
     /// Its `application_name`: every lock session of this process carries the process's own.
     name: Option<String>,
     started: Option<String>,
@@ -98,16 +102,24 @@ impl From<StoreError> for TakeError {
     }
 }
 
+/// How many backends of its own lock connections the process remembers.
+const OPENED_KEPT: usize = 16;
+
+/// The backends of the lock connections this process opened, newest last, each recorded
+/// before its session tries the lock: so also one whose take was given up after the lock
+/// was granted.
+type Opened = std::sync::Arc<parking_lot::Mutex<Vec<i32>>>;
+
 /// The database held by this process alone, as long as this lives.
 #[derive(Debug)]
 pub struct InstanceLock {
     conn: Option<PgConnection>,
     /// The backend of the session that holds the lock now.
     pid: i32,
-    /// This process's `application_name` for its lock sessions, unique to the process: a
-    /// session that carries it is this process's own, also one whose take of the lock was
-    /// given up after the lock was granted.
+    /// This process's `application_name` for its lock sessions.
     name: String,
+    /// The backends of this process's own lock connections.
+    opened: Opened,
     /// The connection settings, with `name`.
     options: PgConnectOptions,
 }
@@ -123,17 +135,25 @@ impl Store {
     /// [`StoreError::InUse`], naming the session that holds it, when another one still does
     /// after `wait`; a database error otherwise.
     pub async fn hold_instance_lock(&self, wait: Duration) -> Result<InstanceLock, StoreError> {
-        let since_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let name = format!("pubky-switch {}-{since_epoch}", std::process::id());
+        let mut suffix = [0u8; 8];
+        if getrandom::fill(&mut suffix).is_err() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos());
+            suffix = now.to_le_bytes()[..8].try_into().unwrap_or_default();
+        }
+        let name = format!(
+            "pubky-switch {}-{}",
+            std::process::id(),
+            hex::encode(suffix)
+        );
+        let opened = Opened::default();
         let options = (*self.pool.connect_options())
             .clone()
             .application_name(&name);
         let deadline = Instant::now() + wait;
         loop {
-            let refused = match InstanceLock::take(&options, &name).await {
+            let refused = match InstanceLock::take(&options, &name, &opened).await {
                 Ok(lock) => return Ok(lock),
                 Err(TakeError::Store(error)) => return Err(error),
                 Err(TakeError::Held(holder)) => holder.describe(),
@@ -150,15 +170,20 @@ impl Store {
 impl InstanceLock {
     /// Take the lock on a new connection, ending first a session of this process's own that
     /// still holds it.
-    async fn take(options: &PgConnectOptions, name: &str) -> Result<Self, TakeError> {
+    async fn take(
+        options: &PgConnectOptions,
+        name: &str,
+        opened: &Opened,
+    ) -> Result<Self, TakeError> {
         let mut conn = PgConnection::connect_with(options)
             .await
             .map_err(StoreError::from)?;
-        match Self::take_on(&mut conn, name).await {
+        match Self::take_on(&mut conn, name, opened).await {
             Ok(pid) => Ok(Self {
                 conn: Some(conn),
                 pid,
                 name: name.to_string(),
+                opened: opened.clone(),
                 options: options.clone(),
             }),
             Err(error) => {
@@ -168,19 +193,39 @@ impl InstanceLock {
         }
     }
 
-    async fn take_on(conn: &mut PgConnection, name: &str) -> Result<i32, TakeError> {
+    async fn take_on(
+        conn: &mut PgConnection,
+        name: &str,
+        opened: &Opened,
+    ) -> Result<i32, TakeError> {
+        // Recorded before the session tries the lock, so a take given up at any later point
+        // leaves a session this process knows.
+        let pid = this_pid(conn).await?;
+        {
+            let mut opened = opened.lock();
+            if opened.len() >= OPENED_KEPT {
+                opened.remove(0);
+            }
+            opened.push(pid);
+        }
         conn.execute(SESSION_SETTINGS)
             .await
             .map_err(StoreError::from_db)?;
         for _ in 0..3 {
             if try_lock(conn).await? {
-                return Ok(this_pid(conn).await?);
+                return Ok(pid);
             }
-            // Let go between the two reads: try the lock again.
+            // Let go between the reads: try the lock again.
             let Some(holder) = holder(conn).await? else {
                 continue;
             };
-            if holder.name.as_deref() != Some(name) {
+            if !holder.present {
+                continue;
+            }
+            // Only a backend this process opened, carrying its name, is its own: a copy of
+            // the process, which carries the same name, never opened this one's backends.
+            let own = holder.name.as_deref() == Some(name) && opened.lock().contains(&holder.pid);
+            if !own {
                 return Err(TakeError::Held(holder));
             }
             // This process's own earlier session, whose connection stopped answering or
@@ -193,7 +238,7 @@ impl InstanceLock {
                 .map_err(StoreError::from_db)?;
             for _ in 0..20 {
                 if try_lock(conn).await? {
-                    return Ok(this_pid(conn).await?);
+                    return Ok(pid);
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -239,7 +284,8 @@ impl InstanceLock {
             // Given up without waiting: its session may stay on the server, and a take ends
             // it while it still holds the lock.
             drop(self.conn.take());
-            match tokio::time::timeout(every, Self::take(&self.options, &self.name)).await {
+            let take = Self::take(&self.options, &self.name, &self.opened);
+            match tokio::time::timeout(every, take).await {
                 Ok(Ok(taken)) => {
                     tracing::warn!("the instance lock's session was lost; the lock is held again");
                     self.conn = taken.conn;
@@ -294,6 +340,7 @@ async fn holder(conn: &mut PgConnection) -> Result<Option<Holder>, StoreError> {
     row.map(|row| {
         Ok(Holder {
             pid: row.try_get("pid")?,
+            present: row.try_get("present")?,
             name: row.try_get("name")?,
             started: row.try_get("started")?,
             addr: row.try_get("addr")?,
@@ -537,7 +584,7 @@ mod tests {
         let (options, frozen) = freezing_proxy(&db).await;
         let name = "pubky-switch frozen".to_string();
         let options = options.application_name(&name);
-        let held = InstanceLock::take(&options, &name)
+        let held = InstanceLock::take(&options, &name, &Opened::default())
             .await
             .unwrap_or_else(|_| panic!("lock"));
         let old = held.pid;
@@ -600,6 +647,8 @@ mod tests {
         }
         assert!(granted, "the left session holds the lock");
         let left_pid = this_pid(&mut left).await.expect("pid");
+        // A take of this process's records its backend as it opens the connection.
+        held.opened.lock().push(left_pid);
         let first_pid = held.pid;
         let keeper = tokio::spawn(held.keep(Duration::from_millis(100)));
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -621,6 +670,48 @@ mod tests {
         keeper.abort();
         let _ = keeper.await;
         drop(left);
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_store_instance_lock_copy_of_the_process_is_another_process() {
+        // Two copies of one process carry the same name, as a restored snapshot of a running
+        // host does. A session the other copy opened holds the lock: this copy didn't open
+        // it, so it takes it for another process's and stops, and the other serves on.
+        let Some(db) = super::super::testing::test_database().await else {
+            return;
+        };
+        let mut first = db
+            .store()
+            .hold_instance_lock(Duration::ZERO)
+            .await
+            .expect("lock");
+        end_session(&db, &mut first).await;
+        let mut copy = None;
+        for _ in 0..50 {
+            match InstanceLock::take(&first.options, &first.name, &Opened::default()).await {
+                Ok(lock) => {
+                    copy = Some(lock);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        let copy = copy.expect("the copy holds the lock");
+        let copy_pid = copy.pid;
+        let copy_keeper = tokio::spawn(copy.keep(Duration::from_millis(100)));
+        let lost = tokio::time::timeout(
+            Duration::from_secs(10),
+            first.keep(Duration::from_millis(100)),
+        )
+        .await
+        .expect("the first copy stops");
+        assert!(matches!(lost, InstanceLockLost::InUse(_)), "{lost:?}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!copy_keeper.is_finished(), "the other copy serves on");
+        assert_eq!(holders(&db).await, vec![copy_pid]);
+        copy_keeper.abort();
+        let _ = copy_keeper.await;
         db.drop_database().await.expect("drop");
     }
 
