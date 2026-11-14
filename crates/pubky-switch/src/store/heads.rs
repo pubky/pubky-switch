@@ -79,6 +79,20 @@ pub async fn service_keys_after(
         .collect()
 }
 
+/// Whether anything in the database names key `id` now: an account's service key or its
+/// pending key, or a deletion owed in `erased_keys`, by an erasure, a retirement or a push
+/// key's release still under way (Switch wire 7.4.16).
+pub async fn key_named(conn: &mut PgConnection, id: &KeyId) -> Result<bool, StoreError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM accounts WHERE service_key = $1 OR pending_key = $1) \
+         OR EXISTS (SELECT 1 FROM erased_keys WHERE key_id = $1)",
+    )
+    .bind(id.as_str())
+    .fetch_one(conn)
+    .await
+    .map_err(StoreError::from_db)
+}
+
 /// The heads of the accounts `ids` names that are there now, in the order of their IDs.
 pub async fn heads(conn: &mut PgConnection, ids: &[String]) -> Result<Vec<StoredHead>, StoreError> {
     let rows = sqlx::query(

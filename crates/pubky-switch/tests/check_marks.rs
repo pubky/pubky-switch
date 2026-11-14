@@ -7,13 +7,14 @@
 #![allow(clippy::expect_used)]
 
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
 
 use pubky_switch::{
     check_marks::{self, AccountReport, CheckOptions, DatabaseChoice, MarkState},
-    keys::{FileKeyStore, KeyStore, Mark},
+    keys::{FileKeyStore, KeyStore, KeyStoreView, Mark},
     store::{
         NewAccount,
         heads::open_read_only_with,
@@ -113,7 +114,7 @@ fn options(db: &TestDatabase, key_dir: &Path, all: bool) -> CheckOptions {
         database: db.options().clone(),
         choice: DatabaseChoice::Configured,
         key_dir: key_dir.to_path_buf(),
-        origin: Some(ORIGIN.into()),
+        origin: ORIGIN.into(),
         all,
     }
 }
@@ -279,6 +280,8 @@ async fn test_check_marks_reports_each_state() {
     assert_eq!(summary.needs_attention, 6);
     assert_eq!(summary.states[&MarkState::Current], 1);
     assert_eq!(summary.states[&MarkState::Behind], 2);
+    assert_eq!(summary.states[&MarkState::AccountMissing], 0);
+    assert!(report.missing.is_empty());
     assert!(report.needs_attention());
 
     // Without `all`, only the accounts that need attention, in the order of their IDs.
@@ -434,11 +437,125 @@ fn test_check_marks_options_from_config() {
         Err(check_marks::CheckError::NoKeyStore)
     ));
     config.keys.path = Some(PathBuf::from("/nonexistent/keys"));
+    // Without an origin no account reads as serving: refused, not a pass.
+    assert!(matches!(
+        CheckOptions::from_config(&config, Some("postgres://h/db"), false),
+        Err(check_marks::CheckError::NoOrigin)
+    ));
     config.server.origin = Some(ORIGIN.into());
     let options =
         CheckOptions::from_config(&config, Some("postgres://h/db"), true).expect("options");
     assert_eq!(options.choice, DatabaseChoice::Replica);
-    assert_eq!(options.origin.as_deref(), Some(ORIGIN));
+    assert_eq!(options.origin, ORIGIN);
     assert!(options.all);
     assert!(CheckOptions::from_config(&config, Some("not a url"), false).is_err());
+}
+
+/// Run `sql` on a connection that may write, as the service or a restore would.
+async fn write(db: &TestDatabase, sql: &str) {
+    let mut conn = sqlx::PgConnection::connect_with(db.options())
+        .await
+        .expect("connect");
+    sqlx::raw_sql(sql).execute(&mut conn).await.expect("write");
+}
+
+#[tokio::test]
+async fn test_check_marks_reports_an_account_the_database_lost() {
+    let Some(fx) = fixture().await else { return };
+    let (db, keys, dir) = (&fx.db, &fx.keys, fx.key_dir.path());
+    create(db, keys, "kept", true).await;
+    append(db, keys, "kept", &[1], true).await;
+    // Enrolled and marked, then gone, as a restore from before its enrollment leaves it.
+    let gone = create(db, keys, "gone", true).await;
+    append(db, keys, "gone", &[1, 2], true).await;
+    write(db, "DELETE FROM accounts WHERE id = 'gone'").await;
+
+    let report = check_marks::run(&options(db, dir, false))
+        .await
+        .expect("check");
+    assert!(report.accounts.is_empty());
+    assert_eq!(report.missing.len(), 1);
+    let missing = &report.missing[0];
+    assert_eq!(missing.key, gone.service_key);
+    assert_eq!(
+        (missing.state, missing.generation, missing.mark_seq),
+        (MarkState::AccountMissing, 1, 2)
+    );
+    assert_eq!(report.summary.accounts, 1);
+    assert_eq!(report.summary.needs_attention, 1);
+    assert_eq!(report.summary.states[&MarkState::AccountMissing], 1);
+    assert!(report.needs_attention());
+    let text = report.to_json_lines().expect("encode");
+    let first: serde_json::Value =
+        serde_json::from_str(text.lines().next().expect("a line")).expect("json");
+    assert_eq!(
+        first,
+        serde_json::json!({
+            "key": gone.service_key.as_str(), "state": "account_missing",
+            "generation": 1, "mark_seq": 2
+        })
+    );
+    fx.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_check_marks_keys_the_database_names_are_not_missing() {
+    let Some(fx) = fixture().await else { return };
+    let (db, keys, dir) = (&fx.db, &fx.keys, fx.key_dir.path());
+    // An erasure under way: the account is gone, its key owed deleting, its files still
+    // there.
+    let erasing = create(db, keys, "erasing", true).await;
+    append(db, keys, "erasing", &[1], true).await;
+    write(
+        db,
+        &format!(
+            "DELETE FROM accounts WHERE id = 'erasing'; \
+             INSERT INTO erased_keys (key_id, account_id, erased_at_ms, reason) \
+             VALUES ('{}', 'erasing', {T0}, 'erasure')",
+            erasing.service_key
+        ),
+    )
+    .await;
+    // A pending key the account names, with a mark file, and a push key with none.
+    let pending = create(db, keys, "pending", true).await;
+    let next = keys.generate().await.expect("pending key");
+    write_mark(
+        dir,
+        &NewAccount {
+            service_key: next.id.clone(),
+            ..pending
+        },
+        Mark {
+            generation: 2,
+            seq: 1,
+            chain_hash: [1; 32],
+        },
+    );
+    write(
+        db,
+        &format!(
+            "UPDATE accounts SET pending_key = '{}' WHERE id = 'pending'",
+            next.id
+        ),
+    )
+    .await;
+    keys.generate().await.expect("push key");
+
+    let report = check_marks::run(&options(db, dir, true))
+        .await
+        .expect("check");
+    assert!(report.missing.is_empty(), "{:?}", report.missing);
+    assert_eq!(report.summary.states[&MarkState::AccountMissing], 0);
+
+    // An account created after the accounts were read, before the mark files are: the
+    // database names its key by the time its mark is listed.
+    let view = KeyStoreView::open(dir).expect("view");
+    let mut conn = open_read_only_with(db.options()).await.expect("connect");
+    create(db, keys, "late", true).await;
+    append(db, keys, "late", &[1], true).await;
+    let missing = check_marks::missing_accounts(&mut conn, &view, &HashSet::new())
+        .await
+        .expect("missing");
+    assert!(missing.is_empty(), "{missing:?}");
+    fx.db.drop_database().await.expect("drop");
 }
