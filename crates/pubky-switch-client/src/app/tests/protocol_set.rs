@@ -1260,3 +1260,29 @@ async fn test_protocol_set_owed_call_never_lets_the_cursor_pass_what_its_protoco
     assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
     assert!(app.cursor().seq >= chat_second, "{:?}", app.cursor());
 }
+
+#[tokio::test]
+async fn test_protocol_set_load_refuses_a_certificate_with_a_root_no_protocol_owns() {
+    let p = Pair::new();
+    let id = p.join().await.app_id();
+    // The certificate the app holds names a scope of a root none of its protocols owns.
+    let cert = cert_for(
+        &p.w.alice,
+        &app_keys("wallet"),
+        START,
+        &["tasks", "chat", "news"],
+    );
+    let ns = crate::store::client_namespace(&id);
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(
+            &ns,
+            b"cert".to_vec(),
+            crate::app::state::encode(cert.signed()).unwrap(),
+        )
+        .unwrap();
+    p.store.commit(batch).unwrap();
+    let before = p.snapshot(&id);
+    usage(p.load(id).await, "`news`");
+    assert_eq!(p.snapshot(&id), before);
+}
