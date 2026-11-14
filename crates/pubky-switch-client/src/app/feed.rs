@@ -2188,13 +2188,7 @@ impl App {
             .stored
             .and_then(|id| self.state.parked.get(&id).cloned().map(|entry| (id, entry)));
         let (id, parked) = match stored {
-            Some((id, stored)) => (
-                id,
-                ParkedEntry {
-                    reason,
-                    ..stored
-                },
-            ),
+            Some((id, stored)) => (id, ParkedEntry { reason, ..stored }),
             None => (
                 self.new_stored_id(tx)?,
                 ParkedEntry {
