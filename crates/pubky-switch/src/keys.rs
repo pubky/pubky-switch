@@ -355,8 +355,8 @@ pub fn sign_checkpoint(
 /// synced, so a crash leaves the old content or the new, never a mix. A write that fails may
 /// have landed its rename without the directory sync, so nothing the store reads from a file
 /// counts as written before a directory sync covers it: a retry that finds its file in place
-/// repeats the sync before it reports success, and the store syncs its directories when it
-/// opens, before it reads them. Put the directory on
+/// repeats the sync before it reports success, writes the file again or is refused, and the
+/// store syncs its directories when it opens, before it reads them. Put the directory on
 /// a disk that database backups don't cover, and back it up on its own: losing it loses
 /// every account's service key.
 ///
@@ -1633,7 +1633,12 @@ mod tests {
         faults.lock().fail_sync(dir.path(), 2);
         assert!(store.operator().await.is_err());
         assert!(store.operator().await.is_err());
-        store.operator().await.expect("operator");
+        let first = store.operator().await.expect("operator").public_key();
+        let store = crash_and_reopen(&dir, &faults);
+        assert_eq!(
+            store.operator().await.expect("operator").public_key(),
+            first
+        );
     }
 
     #[tokio::test]
