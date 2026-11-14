@@ -5007,6 +5007,28 @@ async fn test_hold_message_backup_naming_a_message_outside_its_outbox_is_refused
     assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
 }
 
+/// A hold left by a delivery that ended without its give-up told, as a kept batch dropped
+/// leaves one, holds nothing once the message is queued again.
+#[tokio::test]
+async fn test_hold_message_left_from_an_ended_delivery_holds_nothing_queued_again() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    let mut tx = wallet.tx().unwrap();
+    super::super::send::put_message_hold(&mut tx, signed.msg_id()).unwrap();
+    wallet.commit(tx).await.unwrap();
+    assert!(wallet.held_messages().await.unwrap().is_empty());
+    wallet.queue_signed(signed.clone()).await.unwrap();
+    assert!(wallet.held_messages().await.unwrap().is_empty());
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![signed.msg_id().to_owned()]);
+    assert_eq!(p.bob.switch().entries_from(&alice), 1);
+}
+
 /// Withdrawing one message gives it up, told once, and never queued again, while another
 /// to the same counterparty still goes; its hold ends with it.
 #[tokio::test]

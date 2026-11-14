@@ -2086,14 +2086,16 @@ impl App {
                 // The entries it brings back are told to the protocol again, in steps after
                 // the restore commits (Switch spec 12.4).
                 parked::Retell::start(&app.state, &mut tx)?;
+                // The store's message holds before the backup's outbox: a message the backup
+                // left out past its budget is given up there, which ends its hold.
+                for msg_id in &old_message_holds {
+                    send::put_message_hold(&mut tx, msg_id)?;
+                }
                 app.reinstall_outbox(backup, &mut tx)?;
                 for rest in &old_holds {
                     if let Ok(pubky) = pubky_switch_core::enc::unb64_array::<32>(rest) {
                         send::put_hold(&mut tx, &pubky)?;
                     }
-                }
-                for msg_id in &old_message_holds {
-                    send::put_message_hold(&mut tx, msg_id)?;
                 }
                 tx.local(&layer_writes)?;
                 tx.put(key::PROTOCOLS, &protocols_names)?;
@@ -3360,16 +3362,17 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Left`] for an app that left; a store failure, after which the app holds
-    /// no alarm and the host raises it again.
+    /// [`Refusal::Left`] for an app that left; a store failure, after which the app isn't
+    /// stopped on this alarm: the host raises it again, and one the store kept after all is
+    /// the alarm then returned.
     pub async fn raise_rollback(&mut self, reason: impl Into<String>) -> Result<Alarm, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
-            if let Some(held) = &self.state.alarm {
-                return Ok(held.clone());
-            }
             if self.state.leave.is_some() {
                 return Err(Refusal::Left.into());
+            }
+            if let Some(held) = &self.state.alarm {
+                return Ok(held.clone());
             }
             let alarm = Alarm::Rollback {
                 reason: records::cut_reason(reason.into()),

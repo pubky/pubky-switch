@@ -989,7 +989,9 @@ impl App {
     ///   the app's other messages to the same counterparty.
     /// - **The replay deadline keeps running** ([`App::queue_stored`]): a message still held
     ///   past it is given up and the protocol told ([`AppEvent::MessageUndelivered`]). The
-    ///   hold ends in the commit that gives the delivery up, whatever gives it up.
+    ///   hold ends in the commit that gives the delivery up, whatever gives it up; a
+    ///   message queued again ([`App::queue_signed`], [`App::queue_stored`]) starts unheld,
+    ///   as one a dropped kept batch would have queued.
     /// - **Where it holds:** in this app's store: another app or device of the same
     ///   identity has an outbox of its own.
     /// - **A backup carries it** for a message the backup carries in its outbox. A restore
@@ -1174,6 +1176,9 @@ impl App {
             }
             let mut tx = self.tx()?;
             put_outbox_item(&mut tx, &item)?;
+            // Queued anew, it starts unheld: a hold left by a delivery that ended without
+            // its give-up told, such as a kept batch dropped, holds nothing now.
+            end_message_hold(&mut tx, &item.msg_id)?;
             self.commit(tx).await?;
             Ok(item.msg_id)
         })
@@ -1246,6 +1251,7 @@ impl App {
             let written = async {
                 let mut tx = self.tx()?;
                 put_outbox_item(&mut tx, &item)?;
+                end_message_hold(&mut tx, &item.msg_id)?;
                 self.commit(tx).await
             }
             .await;
@@ -1857,8 +1863,9 @@ impl App {
         if item.failed.is_some() {
             return Ok(false);
         }
-        // A delivery to a counterparty the host holds, or one its protocol holds back, isn't
-        // tried, a first one or a re-send ([`App::hold_queued`], [`super::Protocol::may_send`]);
+        // A delivery to a counterparty the host holds, of a message it holds, or one its
+        // protocol holds back, isn't tried, a first one or a re-send ([`App::hold_queued`],
+        // [`App::hold_message`], [`super::Protocol::may_send`]);
         // its replay deadline still runs, and its record job goes.
         let held = self.delivery_waits(&item).await?;
         // A delivery with a replay deadline, one a restore put back, one `queue_stored`
