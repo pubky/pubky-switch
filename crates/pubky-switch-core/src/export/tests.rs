@@ -883,16 +883,6 @@ fn test_part_reading_rules() {
         v.as_object_mut().unwrap().remove(k);
         assert_eq!(Part::read(&v).unwrap_err().status(), 400, "{k}");
     }
-    // An earlier form's members are refused, whatever they hold.
-    for old in [json!(null), json!([]), json!("x")] {
-        let mut v = app.clone();
-        v["key_bundles"] = old.clone();
-        assert!(Part::read(&v).unwrap_err().reason.contains("key_bundles"));
-        let mut c: Value =
-            serde_json::from_slice(&f.parts[f.index("claim")].to_json().unwrap()).unwrap();
-        c["claim"]["entries"] = old;
-        assert!(Part::read(&c).unwrap_err().reason.contains("entries"));
-    }
     let mut b: Value =
         serde_json::from_slice(&f.parts[f.index("batch")].to_json().unwrap()).unwrap();
     b["record"]["proofs"] = json!([f.record_proof]);

@@ -45,6 +45,6 @@ pub use key::{
 };
 pub use protocol::{GrantPath, Protocol, ProtocolError, Protocols, ScopeDef, ScopeTerms};
 pub use signer::{
-    AbortOutcome, AppReview, ApprovedRequest, CertChange, HighWater, ReceivingApp, RunDue, Signer,
-    SignerEnv, SignerStatus, UserConfirmed,
+    AbortOutcome, AppReview, AppStanding, AppSummary, ApprovedRequest, CertChange, HighWater,
+    ReceivingApp, RunDue, Signer, SignerEnv, SignerStatus, UserConfirmed,
 };

@@ -258,13 +258,24 @@ fn test_vectors_keys_identities_through_the_vault() {
     }
 }
 
-/// The records `envelopes.json` `signer_handover` seals, as JSON bytes, with `doc` in place of
-/// version 3 and, for a backup, `prev`: the records a signer holding `doc` seals, when it holds
-/// the vector's other records (Switch wire 3.12, 3.13).
+/// The records `envelopes.json` `signer_handover` seals, as a backup's plaintext in JSON bytes,
+/// with `doc` in place of version 3 and `prev`: the records a signer holding `doc` backs up,
+/// when it holds the vector's other records (Switch wire 3.12, 3.13). A backup's plaintext is
+/// the hand-over's with its own `kind` and without `identity_secret`.
 fn vector_records(doc: &SignedDoc, prev: Option<[u8; 32]>) -> Vec<u8> {
     let plaintext = text(&load("envelopes.json")["signer_handover"], "plaintext_json").to_owned();
+    let handover: Value = serde_json::from_str(&plaintext).unwrap();
+    let secret = format!(
+        ",\"identity_secret\":\"{}\"",
+        text(&handover, "identity_secret")
+    );
     let v3 = document("alice identity.json");
     let mut records = plaintext
+        .replace(
+            "\"kind\":\"pubky-switch.signer_handover\"",
+            "\"kind\":\"pubky-switch.signer_backup\"",
+        )
+        .replace(&secret, "")
         .replace(&v3.body, &doc.body)
         .replace(&v3.sig, &doc.sig);
     if let Some(prev) = prev {
@@ -314,7 +325,12 @@ impl Alice {
     fn backup_records(&self) -> Vec<u8> {
         let bytes = self.homeserver.file(SIGNER_BACKUP_PATH).expect("a backup");
         let backup: SignerBackup = serde_json::from_slice(&bytes).unwrap();
-        backup.open(&self.key).unwrap().to_json().unwrap().to_vec()
+        backup
+            .open(&self.key)
+            .unwrap()
+            .to_backup_json()
+            .unwrap()
+            .to_vec()
     }
 
     fn doc(&self, name: &str) -> IdentityDoc {

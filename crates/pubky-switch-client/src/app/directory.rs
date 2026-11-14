@@ -133,7 +133,6 @@ struct PeersDoc {
     /// The Pubky IDs of the counterparties still owed the delivery, tried again at each
     /// call until it goes or they stop being recent: those a call's budget left untried
     /// first, then those whose delivery failed, in the order they failed.
-    #[serde(default)]
     owed: Vec<String>,
     /// How many of `owed`, from its start, the pass under way hasn't tried yet. While it is
     /// above zero, a call tries only those; at zero, the next call starts a pass over all.
@@ -149,13 +148,11 @@ fn is_zero(n: &usize) -> bool {
 /// `identity.json`, and whether the read succeeded (Switch spec 4.3, "The switch's copy").
 /// `lookup` is the number the lookup took when it began ([`switch_lookups_key`]): which
 /// lookup is the newer is judged by it, not by the clock, which may give two lookups the
-/// same millisecond or move back between them. A record kept before the number reads as 0,
-/// older than any lookup begun since.
+/// same millisecond or move back between them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct SwitchRead {
     at_ms: u64,
     read: bool,
-    #[serde(default)]
     lookup: u64,
 }
 

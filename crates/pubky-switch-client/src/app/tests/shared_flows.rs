@@ -6005,7 +6005,7 @@ async fn test_scripted_feed_query_is_read_as_the_service_reads_it() {
         "feed?after=1:0&after=1:1",
         "feed?limit=%zz",
         "feed?limit=+5",
-        "feed?limit=0",
+        "feed?limit=0&wait=1",
         "feed?limit=501",
         "feed?wait=26",
         "feed?wait=+1",
@@ -6018,6 +6018,7 @@ async fn test_scripted_feed_query_is_read_as_the_service_reads_it() {
     }
     for rest in [
         "feed?limit=%35",
+        "feed?limit=0",
         "feed?limit=500",
         "feed?after=1%3A0&wait=0",
     ] {
@@ -6027,6 +6028,119 @@ async fn test_scripted_feed_query_is_read_as_the_service_reads_it() {
         scripted_get(&s, None, "feed?limit=1&limit=2"),
         (403, json!("permission_missing"), true)
     );
+}
+
+/// A page with no items, as the service answers it (Switch wire 7.4.4): no item, `next`
+/// where the page starts, `more` when anything follows, the head and the cursor of any page,
+/// and the reader's lagging mark kept.
+#[tokio::test]
+async fn test_scripted_feed_page_with_no_items_ends_where_it_starts() {
+    let s = Setup::new();
+    let phone = s.join("phone").await;
+    let me = Some(phone.app_id());
+    let generation = s.w.switch.lock().tip.generation;
+    let last = s.w.switch.seq();
+    let full = scripted_page(&s, me, "feed");
+    s.w.switch
+        .lock()
+        .apps
+        .get_mut(&phone.app_id())
+        .unwrap()
+        .lagging = true;
+    let page = scripted_page(&s, me, "feed?limit=0");
+    assert_eq!(page["items"], json!([]));
+    assert_eq!(
+        (
+            page["next"].clone(),
+            page["scanned_through"].clone(),
+            page["more"].clone()
+        ),
+        (json!(format!("{generation}:0")), json!(0), json!(true))
+    );
+    assert_eq!(
+        (page["head"].clone(), page["cursor"].clone()),
+        (full["head"].clone(), full["cursor"].clone())
+    );
+    let page = scripted_page(&s, me, &format!("feed?after={generation}:{last}&limit=0"));
+    assert_eq!(
+        (
+            page["items"].clone(),
+            page["next"].clone(),
+            page["more"].clone()
+        ),
+        (
+            json!([]),
+            json!(format!("{generation}:{last}")),
+            json!(false)
+        )
+    );
+    assert!(
+        s.w.switch.app(&phone.app_id()).lagging,
+        "a page with no items keeps the mark"
+    );
+}
+
+/// A feed read of `rest` by own app `app` at alice's switch, as the holding transport takes
+/// it.
+fn feed_read(s: &Setup, app: [u8; 16], rest: &str) -> crate::transport::Request {
+    crate::transport::Request {
+        method: "GET".into(),
+        origin: ORIGIN.into(),
+        path_and_query: format!("/v1/{}/{rest}", s.w.alice.id()),
+        headers: vec![
+            crate::transport::Header::new(
+                pubky_switch_core::http::header::IDENTITY,
+                &s.w.alice.id(),
+            ),
+            crate::transport::Header::new(
+                pubky_switch_core::http::header::APP,
+                &pubky_switch_core::enc::zbase32_encode(&app),
+            ),
+        ],
+        body: Vec::new(),
+    }
+}
+
+/// `limit=0` with `wait` at the holding transport, as at the service: `400` from the query,
+/// before the read is admitted, so the app's lagging mark stays (Switch wire 7.4.4).
+#[tokio::test]
+async fn test_scripted_feed_page_with_no_items_and_a_wait_keeps_the_lagging_mark() {
+    let s = Setup::new();
+    let phone = s.join("phone").await;
+    let app = phone.app_id();
+    let transport = s.w.switch.holding_transport();
+    s.w.switch.lock().apps.get_mut(&app).unwrap().lagging = true;
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        transport.send(feed_read(&s, app, "feed?limit=0&wait=5")),
+    )
+    .await
+    .expect("answered")
+    .unwrap();
+    assert_eq!(answer.status, 400);
+    assert!(s.w.switch.app(&app).lagging, "a refused read ends no mark");
+}
+
+/// `limit=0` with `wait` and nothing to show at the holding transport, as at the service:
+/// `400` at once, never held (Switch wire 7.4.4).
+#[tokio::test]
+async fn test_scripted_feed_page_with_no_items_and_a_wait_is_never_held() {
+    let s = Setup::new();
+    let phone = s.join("phone").await;
+    let app = phone.app_id();
+    let generation = s.w.switch.lock().tip.generation;
+    let last = s.w.switch.seq();
+    let transport = s.w.switch.holding_transport();
+    let rest = format!("feed?after={generation}:{last}&limit=0&wait=5");
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        transport.send(feed_read(&s, app, &rest)),
+    )
+    .await
+    .expect("answered at once, not held")
+    .unwrap();
+    assert_eq!(answer.status, 400);
+    assert_eq!(s.w.switch.held_reads(), 0);
 }
 
 /// The peer switch reads an append's query first: decoded, a parameter given twice and a

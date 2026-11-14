@@ -10,9 +10,9 @@
 //! entry points belong to this crate alone. The crate signs only inputs it builds itself, for
 //! the identity-key formats of Switch wire 2.3, the approval's companion claim (Switch wire
 //! 3.10) and Pubky's own formats for the same key, and its public API offers no signing of
-//! bytes a caller supplies (Switch wire 2.1). The secret leaves the vault for two reasons only,
-//! each named by an [`ExportReason`]: sealed in a hand-over to another signer (Switch wire
-//! 3.12), or sealed in the signer's own backup (Switch wire 3.13).
+//! bytes a caller supplies (Switch wire 2.1). The secret leaves the vault for one reason only,
+//! named by an [`ExportReason`]: sealed in a hand-over to another signer (Switch wire 3.12).
+//! The signer's own backup (Switch wire 3.13) holds no secret.
 //!
 //! # For hosts
 //!
@@ -161,7 +161,8 @@ pub enum KeyError {
     Crypto(String),
 }
 
-/// Why the identity secret leaves the vault (Switch spec 12.8). There is no other reason.
+/// Why the identity secret leaves the vault (Switch spec 12.8). There is no other reason:
+/// the signer's backup holds no secret (Switch wire 3.13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportReason {
     /// Sealed in a hand-over to the app with this App ID, the new signer (Switch wire 3.12).
@@ -169,8 +170,6 @@ pub enum ExportReason {
         /// The new signer's App ID.
         to_app: [u8; 16],
     },
-    /// Sealed in the signer's own backup on the Homeserver (Switch wire 3.13).
-    Backup,
 }
 
 /// The identity key, through the host's vault.
@@ -310,10 +309,9 @@ impl IdentityKeyring {
         Ok(keyring)
     }
 
-    /// Take the identity secret received in a hand-over, or opened from the signer's backup,
-    /// into `vault` (Switch spec 12.8). The secret must be the key of `identity`. It is added
-    /// like a new one, so it never replaces another identity's secret, even one added at the
-    /// same moment. A vault that already holds this same secret, as after a retry, is fine.
+    /// Take the identity secret received in a hand-over into `vault` (Switch spec 12.8). The
+    /// secret must be the key of `identity`. It is added like a new one, so it never replaces
+    /// another identity's secret, even one added at the same moment. A vault that already holds this same secret, as after a retry, is fine.
     ///
     /// # Errors
     ///
@@ -426,10 +424,9 @@ impl IdentityKeyring {
     }
 
     /// Open the signer's backup `backup` with the identity key (Switch wire 3.13): what it
-    /// holds, without the identity key it carries, or `None` for one that doesn't open or
-    /// verify. The key opens it and does nothing else; the key in the records goes with them
-    /// here, zeroized. A restore takes the records it shows, never that key: the install
-    /// restores with the key its keyring holds, and signs through the gate.
+    /// holds, or `None` for one that doesn't open or verify. The key opens it and does nothing
+    /// else. The backup holds no key: the install restores with the key its keyring holds,
+    /// and signs through the gate.
     ///
     /// # Errors
     ///
@@ -458,7 +455,7 @@ impl IdentityKeyring {
     }
 }
 
-/// What an opened signer backup holds, but its identity key (Switch wire 3.13).
+/// What an opened signer backup holds (Switch wire 3.13).
 #[derive(Clone, Debug)]
 pub(crate) struct BackupView {
     /// The newest `identity.json` the backup's signer signed.
@@ -526,9 +523,9 @@ impl SigningKey {
         Arc::new(GatedSigner(Arc::clone(&self.key)))
     }
 
-    /// Seal the signer's backup holding `doc` and these records to the backup key, with the
-    /// identity secret in it ([`ExportReason::Backup`], Switch spec 12.8, Switch wire 3.13).
-    /// This is the one place the secret leaves the vault, and only sealed.
+    /// Seal the signer's backup holding `doc` and these records to the backup key (Switch spec
+    /// 12.8, Switch wire 3.13). The key signs it and derives the backup key; the backup holds
+    /// no secret.
     ///
     /// # Errors
     ///
@@ -563,8 +560,8 @@ impl SigningKey {
     /// Seal the hand-over of the identity to `new_signer`, the certificate of a current app,
     /// holding `doc`, the newest version the switch accepted from this signer, and these
     /// records ([`ExportReason::HandOver`], Switch wire 3.12, Switch spec 12.8). The identity
-    /// secret goes into it, sealed to the app's certified bundle key: the second and last
-    /// place it leaves the vault. Only on the user's confirmation.
+    /// secret goes into it, sealed to the app's certified bundle key: the one place it leaves
+    /// the vault. Only on the user's confirmation.
     ///
     /// # Errors
     ///

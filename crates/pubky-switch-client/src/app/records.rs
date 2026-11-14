@@ -196,8 +196,7 @@ pub(crate) fn seen_key(key: &[u8; 32]) -> String {
     format!("{SEEN_PREFIX}{}", b64(key))
 }
 
-/// Where a record's flagged writes are kept. A store kept by an earlier build may hold
-/// them keyed by their version, under the same prefix.
+/// Where a record's flagged writes are kept.
 fn flag_prefix(key: &[u8; 32]) -> String {
     format!("{FLAG_PREFIX}{}/", b64(key))
 }
@@ -611,7 +610,7 @@ pub(crate) struct HeldRecord {
     collection: String,
     policy: Policy,
     op: SignedDoc,
-    cert: Option<SignedDoc>,
+    cert: SignedDoc,
     proof: Option<SignedDoc>,
     #[serde(with = "version_serde")]
     version: RecordVersion,
@@ -630,17 +629,11 @@ pub(crate) struct HeldRecord {
     follow: Option<RecordVersion>,
     /// Whether that refused write is a delete: the next write then builds on `{0, 0}`, as
     /// on a delete the app holds (Switch wire 6.2), since the service may forget the key.
-    #[serde(default)]
     follow_deleted: bool,
     /// Whether the refused write followed names the app that signed it (Switch spec 8.2):
     /// `false` for one refused only on the service's word, which names nobody and reads as
-    /// not flagged. A record an earlier build kept followed only named writes.
-    #[serde(default = "named_by_default")]
+    /// not flagged.
     follow_named: bool,
-}
-
-fn named_by_default() -> bool {
-    true
 }
 
 impl std::fmt::Debug for HeldRecord {
@@ -969,12 +962,10 @@ impl App {
             .scan::<HeldRecord>(RECORD_PREFIX)
             .await?
             .into_iter()
-            .filter_map(|(_, held)| {
-                Some(KeptOp {
-                    op: held.op,
-                    cert: held.cert?,
-                    proof: held.proof,
-                })
+            .map(|(_, held)| KeptOp {
+                op: held.op,
+                cert: held.cert,
+                proof: held.proof,
             })
             .collect();
         let (claim_ops, proofs, claim_entries_left_out) = self.claim_evidence_items().await?;
@@ -1396,7 +1387,7 @@ impl App {
             let collection = Collection::new(&record.collection, record.policy.clone());
             let evidence = Evidence {
                 op: &record.op,
-                cert: record.cert.as_ref(),
+                cert: Some(&record.cert),
                 proof: record.proof.as_ref(),
                 stub: None,
                 view_version: Some(record.version),
@@ -2402,7 +2393,7 @@ impl App {
             collection: accepted.collection.name.clone(),
             policy: accepted.collection.policy.clone(),
             op: accepted.op,
-            cert: Some(accepted.cert.signed().clone()),
+            cert: accepted.cert.signed().clone(),
             proof: accepted.proof,
             version: accepted.version.version,
             authenticated: accepted.version.authenticated,

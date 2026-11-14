@@ -41,7 +41,8 @@ pub(crate) const MAX_WAIT_SECONDS: u64 = 25;
 pub(crate) struct FeedQuery {
     /// The position the page starts after; `None` for the start.
     pub(crate) after: Option<Position>,
-    /// Items per page, 1 to 500.
+    /// Items per page, 0 to 500: 0 shows none, for the page's signed head, time and cursor
+    /// alone.
     pub(crate) limit: usize,
     /// Long-poll seconds, at most 25.
     pub(crate) wait: u64,
@@ -52,8 +53,8 @@ impl FeedQuery {
     ///
     /// # Errors
     ///
-    /// `400` for a malformed `after`, or a `limit` or `wait` that isn't an integer in its
-    /// range.
+    /// `400` for a malformed `after`, a `limit` or `wait` that isn't an integer in its
+    /// range, or `wait` with `limit=0`, which is answered at once.
     pub(crate) fn parse(query: &BTreeMap<String, String>) -> Result<Self, ApiError> {
         let after = query
             .get("after")
@@ -82,14 +83,19 @@ impl FeedQuery {
             None => DEFAULT_LIMIT,
             Some(n) => usize::try_from(n)
                 .ok()
-                .filter(|n| (1..=MAX_LIMIT).contains(n))
-                .ok_or_else(|| ApiError::bad_request("7.4.4: limit is 1 to 500"))?,
+                .filter(|n| *n <= MAX_LIMIT)
+                .ok_or_else(|| ApiError::bad_request("7.4.4: limit is 0 to 500"))?,
         };
         let wait = match number("wait")? {
             None => 0,
             Some(n) if n <= MAX_WAIT_SECONDS => n,
             Some(_) => return Err(ApiError::bad_request("7.4.4: wait is at most 25")),
         };
+        if limit == 0 && wait > 0 {
+            return Err(ApiError::bad_request(
+                "7.4.4: a page with no items is answered at once, without wait",
+            ));
+        }
         Ok(Self { after, limit, wait })
     }
 }
@@ -107,6 +113,14 @@ pub(super) struct FeedRead {
     query: FeedQuery,
     /// The service time the request stamped.
     time_ms: u64,
+}
+
+impl FeedRead {
+    /// Whether the page may show items: not one with `limit=0`, which reads no entry, so it
+    /// doesn't end a lagging mark (Switch wire 7.4.4).
+    pub(super) fn reads_items(&self) -> bool {
+        self.query.limit > 0
+    }
 }
 
 /// How a feed read that can't answer with a page is answered.
@@ -499,7 +513,10 @@ impl PageBuilder {
         if !self.cut {
             self.close_group();
         }
-        let scanned_through = if self.cut {
+        // A page with no items covers no position: it ends where it starts (Switch wire 7.4.4).
+        let scanned_through = if self.limit == 0 {
+            snapshot.start
+        } else if self.cut {
             self.covered.unwrap_or(snapshot.start)
         } else {
             snapshot
@@ -549,7 +566,7 @@ impl PageReader for PageBuilder {
             #[cfg(test)]
             Reader::Fixed(cert) => {
                 self.cert = Some(cert.clone());
-                true
+                self.limit > 0
             }
             Reader::Checked {
                 identity_key,
@@ -600,7 +617,8 @@ impl PageReader for PageBuilder {
                             return false;
                         }
                         self.cert = Some(cert);
-                        true
+                        // A page with no items reads none, its reader checked all the same.
+                        self.limit > 0
                     }
                     Err(stop) => {
                         self.refusal = Some(stop);
@@ -1611,6 +1629,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_feed_page_with_no_items_ends_where_it_starts() {
+        // A page with no items reads none and covers no position: it ends where it starts,
+        // `more` when anything follows (Switch wire 7.4.4).
+        for (start, last_seq, more) in [
+            (0, 9, true),
+            (4, 9, true),
+            (9, 9, false),
+            (12, 9, false),
+            (0, 0, false),
+        ] {
+            let snapshot = snapshot(start, last_seq.min(start + 1000), last_seq);
+            let reader = reader(&["tasks"], &[Permission::ClaimsRead]);
+            let mut builder = PageBuilder::new(reader, 0, usize::MAX);
+            assert!(!builder.begin(&snapshot), "reads no item");
+            let page = builder.finish(&snapshot).expect("page");
+            assert_eq!(
+                (page.items.len(), page.scanned_through, page.more),
+                (0, start, more),
+                "after {start}"
+            );
+        }
+    }
+
     fn query(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
             .iter()
@@ -1653,7 +1695,6 @@ mod tests {
             [("after", "4")],
             [("after", "1:")],
             [("after", "x:1")],
-            [("limit", "0")],
             [("limit", "501")],
             [("limit", "-1")],
             [("limit", "1.5")],
@@ -1663,5 +1704,16 @@ mod tests {
             let error = FeedQuery::parse(&query(&pairs)).expect_err("refused");
             assert_eq!(error.status(), 400, "{pairs:?}");
         }
+    }
+
+    #[test]
+    fn test_feed_query_with_no_items_takes_no_wait() {
+        // `limit=0` shows no item and is answered at once (Switch wire 7.4.4).
+        let parsed = FeedQuery::parse(&query(&[("limit", "0")])).expect("limit 0");
+        assert_eq!((parsed.limit, parsed.wait), (0, 0));
+        assert!(FeedQuery::parse(&query(&[("limit", "0"), ("wait", "0")])).is_ok());
+        let error =
+            FeedQuery::parse(&query(&[("limit", "0"), ("wait", "1")])).expect_err("refused");
+        assert_eq!(error.status(), 400);
     }
 }

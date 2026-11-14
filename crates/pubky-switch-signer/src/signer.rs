@@ -51,6 +51,7 @@ use crate::protocol::Protocols;
 use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 
 mod approval;
+mod apps;
 mod clients;
 mod erasure;
 pub(crate) mod gate;
@@ -67,6 +68,7 @@ mod vector_cases;
 mod vector_protocol;
 
 pub use approval::{AppReview, ApprovedRequest};
+pub use apps::{AppStanding, AppSummary};
 use clients::{RequestClient, SigningClient, Target};
 pub use handover::AbortOutcome;
 pub use renewal::{CertChange, RunDue};
@@ -1413,8 +1415,8 @@ impl Signer {
         Ok(self.keyring.open_backup(&backup)?)
     }
 
-    /// Seal the signer's records, holding `doc`, to the backup key (Switch wire 3.13). The
-    /// identity secret goes into it, so it is the backup's export (Switch spec 12.8).
+    /// Seal the signer's records, holding `doc`, to the backup key (Switch wire 3.13). It holds
+    /// no identity secret (Switch spec 12.8).
     fn seal_backup(&self, doc: &SignedDoc, prev: Option<[u8; 32]>) -> Result<SignerBackup> {
         let identity = self.state.identity;
         let doc = IdentityDoc::verify(doc, &identity)?;

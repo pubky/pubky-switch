@@ -55,6 +55,7 @@ fn app_of<'a>(keys: &'a Keys, app_id: &[u8; 16]) -> &'a AppKeys {
 #[test]
 fn test_vectors_envelopes() {
     let keys = keys();
+    signer_backup_case(&keys);
     let v = load("envelopes.json");
     let members: Vec<&str> = v
         .as_object()
@@ -796,6 +797,63 @@ fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
     }
 }
 
+/// `signer_backup` (Switch wire 3.13), which `pubky-switch-core` generates (README "How the
+/// files were generated"): alice's records of `signer_handover`, with `prev` the document
+/// hash of her version 1, which version 3 builds on, as a backup's plaintext, in one part,
+/// sealed to her backup key with the seed `envelopes/signer_backup`, and signed with her
+/// identity key; and `signatures.json`'s case of the backup's label, which is this backup's.
+fn signer_backup_case(keys: &Keys) {
+    use pubky_switch_core::{enc, sig};
+    let alice = keys.identity("alice");
+    let key = identity_key(keys, &alice);
+    let file = load("envelopes.json");
+    let handover: Value =
+        serde_json::from_str(st(&file["signer_handover"], "plaintext_json")).unwrap();
+    let v1 = identity_named("alice identity.json, first delivery (version 1)", &alice);
+    let records = alice_records(keys, &handover, Some(v1.hash()));
+    let json = records.to_backup_json().unwrap();
+    let label = "envelopes/signer_backup";
+    let randomness = fixed_from_seeds(label);
+    let backup = SignerBackup::seal_parts_with(&key, &[json.as_slice()], &[randomness]).unwrap();
+    let envelope = &backup.envelopes()[0];
+    let (sk_e, _) = envelope::ephemeral_key(&randomness.ikm_e);
+    let case = serde_json::json!({
+        "backup": serde_json::to_value(&backup).unwrap(),
+        "backup_kid": enc::b64(&kid(&key.backup_public())),
+        "backup_secret_hex": hex::encode(key.backup_secret()),
+        "cek_hex": hex::encode(randomness.content_key),
+        "envelope_len": envelope.len(),
+        "ikm_e_hex": hex::encode(randomness.ikm_e),
+        "nonce_hex": hex::encode(randomness.nonce),
+        "note": "Wire 3.13: alice's signer backup, as her signer writes it on her Homeserver at path, under /priv, which the Homeserver serves only to her sessions whose capabilities cover it. Its JSON, plaintext_json, is a backup's plaintext: signer_handover's records with kind pubky-switch.signer_backup, without identity_secret, and with prev, the document hash of her version 1, which version 3 builds on. It is in one part, in an envelope to her backup key (keys.json backup_public, derived from her identity secret), sealed with the seed envelopes/signer_backup, notify off, HPKE info naming alice and that key's kid, plaintext u32_be(len) | JSON | zeros; alice's identity key signs lp(\"pubky-switch/v1/signer-backup\", identity, u32_be(1), envelope bytes) (signatures.json). It opens only with her backup secret, which only the identity key derives.",
+        "path": records::SIGNER_BACKUP_PATH,
+        "plaintext_json": std::str::from_utf8(&json).unwrap(),
+        "sk_e_hex": hex::encode(sk_e),
+    });
+    generated("envelopes.json", &[(Place::Member("/signer_backup"), case)]);
+    let count = 1u32.to_be_bytes();
+    let fields: [&[u8]; 3] = [&alice, &count, envelope];
+    let names = ["identity", "u32_be(n)", "envelope 1 bytes"];
+    let signatures = load("signatures.json");
+    let index = arr(&signatures, "signatures")
+        .iter()
+        .position(|c| c["label"] == labels::sig::SIGNER_BACKUP)
+        .unwrap();
+    let mut held = arr(&signatures, "signatures")[index].clone();
+    held["fields"] = names
+        .iter()
+        .zip(fields)
+        .map(|(name, field)| serde_json::json!({ "hex": hex::encode(field), "name": name }))
+        .collect();
+    held["signature"] = Value::String(enc::b64(&backup.sig()));
+    held["signed_bytes_hex"] = Value::String(hex::encode(sig::signed_bytes(
+        labels::sig::SIGNER_BACKUP,
+        &fields,
+    )));
+    let pointer = format!("/signatures/{index}");
+    generated("signatures.json", &[(Place::Element(&pointer), held)]);
+}
+
 /// `signer_backup` (Switch wire 3.13): alice's backup in one part, opened with her key,
 /// rebuilt byte for byte, and checked for a restore.
 fn check_signer_backup(keys: &Keys, b: &Value) {
@@ -822,14 +880,20 @@ fn check_signer_backup(keys: &Keys, b: &Value) {
     let json = st(b, "plaintext_json").as_bytes();
     let records = backup.open(&key).unwrap();
     assert!(
-        *records.to_json().unwrap() == *json,
+        *records.to_backup_json().unwrap() == *json,
         "the records written again"
     );
+    // A backup's plaintext holds no secret, and names its own kind.
+    let plaintext: Value = serde_json::from_slice(json).unwrap();
+    assert!(plaintext.get("identity_secret").is_none());
+    assert_eq!(st(&plaintext, "kind"), records::BACKUP_KIND);
     let v1 = identity_named("alice identity.json, first delivery (version 1)", &alice);
     assert_eq!(records.prev(), Some(v1.hash()), "prev names version 1");
-    let plaintext: Value = serde_json::from_slice(json).unwrap();
     let rebuilt = alice_records(keys, &plaintext, Some(v1.hash()));
-    assert!(*rebuilt.to_json().unwrap() == *json, "the records rebuilt");
+    assert!(
+        *rebuilt.to_backup_json().unwrap() == *json,
+        "the records rebuilt"
+    );
     let randomness = fixed(st(b, "cek_hex"), st(b, "nonce_hex"), st(b, "ikm_e_hex"));
     let again = SignerBackup::seal_parts_with(&key, &[json], &[randomness]).unwrap();
     assert!(again == backup, "the backup rebuilt");

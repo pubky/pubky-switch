@@ -148,10 +148,8 @@ pub(crate) struct ErasingRecord {
     /// The first try, app clock.
     pub(crate) since_ms: u64,
     /// The last try counted, app clock.
-    #[serde(default)]
     pub(crate) last_ms: u64,
     /// The tries counted.
-    #[serde(default)]
     pub(crate) tries: u32,
 }
 

@@ -1099,6 +1099,14 @@ impl ScriptedSwitch {
             Some(value) => Position::parse(value).ok()?.seq,
             None => 0,
         };
+        // As the feed reads `limit` (`Inner::feed`): one it refuses, `limit=0` with `wait`
+        // among them, is answered at once.
+        let limit = params
+            .get("limit")
+            .map_or(Some(100), |value| decimal(value));
+        if !limit.is_some_and(|limit| (1..=500).contains(&limit)) {
+            return None;
+        }
         let wait_s = feed_wait(params.get("wait")?).filter(|seconds| *seconds > 0)?;
         // The read is admitted as it arrives, as the service admits it under its lock: an
         // account that doesn't serve it (gone, staged, or frozen for a write) or an app that
@@ -2395,8 +2403,9 @@ impl Inner {
         }
         self.feed_reads += 1;
         // The query as the service reads it (`crates/pubky-switch/src/service/feed.rs`,
-        // `FeedQuery::parse`): decoded, `after` a position, `limit` 1 to 500 (100 by
-        // default) and `wait` at most 25, each digits only. The read was held before it came
+        // `FeedQuery::parse`): decoded, `after` a position, `limit` 0 to 500 (100 by
+        // default) and `wait` at most 25, each digits only, `wait` above 0 refused with
+        // `limit=0`. The read was held before it came
         // here, if it had nothing to show.
         let Some(params) = parse_query(query) else {
             return bad(
@@ -2412,13 +2421,15 @@ impl Inner {
         };
         let limit = match params.get("limit").map(|value| decimal(value)) {
             None => 100usize,
-            Some(Some(value @ 1..=500)) => usize::try_from(value).unwrap_or(500),
+            Some(Some(value @ 0..=500)) => usize::try_from(value).unwrap_or(500),
             Some(_) => return bad(ErrorCode::BadRequest, "limit", json!(null)),
         };
-        if params
-            .get("wait")
-            .is_some_and(|value| feed_wait(value).is_none())
-        {
+        let wait = match params.get("wait").map(|value| feed_wait(value)) {
+            None => 0,
+            Some(Some(wait)) => wait,
+            Some(None) => return bad(ErrorCode::BadRequest, "wait", json!(null)),
+        };
+        if limit == 0 && wait > 0 {
             return bad(ErrorCode::BadRequest, "wait", json!(null));
         }
         let mut items = Vec::new();
@@ -2437,6 +2448,12 @@ impl Inner {
                 }
                 _ => groups.push(vec![item]),
             }
+        }
+        // A page with no items covers no position: it ends where it starts, `more` when
+        // anything follows (Switch wire 7.4.4).
+        if limit == 0 {
+            groups.clear();
+            truncated = after < self.seq;
         }
         for (scanned, group) in groups.into_iter().enumerate() {
             if items.len() >= limit || self.max_page_scan.is_some_and(|max| scanned >= max) {
@@ -2460,7 +2477,7 @@ impl Inner {
             }
             items.extend(shown);
         }
-        if !truncated {
+        if !truncated && limit > 0 {
             last = last.max(self.seq);
         }
         // The `seq` of the reader's own cursor, 0 before its first move, as the service
@@ -2482,8 +2499,11 @@ impl Inner {
         {
             page["freeze"] = json!(freeze);
         }
-        // The reader's feed read ends its lagging mark (Switch wire 7.4.4).
-        if let Some(held) = self.apps.get_mut(&app) {
+        // The reader's feed read ends its lagging mark, unless it reads no entry (Switch wire
+        // 7.4.4).
+        if limit > 0
+            && let Some(held) = self.apps.get_mut(&app)
+        {
             held.lagging = false;
         }
         (200, page)
