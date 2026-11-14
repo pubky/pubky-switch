@@ -6978,8 +6978,12 @@ impl Protocol for LayeredDenyProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &crate::app::ReceivedMessage) -> crate::app::Outcome {
-        self.sample.receive(message)
+    fn receive(
+        &self,
+        message: &crate::app::ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> crate::app::Outcome {
+        self.sample.receive(message, cx)
     }
 
     fn resend_needed(
