@@ -1039,6 +1039,244 @@ async fn move_cursor_at(replay: &Replay, name: &str, seq: u64, at: &str) {
     );
 }
 
+/// A renewal of the wallet's certificate by alice, issued at `issued_ms`.
+fn wallet_renewal(issued_ms: u64) -> pubky_switch_core::records::AppCert {
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet");
+    let app_keys = AppKeys::from_secrets(
+        hex32(&wallet["signing_secret_hex"]),
+        hex32(&wallet["bundle_secret_hex"]),
+    );
+    let identity =
+        pubky_switch_core::keys::IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let old =
+        pubky_switch_core::records::AppCert::verify(&doc("wallet certificate"), &identity.public())
+            .expect("old");
+    pubky_switch_core::records::AppCert::issue(
+        &identity,
+        pubky_switch_core::records::AppCertBody::new(
+            identity.public(),
+            app_keys.signing_public(),
+            app_keys.bundle_public(),
+            old.scopes().to_vec(),
+            old.permissions(),
+            issued_ms,
+            issued_ms + 180 * 86_400_000,
+        ),
+    )
+    .expect("cert")
+}
+
+/// The signer stores `cert` as its app's renewed certificate, with a key bundle part made
+/// for it (`cert.put`, Switch wire 7.4.12).
+async fn store_renewal(replay: &Replay, cert: &pubky_switch_core::records::AppCert, batch: u8) {
+    let identity = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+        &alice(&vectors("keys.json"))["secret_hex"],
+    ));
+    let part = pubky_switch_core::records::seal_bundle_parts(&identity, cert, 1, 1, &|_| true)
+        .expect("bundle")
+        .remove(0);
+    let ops = sign_batch(
+        &identity,
+        &identity.public(),
+        None,
+        1,
+        [batch; 16],
+        vec![
+            (
+                Vec::new(),
+                OpKind::CertPut {
+                    target_app_id: cert.app_id(),
+                    cert: cert.signed().clone(),
+                },
+            ),
+            (
+                Vec::new(),
+                OpKind::KeyBundlePut(pubky_switch_core::ops::KeyBundlePut {
+                    target_app_id: cert.app_id(),
+                    bundle: part.bundle,
+                    first_epoch: part.first_epoch,
+                    last_epoch: part.last_epoch,
+                }),
+            ),
+        ],
+    )
+    .expect("batch");
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &format!("/v1/{}/ops", alice_id()),
+            OpsRequest::new(&ops, None).to_json(),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+/// alice's signer delivers the version after `prev`, with `change`.
+async fn deliver_after(
+    replay: &Replay,
+    prev: &SignedDoc,
+    change: impl FnOnce(&mut pubky_switch_core::records::IdentityBody),
+) -> SignedDoc {
+    let mut body: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&prev.body_bytes().expect("body")).expect("body");
+    body.version += 1;
+    change(&mut body);
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+        &alice(&vectors("keys.json"))["secret_hex"],
+    ));
+    let next = pubky_switch_core::records::IdentityDoc::sign(&key, body)
+        .expect("sign")
+        .signed()
+        .clone();
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: next.clone(),
+        prev: Some(prev.doc_hash().expect("hash")),
+    }
+    .to_json();
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &format!("/v1/{}/identity", alice_id()),
+            delivery,
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    next
+}
+
+#[tokio::test]
+async fn test_inbox_an_entry_waits_while_a_cert_put_leaves_its_target_not_current() {
+    let Some(replay) = replay().await else { return };
+    let chain = vectors("chain.json");
+    serve_alice(&replay).await;
+    replay_batch(&replay, &chain, &[3, 4]).await;
+    assert_eq!(replay.db.give_out_seq(&alice_id()).await.expect("seq"), 5);
+    replay_batch(&replay, &chain, &[6]).await;
+    replay_batch(&replay, &chain, &[7, 8]).await;
+    set_time(&replay.clock, &at());
+    register_phone(&replay, ms(&at())).await;
+    wallet_op(
+        &replay,
+        OpKind::AllowPut {
+            pubky: hex32(&bob()["public_hex"]),
+            kind: AllowKind::Contact,
+        },
+        61,
+    )
+    .await;
+    deliver_bob(&replay).await;
+    let identity = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+        &alice(&vectors("keys.json"))["secret_hex"],
+    ));
+    let old =
+        pubky_switch_core::records::AppCert::verify(&doc("wallet certificate"), &identity.public())
+            .expect("old");
+    let b = wallet_renewal(old.issued_at() + 60_000);
+    let c = wallet_renewal(old.issued_at() + 120_000);
+    let wallet = app_id_of("wallet");
+    // The signer stores renewal B, then lists it and closes the certificate the wallet's
+    // record carries: the wallet is current through B alone.
+    store_renewal(&replay, &b, 95).await;
+    let listed_b = deliver_after(&replay, &doc("alice identity.json"), |body| {
+        if let Some(listed) = body.apps.iter_mut().find(|listed| listed.app_id == wallet) {
+            listed.cert = b.hash();
+        }
+        body.renewed.push(pubky_switch_core::records::RenewedCert {
+            app_id: wallet,
+            cert: old.hash(),
+            until: Some(ms(&at())),
+        });
+    })
+    .await;
+    assert_eq!(
+        status_of(&apps_status(&replay).await, "wallet")["current"],
+        json!(true)
+    );
+    let version = apps_version(&replay).await;
+    let answer = from_shop(
+        &replay,
+        sealed_to(&[receive_public("wallet")], 15),
+        Some(version),
+        None,
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let seq = entry_seq(&replay).await;
+    // The signer stores renewal C, which no document lists: the wallet stops being current
+    // with no departure, and the entry, wrapped to it alone, waits as an entry (Switch wire
+    // 7.4.4 "Unreadable items").
+    store_renewal(&replay, &c, 96).await;
+    assert_eq!(
+        status_of(&apps_status(&replay).await, "wallet")["current"],
+        json!(false)
+    );
+    assert_eq!(
+        (
+            count(&replay, "entry").await,
+            count(&replay, "unreadable").await
+        ),
+        (1, 0)
+    );
+    // The phone's cursor moves past it, with trusted time: it still waits, unconverted.
+    move_cursor(&replay, "phone", seq).await;
+    assert_eq!(
+        (
+            count(&replay, "entry").await,
+            count(&replay, "unreadable").await
+        ),
+        (1, 0)
+    );
+    // A version listing C makes the wallet current again: it reads the entry, and its
+    // cursor past it lets it go.
+    deliver_after(&replay, &listed_b, |body| {
+        if let Some(listed) = body.apps.iter_mut().find(|listed| listed.app_id == wallet) {
+            listed.cert = c.hash();
+        }
+        body.renewed.push(pubky_switch_core::records::RenewedCert {
+            app_id: wallet,
+            cert: b.hash(),
+            until: Some(ms(&at())),
+        });
+    })
+    .await;
+    assert_eq!(
+        status_of(&apps_status(&replay).await, "wallet")["current"],
+        json!(true)
+    );
+    let feed = wallet_feed(&replay, seq - 1).await;
+    assert!(
+        feed["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .any(|item| item["type"] == "entry" && item["seq"] == seq),
+        "{feed}"
+    );
+    move_cursor(&replay, "wallet", seq).await;
+    assert_eq!(entries(&replay).await, 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
 /// What one entry of the tests' envelopes counts against the inbox quota.
 fn entry_bytes() -> u64 {
     u64::try_from(sealed_to(&[receive_public("executor")], 1).len()).expect("len")

@@ -30,7 +30,7 @@ pub struct KeptAppId {
     /// When it was revoked or departed, or the enrollment that named it.
     pub at_ms: u64,
     /// The newest document's data epoch then, which its rotation goes above; `None` for an
-    /// enrollment's, and for one kept before the service recorded it.
+    /// enrollment's.
     pub data_epoch: Option<u64>,
     /// Whether a delivered document has listed it in `removed` above that epoch: a
     /// departure's rotation is done, for good.
@@ -183,8 +183,7 @@ impl AccountTxn {
     }
 
     /// Note the rotations `doc` makes: each departed app it lists in `removed` at a data epoch
-    /// above the one at its departure (Switch wire 7.4.12 `awaiting_rotation`). An App ID
-    /// kept without that epoch counts any.
+    /// above the one at its departure (Switch wire 7.4.12 `awaiting_rotation`).
     pub async fn note_rotations(
         &mut self,
         removed: &[[u8; 16]],
@@ -195,7 +194,7 @@ impl AccountTxn {
         sqlx::query(
             "UPDATE kept_app_ids SET rotated = true WHERE account_id = $1 \
              AND reason = 'departed' AND app_id = ANY($2) \
-             AND (data_epoch IS NULL OR data_epoch < $3)",
+             AND data_epoch < $3",
         )
         .bind(id)
         .bind(removed)

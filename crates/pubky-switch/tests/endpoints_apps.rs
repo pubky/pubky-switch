@@ -593,6 +593,44 @@ async fn next_version(
 }
 
 #[tokio::test]
+async fn test_apps_a_relisted_app_keeps_its_first_listing() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let keys = vectors("keys.json");
+    let wallet =
+        pubky_switch_core::enc::app_id_decode(app(&keys, "wallet")["app_id"].as_str().expect("id"))
+            .expect("app id");
+    let v3 = held_doc("alice identity.json");
+    let v3_body: IdentityBody =
+        serde_json::from_slice(&v3.body_bytes().expect("body")).expect("identity body");
+    let entry = v3_body
+        .apps
+        .iter()
+        .find(|listed| listed.app_id == wallet)
+        .copied()
+        .expect("listed");
+    let apps = body(&get_apps(&replay, "signer", &at).await);
+    assert_eq!(status(&apps, "wallet")["keys_through"], 1);
+    // Dropped from apps at data epoch 3, then listed again at 4: `keys_through` starts at
+    // the first `identity.json` that listed it, and a later listing never dates it again
+    // (Switch wire 7.4.12).
+    let v4 = version_4(|body| {
+        body.apps.retain(|listed| listed.app_id != wallet);
+        body.data_epoch = 3;
+    });
+    assert_eq!(deliver(&replay, v4.clone(), &at).await.status, 200);
+    next_version(&replay, &v4, &at, |body| {
+        body.data_epoch = 4;
+        body.apps.push(entry);
+    })
+    .await;
+    let apps = body(&get_apps(&replay, "signer", &at).await);
+    assert_eq!(status(&apps, "wallet")["keys_through"], 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_apps_departure_rotation_is_done_for_good() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;

@@ -952,13 +952,11 @@ impl Service {
             }
         };
         // Step 4, with trusted time only, for a caller that has verified: a bounded batch of
-        // the claims whose time has passed goes, by the time base (Switch wire 7.3), a
-        // bounded batch of the documents chained before superseded documents were deleted
-        // is checked (Switch wire 7.5), and the sweeps of 9.1 run (`sweeps.rs`). It comes
-        // before the endpoint, so a refusal doesn't undo it; an unauthenticated request, or
-        // the public read, pays for none of it. A claim a request reads or writes goes when
-        // it is due, whatever the batch reached. Chain stub retention comes last
-        // (`retention.rs`).
+        // the claims whose time has passed goes, by the time base (Switch wire 7.3), and the
+        // sweeps of 9.1 run (`sweeps.rs`). It comes before the endpoint, so a refusal doesn't
+        // undo it; an unauthenticated request, or the public read, pays for none of it. A
+        // claim a request reads or writes goes when it is due, whatever the batch reached.
+        // Chain stub retention comes last (`retention.rs`).
         if let (Some(base), Some(_)) = (due, caller)
             && let Err(error) = match self.step_four(&mut txn, base).await {
                 Ok(()) => self.retain_chain(&mut txn, &signer, base).await,
