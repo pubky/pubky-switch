@@ -145,7 +145,7 @@ impl App {
     }
 
     /// Whether a position of `generation` is of the current sequence (Switch spec 8.3).
-    fn current_sequence(&self, generation: u64) -> bool {
+    pub(crate) fn current_sequence(&self, generation: u64) -> bool {
         self.state
             .own_doc
             .body()

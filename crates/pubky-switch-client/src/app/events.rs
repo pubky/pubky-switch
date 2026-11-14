@@ -42,7 +42,7 @@ use pubky_switch_core::enc::serde_b64;
 
 use super::error::Alarm;
 use super::feed::OwedCall;
-use super::protocol::{MissedEntries, ResendNeeded, StoreFailure};
+use super::protocol::{DenyListChange, MissedEntries, ResendNeeded, StoreFailure};
 use super::recovery::ProviderLoss;
 
 /// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
@@ -369,6 +369,28 @@ pub enum AppEvent {
         /// owed then, and asked by a later read.
         resend_asked: bool,
     },
+    /// A read stopped before handing anything, because a call the protocol must take first
+    /// failed again (an owed re-send, missed-entries or deny list call, a deny list change
+    /// whose writer couldn't be looked up yet, or a deny list gap): raised from the
+    /// [`super::RETRY_EVENT_READS`]th such read in a row on, on each, the read where it
+    /// first failed included. Nothing after it is handed until the protocol takes it; the
+    /// host repairs or frees the protocol's store, or its connection.
+    OwedCallHeld {
+        /// The reads in a row that stopped there, this one included.
+        reads: u32,
+    },
+    /// A deny list operation the feed showed that isn't the identity's own (Switch wire
+    /// 6.2): signed by no app holding `lists.manage`, by a removed app after its
+    /// `distrust_from`, or of another identity. Neither applied to the copy of the lists
+    /// nor handed to the protocol. A faulty or hostile service showed it.
+    DenyListChangeRefused {
+        /// The generation of the feed item.
+        generation: u64,
+        /// Its `seq`.
+        seq: u64,
+        /// The rule it broke.
+        reason: String,
+    },
     /// A feed page reported the cursor the service holds ahead of the furthest position
     /// the app committed or sent, for an app whose devices don't share its cursor (Switch
     /// spec 8.3): an instance of the app passed entries its state doesn't hold. Its state
@@ -645,9 +667,10 @@ pub enum AppEvent {
         /// The attempt.
         attempt_id: [u8; 16],
     },
-    /// A restore in place left behind kept duty events and owed protocol calls whose stored
-    /// values didn't read: what they said is lost, and the protocol learns only how many
-    /// (`STATE.md`, "What the app owes its protocol"). A duty event.
+    /// A restore left behind kept duty events and owed protocol calls whose values didn't
+    /// read, the store's at a restore in place, the backup's on a store without an epoch:
+    /// what they said is lost, and the protocol learns only how many (`STATE.md`, "What the
+    /// app owes its protocol"). A duty event.
     RestoreLeftBehind {
         /// The duty event's ID.
         id: EventId,
@@ -892,6 +915,16 @@ pub enum RefusedCall {
     },
     /// [`super::Protocol::missed`].
     Missed(MissedEntries),
+    /// [`super::Protocol::deny_list_changed`].
+    DenyListChanged(DenyListChange),
+    /// [`super::Protocol::deny_list_gap`], about the gap after this position; the copy of
+    /// the lists was taken without its writes.
+    DenyListGap {
+        /// The generation of the last position the history is known complete through.
+        generation: u64,
+        /// That position's `seq`.
+        seq: u64,
+    },
     /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at this loss;
     /// the loss went on without them.
     ProviderLost(ProviderLoss),
@@ -910,6 +943,10 @@ pub(crate) enum KeptRefusal {
         declared_at_ms: u64,
         accepted_from_ms: u64,
         uncertain_until_ms: u64,
+    },
+    DenyGap {
+        generation: u64,
+        seq: u64,
     },
 }
 
@@ -930,6 +967,7 @@ impl KeptRefusal {
                 accepted_from_ms,
                 uncertain_until_ms,
             }),
+            Self::DenyGap { generation, seq } => RefusedCall::DenyListGap { generation, seq },
         }
     }
 }

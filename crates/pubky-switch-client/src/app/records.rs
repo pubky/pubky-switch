@@ -2137,7 +2137,7 @@ impl App {
     /// The certificates of `app_id` that `tx` keeps, not committed yet: those of the writes
     /// taken earlier in the same read, so one view read serves a page's writes under one
     /// certificate. Each is read once, however often `tx` keeps it.
-    fn pending_certs(&self, tx: &Tx, app_id: &[u8; 16]) -> Vec<AppCert> {
+    pub(crate) fn pending_certs(&self, tx: &Tx, app_id: &[u8; 16]) -> Vec<AppCert> {
         let prefix = format!(
             "{CERT_PREFIX}{}/",
             pubky_switch_core::enc::zbase32_encode(app_id)

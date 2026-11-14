@@ -84,11 +84,11 @@ pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PEEK_PAGES, PeekReport, Peeked};
 pub use protocol::{
-    Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
-    MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need,
-    OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS,
-    ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, WriteBase, decode_local_state,
-    encode_local_state, local_writes_bytes,
+    DenyListChange, DenyListGap, Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS,
+    MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES,
+    MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer,
+    RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, WriteBase,
+    decode_local_state, encode_local_state, local_writes_bytes,
 };
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
@@ -138,6 +138,7 @@ use pubky_switch_core::records::{
     AppCert, AppRecord, AppRecordBody, AppRequest, Approval, CLOCK_TOLERANCE_MS, DAY_MS,
     IdentityDoc, ReceiveKeyBody, ReceiveKeyRecord,
 };
+use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
@@ -428,6 +429,13 @@ pub struct AppBackup {
     /// The protocol's layer, if it added one; absent from the bytes otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     protocol: Option<LayerOut>,
+    /// The re-send and missed-entries calls the protocol was owed when the backup was
+    /// taken (`owed/`), each by its key after the prefix, with its value as stored. Most
+    /// are at or behind the backup's cursor, which the restored feed never shows again;
+    /// one may be ahead of it, carried ahead by an earlier restore in place, and waits for
+    /// the feed to reach its item. A deny list call is left out: every restore tells the
+    /// protocol a deny list gap at the restored cursor, whose full list covers it.
+    owed: Vec<(String, serde_json::Value)>,
 }
 
 /// The version a backup with a protocol layer carries, in place of [`SCHEMA_VERSION`]: a
@@ -633,6 +641,24 @@ pub struct App {
     /// only.
     directory_failed_ms: Option<u64>,
     events: Vec<AppEvent>,
+    /// Whether an owed call holds the read, as the last retry of `owed/` left it, and set as
+    /// calls are owed. In memory only.
+    owed_known: Option<bool>,
+    /// How many reads in a row stopped at an owed call or deny list gap the protocol didn't
+    /// take ([`AppEvent::OwedCallHeld`]). In memory only.
+    owed_held_reads: u32,
+    /// The first owed call past the cursor, by its item's `seq` in the cursor's sequence,
+    /// which a move or a key change in place continues under the next generation, as a
+    /// restore in place carries it: the feed stops before any later item, so the call
+    /// goes in feed order, once. It may be any distance ahead: a restore in place from a
+    /// backup older than the store carries the calls the store owed past the backup's
+    /// cursor. Reading on up to it is safe: the feed hands each item before it, in order,
+    /// and passes its item without handing it, the call being that item's notice. Set at
+    /// each read's start. In memory only.
+    owed_ahead: Option<u64>,
+    /// The read (by [`App::receive`]'s count) the own directory was read in for a deny list
+    /// change's writer, and whether it answered: once a read. In memory only.
+    deny_directory_read: Option<(u64, bool)>,
     /// The highest duty event counter queued in `events` since the app was made: a kept one
     /// above it is queued after a reload (`events` module, "Duty events").
     duty_queued: u64,
@@ -916,6 +942,10 @@ impl App {
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
                 events: Vec::new(),
+                owed_known: None,
+                owed_held_reads: 0,
+                owed_ahead: None,
+                deny_directory_read: None,
                 duty_queued: 0,
                 duty_handed: 0,
                 time_fresh_at: None,
@@ -1060,6 +1090,10 @@ impl App {
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
                 events: Vec::new(),
+                owed_known: None,
+                owed_held_reads: 0,
+                owed_ahead: None,
+                deny_directory_read: None,
                 duty_queued: 0,
                 duty_handed: 0,
                 time_fresh_at: None,
@@ -1176,8 +1210,9 @@ impl App {
 
     /// The app's backup (Switch spec 12.4): its keys, certificate and record, scope keys
     /// and naming key, its receive keys and the kids it knows, its cursor and chain view,
-    /// and its outbox. The app should take one at every rotation, replacing the previous one
-    /// (Switch spec 3.6).
+    /// its outbox, and the re-send and missed-entries calls it owes its protocol
+    /// ([`AppBackup`]). The app should take one at every rotation, replacing the previous
+    /// one (Switch spec 3.6).
     ///
     /// The outbox goes in whole, but for the messages refused for good: each message with
     /// its signed plaintext and the envelope sealed for its last try, so a restore delivers
@@ -1282,6 +1317,7 @@ impl App {
             outbox_left_out: Vec::new(),
             held_counterparties: Vec::new(),
             protocol: None,
+            owed: Vec::new(),
         })
     }
 
@@ -1337,6 +1373,22 @@ impl App {
             .await?
             .into_iter()
             .map(|(rest, _)| rest)
+            .collect();
+        // The owed re-send and missed-entries calls, as stored. One that doesn't read as a
+        // call fails every read of this store already; it isn't a call to carry.
+        backup.owed = reader
+            .scan_raw(key::OWED_PREFIX)
+            .await?
+            .into_iter()
+            .filter_map(|(rest, bytes)| {
+                let call = state::decode::<feed::OwedCall>(&bytes).ok()?;
+                let carried = matches!(
+                    call,
+                    feed::OwedCall::Resend { .. } | feed::OwedCall::Missed { .. }
+                );
+                let value = state::decode::<serde_json::Value>(&bytes).ok()?;
+                carried.then_some((rest, value))
+            })
             .collect();
         Ok(())
     }
@@ -1537,9 +1589,17 @@ impl App {
     /// What the store holds that the app still owes its protocol stays, a layered restore's
     /// included: the duty events
     /// not acknowledged, with their IDs, delivered again as after [`App::load`], and the
-    /// protocol calls it couldn't answer, made again by the next read. A backup carries
-    /// neither, so a restore on another device starts without them, under a new event epoch
-    /// ([`EventId`]).
+    /// protocol calls it couldn't answer, made again by the next read. A backup carries no
+    /// duty event, so a restore onto a store without an epoch, on another device or wiped,
+    /// starts a new event epoch ([`EventId`]). Every restore takes the re-send and
+    /// missed-entries calls the backup carries ([`App::backup`]), each checked as a carried
+    /// call is, one that isn't whole left behind and counted in
+    /// [`AppEvent::RestoreLeftBehind`]. A call the store made after the backup is made
+    /// again: the restore replaces the protocol's state with the backup's layer, or with
+    /// none, which lacks its writes. A restore in place adds the store's own calls, the store's value winning for
+    /// a key both hold. For an app holding `lists.read`, the commit also owes the protocol a
+    /// deny list gap at the backup's position, whatever the backup held, told by the next
+    /// read with the full list ([`Protocol::deny_list_gap`], Switch spec 8.3).
     ///
     /// # Errors
     ///
@@ -1791,7 +1851,15 @@ impl App {
                 ns: ns.clone(),
                 store: env.store.clone(),
             };
-            let carried = Self::kept_for_protocol(&old).await?.unwrap_or_default();
+            let carried = Self::kept_for_protocol(&old).await?;
+            // Every restore takes the backup's owed calls, each checked as a carried one is;
+            // one that isn't whole is left behind and counted. The restore replaces the
+            // protocol's local state with the backup's layer, or with nothing, so a call the
+            // store made after the backup is owed again: its writes are gone with that
+            // state. A restore in place also carries the store's own calls, the store's
+            // value winning for a key both hold.
+            let from_backup = Self::owed_of_backup(backup);
+            let carried = carried.unwrap_or_default();
             // A restore in place keeps the store's holds beside the backup's: a hold the host
             // set after the backup still holds (`App::hold_queued`).
             let old_holds: Vec<String> = old
@@ -1829,6 +1897,10 @@ impl App {
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
                 events: Vec::new(),
+                owed_known: None,
+                owed_held_reads: 0,
+                owed_ahead: None,
+                deny_directory_read: None,
                 duty_queued: 0,
                 duty_handed: 0,
                 time_fresh_at: None,
@@ -1870,19 +1942,44 @@ impl App {
                     }
                 }
                 tx.local(&layer_writes)?;
+                // The protocol's layer is its state as committed when the backup was taken,
+                // which may lack a deny list change or gap it was owed then: a backup
+                // carries no deny list call and no gap, and the feed doesn't hand again what
+                // the backup's cursor passed. So every restore by an app holding
+                // `lists.read` notes a gap in the deny list's history at the restored
+                // cursor, in this commit, and the protocol is told the full list after the
+                // carried calls (Switch spec 8.3). The namespace's delete above takes the
+                // `dgap` the store held, so no earlier gap moves it.
+                if app.state.cert.has_permission(Permission::ListsRead) {
+                    tx.put(
+                        feed::DENY_GAP,
+                        &(backup.cursor.generation, backup.cursor.seq),
+                    )?;
+                }
                 tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
-                carrying = true;
-                for (stored, value) in &carried.values {
+                for (stored, value) in &from_backup.0 {
                     tx.put(stored, value)?;
                 }
+                carrying = true;
+                for (stored, value) in &carried.values {
+                    // Written once: a key the backup carried with the same value is in.
+                    let same = from_backup
+                        .0
+                        .iter()
+                        .any(|(key, kept)| key == stored && kept == value);
+                    if !same {
+                        tx.put(stored, value)?;
+                    }
+                }
                 // What didn't read is left behind, and the protocol told how much.
-                if carried.lost_duties > 0 || carried.lost_owed > 0 {
+                let lost_owed = carried.lost_owed.saturating_add(from_backup.1);
+                if carried.lost_duties > 0 || lost_owed > 0 {
                     app.keep_duty(
                         &mut tx,
                         events::Duty::RestoreLeftBehind {
                             duty_events: carried.lost_duties,
-                            owed_calls: carried.lost_owed,
+                            owed_calls: lost_owed,
                         },
                     )?;
                 }
@@ -2203,7 +2300,8 @@ impl App {
     }
 
     /// How many protocol calls the protocol answered with an error and the app still owes
-    /// it ([`Protocol::resend_needed`], [`Protocol::missed`]): each read makes them again,
+    /// it ([`Protocol::resend_needed`], [`Protocol::missed`], [`Protocol::deny_list_changed`],
+    /// with the deny list changes owed behind one): each read makes them again,
     /// so a count that stays up shows a protocol that keeps failing.
     ///
     /// # Errors
@@ -2334,7 +2432,13 @@ impl App {
             }
         }
         for (rest, bytes) in reader.scan_raw(key::OWED_PREFIX).await? {
-            let read = state::decode::<feed::OwedCall>(&bytes)
+            // Carried only when whole, as the queue reads it: a key that names a feed
+            // position, and a change not checked yet that keeps its own operation. One that
+            // isn't would fail every read of the restored store; it is counted as left
+            // behind instead, so the restore repairs the store.
+            let read = feed::owed_place(&rest)
+                .and_then(|_| state::decode::<feed::OwedCall>(&bytes))
+                .and_then(|call| call.kept_op_body())
                 .and_then(|_| state::decode::<serde_json::Value>(&bytes));
             match read {
                 Ok(value) => carried
@@ -2351,6 +2455,25 @@ impl App {
             _ => carried.next_duty = past_kept,
         }
         Ok(Some(carried))
+    }
+
+    /// The owed calls a backup carries, by stored key, each whole as a carried one must be
+    /// ([`App::kept_for_protocol`]), and how many aren't.
+    fn owed_of_backup(backup: &AppBackup) -> (Vec<(String, serde_json::Value)>, u64) {
+        let mut whole = Vec::new();
+        let mut lost = 0u64;
+        for (rest, value) in &backup.owed {
+            let read = feed::owed_place(rest)
+                .and_then(|_| {
+                    serde_json::from_value::<feed::OwedCall>(value.clone()).map_err(|_| corrupt())
+                })
+                .and_then(|call| call.kept_op_body());
+            match read {
+                Ok(_) => whole.push((format!("{}{rest}", key::OWED_PREFIX), value.clone())),
+                Err(_) => lost = lost.saturating_add(1),
+            }
+        }
+        (whole, lost)
     }
 
     /// The local ID the store's next entry stored locally would take, for a restore in

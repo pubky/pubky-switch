@@ -531,3 +531,48 @@ async fn test_held_cursor_gap_is_handed_once_across_a_key_change() {
     assert_eq!(changed.app(&me).cursor, position + 4);
     assert_eq!(gaps(), 1);
 }
+
+#[tokio::test]
+async fn test_held_cursor_gap_whose_call_fails_holds_the_page() {
+    // Switch spec 8.3: the gap ahead goes to the protocol before anything after it. Its
+    // call failing, it is owed at the compared position, and nothing of the page is handed
+    // until the protocol takes it.
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let position = app.cursor().seq;
+    // Another instance passed the first note; the second comes after the gap.
+    let (passed, _) = w.note(me, "passed elsewhere");
+    let (note, _) = w.note(me, "after the gap");
+    assert!(passed > position);
+    w.switch.set_held_cursor(&me, passed);
+    *w.protocol.failing.lock().unwrap() = 1;
+    let held = app.receive(None).await.unwrap();
+    assert!(held.stopped);
+    let received = || -> Vec<u64> {
+        w.protocol
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(seq, _, _)| *seq)
+            .collect()
+    };
+    assert!(!received().contains(&note));
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    for _ in 0..2 {
+        app.receive(None).await.unwrap();
+    }
+    let gaps = w
+        .protocol
+        .missed
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.entries == 0)
+        .count();
+    assert_eq!(gaps, 1);
+    assert!(received().contains(&note));
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+}
