@@ -93,19 +93,16 @@ fn expect_revoked_at(world: &World, name: &str, at: u64) -> FlowResult {
 }
 
 /// What a status shows of a purged app, freed down to its App ID and the time it was
-/// revoked (Switch wire 9.1 "Departure, revoked app", 7.4.12): no record, certificate,
-/// cursor, last-seen time or key bundle part, and nothing unread.
-const FREED: [(&str, &str); 10] = [
+/// revoked: a kept App ID that isn't current (Switch wire 7.4.12), and no last-seen time,
+/// record, certificate from that record or key bundle part (Switch wire 9.1 "Departure,
+/// revoked app").
+const FREED: [(&str, &str); 6] = [
     ("current", "bool false"),
     ("last_seen", "null"),
     ("record_cert", "null"),
     ("record_at", "null"),
     ("cert_expires_at", "null"),
-    ("keys_through", "null"),
-    ("full_bundle_requested", "null"),
     ("bundle_ranges", "array of 0"),
-    ("unread_entries", "number 0"),
-    ("lagging", "bool false"),
 ];
 
 /// Fail the flow unless the signer's last read of the apps reports alice's app `name` as
@@ -118,7 +115,7 @@ fn expect_freed(world: &World, name: &str, freed: bool) -> FlowResult {
     let shows = |member: &str, value: &str| status.get(member).is_some_and(|held| held == value);
     let held = ["record_cert", "record_at", "cert_expires_at", "last_seen"]
         .iter()
-        .all(|member| !shows(member, "null"));
+        .all(|member| status.get(*member).is_some_and(|value| value != "null"));
     let all_freed = FREED.iter().all(|(member, value)| shows(member, value));
     if (freed && all_freed) || (!freed && held) {
         Ok(())

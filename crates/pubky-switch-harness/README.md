@@ -163,22 +163,25 @@ The flows send every call the service serves, each at both switches. What they l
   at a restore, a Homeserver that holds another body at a restore, and a restore in place
   below the signer's mark.
 - **More of a removal.** The removal flows date a revocation and a departure, clean up
-  after one, purge its entry and free what the switch held of the app, and send a revocation past a read that failed or during a
-  recovery. A removal time a switch reports before the app was listed or after its own
-  answer, and a switch's copy that doesn't verify, take a switch that misbehaves: they
-  stay with the signer's tests on the scripted switch.
+  after one, purge its entry and free what the switch held of the app, and send a
+  revocation past a read that failed or during a recovery. A removal time a switch
+  reports before the app was listed or after its own answer, and a switch's copy that
+  doesn't verify, take a switch that misbehaves: they stay with the signer's tests on the
+  scripted switch.
 
 Not this crate's to cover: refusals, limits, rates, quotas and retention, which the
-service's own tests hold, and a faulty or hostile switch, which stays on the scripted
-switch. Around the service, the flows don't touch TLS, the listener, the proxy's
-client-address header, the client's HTTPS transport, the time source (trusted time comes
-from the test clock), name resolution (every relay host resolves to one public address), key generation (accounts take keys from fixed seeds), or more than one
-instance on a database. Of a service's limits, a world carries only the inbox quota, the
-app limit and the hourly limit of recovery uploads to the scripted switch
-(`World::add_switch_with`): a flow that leaned on
-another would compare a service so set with a scripted switch at its defaults. `src/check.rs`
-says what of an answer the harness verifies itself
-and what it leaves to the client and the signer.
+service's own tests hold, but for the push flow's `400` for more handles than one relay
+host takes (Switch wire 8.1), on which the flow's end with the app rests; and a faulty or
+hostile switch, which stays on the scripted switch. Around the service, the flows don't
+touch TLS, the listener, the proxy's client-address header, the client's HTTPS
+transport, the time source (trusted time comes from the test clock), name resolution
+(every relay host resolves to one public address), key generation (accounts take keys
+from fixed seeds), or more than one instance on a database. Of a service's limits, a
+world carries only the inbox quota, the app limit and the hourly limit of recovery
+uploads to the scripted switch (`World::add_switch_with`): a flow that leaned on another
+would compare a service so set with a scripted switch at its defaults. `src/check.rs`
+says what of an answer the harness verifies itself and what it leaves to the client and
+the signer.
 
 ## Adding a flow
 

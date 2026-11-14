@@ -70,7 +70,7 @@ fn matches(pattern: &str, text: &str) -> bool {
     true
 }
 
-/// Every accepted difference, by flow. None today: the two switches answer every flow
+/// Every accepted difference, by flow. Empty while the two switches answer every flow
 /// alike.
 pub static ALLOWED: &[Allowed] = &[];
 

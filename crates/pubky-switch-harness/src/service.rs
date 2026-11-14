@@ -36,8 +36,10 @@ const MAX_ANSWER_BYTES: usize = 256 * 1024 * 1024;
 const PEER: ([u8; 4], u16) = ([127, 0, 0, 1], 4000);
 
 /// The address every relay host resolves to at the service: a public one, as a relay URL
-/// must resolve only to public addresses (Switch wire 8.1, 8.2). Nothing connects to it: no
-/// world runs the service's webhook delivery.
+/// must resolve only to public addresses (Switch wire 8.1, 8.2), and the documentation
+/// ranges aren't public there. Nothing connects to it: no world runs the service's webhook
+/// delivery, and a flow that delivered would have to route it in process through
+/// `Service::with_relay_route`.
 const RELAY_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14));
 
 /// A resolver that answers [`RELAY_ADDRESS`] for every host, so a flow's relay URL needs no

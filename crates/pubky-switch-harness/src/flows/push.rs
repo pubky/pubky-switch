@@ -1,5 +1,6 @@
 //! An app's push registration, and its end with the app (Switch spec 9, Switch wire 8.1).
 
+use pubky_switch::store::PUSH_PER_HOST;
 use pubky_switch_client::TransportError;
 use pubky_switch_client::app::{
     AppError, LeaveMode, MAX_HANDLES, PushHandles, PushRegistration, PushRelay,
@@ -14,6 +15,10 @@ use super::messaging::joined;
 use super::removal::result;
 use super::{ORIGIN, STEP_MS};
 use crate::{FlowResult, World};
+
+// The flow fills one relay host to the service's per-host limit from one registration, so
+// the client's per-registration limit must be the same number (Switch wire 8.1).
+const _: () = assert!(MAX_HANDLES == PUSH_PER_HOST);
 
 /// The relay every app of the flow registers at: one relay host.
 const RELAY_URL: &str = "https://push.example/v1/hook";
@@ -76,7 +81,7 @@ pub async fn push_registration(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
 
     // The wallet's other devices, from its host's device sync, bound to the same push key.
-    let others = (1..MAX_HANDLES)
+    let others = (1..PUSH_PER_HOST)
         .map(|device| format!("wallet device {device} at the relay"))
         .collect();
     wallet
@@ -110,7 +115,7 @@ pub async fn push_registration(world: &World) -> FlowResult {
         }),
     );
     let taken = taken?;
-    if taken.handles != 8 || taken.push_key != first.push_key {
+    if usize::try_from(taken.handles) != Ok(PUSH_PER_HOST) || taken.push_key != first.push_key {
         return Err("the wallet's eight handles weren't taken under its push key".into());
     }
     world.advance_ms(STEP_MS);
