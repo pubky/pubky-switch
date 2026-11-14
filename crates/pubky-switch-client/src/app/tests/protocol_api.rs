@@ -1460,8 +1460,9 @@ async fn test_outbox_record_job_given_up_names_the_batch_it_left_kept() {
         tag: b"sent".to_vec(),
     });
     let msg_id = wallet.queue_signed(signed).await.unwrap();
-    // Accepted; the record job's batch, after the conversation entry's, is kept unsent.
-    p.alice.switch().fail_next(Fault::Unreachable {
+    // Accepted; the record job's batch, after the conversation entry's, is sent and never
+    // answered: kept, stamped, unapplied.
+    p.alice.switch().fail_next(Fault::Unanswered {
         path: "ops".into(),
         after: 1,
     });

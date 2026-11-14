@@ -27,9 +27,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   in order. Each operation's signature is
   verified, and an own app must be current with an unexpired certificate.
 - **Injected faults** (`fail_next`) script a network or a service that fails: an error
-  answer, a lost answer (the request applied, the caller sees a timeout), a connection that
-  fails, or an answer with a member left out. A lost answer or a failed connection can let a
-  number of matching requests through first (`LoseAnswerAfter`, `Unreachable`), so a test
+  answer, a lost answer (the request applied, the caller sees a timeout), a request never
+  answered (nothing applied, the caller sees a timeout), a connection that fails (nothing
+  sent), or an answer with a member left out. A lost answer or a failed connection can let a
+  number of matching requests through first (`LoseAnswerAfter`, `Unanswered`,
+  `Unreachable`), so a test
   can pick one request of several to the same path.
 - **Rates** (Switch wire 6.4 step 7, 9.4): no operation, control, per-caller or
   failed-authentication limits; never `429 rate_limited`.

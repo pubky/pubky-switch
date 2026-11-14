@@ -49,15 +49,20 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **After a failed commit the app reloads** from the store before its next call.
 - **A kept batch or effect is never sent again past its window**, whatever the generation:
   30 days from its first send, less an hour, both ends in verified service time, erring
-  older. Its first send is stamped (`kept_ms`) at the earlier of the device clock and a
-  service time verified in that call, which a one-item feed read fetches first when no
-  answer of the call brought one, and the stamp is committed before the request leaves; a
-  batch never sent has no stamp and no window, can't be ambiguous, and is never judged for
-  age, and a call that can't verify a time leaves it kept and unsent. An effect is stamped
+  older. Its first send is stamped (`kept_ms`) at the earlier of the device clock and the
+  highest service time verified with the current service key, and the stamp is committed
+  before the request leaves. The service's stamped time never goes back, so that stamp is
+  at or before the time the service applies the batch however old the held time is; the
+  app reads a time first only when it holds none of the current key, or one more than a day
+  behind the device clock, so that the window doesn't end much sooner than it could. The
+  read is of a feed page with no items (`limit=0`, Switch wire 7.4.4). A batch never sent
+  has no stamp and no window, can't be ambiguous, and is never judged for age, and a call
+  that needs a time and can't verify one leaves it kept and unsent. An effect is stamped
   the same way when it is kept, right before its first send. Its age is judged at the later
-  of the device clock and a service time verified in the call that sends it again, fetched
-  the same way; a time verified more than 10 minutes before by the device clock, or with the
-  device clock gone back since, is read again. One past the window by the clocks at hand
+  of the device clock and a service time verified in the call that sends it again, which
+  the same read fetches when no answer of the call brought one; a time verified more than
+  10 minutes before by the device clock, or with the device clock gone back since, is read
+  again. One past the window by the clocks at hand
   already, the device clock or the service time held, needs no reading. Past it a retry
   would get `409 conflict` once the service dropped its proofs, or be taken as new once it
   forgot the ID (Switch wire 6.4 step 5): the effect's entry is parked as uncertain, the
@@ -124,8 +129,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   holds the entry (Switch wire 7.4.3 step 1), and the recipient's apps drop a copy taken as
   new by its processed pair, kept 30 days and the tolerance from processing, which is at or
   after the first acceptance (Switch spec 11). Every try checks it before the delivery, at
-  the later of the device clock and a service time verified in the call, which a one-item
-  feed read fetches when the device clock says the deadline hasn't passed: past it the
+  the later of the device clock and a service time verified in the call, which a read of a
+  feed page with no items fetches when the device clock says the deadline hasn't passed: past it the
   delivery is given up in one commit with a `MessageUndelivered` duty event, a message never
   accepted deleted, one accepted before kept for its owed record job, its sealed envelope
   dropped. A later backup carries the deadline and a later restore keeps the earlier of it

@@ -445,6 +445,16 @@ pub(crate) fn refused_at(error: &AppError) -> Option<RefusalPlace> {
 /// (the request is signed again, the body isn't), `409 identity_needed`, `410 moved`, a
 /// transport failure, or an answer whose signature didn't verify or that didn't read, which
 /// may not be the service's (Switch wire 2.1, 7.1).
+/// Whether `error` says the request never left: the transport made no connection, or
+/// refused the origin ([`TransportError::Connect`], [`TransportError::Refused`]). Any other
+/// failure may have reached the switch.
+pub(crate) fn never_left(error: &AppError) -> bool {
+    matches!(
+        error.unkept(),
+        AppError::Transport(TransportError::Connect(_) | TransportError::Refused(_))
+    )
+}
+
 pub(crate) fn refused_for_good(error: &AppError) -> Option<ErrorCode> {
     let AppError::Switch(ClientError::Switch { code, .. }) = error else {
         return None;

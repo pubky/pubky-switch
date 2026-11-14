@@ -244,10 +244,10 @@ pub(crate) fn answer_decides(now: u64, kept_ms: Option<u64>) -> bool {
 
 impl App {
     /// The time a batch's first send is stamped at: the earlier of the device clock and the
-    /// service time verified in this call, which every path fetches first, before a kept
-    /// batch's first send and before an effect is kept ([`App::fresh_service_time`]), so a
-    /// device clock ahead doesn't make it look younger, and a time from long before doesn't
-    /// make it look older.
+    /// highest service time verified with the current service key, which every path makes
+    /// sure of first, before a kept batch's first send and before an effect is kept
+    /// ([`App::stamp_service_time`]), so a device clock ahead doesn't make it look younger,
+    /// and a time from long before doesn't make it look older.
     pub(crate) fn kept_stamp(&self) -> u64 {
         let now = self.now();
         self.state
@@ -255,10 +255,39 @@ impl App {
             .map_or(now, |time| now.min(time.highest_ms))
     }
 
+    /// A verified service time to stamp a first send with ([`App::kept_stamp`]). None is
+    /// read when the app holds one of the current service key that is recent by the device
+    /// clock ([`RECENT_SERVICE_TIME_MS`]), or when the device clock is behind it, since the
+    /// stamp is then the device clock's whatever a read brings.
+    ///
+    /// The stamp must be at or before the time the service applies the batch, so that the
+    /// kept copy's window never outlasts the service's memory of the batch ID
+    /// ([`KEPT_BATCH_ANSWER_MS`]). It is: the service's stamped time never goes back
+    /// (Switch wire 7.3), so the time the key stamps the batch at is no earlier than the
+    /// highest time the app verified with that key, fresh or not. The age of the held time
+    /// only bounds how much sooner than needed the window ends. Without such a time (none
+    /// held, one of another key, or an older one) the app reads one
+    /// ([`App::fresh_service_time`]).
+    ///
+    /// # Errors
+    ///
+    /// The read's: nothing is stamped or sent.
+    pub(crate) async fn stamp_service_time(&mut self) -> Result<(), AppError> {
+        let now = self.now();
+        let key = self.state.meta.service_key;
+        let recent = self.state.service_time.is_some_and(|held| {
+            held.key == key && now.saturating_sub(held.highest_ms) <= RECENT_SERVICE_TIME_MS
+        });
+        if recent {
+            return Ok(());
+        }
+        self.fresh_service_time().await
+    }
+
     /// A service time verified in this call, before a kept batch's age is judged: a read of
-    /// one feed item, the cheapest authenticated request, when no answer of this call
-    /// brought one within [`FRESH_SERVICE_TIME_MS`] on the device clock
-    /// ([`App::kept_window_now`]).
+    /// a feed page with no items (Switch wire 7.4.4), a small signed answer that moves no
+    /// position, when no answer of this call brought a time within
+    /// [`FRESH_SERVICE_TIME_MS`] on the device clock ([`App::kept_window_now`]).
     ///
     /// # Errors
     ///
@@ -276,7 +305,7 @@ impl App {
                 generation: self.state.cursor.generation,
                 seq: self.state.cursor.seq,
             }),
-            limit: Some(1),
+            limit: Some(0),
             wait: None,
         };
         let result = self.client.feed(query).await;
@@ -309,6 +338,13 @@ impl App {
 /// between the reading and the send, and left more than about 45 minutes behind true time,
 /// still passes this test, since the device clock is all it measures the gap by.
 pub(crate) const FRESH_SERVICE_TIME_MS: u64 = 10 * 60 * 1000;
+
+/// How old, by the device clock, the highest service time verified with the current key may
+/// be for a first send to be stamped without reading another
+/// ([`App::stamp_service_time`]): a day. The stamp is at most that much before the true
+/// time, so the kept copy's window ([`KEPT_BATCH_ANSWER_MS`]) ends at most a day sooner
+/// than it could, of its 30 days.
+pub(crate) const RECENT_SERVICE_TIME_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// How many provider changes one follow takes in a row, each given up for a newer own
 /// `identity.json` met on the way; the next call goes on from there.

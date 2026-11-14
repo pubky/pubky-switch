@@ -17,39 +17,35 @@ use std::time::Duration;
 use pubky_switch_core::net::{UrlUse, check_addresses, check_url};
 use reqwest::header::{HeaderName, HeaderValue};
 
-use super::{BoxFuture, Header, Request, Response, Transport, TransportError};
+use super::{BoxFuture, Header, Request, Response, TimeoutClass, Transport, TransportError};
 
 /// The settings of an [`HttpTransport`].
 ///
 /// Each call has a timeout for the whole of it, from connecting to the last byte of the
-/// answer, sized by what it can carry (Switch wire 7.1 "Answer sizes"). A call whose
-/// request or answer can pass a mebibyte gets the long one, [`HttpConfig::long_timeout_ms`]:
-/// a feed read, whose long poll holds it up to 25 s and whose page may take 8 MiB (Switch
-/// wire 7.4.4), a records listing (7.4.9), the directory (7.4.10), the apps and an app's
-/// key bundle parts (7.4.11, 7.4.12), a claim's entries (7.4.8), the admission lists
-/// (7.4.6), a batch of operations whose body passes a mebibyte (6.4), an append, whose
-/// `409 stale_key` carries the directory (7.6), a recovery upload (7.4.14), the handover
-/// (7.4.17), an enrollment (7.4.1), and a move's export and import (10.2 to 10.4). A batch
-/// of at most a mebibyte gets [`HttpConfig::request_timeout_ms`] and a share of what the
-/// long timeout adds to it, in proportion to its body: about the short timeout for a batch
-/// of a few KiB, the long one for a batch of a mebibyte. So a slow uplink that sends a
-/// mebibyte within the long timeout's extra time sends every smaller batch too. The share
-/// grows with the request body only, not with the answer: a small batch whose answer is a
-/// `409 conflict` carrying a large record's view, up to about 950 KB (7.1 "Answer sizes"),
-/// gets the short timeout all the same. On a downlink below about 0.8 Mbit/s such an answer
-/// doesn't arrive in time, so the batch stays kept, each resend meets the same conflict
-/// and times out the same way, and the writes behind it wait until its answer window ends
-/// (`KEPT_BATCH_ANSWER_MS`): a host on such a link raises [`HttpConfig::request_timeout_ms`].
-/// Every other call gets [`HttpConfig::request_timeout_ms`], the time sample a write takes
-/// first among them: a feed read of one item with no wait. At the limits some long calls
-/// carry tens of megabytes: a host on a slow network raises the settings.
+/// answer, by the class the client picked for it ([`TimeoutClass`], Switch wire 7.1 "Answer
+/// sizes"):
+///
+/// - **[`TimeoutClass::Ordinary`]:** [`HttpConfig::request_timeout_ms`], and a share of what
+///   the long timeout adds to it, in proportion to the request body: about the short timeout
+///   for a body of a few KiB, the long one from a mebibyte on. So a slow uplink that sends a
+///   mebibyte within the long timeout's extra time sends every smaller body too.
+/// - **[`TimeoutClass::Bulk`]:** [`HttpConfig::long_timeout_ms`]. A batch of operations that
+///   writes a shared record is one, whatever its size: its `409 conflict` carries the
+///   record's view, up to about 950 KB, and a batch kept for a resend meets the same answer
+///   every time, so the short timeout would hold it, and the writes behind it, on a slow
+///   downlink.
+/// - **[`TimeoutClass::LongPoll`]:** the wait the request names, then
+///   [`HttpConfig::long_timeout_ms`] for the page.
+///
+/// At the limits some bulk calls carry tens of megabytes: a host on a slow network raises
+/// the settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HttpConfig {
-    /// The timeout of every call but the long ones, in milliseconds: 10 s by default.
+    /// The timeout of a small call, in milliseconds: 10 s by default.
     pub request_timeout_ms: u64,
-    /// The timeout of a call that can carry megabytes, the feed's long poll among them, in
-    /// milliseconds: 40 s by default, above the longest wait of 25 s.
+    /// The timeout of a call that can carry megabytes, and what the feed's long poll has
+    /// after its wait, in milliseconds: 40 s by default.
     pub long_timeout_ms: u64,
     /// The connection timeout, in milliseconds.
     pub connect_timeout_ms: u64,
@@ -115,83 +111,27 @@ pub struct HttpTransport {
     long_timeout: Duration,
 }
 
-/// The body size past which a batch of operations gets the long timeout.
+/// The body size from which an ordinary call gets the long timeout.
 const LONG_BODY_BYTES: usize = 1 << 20;
 
-/// The timeout of `request` ([`HttpConfig`]): `long` for a long call, `short` for a short
-/// one, and for a batch of operations of at most [`LONG_BODY_BYTES`] `short` and the share
-/// of `long - short` its body is of [`LONG_BODY_BYTES`].
+/// The timeout of `request` by its class ([`HttpConfig`]): for an ordinary call `short`
+/// and the share of `long - short` its body is of [`LONG_BODY_BYTES`], at most `long`; for
+/// a bulk call `long`; for a long poll its wait, then `long`.
 fn call_timeout(request: &Request, short: Duration, long: Duration) -> Duration {
-    if is_long_call(request) {
-        return long;
-    }
-    let path = request
-        .path_and_query
-        .split_once('?')
-        .map_or(request.path_and_query.as_str(), |(path, _)| path);
-    let batch = request.method == "POST"
-        && path
-            .strip_prefix("/v1/")
-            .and_then(|rest| rest.split_once('/'))
-            .is_some_and(|(_, rest)| rest == "ops");
-    if !batch {
-        return short;
-    }
-    let extra = long.saturating_sub(short).as_millis() * request.body.len() as u128
-        / LONG_BODY_BYTES as u128;
-    short.saturating_add(Duration::from_millis(
-        u64::try_from(extra).unwrap_or(u64::MAX),
-    ))
-}
-
-/// Whether `request` is a call whose request or answer can pass a mebibyte, or the feed's
-/// long poll ([`HttpConfig`]): judged by its method, its path after `/v1/{id}/` and, for a
-/// feed read, its query.
-fn is_long_call(request: &Request) -> bool {
-    let (path, query) = request
-        .path_and_query
-        .split_once('?')
-        .unwrap_or((request.path_and_query.as_str(), ""));
-    // An enrollment may name thousands of purged App IDs (Switch wire 7.1 "Answer sizes").
-    if path == "/v1/enroll" {
-        return true;
-    }
-    let Some(rest) = path
-        .strip_prefix("/v1/")
-        .and_then(|rest| rest.split_once('/'))
-        .map(|(_, rest)| rest)
-    else {
-        return false;
-    };
-    match request.method.as_str() {
-        // A feed read of one item with no wait, the time sample a write takes first, is
-        // short. It reads after the cursor, and its page runs to the end of a batch whose
-        // items it starts (Switch wire 7.4.4): while the cursor is behind, at a batch of
-        // many items, the page may carry up to about 5 MiB under the short timeout. On a
-        // slow link that sample can time out; the write then fails before its own batch
-        // is sent, as its error says, until a read moves the cursor on.
-        "GET" if rest == "feed" => {
-            let mut params = query.split('&');
-            params.clone().any(|param| param.starts_with("wait="))
-                || !params.any(|param| param == "limit=1")
+    match request.timeout {
+        TimeoutClass::Ordinary => {
+            let extra = long.saturating_sub(short).as_millis() * request.body.len() as u128
+                / LONG_BODY_BYTES as u128;
+            short
+                .saturating_add(Duration::from_millis(
+                    u64::try_from(extra).unwrap_or(u64::MAX),
+                ))
+                .min(long.max(short))
         }
-        "GET" => {
-            matches!(
-                rest,
-                "records" | "directory" | "apps" | "allow" | "handover" | "export"
-            ) || rest.starts_with("export/chunks/")
-                || rest.starts_with("claims/")
-                || (rest.starts_with("apps/") && rest.ends_with("/keys"))
+        TimeoutClass::Bulk => long,
+        TimeoutClass::LongPoll { wait_s } => {
+            long.saturating_add(Duration::from_secs(u64::from(wait_s)))
         }
-        // A batch's items take up to 5 MiB: one whose body passes a mebibyte is long. A
-        // smaller one's answer is its proofs and a head, or a `409 conflict` with one
-        // record's view (under 1 MiB), and its timeout grows with its body
-        // (`call_timeout`). An append's `409 stale_key` carries the directory,
-        // and an import's start its manifest.
-        "POST" if rest == "ops" => request.body.len() > LONG_BODY_BYTES,
-        "POST" => matches!(rest, "inbox" | "recovery/upload" | "import"),
-        "PUT" => rest == "handover" || rest.starts_with("import/chunks/"),
-        _ => false,
     }
 }
 
@@ -392,6 +332,7 @@ mod tests {
             path_and_query: "/v1/x/directory".into(),
             headers: Vec::new(),
             body: Vec::new(),
+            timeout: TimeoutClass::Ordinary,
         }
     }
 
@@ -514,93 +455,54 @@ mod tests {
         assert!(!matches!(error, TransportError::Refused(_)), "{error:?}");
     }
 
-    fn call(method: &str, path_and_query: &str) -> Request {
+    fn call(timeout: TimeoutClass, body: usize) -> Request {
         Request {
-            method: method.into(),
-            path_and_query: path_and_query.into(),
+            method: "POST".into(),
+            path_and_query: "/v1/x/ops".into(),
+            body: vec![b'x'; body],
+            timeout,
             ..request("https://inbox.example")
         }
     }
 
     #[test]
-    fn test_http_long_timeout_is_for_the_feed_and_the_large_calls() {
-        for (method, path) in [
-            ("GET", "/v1/x/feed?after=1:2&limit=100&wait=25"),
-            ("GET", "/v1/x/feed?after=1:2&limit=1&wait=25"),
-            ("GET", "/v1/x/feed?after=1:2&limit=100"),
-            ("GET", "/v1/x/feed?after=1:2&limit=10"),
-            ("GET", "/v1/x/feed"),
-            ("GET", "/v1/x/records?collection=c&after=k&limit=1000"),
-            ("GET", "/v1/x/directory"),
-            ("GET", "/v1/x/apps"),
-            ("GET", "/v1/x/apps/a/keys"),
-            ("GET", "/v1/x/claims/k"),
-            ("GET", "/v1/x/allow"),
-            ("GET", "/v1/x/handover"),
-            ("PUT", "/v1/x/handover"),
-            ("POST", "/v1/x/inbox?apps_version=1"),
-            ("POST", "/v1/x/recovery/upload"),
-            ("POST", "/v1/enroll"),
-            ("GET", "/v1/x/export"),
-            ("GET", "/v1/x/export/chunks/c1"),
-            ("POST", "/v1/x/import"),
-            ("PUT", "/v1/x/import/chunks/c1"),
-        ] {
-            assert!(is_long_call(&call(method, path)), "{method} {path}");
-        }
-        // Every other call has the short one, the time sample a write takes first included.
-        for (method, path) in [
-            ("GET", "/v1/x/feed?after=1:2&limit=1"),
-            ("GET", "/v1/x/records/k"),
-            ("PUT", "/v1/x/identity"),
-            ("POST", "/v1/x/apps/a/keys"),
-            ("POST", "/v1/x/apps/a/leave"),
-            ("POST", "/v1/x/connect"),
-            ("POST", "/v1/x/import/activate"),
-            ("POST", "/v1/x/feed"),
-            ("GET", "/v1/x/feeds"),
-            ("GET", "/feed"),
-        ] {
-            assert!(!is_long_call(&call(method, path)), "{method} {path}");
-        }
-        // A batch is long only once its body passes a mebibyte.
-        let batch = |bytes: usize| Request {
-            body: vec![b'x'; bytes],
-            ..call("POST", "/v1/x/ops")
-        };
-        assert!(!is_long_call(&batch(LONG_BODY_BYTES)));
-        assert!(is_long_call(&batch(LONG_BODY_BYTES + 1)));
-        // A smaller one's timeout grows with its body, from the short to the long one.
+    fn test_http_timeout_follows_the_class_the_client_picked() {
         let (short, long) = (Duration::from_secs(10), Duration::from_secs(40));
-        let timeout = |request: &Request| call_timeout(request, short, long);
-        assert_eq!(timeout(&batch(0)), short);
+        let timeout = |class, body| call_timeout(&call(class, body), short, long);
+        // An ordinary call's timeout grows with its body, from the short to the long one.
+        assert_eq!(timeout(TimeoutClass::Ordinary, 0), short);
+        assert!(timeout(TimeoutClass::Ordinary, 4 << 10) < Duration::from_millis(10_200));
         assert_eq!(
-            timeout(&batch(LONG_BODY_BYTES / 2)),
+            timeout(TimeoutClass::Ordinary, LONG_BODY_BYTES / 2),
             Duration::from_secs(25)
         );
-        assert_eq!(timeout(&batch(LONG_BODY_BYTES)), long);
-        assert_eq!(timeout(&batch(LONG_BODY_BYTES + 1)), long);
-        assert!(timeout(&batch(4 << 10)) < Duration::from_millis(10_200));
-        let other = Request {
-            body: vec![b'x'; LONG_BODY_BYTES / 2],
-            ..call("POST", "/v1/x/apps/a/leave")
+        assert_eq!(timeout(TimeoutClass::Ordinary, LONG_BODY_BYTES), long);
+        assert_eq!(timeout(TimeoutClass::Ordinary, 4 * LONG_BODY_BYTES), long);
+        // A bulk call has the long one whatever it sends: its answer is what is large.
+        assert_eq!(timeout(TimeoutClass::Bulk, 0), long);
+        assert_eq!(timeout(TimeoutClass::Bulk, LONG_BODY_BYTES), long);
+        // A long poll has its wait, then the long one.
+        assert_eq!(
+            timeout(TimeoutClass::LongPoll { wait_s: 25 }, 0),
+            Duration::from_secs(65)
+        );
+        assert_eq!(timeout(TimeoutClass::LongPoll { wait_s: 0 }, 0), long);
+        // The path decides nothing: the same class has the same timeout at any path.
+        let feed = Request {
+            method: "GET".into(),
+            path_and_query: "/v1/x/feed?after=1:2&limit=100&wait=25".into(),
+            ..call(TimeoutClass::Ordinary, 0)
         };
-        assert_eq!(timeout(&other), short);
-        // The time sample, as a write sends it.
-        let sample = crate::client::answers::FeedQuery {
-            after: Some(pubky_switch_core::ops::Position {
-                generation: 1,
-                seq: 2,
-            }),
-            limit: Some(1),
-            wait: None,
-        };
-        let path = format!("/v1/x/{}", sample.path());
-        assert!(!is_long_call(&call("GET", &path)), "{path}");
+        assert_eq!(call_timeout(&feed, short, long), short);
+        // A long timeout set below the short one never shortens an ordinary call.
+        assert_eq!(
+            call_timeout(&call(TimeoutClass::Ordinary, LONG_BODY_BYTES), long, short),
+            long
+        );
     }
 
     #[tokio::test]
-    async fn test_http_short_timeout_ends_a_call_the_long_poll_outlasts() {
+    async fn test_http_timeout_ends_each_class_at_its_own_time() {
         // A server that takes every connection and never answers.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -612,31 +514,33 @@ mod tests {
         });
         let transport = HttpTransport::without_address_checks_for_loopback_tests(HttpConfig {
             request_timeout_ms: 100,
-            long_timeout_ms: 1_500,
+            long_timeout_ms: 700,
             ..HttpConfig::default()
         })
         .unwrap();
-        // The time sample a write takes first: a feed read of one item with no wait.
-        let started = std::time::Instant::now();
-        let error = transport
-            .send(Request {
+        let timed = |class: TimeoutClass| {
+            let request = Request {
                 origin: origin.clone(),
-                ..call("GET", "/v1/x/feed?after=1:0&limit=1")
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(error, TransportError::Timeout), "{error:?}");
-        assert!(started.elapsed() < Duration::from_millis(1_000));
-        let started = std::time::Instant::now();
-        let error = transport
-            .send(Request {
-                origin: origin.clone(),
-                ..call("GET", "/v1/x/feed?after=1:0&limit=1&wait=25")
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(error, TransportError::Timeout), "{error:?}");
-        assert!(started.elapsed() >= Duration::from_millis(1_500));
+                method: "GET".into(),
+                path_and_query: "/v1/x/feed?after=1:0&limit=0".into(),
+                ..call(class, 0)
+            };
+            let transport = &transport;
+            async move {
+                let started = std::time::Instant::now();
+                let error = transport.send(request).await.unwrap_err();
+                assert!(matches!(error, TransportError::Timeout), "{error:?}");
+                started.elapsed()
+            }
+        };
+        // The read of the service time, an ordinary call, ends long before a page would.
+        assert!(timed(TimeoutClass::Ordinary).await < Duration::from_millis(600));
+        let bulk = timed(TimeoutClass::Bulk).await;
+        assert!(bulk >= Duration::from_millis(700), "{bulk:?}");
+        assert!(bulk < Duration::from_millis(1_600), "{bulk:?}");
+        // A long poll outlasts its wait by the long timeout.
+        let poll = timed(TimeoutClass::LongPoll { wait_s: 1 }).await;
+        assert!(poll >= Duration::from_millis(1_700), "{poll:?}");
         server.abort();
     }
 

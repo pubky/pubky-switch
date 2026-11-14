@@ -551,6 +551,7 @@ impl World {
                 path_and_query: path.to_owned(),
                 headers: Vec::new(),
                 body: Vec::new(),
+                timeout: pubky_switch_client::transport::TimeoutClass::default(),
             })
             .await
     }

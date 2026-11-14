@@ -892,6 +892,7 @@ mod tests {
             body: json!({ "enrollment": enrollment.signed() })
                 .to_string()
                 .into_bytes(),
+            timeout: crate::transport::TimeoutClass::default(),
         };
         switch.lock().enroll(&request).unwrap()
     }
@@ -960,6 +961,7 @@ mod tests {
             body: json!({ "enrollment": enrollment.signed() })
                 .to_string()
                 .into_bytes(),
+            timeout: crate::transport::TimeoutClass::default(),
         };
         assert!(switch.handle(&request).is_err(), "the answer is lost");
         assert!(switch.lock().answer_key.is_none());
@@ -1057,6 +1059,7 @@ mod tests {
             body: json!({ "enrollment": enrollment.signed() })
                 .to_string()
                 .into_bytes(),
+            timeout: crate::transport::TimeoutClass::default(),
         };
         let refused = |answer: &crate::transport::Response| {
             let body: Value = serde_json::from_slice(&answer.body).unwrap();

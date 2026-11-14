@@ -3857,6 +3857,11 @@ async fn test_batch_error_says_kept_exactly_when_the_batch_stays() {
     for (name, fault, stays) in cases {
         let s = Setup::new();
         let mut app = s.join("wallet").await;
+        // A first send reads the service time only when the one held is over a day old.
+        if name.starts_with("time read") {
+            s.w.clock
+                .advance_ms(crate::app::provider::RECENT_SERVICE_TIME_MS + 1);
+        }
         s.w.switch.fail_next(fault);
         let error = app
             .submit_batch(OpBatch::new().op(OpKind::DenyPut { pubky: [9; 32] }))
@@ -5402,6 +5407,7 @@ fn scripted_answer(s: &Setup, app: Option<[u8; 16]>, rest: &str) -> (u16, Value,
                 path_and_query: format!("/v1/{}/{rest}", s.w.alice.id()),
                 headers,
                 body: Vec::new(),
+                timeout: crate::transport::TimeoutClass::default(),
             })
             .unwrap();
     let head = response
@@ -5602,6 +5608,7 @@ async fn test_scripted_peer_identity_needed_carries_known_version() {
             ),
         ],
         body: Vec::new(),
+        timeout: crate::transport::TimeoutClass::default(),
     };
     let response = s.peer.transport().send(request).await.unwrap();
     assert_eq!(response.status, 409);
@@ -6098,6 +6105,7 @@ fn feed_read(s: &Setup, app: [u8; 16], rest: &str) -> crate::transport::Request 
             ),
         ],
         body: Vec::new(),
+        timeout: crate::transport::TimeoutClass::default(),
     }
 }
 
@@ -6165,6 +6173,7 @@ async fn test_scripted_peer_append_query_is_read_first() {
                 ),
             ],
             body: Vec::new(),
+            timeout: crate::transport::TimeoutClass::default(),
         };
         let response = s.peer.transport().send(request).await.unwrap();
         assert_eq!(response.status, 400, "{query}");
@@ -6645,6 +6654,7 @@ fn scripted_request(
                     ),
                 ],
                 body,
+                timeout: crate::transport::TimeoutClass::default(),
             })
             .unwrap();
     let body: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
@@ -7474,11 +7484,11 @@ async fn test_records_waiting_entry_waits_for_an_owed_reopening() {
     let log = s.log();
     let read = &log[from..];
     let effect = read.iter().position(|line| line.contains("/ops")).unwrap();
-    // The one-item read that verifies a service time before the effect is sent isn't the
-    // feed's (Switch spec 10.1).
+    // The read of a page with no items that verifies a service time before the effect is
+    // sent isn't the feed's (Switch spec 10.1).
     let feed = read
         .iter()
-        .position(|line| line.contains("/feed") && !line.ends_with("limit=1"))
+        .position(|line| line.contains("/feed") && !line.ends_with("limit=0"))
         .unwrap();
     assert!(effect < feed, "{read:?}");
 }

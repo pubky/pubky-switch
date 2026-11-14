@@ -11,6 +11,7 @@ use pubky_switch_core::ops::{
 use super::read::{self, Obj};
 use super::{Auth, Body, Credentials, DynSigner, SwitchClient, verify_head};
 use crate::error::ClientError;
+use crate::transport::TimeoutClass;
 
 /// A batch for `POST /v1/{id}/ops` (Switch wire 6.4): its signed operations, its cursor move
 /// and the exact request body.
@@ -89,6 +90,22 @@ impl Batch {
     /// The cursor move, if any.
     pub fn cursor(&self) -> Option<Position> {
         self.cursor
+    }
+
+    /// How long the batch's call may take: a batch that writes a shared record may be
+    /// answered `409 conflict` with the record's view, up to about a mebibyte (Switch wire
+    /// 7.6, 7.1 "Answer sizes"), on its first send and on every resend of the same bytes;
+    /// any other batch's answer is small.
+    pub(crate) fn timeout(&self) -> TimeoutClass {
+        let writes_a_record = self
+            .ops
+            .iter()
+            .any(|op| matches!(op.body().kind, OpKind::RecordPut(_)));
+        if writes_a_record {
+            TimeoutClass::Bulk
+        } else {
+            TimeoutClass::Ordinary
+        }
     }
 
     /// The exact request body.
@@ -204,7 +221,10 @@ impl SwitchClient {
                 &self.path("ops"),
                 batch.body.clone(),
                 Body::Json,
-                Auth::default(),
+                Auth {
+                    timeout: batch.timeout(),
+                    ..Auth::default()
+                },
             )
             .await?;
         let (value, what) =

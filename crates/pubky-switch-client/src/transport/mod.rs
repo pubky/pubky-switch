@@ -57,6 +57,30 @@ pub fn header_value<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
     Some(first.value.as_str())
 }
 
+/// How long a call may take, by what it can carry. The client picks the class of every
+/// call it makes ([`Request::timeout`]), from the call itself, never from its path; a
+/// transport gives each class a timeout (`HttpConfig` for the HTTPS transport).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimeoutClass {
+    /// A small request with a small answer: a write of a document or a setting, a read of
+    /// one small value, the read of the signed service time (a feed page with no items,
+    /// Switch wire 7.4.4), and a batch of operations that writes no shared record (its
+    /// answer is its proofs, or a refusal with at most a claim's view).
+    #[default]
+    Ordinary,
+    /// A request or an answer that can carry about a mebibyte or more (Switch wire 7.1
+    /// "Answer sizes"): a paged or listing read, a shared record's view, an upload, and a
+    /// batch of operations that writes a shared record, whose `409 conflict` carries the
+    /// record's view (Switch wire 7.6).
+    Bulk,
+    /// The feed's long poll (Switch wire 7.4.4): the service holds the read for up to
+    /// `wait_s` seconds, then answers a page as a [`TimeoutClass::Bulk`] read does.
+    LongPoll {
+        /// The longest the service holds the read, in seconds: the request's `wait`.
+        wait_s: u32,
+    },
+}
+
 /// A request to the switch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -71,6 +95,8 @@ pub struct Request {
     pub headers: Vec<Header>,
     /// The body bytes.
     pub body: Vec<u8>,
+    /// How long the call may take: the class the client picked for it. It isn't sent.
+    pub timeout: TimeoutClass,
 }
 
 impl Request {

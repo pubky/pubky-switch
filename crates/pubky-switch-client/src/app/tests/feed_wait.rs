@@ -1397,10 +1397,10 @@ async fn test_receive_reads_at_most_its_page_budget() {
 }
 
 #[tokio::test]
-async fn test_update_record_takes_one_time_sample_for_all_its_tries() {
+async fn test_update_record_reads_the_service_time_once_for_all_its_tries() {
     // The phone writes the record after the wallet's last read: the wallet's first try is
-    // refused `409 conflict`, the next builds on the phone's write, and the call takes its
-    // service time once.
+    // refused `409 conflict`, the next builds on the phone's write, and the call, which
+    // holds no recent service time, reads one once: a feed page with no items.
     let s = Setup::new(false);
     let mut app = s.join("wallet").await;
     let mut phone = s.join("phone").await;
@@ -1418,7 +1418,7 @@ async fn test_update_record_takes_one_time_sample_for_all_its_tries() {
         s.sent_since(from)
             .iter()
             .filter(|line| {
-                line.contains("/feed?") && line.contains("limit=1") && !line.contains("wait=")
+                line.contains("/feed?") && line.ends_with("limit=0")
             })
             .count()
     };
@@ -1428,6 +1428,8 @@ async fn test_update_record_takes_one_time_sample_for_all_its_tries() {
             .filter(|line| line.contains("/ops"))
             .count()
     };
+    s.w.clock
+        .advance_ms(crate::app::provider::RECENT_SERVICE_TIME_MS + 1);
     let from = s.router.log().len();
     let updated = app
         .update_record(&target, vec![], |_| Some(value(&["w"])))

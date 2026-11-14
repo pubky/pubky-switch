@@ -91,7 +91,10 @@ pub enum BatchError {
 /// A failure to carry a request to the switch or its answer back.
 ///
 /// None of these is an answer of the switch: a request that failed here may or may not have
-/// reached it, so a write is resent with the same bytes (Switch wire 2.1).
+/// reached it, so a write is resent with the same bytes (Switch wire 2.1). The two that
+/// say nothing was sent, [`TransportError::Refused`] and [`TransportError::Connect`], are
+/// relied on: a batch whose first send fails with one is kept as never sent, so a
+/// transport returns them only when no byte of the request left.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransportError {
@@ -99,7 +102,7 @@ pub enum TransportError {
     /// (Switch wire 7.1, 8.2). Nothing was sent.
     #[error("refused origin: {0}")]
     Refused(String),
-    /// No connection could be made.
+    /// No connection could be made. Nothing was sent.
     #[error("connection failed: {0}")]
     Connect(String),
     /// The call took longer than its timeout.

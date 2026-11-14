@@ -347,7 +347,7 @@ async fn test_kept_batch_status_refused_after_signing_again_names_the_first_id()
 /// which a resend tells.
 async fn sent_past_the_window(w: &World, router: &Router) -> ([u8; 16], SignedMessage, [u8; 16]) {
     let mut app = join_app(w, router).await;
-    w.switch.fail_next(Fault::Unreachable {
+    w.switch.fail_next(Fault::Unanswered {
         path: "ops".into(),
         after: 0,
     });
@@ -719,7 +719,7 @@ async fn test_kept_batch_status_load_leaves_an_index_a_kept_batch_holds() {
 /// A batch sent once, its answer lost to the network, unapplied, still inside its window.
 async fn sent_unanswered(w: &World, router: &Router) -> ([u8; 16], SignedMessage, [u8; 16]) {
     let mut app = join_app(w, router).await;
-    w.switch.fail_next(Fault::Unreachable {
+    w.switch.fail_next(Fault::Unanswered {
         path: "ops".into(),
         after: 0,
     });

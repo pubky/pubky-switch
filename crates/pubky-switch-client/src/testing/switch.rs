@@ -220,6 +220,15 @@ pub enum Fault {
         /// A part of the request's path and query.
         path: String,
     },
+    /// Take the request, apply nothing and never answer, once `after` matching requests
+    /// went through: the caller sees a timeout, and can't tell that the request wasn't
+    /// applied.
+    Unanswered {
+        /// A part of the request's path and query.
+        path: String,
+        /// How many matching requests go through first.
+        after: usize,
+    },
     /// [`Fault::LoseAnswer`], once `after` matching requests went through.
     LoseAnswerAfter {
         /// A part of the request's path and query.
@@ -1204,6 +1213,7 @@ impl ScriptedSwitch {
         let matching = inner.faults.iter().position(|fault| match fault {
             Fault::Error { path: p, .. }
             | Fault::LoseAnswer { path: p }
+            | Fault::Unanswered { path: p, .. }
             | Fault::LoseAnswerAfter { path: p, .. }
             | Fault::Unreachable { path: p, .. }
             | Fault::LeaveOut { path: p, .. }
@@ -1212,8 +1222,11 @@ impl ScriptedSwitch {
             | Fault::ErrorSignedWith { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
-            Some(Fault::Unreachable { after, .. } | Fault::LoseAnswerAfter { after, .. })
-                if *after > 0 =>
+            Some(
+                Fault::Unreachable { after, .. }
+                | Fault::Unanswered { after, .. }
+                | Fault::LoseAnswerAfter { after, .. },
+            ) if *after > 0 =>
             {
                 *after -= 1;
                 true
@@ -1258,6 +1271,7 @@ impl ScriptedSwitch {
                     inner.unreached.push(request.body.clone());
                     return Err(TransportError::Connect("scripted".into()));
                 }
+                Some(Fault::Unanswered { .. }) => return Err(TransportError::Timeout),
                 None => {}
             }
         }

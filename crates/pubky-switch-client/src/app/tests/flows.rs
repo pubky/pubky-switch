@@ -4813,6 +4813,7 @@ async fn test_switch_cursor_set_behind_the_cursor_changes_nothing() {
                     ),
                 ],
                 body,
+                timeout: crate::transport::TimeoutClass::default(),
             })
             .unwrap()
             .status

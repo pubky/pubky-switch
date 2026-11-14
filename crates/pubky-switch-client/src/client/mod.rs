@@ -35,7 +35,7 @@ use serde_json::Value;
 
 use crate::clock::Clock;
 use crate::error::ClientError;
-use crate::transport::{Header, Request, Response, Transport};
+use crate::transport::{Header, Request, Response, TimeoutClass, Transport};
 
 /// Who signs the requests (Switch wire 7.2).
 #[derive(Clone)]
@@ -178,6 +178,9 @@ pub(crate) struct Auth<'a> {
     /// a delivery that starts a generation (Switch wire 7.4.2). Other statuses are still
     /// checked with the pinned key.
     pub(crate) success_key: Option<[u8; 32]>,
+    /// How long the call may take ([`TimeoutClass`]), which goes to the transport with
+    /// the request.
+    pub(crate) timeout: TimeoutClass,
 }
 
 /// The `Content-Type` of a request body (Switch wire 7.1).
@@ -544,6 +547,9 @@ impl SwitchClient {
     /// The timestamp is the clock's time to the second. An app calling another identity's
     /// account sends `Switch-Cert`; the next service signs over the transfer label.
     ///
+    /// The request's timeout class is [`TimeoutClass::Ordinary`]; a caller whose request
+    /// or answer can be large sets [`Request::timeout`] before sending it.
+    ///
     /// # Errors
     ///
     /// [`ClientError::Usage`] for an invite code that isn't a token.
@@ -594,6 +600,7 @@ impl SwitchClient {
                     path_and_query: path_and_query.to_owned(),
                     headers,
                     body,
+                    timeout: auth.timeout,
                 },
                 signature: None,
             });
@@ -667,6 +674,7 @@ impl SwitchClient {
                 path_and_query: path_and_query.to_owned(),
                 headers,
                 body,
+                timeout: auth.timeout,
             },
             signature: Some(signature),
         })

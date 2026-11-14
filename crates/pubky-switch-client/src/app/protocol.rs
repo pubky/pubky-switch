@@ -83,11 +83,17 @@ pub struct OpaqueRule {
 /// protocol for check 10 ([`Protocol::check_body`]) and its effect ([`Protocol::receive`]).
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage {
-    /// The `seq` the entry was read at: in the current generation for an entry of the
-    /// feed, and for one stored locally (`parked`) in the generation it was read at, which
-    /// a provider change since may have left behind. A stored entry's handle is its local
-    /// ID ([`super::AppEvent::Parked`]), not this `seq`.
+    /// The `seq` the entry was read at, in [`ReceivedMessage::generation`]. A stored
+    /// entry's handle is its local ID ([`super::AppEvent::Parked`]), not this `seq`.
     pub seq: u64,
+    /// The generation the entry was read at: the current one for an entry of the feed, and
+    /// for one stored locally (`parked`) the one it was first read at, which a provider
+    /// change since may have left behind; a retry reports the same pair every time. With
+    /// `seq` it is the entry's position in the inbox, by which a protocol orders what it
+    /// keeps: a move or a key change continues the sequence under the next generation, and
+    /// a provider loss starts a new one, so two entries can share a `seq` in different
+    /// generations.
+    pub generation: u64,
     /// The sender identity.
     pub sender: [u8; 32],
     /// When the inbox accepted it, service time in Unix milliseconds.

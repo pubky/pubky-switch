@@ -73,6 +73,11 @@ impl Router {
         self.0.limit_feeds(reads);
     }
 
+    /// Every request sent, as `"METHOD origin path"`, in order.
+    pub(crate) fn log(&self) -> Vec<String> {
+        self.0.log()
+    }
+
     pub(crate) fn env(&self, w: &World, store: Arc<dyn StateStore>) -> AppEnv {
         w.signer.env_with(
             store,
@@ -1671,6 +1676,7 @@ fn upload_request(lost: &Lost, body: &str) -> crate::transport::Request {
             &pubky_switch_core::enc::zbase32_encode(&app_keys("wallet").app_id_bytes()),
         )],
         body: body.as_bytes().to_vec(),
+        timeout: crate::transport::TimeoutClass::default(),
     }
 }
 
@@ -3311,7 +3317,7 @@ async fn test_key_change_drops_a_kept_batch_older_than_the_batch_window() {
     )
     .await;
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
-    w.switch.fail_next(Fault::Unreachable {
+    w.switch.fail_next(Fault::Unanswered {
         path: "ops".into(),
         after: 0,
     });
@@ -4265,7 +4271,7 @@ async fn kept_attempt_batch(
     crate::client::Batch,
 ) {
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
-    w.switch.fail_next(Fault::Unreachable {
+    w.switch.fail_next(Fault::Unanswered {
         path: "ops".into(),
         after: 0,
     });
@@ -4865,6 +4871,7 @@ fn signer_call(
             path_and_query: format!("/v1/{}/{route}", w.alice.id()),
             headers: Vec::new(),
             body,
+            timeout: crate::transport::TimeoutClass::default(),
         })
         .unwrap();
     (

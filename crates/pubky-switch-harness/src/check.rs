@@ -657,6 +657,7 @@ mod tests {
             path_and_query: path,
             headers: vec![Header::new(header::IDENTITY, &id)],
             body: serde_json::to_vec(body).unwrap(),
+            timeout: pubky_switch_client::transport::TimeoutClass::default(),
         }
     }
 

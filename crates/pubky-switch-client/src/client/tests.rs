@@ -1098,3 +1098,83 @@ async fn test_last_server_time_follows_checked_answers_only() {
     assert_eq!(client.last_server_time(), None);
     assert_eq!(client.latest_server_time(), None);
 }
+
+/// A batch of one shared record write.
+fn record_write() -> Vec<(Vec<Condition>, OpKind)> {
+    use pubky_switch_core::ident::{Policy, collection_id};
+    use pubky_switch_core::ops::{RecordPut, RecordVersion};
+    use pubky_switch_core::sealed::SealedValue;
+    let identity = identity().public();
+    let policy = Policy::new("sample", &["sample"]);
+    let key = [2; 32];
+    let put = RecordPut {
+        key,
+        collection: collection_id("sample.items", &identity),
+        policy,
+        expected_version: RecordVersion::new(1, 4),
+        value_sealed: SealedValue::seal(&[3; 32], &identity, 1, "sample", &key, b"{}").unwrap(),
+        id_inputs: None,
+    };
+    vec![(Vec::new(), OpKind::RecordPut(put))]
+}
+
+#[tokio::test]
+async fn test_calls_pick_their_timeout_class() {
+    // A switch whose answers don't read: every call fails, after its request went.
+    let transport = fixed(service_key(), 200, json!({}));
+    let client = client_with(app(), Some(service_public()), Arc::clone(&transport));
+    // The class of the `n`th request, which the call just made must have sent.
+    let class = |n: usize| {
+        let sent = transport.requests();
+        assert_eq!(sent.len(), n, "the call sent no request");
+        sent[n - 1].timeout
+    };
+    let feed = |limit, wait| answers::FeedQuery {
+        after: None,
+        limit,
+        wait,
+    };
+    // A feed page with no items, the read of the service time, is small.
+    let _ = client.feed(feed(Some(0), None)).await;
+    assert_eq!(class(1), TimeoutClass::Ordinary);
+    // A page is bulk, and a long poll carries its wait.
+    let _ = client.feed(feed(Some(100), None)).await;
+    assert_eq!(class(2), TimeoutClass::Bulk);
+    let _ = client.feed(feed(None, Some(0))).await;
+    assert_eq!(class(3), TimeoutClass::Bulk);
+    let _ = client.feed(feed(Some(1), Some(25))).await;
+    assert_eq!(class(4), TimeoutClass::LongPoll { wait_s: 25 });
+    // Listings, a record's view and an append are bulk.
+    let _ = client.directory(None).await;
+    assert_eq!(class(5), TimeoutClass::Bulk);
+    let _ = client.allow().await;
+    assert_eq!(class(6), TimeoutClass::Bulk);
+    let _ = client.record(&[1; 32]).await;
+    assert_eq!(class(7), TimeoutClass::Bulk);
+    let _ = client.claim(&[1; 32]).await;
+    assert_eq!(class(8), TimeoutClass::Bulk);
+    let _ = client.append(vec![0; 16], 1, None).await;
+    assert_eq!(class(9), TimeoutClass::Bulk);
+    // A small write and the public read are ordinary.
+    let _ = client.connect().await;
+    assert_eq!(class(10), TimeoutClass::Ordinary);
+    let _ = client.public_identity().await;
+    assert_eq!(class(11), TimeoutClass::Ordinary);
+    // A batch that writes no shared record is ordinary.
+    let lists = client.sign_batch(1, two_lists(), None).unwrap();
+    let _ = client.submit(&lists).await;
+    assert_eq!(class(12), TimeoutClass::Ordinary);
+    // One that writes a shared record is bulk, on its first send and read back from its
+    // kept body for a resend: its refusal can carry the record's view.
+    let record = client.sign_batch(1, record_write(), None).unwrap();
+    let _ = client.submit(&record).await;
+    assert_eq!(class(13), TimeoutClass::Bulk);
+    let kept = Batch::from_body(record.body().to_vec()).unwrap();
+    let _ = client.submit(&kept).await;
+    assert_eq!(class(14), TimeoutClass::Bulk);
+    // A request signed for the caller to send is ordinary until the caller says otherwise.
+    let signed = client
+        .sign_request("GET", "/v1/x/feed", Vec::new(), None)
+        .unwrap();
+    assert_eq!(signed.request.timeout, TimeoutClass::Ordinary);
+}
