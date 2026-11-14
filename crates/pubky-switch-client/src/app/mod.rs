@@ -409,8 +409,7 @@ pub struct AppBackup {
     stored_next: u64,
     /// When the backup was taken, the app's clock: a restore reinstalls the messages whose
     /// delivery is owed only within [`SENT_RETENTION_MS`] of it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    taken_ms: Option<u64>,
+    taken_ms: u64,
     /// The highest service time the app had verified when the backup was taken, the base of
     /// the outbox's replay deadline in place of `taken_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,13 +429,6 @@ pub struct AppBackup {
     protocol: Option<LayerOut>,
 }
 
-/// The version a backup with a protocol layer carries, in place of [`SCHEMA_VERSION`]: a
-/// reader that knows no layers, which takes only that version, refuses such a backup
-/// rather than restore it without the layer. A schema change gives both kinds of backup
-/// new versions.
-const LAYERED_BACKUP_VERSION: u32 = 4;
-const _: () = assert!(LAYERED_BACKUP_VERSION != SCHEMA_VERSION);
-
 /// A [`ProtocolLayer`] as a backup's bytes carry it, with what the app's feed holds beyond
 /// its cursor at the same moment: the entries processed past a held one, the entries
 /// stored locally, and the processed pairs (Switch spec 11). The layer reflects those
@@ -446,12 +438,9 @@ const _: () = assert!(LAYERED_BACKUP_VERSION != SCHEMA_VERSION);
 struct LayerOut {
     name: String,
     data: String,
-    #[serde(default)]
     seen: Vec<u64>,
-    #[serde(default)]
     parked: Vec<(u64, ParkedEntry)>,
     /// Each pair's key after `proc/`, and its record.
-    #[serde(default)]
     processed: Vec<(String, Processed)>,
 }
 
@@ -472,39 +461,27 @@ impl AppBackup {
             .map_err(|_| AppError::Store(StoreError::Other("the backup can't be written".into())))
     }
 
-    /// Read a backup's bytes. A backup with a protocol layer carries a version of its own,
-    /// which a reader from before layers refuses, so none restores it without the layer.
+    /// Read a backup's bytes. A backup with a protocol layer is told by its `protocol`
+    /// member, under the same version as one without.
     ///
     /// # Errors
     ///
-    /// [`StoreError::OldSchema`] for a backup an earlier schema wrote, as for a store of
-    /// one; [`AppError::InvalidData`] if they don't read as a backup, or their version isn't
-    /// the one of a backup with, or without, a layer.
+    /// [`AppError::InvalidData`] if they don't read as a backup, or their version isn't
+    /// [`SCHEMA_VERSION`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AppError> {
         #[derive(Deserialize)]
         struct Version {
             v: u32,
-            #[serde(default)]
-            protocol: Option<serde_json::Value>,
         }
         let version: Version = serde_json::from_slice(bytes)
             .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))?;
-        let expected = if version.protocol.is_some() {
-            LAYERED_BACKUP_VERSION
-        } else {
-            SCHEMA_VERSION
-        };
-        if version.v < expected {
-            return Err(AppError::Store(StoreError::OldSchema { found: version.v }));
-        }
-        let backup: Self = serde_json::from_slice(bytes)
-            .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))?;
-        if backup.v != expected {
+        if version.v != SCHEMA_VERSION {
             return Err(AppError::InvalidData(
                 "the backup is of another schema version".into(),
             ));
         }
-        Ok(backup)
+        serde_json::from_slice(bytes)
+            .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))
     }
 
     /// The protocol's layer, if the backup holds one.
@@ -755,7 +732,7 @@ fn uncertain_copy(
             id,
             ParkedEntry {
                 reason: ParkReason::Uncertain,
-                released: stored.was_released(),
+                released: stored.released,
                 ..stored.clone()
             },
         ));
@@ -1100,12 +1077,6 @@ impl App {
                 listed_before_items: false,
                 reopen_failures: 0,
             };
-            // A store an earlier build wrote keeps the epoch read now.
-            if !app.reader().exists(key::DUTY_EPOCH).await? {
-                let mut tx = Tx::new(&app.ns);
-                tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
-                tx.commit(&app.env.store).await?;
-            }
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties().await?;
             app.queue_duties(kept);
@@ -1156,13 +1127,13 @@ impl App {
             record: reader.get(key::RECORD).await?.ok_or_else(missing)?,
             naming: reader.get(key::NAMING).await?.ok_or_else(missing)?,
             scope_keys,
-            bundle: reader.get(key::BUNDLE).await?.unwrap_or_default(),
+            bundle: reader.get(key::BUNDLE).await?.ok_or_else(missing)?,
             own_doc,
             receive_keys: reader.scan_numbered("rk/").await?,
             known_kids,
             registrations: reader.scan_numbered("reg/").await?,
-            rotation: reader.get(key::ROTATION).await?.unwrap_or_default(),
-            device: reader.get(key::DEVICE).await?.unwrap_or_default(),
+            rotation: reader.get(key::ROTATION).await?.ok_or_else(missing)?,
+            device: reader.get(key::DEVICE).await?.ok_or_else(missing)?,
             cursor: reader.get(key::CURSOR).await?.ok_or_else(missing)?,
             chain: ChainView::load(reader).await?,
             held: reader.scan_numbered("held/").await?,
@@ -1186,11 +1157,7 @@ impl App {
             service_time: reader.get(key::SERVICE_TIME).await?,
             gone: reader.get(provider::keys::GONE).await?,
             next_duty: Self::next_duty(reader).await?,
-            duty_epoch: match reader.get(key::DUTY_EPOCH).await? {
-                Some(epoch) => epoch,
-                // A store an earlier build wrote: `App::load` keeps this one.
-                None => state::DutyEpoch::random()?,
-            },
+            duty_epoch: reader.get(key::DUTY_EPOCH).await?.ok_or_else(missing)?,
             erasing: reader.get(provider::keys::ERASING).await?,
             meta,
         })
@@ -1233,7 +1200,7 @@ impl App {
             )
             .into());
         }
-        let mut backup = Self::backup_of(&self.state)?;
+        let mut backup = self.backup_of(&self.state)?;
         self.carry_outbox(&self.reader(), &mut backup).await?;
         // The restore is built, not committed, as for a layered backup: one that can never
         // be installed is refused now.
@@ -1253,8 +1220,8 @@ impl App {
         Ok(backup)
     }
 
-    /// The backup of `state`.
-    fn backup_of(state: &AppState) -> Result<AppBackup, AppError> {
+    /// The backup of `state`, taken now.
+    fn backup_of(&self, state: &AppState) -> Result<AppBackup, AppError> {
         if state.leave.is_some() {
             return Err(Refusal::Left.into());
         }
@@ -1298,8 +1265,8 @@ impl App {
                 .collect(),
             bundle: state.bundle.clone(),
             stored_next: state.next_stored_id,
-            taken_ms: None,
-            taken_service_ms: None,
+            taken_ms: self.now(),
+            taken_service_ms: self.state.service_time.map(|time| time.highest_ms),
             outbox: Vec::new(),
             outbox_left_out: Vec::new(),
             held_counterparties: Vec::new(),
@@ -1316,8 +1283,7 @@ impl App {
     fn reinstall_outbox(&mut self, backup: &AppBackup, tx: &mut Tx) -> Result<(), AppError> {
         let baseline = backup
             .taken_service_ms
-            .or(backup.taken_ms)
-            .unwrap_or(0)
+            .unwrap_or(backup.taken_ms)
             .saturating_sub(CLOCK_TOLERANCE_MS);
         for item in &backup.outbox {
             let mut item = item.clone();
@@ -1345,12 +1311,10 @@ impl App {
         Ok(())
     }
 
-    /// Put the outbox in `backup`, as `reader` holds it, with the backup's times (Switch
-    /// spec 11): every message the app still owes a job, so a restore delivers what was
-    /// queued before the backup with the same `msg_id` and bytes.
+    /// Put the outbox in `backup`, as `reader` holds it (Switch spec 11): every message the
+    /// app still owes a job, so a restore delivers what was queued before the backup with
+    /// the same `msg_id` and bytes.
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
-        backup.taken_ms = Some(self.now());
-        backup.taken_service_ms = self.state.service_time.map(|time| time.highest_ms);
         let carried = send::carried_outbox(reader).await?;
         backup.outbox = carried.items;
         backup.outbox_left_out = carried.left_out;
@@ -1455,7 +1419,7 @@ impl App {
             };
             let reader = self.reader();
             let state = Self::read_state(&reader).await?;
-            let mut backup = Self::backup_of(&state)?;
+            let mut backup = self.backup_of(&state)?;
             self.carry_outbox(&reader, &mut backup).await?;
             let local = self.protocol_scan(b"").await?;
             let mut processed = reader.scan::<Processed>("proc/").await?;
@@ -1493,7 +1457,6 @@ impl App {
             let data = self.protocol.backup_layer(local).map_err(|why| {
                 AppError::InvalidData(format!("the protocol's backup layer: {why}"))
             })?;
-            backup.v = LAYERED_BACKUP_VERSION;
             backup.protocol = Some(LayerOut {
                 name,
                 data: pubky_switch_core::enc::b64(&data),

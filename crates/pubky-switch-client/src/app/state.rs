@@ -6,9 +6,8 @@
 //! every network effect follows one pattern (`store` module): sign an artifact and commit it
 //! with the next step, send those bytes until there is an answer, then commit the outcome.
 //!
-//! Every value is `{"v":<SCHEMA_VERSION>,"d":<record>}`. A reader refuses an earlier `v` as
-//! an old schema and a later or unreadable one as corrupt, so a later schema adds a
-//! migration instead of reading old bytes wrongly.
+//! Every value is `{"v":<SCHEMA_VERSION>,"d":<record>}`. A reader refuses any other `v`, or
+//! bytes that don't read, as corrupt.
 //!
 //! Sensitive records (the app's keys, receive keys, scope keys, the naming key and parked
 //! plaintexts) rely on the store's guarantees: device-bound and encrypted at rest (Switch
@@ -30,9 +29,8 @@ use super::protocol::LocalWrite;
 use crate::error::StoreError;
 use crate::store::{StoreHandle, Write, WriteBatch};
 
-/// The schema version of every value the app layer writes. 2: a kept effect keeps the
-/// entry it is for (`pending/effect`).
-pub const SCHEMA_VERSION: u32 = 3;
+/// The schema version of every value the app layer writes.
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// The prefix of the protocol's own keys in the app's namespace.
 pub const PROTOCOL_PREFIX: &[u8] = b"p/";
@@ -64,15 +62,11 @@ struct Version {
     v: u32,
 }
 
-/// Read a record's bytes. An earlier schema version is an old schema, read from the version
-/// alone, before the record, whose shape that schema may not have; a later one, or bytes
-/// that don't read, are corrupt.
+/// Read a record's bytes. Another schema version, read from the version alone before the
+/// record, whose shape it decides, or bytes that don't read, are corrupt.
 pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, AppError> {
     let version: Version =
         serde_json::from_slice(bytes).map_err(|_| AppError::Store(StoreError::Corrupt))?;
-    if version.v < SCHEMA_VERSION {
-        return Err(AppError::Store(StoreError::OldSchema { found: version.v }));
-    }
     if version.v != SCHEMA_VERSION {
         return Err(AppError::Store(StoreError::Corrupt));
     }
@@ -483,26 +477,17 @@ pub(crate) struct ParkedEntry {
     pub(crate) round: u64,
     /// The host released it ([`super::App::release_parked`]): kept whatever reason it is
     /// stored for again, through a backup and a restore, so each later run is handed over
-    /// as released ([`super::ReceivedMessage::released`]). An entry an earlier build stored
-    /// has none; its reason [`ParkReason::Released`] says so ([`ParkedEntry::was_released`]).
+    /// as released ([`super::ReceivedMessage::released`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) released: bool,
     /// For an entry that waits for a scope key ([`ParkReason::AwaitingKey`]): how many
     /// scope keys the app held when its step last ran. Keys are only ever added while the
     /// app runs, so another count is a changed key set, and only that makes the entry due
-    /// again (`feed.rs`, `due_again`); `None` before its step ran so, for an entry an
-    /// earlier build stored, or for one whose step ran while a reopening was owed
-    /// (`records::REOPEN_DUE`): such an entry is due once its epoch's keys are held and
-    /// no reopening is owed.
+    /// again (`feed.rs`, `due_again`); `None` before its step ran so, and for one whose
+    /// step ran while a reopening was owed (`records::REOPEN_DUE`): such an entry is due
+    /// once its epoch's keys are held and no reopening is owed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) keys_at: Option<u64>,
-}
-
-impl ParkedEntry {
-    /// Whether the host released it, whatever it is stored for now.
-    pub(crate) fn was_released(&self) -> bool {
-        self.released || self.reason == ParkReason::Released
-    }
 }
 
 /// `ident/<identity>/doc`: the newest `identity.json` held for an identity.
@@ -565,8 +550,7 @@ pub(crate) struct PendingEffect {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) deadlines: Vec<(String, super::claims::ObligationDeadline)>,
     /// When it was kept, before its first send, app clock.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) kept_ms: Option<u64>,
+    pub(crate) kept_ms: u64,
     /// The keys of the processed pairs the step forgets, deleted with the outcome, as its
     /// local writes are ([`super::ReceiveContext::forget_processed`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -636,8 +620,7 @@ pub(crate) struct RestoreState {
 }
 
 /// `leave`: a leave in progress or done (Switch spec 12.3). Each call's mode decides how
-/// it goes, so the mode isn't kept; a `two_step` member that stores written before carry
-/// is ignored when read.
+/// it goes, so the mode isn't kept.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LeaveState {
     /// When `leave` succeeded, app clock; `None` while it is owed.
@@ -902,10 +885,8 @@ pub(crate) fn parse_num(text: &str) -> Result<u64, AppError> {
 }
 
 /// The kept form of local writes in a kept effect or batch: each key and value in
-/// base64url (`{"Put":{"key":"…","value":"…"}}`), so a write keeps in at most 4/3 of its
-/// bytes whatever they are (`MAX_STEP_LOCAL_BYTES`). It reads the form written before,
-/// `LocalWrite`'s own, with its bytes as arrays of numbers, too, so no stored value needs a
-/// migration.
+/// base64url (`{"Put":{"key":"...","value":"..."}}`), so a write keeps in at most 4/3 of its
+/// bytes whatever they are (`MAX_STEP_LOCAL_BYTES`).
 pub(crate) mod kept_local {
     use pubky_switch_core::enc::{b64, serde_b64_vec};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -952,14 +933,6 @@ pub(crate) mod kept_local {
         },
     }
 
-    /// The base64 form, or the earlier one with arrays of numbers.
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Either {
-        Kept(Kept),
-        Earlier(LocalWrite),
-    }
-
     pub(crate) fn serialize<S: Serializer>(writes: &[LocalWrite], s: S) -> Result<S::Ok, S::Error> {
         s.collect_seq(writes.iter().map(|write| match write {
             LocalWrite::Put { key, value } => Out::Put { key, value },
@@ -971,13 +944,12 @@ pub(crate) mod kept_local {
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
         d: D,
     ) -> Result<Vec<LocalWrite>, D::Error> {
-        Ok(Vec::<Either>::deserialize(d)?
+        Ok(Vec::<Kept>::deserialize(d)?
             .into_iter()
             .map(|write| match write {
-                Either::Kept(Kept::Put { key, value }) => LocalWrite::Put { key, value },
-                Either::Kept(Kept::Delete { key }) => LocalWrite::Delete { key },
-                Either::Kept(Kept::DeletePrefix { prefix }) => LocalWrite::DeletePrefix { prefix },
-                Either::Earlier(write) => write,
+                Kept::Put { key, value } => LocalWrite::Put { key, value },
+                Kept::Delete { key } => LocalWrite::Delete { key },
+                Kept::DeletePrefix { prefix } => LocalWrite::DeletePrefix { prefix },
             })
             .collect())
     }
@@ -1019,25 +991,6 @@ mod tests {
         assert_eq!(serde_json::from_value::<Kept>(json).unwrap(), kept);
     }
 
-    #[test]
-    fn test_kept_local_writes_of_the_earlier_form_still_read() {
-        // As `LocalWrite`'s own derive wrote them: bytes as arrays of numbers.
-        let earlier = serde_json::json!({
-            "local": writes()
-                .iter()
-                .map(|write| serde_json::to_value(write).unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(
-            earlier["local"][0]["Put"]["value"],
-            serde_json::json!([0, 255, 7])
-        );
-        assert_eq!(
-            serde_json::from_value::<Kept>(earlier).unwrap(),
-            Kept { local: writes() }
-        );
-    }
-
     /// A kept effect at the largest it can be: a `POST /ops` body at its 4 MiB cap, the
     /// largest plaintext and certificate, and `local` writes at the bound.
     fn largest_effect(local: Vec<LocalWrite>) -> PendingEffect {
@@ -1062,7 +1015,7 @@ mod tests {
                     )
                 })
                 .collect(),
-            kept_ms: Some(u64::MAX),
+            kept_ms: u64::MAX,
             forget: Vec::new(),
             entry: KeptEntry {
                 cert: SignedDoc {
@@ -1171,17 +1124,8 @@ mod tests {
             time_ms: 11,
         };
         let bytes = encode(&cursor).unwrap();
-        assert!(bytes.starts_with(b"{\"v\":3,\"d\":"));
+        assert!(bytes.starts_with(b"{\"v\":1,\"d\":"));
         assert_eq!(decode::<Cursor>(&bytes).unwrap(), cursor);
-    }
-
-    #[test]
-    fn test_record_of_an_earlier_schema_is_an_old_schema() {
-        let bytes = br#"{"v":1,"d":{"generation":1}}"#;
-        assert_eq!(
-            decode::<Floor>(bytes).unwrap_err(),
-            AppError::Store(StoreError::OldSchema { found: 1 })
-        );
     }
 
     #[test]

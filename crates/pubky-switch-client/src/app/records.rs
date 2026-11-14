@@ -422,8 +422,8 @@ pub enum Unopened {
     DoesNotOpen,
 }
 
-/// [`RecordContent`] as the store holds it: a value not open for now is kept as before,
-/// its data epoch read from the kept operation.
+/// [`RecordContent`] as the store holds it: a value not open for now is kept as
+/// `Unreadable`, its data epoch read from the kept operation.
 #[derive(Serialize, Deserialize)]
 enum StoredContent {
     Value(#[serde(with = "serde_b64_vec")] Vec<u8>),

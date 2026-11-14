@@ -219,8 +219,6 @@ pub(crate) enum OwedCall {
         seq: u64,
         entries: u64,
         accepted_from_ms: u64,
-        /// Absent in the form written before: no end is known.
-        #[serde(default = "no_end")]
         accepted_until_ms: u64,
     },
     /// A deny list change, owed in feed order: the calls behind it wait for it.
@@ -244,11 +242,6 @@ pub(crate) enum OwedCall {
         /// The operation, as the feed showed it.
         op: SignedDoc,
     },
-}
-
-/// The end of a missed-entries call kept without one ([`OwedCall::Missed`]).
-fn no_end() -> u64 {
-    u64::MAX
 }
 
 impl From<&ResendNeeded> for OwedCall {
@@ -1498,7 +1491,7 @@ impl App {
         self.state
             .parked
             .get(&id)
-            .is_some_and(ParkedEntry::was_released)
+            .is_some_and(|entry| entry.released)
     }
 
     /// The protocol's check 10, then its effect, at most twice after a conflict: the records
@@ -1926,7 +1919,7 @@ impl App {
                 .iter()
                 .map(|(claim_key, deadline)| (pubky_switch_core::enc::b64(claim_key), *deadline))
                 .collect(),
-            kept_ms: Some(self.kept_stamp()),
+            kept_ms: self.kept_stamp(),
             forget: written.forget.to_vec(),
             entry: KeptEntry {
                 cert: entry.cert.clone(),
@@ -2002,7 +1995,7 @@ impl App {
                     ) =>
             {
                 if refused_at(&error) == Some(RefusalPlace::Caller)
-                    && self.answer_decides(pending.kept_ms)
+                    && self.answer_decides(Some(pending.kept_ms))
                 {
                     return Err(error);
                 }
@@ -2122,7 +2115,7 @@ impl App {
             Err(AppError::Switch(ClientError::Switch {
                 code: ErrorCode::StaleGeneration,
                 ..
-            })) if !self.answer_decides(pending.kept_ms) => {
+            })) if !self.answer_decides(Some(pending.kept_ms)) => {
                 return self.effect_uncertain(&pending).await;
             }
             // Refused before the batch ID lookup, which tells nothing: about the caller, kept,
@@ -2135,7 +2128,7 @@ impl App {
                 ) =>
             {
                 if refused_at(&error) == Some(RefusalPlace::Caller)
-                    && self.answer_decides(pending.kept_ms)
+                    && self.answer_decides(Some(pending.kept_ms))
                 {
                     return Err(error);
                 }
@@ -2185,7 +2178,7 @@ impl App {
                 id,
                 ParkedEntry {
                     reason,
-                    released: stored.was_released(),
+                    released: stored.released,
                     ..stored
                 },
             ),
@@ -2267,11 +2260,11 @@ impl App {
         // ID takes the same bytes as new. It isn't sent again; its entry is stored as
         // uncertain (Switch wire 6.4 step 5, Switch spec 12.5 "Kept batches"). Past it by
         // the clocks at hand is past it; only a "still inside" needs a fresh service time.
-        if !self.answer_decides(pending.kept_ms) {
+        if !self.answer_decides(Some(pending.kept_ms)) {
             return self.effect_uncertain(&pending).await;
         }
         self.fresh_service_time().await?;
-        if !self.answer_decides(pending.kept_ms) {
+        if !self.answer_decides(Some(pending.kept_ms)) {
             return self.effect_uncertain(&pending).await;
         }
         if super::batch_generation(&batch).is_some_and(|g| g < self.state.meta.generation) {
@@ -2429,7 +2422,7 @@ impl App {
             released: entry
                 .stored
                 .and_then(|id| self.state.parked.get(&id))
-                .is_some_and(ParkedEntry::was_released),
+                .is_some_and(|entry| entry.released),
             // The step of an entry that waits for a key ran with the keys held now.
             keys_at: reason.awaited_epoch().map(|_| self.keys_held()),
         };

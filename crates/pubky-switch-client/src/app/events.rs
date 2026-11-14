@@ -1292,9 +1292,6 @@ pub enum ParkReason {
     /// ([`super::App::release_parked`]): its processed pair is gone, and a later read tries
     /// it again as a fresh receive, with [`super::ReceivedMessage::released`] set. A run
     /// whose effect is uncertain again is stored as [`ParkReason::Uncertain`] again.
-    ///
-    /// A build earlier than schema 3 (`STATE.md`) refuses a store that holds this reason, or
-    /// [`ParkReason::EffectTooLarge`], from the schema version alone, so neither is misread.
     Released,
     /// Its receive step needs a scope key of `data_epoch` that the app doesn't hold yet
     /// (Switch spec 3.5, 8.2): the step answered [`super::Outcome::AwaitKey`], or applied an

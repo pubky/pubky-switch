@@ -236,8 +236,8 @@ pub const KEPT_BATCH_ANSWER_MS: u64 =
 pub const KEPT_BATCH_MARGIN_MS: u64 = 60 * 60 * 1000;
 
 /// Whether a resend of a batch kept at `kept_ms` still tells whether it was applied, at
-/// `now`: kept less than [`KEPT_BATCH_ANSWER_MS`] ago. A batch without a time, kept by an
-/// earlier build, counts as too old.
+/// `now`: kept less than [`KEPT_BATCH_ANSWER_MS`] ago. `None` is a batch never sent, whose
+/// resend can't tell: it counts as too old.
 pub(crate) fn answer_decides(now: u64, kept_ms: Option<u64>) -> bool {
     kept_ms.is_some_and(|at| now.saturating_sub(at) < KEPT_BATCH_ANSWER_MS)
 }

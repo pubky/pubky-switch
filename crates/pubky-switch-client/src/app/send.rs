@@ -1545,9 +1545,9 @@ impl App {
                 open: true,
             };
             for (msg_id, item) in items {
-                if item.failed.is_some() {
+                if let Some((_, failed_ms)) = &item.failed {
                     // Forgotten, plaintext and all, after the retention of sent messages.
-                    if item.failed.as_ref().is_some_and(|(_, at)| *at <= cutoff) {
+                    if *failed_ms <= cutoff {
                         let mut tx = self.tx()?;
                         tx.delete(&out_key(&msg_id))?;
                         self.commit(tx).await?;

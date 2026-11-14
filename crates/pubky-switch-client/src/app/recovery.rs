@@ -202,10 +202,8 @@ pub(crate) struct LossRecord {
     pub(crate) conversations: Vec<String>,
     /// How many counterparties the protocol named past [`MAX_LOSS_CONVERSATIONS`], not
     /// added back.
-    #[serde(default)]
     pub(crate) conversations_left_out: u64,
     /// How many kept claim entries the upload left out, without a certificate.
-    #[serde(default)]
     pub(crate) claim_entries_left_out: u64,
 }
 
@@ -1011,16 +1009,10 @@ mod tests {
             Some("00000000")
         );
         assert!(record.conversations.windows(2).all(|w| w[0] < w[1]));
-        // Kept with the loss: the count reads back, and a record without it reads as none.
+        // Kept with the loss: the count reads back.
         let bytes = serde_json::to_vec(&record).unwrap();
         let read: LossRecord = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(read.conversations_left_out, 3);
-        let mut old: Value = serde_json::from_slice(&bytes).unwrap();
-        old.as_object_mut()
-            .unwrap()
-            .remove("conversations_left_out");
-        let old: LossRecord = serde_json::from_value(old).unwrap();
-        assert_eq!(old.conversations_left_out, 0);
         // Within the cap, none is left out.
         record.keep_conversations(vec!["b".into(), "a".into(), "a".into()]);
         assert_eq!(record.conversations, ["a", "b"]);

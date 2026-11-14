@@ -304,9 +304,9 @@ async fn test_retention_stops_while_the_account_is_frozen() {
 #[tokio::test]
 async fn test_retention_a_page_without_the_checkpoint_is_a_rollback() {
     // The phone stops reading; 31 days on, the stubs after it are dropped behind a
-    // checkpoint. A switch whose pages drop the stubs and leave the checkpoint out, as
-    // an instance on code from before the checkpoint member, shows the phone a broken
-    // chain: it raises a rollback, where with the checkpoint it reconciles.
+    // checkpoint. A switch whose pages drop the stubs and leave the checkpoint out shows
+    // the phone a broken chain: it raises a rollback, where with the checkpoint it
+    // reconciles.
     let w = World::new();
     w.switch.set_retention(retention(3));
     let mut wallet = writer(&w, "wallet").await;
