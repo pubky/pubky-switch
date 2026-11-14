@@ -2,9 +2,8 @@
 
 The app layer keeps all of one app's durable state in the host's `StateStore`, namespace
 `client/<app_id>` (the App ID in z-base-32). One record per key; no blob is rewritten whole.
-Every value is `{"v":3,"d":<record>}` (`SCHEMA_VERSION`): a reader refuses an earlier `v`
-as an old schema (`StoreError::OldSchema`) and any other as corrupt, so a later
-schema adds a migration instead of reading old bytes wrongly. Keys are ASCII. Numbers in keys
+Every value is `{"v":1,"d":<record>}` (`SCHEMA_VERSION`): any other `v` is corrupt. A
+backup carries the same `v`, with or without a protocol layer. Keys are ASCII. Numbers in keys
 are zero-padded to 20 digits so keys sort numerically. The record types are in `state.rs`.
 
 ## Rules for every change
@@ -209,12 +208,6 @@ Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/
 
 - New records take new keys under a prefix of their own; existing keys keep their meaning.
 - A changed record type bumps `SCHEMA_VERSION` with a migration that runs on load.
-- `SCHEMA_VERSION` 3: entries stored locally are keyed by a local ID (`parked/<id>`, `parkid`) instead of the `seq` they were read at, which they keep as fields with its generation; a provider loss no longer writes them again. `pending/effect` names its entry's local ID (`stored`) and generation, and retries of stored entries count under `sretry/<id>`. A layered backup carries version 4. No migration reads a store of schema 2: it fails to load as an old schema, and so does a backup of schema 2 or a layered backup of version 3. No released build wrote schema 2. A build of schema 2 refuses every record of a schema 3 store from its version alone, as a later schema (`StoreError::Corrupt`), before it reads the record's shape: a store holding what that build doesn't know (`ParkReason::Released` or `EffectTooLarge`, a `LocalWritesRefused`, `RecordUncheckable` or `ReleasedDuplicate` duty event) is refused whole, never misread.
-- `SCHEMA_VERSION` 2: `pending/effect` keeps the opened entry it is for, a required field.
-  No migration reads a store of schema 1; such a store fails to load as an old schema, and
-  a backup an earlier schema wrote (schema 1, or a layered backup of version 2) is refused
-  the same way (`StoreError::OldSchema`). A store or backup of an earlier schema has no way
-  forward but a new join; no tagged or pinned build wrote schema 1.
 - Protocol state stays under `p/`, written only through `LocalWrite`.
 
 ## Moves, recovery and push

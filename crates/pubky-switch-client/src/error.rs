@@ -26,13 +26,6 @@ pub enum StoreError {
     /// A stored value failed its own checks.
     #[error("a stored value is corrupt")]
     Corrupt,
-    /// A stored value of an earlier schema, which this build doesn't read: the store was
-    /// written by an earlier build, and holds no migration to this one.
-    #[error("a stored value is of schema {found}, earlier than this build's")]
-    OldSchema {
-        /// The schema version the value carries.
-        found: u32,
-    },
     /// A write batch, or one value in it, over the working sizes
     /// ([`crate::store::MAX_VALUE_BYTES`], [`crate::store::MAX_BATCH_BYTES`]), refused before
     /// the host sees it. Nothing was applied. It is the writes' fault, not the store's: the

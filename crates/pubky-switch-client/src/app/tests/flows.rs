@@ -3640,79 +3640,24 @@ fn test_app_config_keeps_the_spec_bounds() {
 }
 
 #[tokio::test]
-async fn test_app_store_of_schema_1_fails_to_load_as_an_old_schema_and_stays() {
-    let w = World::new();
-    let mut app = w.join("wallet").await;
-    let me = app.app_id();
-    w.note(me, "one");
-    app.receive(None).await.unwrap();
-    let ns = app.ns.clone();
-    // Every value of the app's own, as schema 1 wrote it.
-    let mut batch = crate::store::WriteBatch::new();
-    for (key, bytes) in app.reader().scan_raw("").await.unwrap() {
-        if key.starts_with("p/") {
-            continue;
-        }
-        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
-        if value.get("v") == Some(&json!(crate::app::SCHEMA_VERSION)) {
-            value["v"] = json!(1);
-            batch
-                .put(
-                    &ns,
-                    key.as_bytes().to_vec(),
-                    serde_json::to_vec(&value).unwrap(),
-                )
-                .unwrap();
-        }
-    }
-    app.env.store.commit(batch).await.unwrap();
-    let before = app.reader().scan_raw("").await.unwrap();
-    let reader = app.reader();
-    drop(app);
-    let loaded = App::load(w.env(), w.protocol.clone(), World::config(), me).await;
-    assert!(
-        matches!(
-            loaded,
-            Err(AppError::Store(crate::StoreError::OldSchema { found: 1 }))
-        ),
-        "{:?}",
-        loaded.map(|_| ())
-    );
-    // Refused, it writes nothing.
-    assert_eq!(reader.scan_raw("").await.unwrap(), before);
-}
-
-#[tokio::test]
 async fn test_app_backup_refuses_another_schema_or_bytes() {
     let w = World::new();
     let app = w.join("wallet").await;
     let bytes = app.backup().await.unwrap().to_bytes().unwrap();
     assert!(AppBackup::from_bytes(&bytes).is_ok());
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    // An earlier schema's backup is an old schema, as its store is; a later one doesn't
-    // read.
-    value["v"] = json!(1);
-    let old = serde_json::to_vec(&value).unwrap();
-    assert!(matches!(
-        AppBackup::from_bytes(&old),
-        Err(AppError::Store(crate::StoreError::OldSchema { found: 1 }))
-    ));
-    // A layered backup as schema 1 wrote it, at version 2.
-    value["v"] = json!(2);
-    value["protocol"] =
-        json!({ "name": "x", "data": "", "seen": [], "parked": [], "processed": [] });
-    let old_layered = serde_json::to_vec(&value).unwrap();
-    assert!(matches!(
-        AppBackup::from_bytes(&old_layered),
-        Err(AppError::Store(crate::StoreError::OldSchema { found: 2 }))
-    ));
+    // Another version doesn't read, with or without a layer.
     value["v"] = json!(9);
-    value.as_object_mut().unwrap().remove("protocol");
     let other = serde_json::to_vec(&value).unwrap();
     assert!(matches!(
         AppBackup::from_bytes(&other),
+        Err(AppError::InvalidData(_))
+    ));
+    value["protocol"] =
+        json!({ "name": "x", "data": "", "seen": [], "parked": [], "processed": [] });
+    let other_layered = serde_json::to_vec(&value).unwrap();
+    assert!(matches!(
+        AppBackup::from_bytes(&other_layered),
         Err(AppError::InvalidData(_))
     ));
     assert!(AppBackup::from_bytes(b"{}").is_err());

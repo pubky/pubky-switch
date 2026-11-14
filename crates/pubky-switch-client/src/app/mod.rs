@@ -429,13 +429,6 @@ pub struct AppBackup {
     protocol: Option<LayerOut>,
 }
 
-/// The version a backup with a protocol layer carries, in place of [`SCHEMA_VERSION`]: a
-/// reader that knows no layers, which takes only that version, refuses such a backup
-/// rather than restore it without the layer. A schema change gives both kinds of backup
-/// new versions.
-const LAYERED_BACKUP_VERSION: u32 = 4;
-const _: () = assert!(LAYERED_BACKUP_VERSION != SCHEMA_VERSION);
-
 /// A [`ProtocolLayer`] as a backup's bytes carry it, with what the app's feed holds beyond
 /// its cursor at the same moment: the entries processed past a held one, the entries
 /// stored locally, and the processed pairs (Switch spec 11). The layer reflects those
@@ -468,39 +461,27 @@ impl AppBackup {
             .map_err(|_| AppError::Store(StoreError::Other("the backup can't be written".into())))
     }
 
-    /// Read a backup's bytes. A backup with a protocol layer carries a version of its own,
-    /// which a reader from before layers refuses, so none restores it without the layer.
+    /// Read a backup's bytes. A backup with a protocol layer is told by its `protocol`
+    /// member, under the same version as one without.
     ///
     /// # Errors
     ///
-    /// [`StoreError::OldSchema`] for a backup an earlier schema wrote, as for a store of
-    /// one; [`AppError::InvalidData`] if they don't read as a backup, or their version isn't
-    /// the one of a backup with, or without, a layer.
+    /// [`AppError::InvalidData`] if they don't read as a backup, or their version isn't
+    /// [`SCHEMA_VERSION`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AppError> {
         #[derive(Deserialize)]
         struct Version {
             v: u32,
-            #[serde(default)]
-            protocol: Option<serde_json::Value>,
         }
         let version: Version = serde_json::from_slice(bytes)
             .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))?;
-        let expected = if version.protocol.is_some() {
-            LAYERED_BACKUP_VERSION
-        } else {
-            SCHEMA_VERSION
-        };
-        if version.v < expected {
-            return Err(AppError::Store(StoreError::OldSchema { found: version.v }));
-        }
-        let backup: Self = serde_json::from_slice(bytes)
-            .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))?;
-        if backup.v != expected {
+        if version.v != SCHEMA_VERSION {
             return Err(AppError::InvalidData(
                 "the backup is of another schema version".into(),
             ));
         }
-        Ok(backup)
+        serde_json::from_slice(bytes)
+            .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))
     }
 
     /// The protocol's layer, if the backup holds one.
@@ -1475,7 +1456,6 @@ impl App {
             let data = self.protocol.backup_layer(local).map_err(|why| {
                 AppError::InvalidData(format!("the protocol's backup layer: {why}"))
             })?;
-            backup.v = LAYERED_BACKUP_VERSION;
             backup.protocol = Some(LayerOut {
                 name,
                 data: pubky_switch_core::enc::b64(&data),
