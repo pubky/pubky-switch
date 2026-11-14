@@ -21,8 +21,8 @@ use super::answers::{
 };
 use super::read::{self, Obj};
 use super::{Auth, Body, CheckedResponse, SwitchClient, check_response, verify_head};
-use crate::transport::TimeoutClass;
 use crate::error::ClientError;
+use crate::transport::TimeoutClass;
 
 /// What the proofs of a write answer must show (Switch wire 6.5).
 enum Expect<'a> {
@@ -694,7 +694,12 @@ impl SwitchClient {
         self.signer_only()?;
         let id = Self::segment(chunk_id)?;
         let checked = self
-            .send_json("PUT", &format!("import/chunks/{id}"), chunk, TimeoutClass::Bulk)
+            .send_json(
+                "PUT",
+                &format!("import/chunks/{id}"),
+                chunk,
+                TimeoutClass::Bulk,
+            )
             .await?;
         ImportStatus::parse(&checked.body).map_err(|_| {
             ClientError::InvalidResponse("Switch wire 10.4: an import status doesn't read".into())

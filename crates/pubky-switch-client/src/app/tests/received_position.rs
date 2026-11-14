@@ -9,7 +9,7 @@ use pubky_switch_core::scopes::Permission;
 
 use super::moves::{Router, has, join_on, note_at, publish_at};
 use super::*;
-use crate::app::{AppEvent, ParkReason, StoreFailure};
+use crate::app::{AppEvent, ParkReason, ReceiveContext, StoreFailure};
 use crate::error::StoreError;
 use crate::testing::SWITCH_ORIGIN as ORIGIN;
 
@@ -58,7 +58,7 @@ impl Protocol for PositionProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         self.handed
             .lock()
             .unwrap()
@@ -66,7 +66,7 @@ impl Protocol for PositionProtocol {
         if *self.rejecting.lock().unwrap() {
             return Outcome::Retry(StoreFailure::of_entry(StoreError::Unavailable));
         }
-        self.sample.receive(message)
+        self.sample.receive(message, cx)
     }
 
     fn resend_needed(
@@ -117,7 +117,10 @@ async fn test_received_position_of_a_feed_entry_is_the_cursors_generation() {
     let second = note_at(&w, &changed, me, "after the change");
     app.receive(None).await.unwrap();
     assert_eq!(app.cursor().generation, 2);
-    assert_eq!(protocol.handed(), vec![(1, first, false), (2, second, false)]);
+    assert_eq!(
+        protocol.handed(),
+        vec![(1, first, false), (2, second, false)]
+    );
 }
 
 #[tokio::test]

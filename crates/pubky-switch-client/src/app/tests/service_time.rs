@@ -86,10 +86,12 @@ async fn test_service_time_of_another_key_or_none_is_read_before_a_first_send() 
     let key = app.state.meta.service_key;
     for held in [
         None,
-        app.state.service_time.map(|time| crate::app::state::ServiceTime {
-            key: [9; 32],
-            ..time
-        }),
+        app.state
+            .service_time
+            .map(|time| crate::app::state::ServiceTime {
+                key: [9; 32],
+                ..time
+            }),
     ] {
         // A later call, so no answer of this one brought a time.
         w.clock.advance_ms(FRESH_SERVICE_TIME_MS + 1);

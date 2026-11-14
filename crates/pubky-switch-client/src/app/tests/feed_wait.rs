@@ -1417,9 +1417,7 @@ async fn test_update_record_reads_the_service_time_once_for_all_its_tries() {
     let samples = |from: usize| {
         s.sent_since(from)
             .iter()
-            .filter(|line| {
-                line.contains("/feed?") && line.ends_with("limit=0")
-            })
+            .filter(|line| line.contains("/feed?") && line.ends_with("limit=0"))
             .count()
     };
     let puts = |from: usize| {

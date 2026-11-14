@@ -32,9 +32,7 @@ use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use super::claims::ObligationDeadline;
-use super::error::{
-    KeptAhead, Refusal, RefusalPlace, never_left, refused_at, refused_for_good,
-};
+use super::error::{KeptAhead, Refusal, RefusalPlace, never_left, refused_at, refused_for_good};
 use super::events::AppEvent;
 use super::kept::{Ended, KeptBatchDrop, index_kept};
 use super::protocol::{LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
@@ -332,8 +330,8 @@ impl App {
     /// So a write sends at most three requests to the switch: a read of the service time,
     /// the kept batch and its own batch. The read is of a feed page with no items, and is
     /// made only when a batch is kept to send again, or when the app holds no recent
-    /// service time of the current key to stamp its own batch with
-    /// ([`App::stamp_service_time`]): most writes send their batch alone. The read has the
+    /// service time of the current key, under a day old, to stamp its own batch with: most
+    /// writes send their batch alone. The read has the
     /// short timeout (10 s by default), a batch that writes no shared record the short
     /// timeout and a share of the long one in proportion to its body, and one that writes
     /// a shared record the long one (40 s), since its refusal can carry the record's view

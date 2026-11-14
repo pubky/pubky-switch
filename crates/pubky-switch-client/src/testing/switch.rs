@@ -1226,8 +1226,7 @@ impl ScriptedSwitch {
                 Fault::Unreachable { after, .. }
                 | Fault::Unanswered { after, .. }
                 | Fault::LoseAnswerAfter { after, .. },
-            ) if *after > 0 =>
-            {
+            ) if *after > 0 => {
                 *after -= 1;
                 true
             }
