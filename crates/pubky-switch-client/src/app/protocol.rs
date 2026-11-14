@@ -736,7 +736,12 @@ pub trait Protocol: Send + Sync {
     ///   come back by its feed. An app without it gets none.
     /// - **Order:** feed order, across everything the app hands over. While a change is
     ///   owed, the read hands nothing after it: no later item, owed call or entry stored
-    ///   locally. So an undeny is seen before the message after it.
+    ///   locally. So an undeny is seen before the message after it. Calls owed from a
+    ///   sequence a provider loss ended come before those of the current sequence, and
+    ///   among themselves in the order (generation, seq): two of one lost sequence owed at
+    ///   different generations, as across a key change in place, may come out of feed
+    ///   order. The gap the loss leaves follows them, with the full list
+    ///   ([`Protocol::deny_list_gap`]).
     /// - **Again:** a change may come twice, after a crash before its commit and after a
     ///   restore, whose feed hands it again; its writes commit once. A protocol keys what it
     ///   keeps by the change's place, or takes it as setting a state.

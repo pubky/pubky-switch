@@ -3133,9 +3133,12 @@ impl App {
     /// cooperative move and a key change in place continue the sequence, so the positions
     /// of the current sequence compare by `seq` alone, whatever generation names them. A
     /// position of a sequence a provider loss ended comes before all of them, by
-    /// generation, then `seq`. One of a generation past the newest own `identity.json` the
-    /// app holds, as a restore in place may carry, is of a sequence it doesn't know yet:
-    /// it comes after everything it knows, and waits until the app follows it.
+    /// generation, then `seq`: the newest own `identity.json` names only the newest loss,
+    /// so two positions of one lost sequence at different generations may compare out of
+    /// feed order; the deny list gap the loss leaves, told after them, carries the full
+    /// list. One of a generation past the newest own `identity.json` the app holds, as a
+    /// restore in place may carry, is of a sequence it doesn't know yet: it comes after
+    /// everything it knows, and waits until the app follows it.
     fn feed_order(&self, generation: u64, seq: u64) -> (u8, u64, u64) {
         if generation > self.state.own_doc.generation() {
             (2, generation, seq)
@@ -3165,28 +3168,29 @@ impl App {
         self.owed_ahead = None;
         // In feed order, not key order: the keys name the generation each item was read
         // at, and a restore in place carries calls of a generation the sequence went on
-        // from. A key that doesn't parse goes first, as one behind the cursor.
-        let mut owed: Vec<_> = owed
+        // from. Every call is keyed by its feed position (`owed/<generation>/<seq>`): a
+        // key that doesn't name one has no place in that order, so the store is corrupt,
+        // and no call is made out of order or dropped.
+        let mut owed = owed
             .into_iter()
             .map(|(rest, call)| {
-                let place = rest.split_once('/').and_then(|(generation, seq)| {
-                    Some((
-                        super::state::parse_num(generation).ok()?,
-                        super::state::parse_num(seq).ok()?,
-                    ))
-                });
-                let order = place.map(|(generation, seq)| self.feed_order(generation, seq));
-                (order, place, rest, call)
+                let (generation, seq) = rest
+                    .split_once('/')
+                    .ok_or(AppError::Store(crate::error::StoreError::Corrupt))?;
+                let place = (
+                    super::state::parse_num(generation)?,
+                    super::state::parse_num(seq)?,
+                );
+                let order = self.feed_order(place.0, place.1);
+                Ok((order, place, rest, call))
             })
-            .collect();
+            .collect::<Result<Vec<_>, AppError>>()?;
         owed.sort_by_key(|(order, ..)| *order);
-        for (order, place, rest, call) in owed {
+        for (order, (generation, seq), rest, call) in owed {
             let at = format!("{}{rest}", key::OWED_PREFIX);
             // A call past the cursor, as a restore in place carries one, waits for the
             // feed to reach its item: the feed stops before anything later.
-            if let (Some(order), Some((generation, seq))) = (order, place)
-                && order > cursor_at
-            {
+            if order > cursor_at {
                 if self.same_sequence(generation, cursor.generation) {
                     self.owed_ahead = Some(seq);
                 }
@@ -3202,12 +3206,21 @@ impl App {
                     at_ms,
                     op,
                 } => {
-                    let Ok(peeked) = SignedOp::peek(&op) else {
-                        tx.delete(&at)?;
-                        self.commit(tx).await?;
-                        continue;
+                    // The operation is kept as the feed showed it, and the change is read
+                    // from it: one that doesn't parse, or isn't that change, is a corrupt
+                    // store. It is neither dropped nor handed (fail closed).
+                    let body = SignedOp::peek(&op)
+                        .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?
+                        .body()
+                        .clone();
+                    let kept = match body.kind {
+                        OpKind::DenyPut { pubky } => Some((pubky, true)),
+                        OpKind::DenyDelete { pubky } => Some((pubky, false)),
+                        _ => None,
                     };
-                    let body = peeked.body().clone();
+                    if kept != Some((pubky, added)) {
+                        return Err(AppError::Store(crate::error::StoreError::Corrupt));
+                    }
                     match self.check_deny_op(&op, &body, at_ms, &tx).await? {
                         DenyCheck::Genuine => {
                             self.note_list_op(&body, &mut tx)?;
@@ -3247,6 +3260,16 @@ impl App {
                         }
                     }
                 }
+                // The copy of the lists takes the change in the commit that hands it to
+                // the protocol, so the two never disagree after a crash. Where the feed
+                // applied it when the call was owed, this sets the same state again; after
+                // a restore in place, whose feed passes the carried call's item without
+                // applying it, this is where the copy takes it, after the changes the feed
+                // handed before it (Switch spec 8.3).
+                call @ OwedCall::Deny { pubky, added, .. } => {
+                    self.note_deny_change(&pubky, added, &mut tx)?;
+                    call
+                }
                 call => call,
             };
             let Ok(writes) = call.make(self.protocol.as_ref()) else {
@@ -3256,11 +3279,6 @@ impl App {
             if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES {
                 // Over the bound: not committed, and the call made no more, since the same
                 // answer would come at every read; the protocol is told.
-                let seq = rest
-                    .rsplit('/')
-                    .next()
-                    .and_then(|seq| super::state::parse_num(seq).ok())
-                    .unwrap_or(0);
                 self.keep_duty(
                     &mut tx,
                     Duty::LocalWritesRefused {

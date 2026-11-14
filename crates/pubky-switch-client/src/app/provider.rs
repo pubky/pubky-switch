@@ -1573,13 +1573,27 @@ impl App {
                 pubky,
                 kind: AllowKind::Contact,
             } => tx.delete(&keys::contact(pubky)),
-            OpKind::DenyPut { pubky } => tx.put(&keys::deny(pubky), &()),
-            OpKind::DenyDelete { pubky } => tx.delete(&keys::deny(pubky)),
+            OpKind::DenyPut { pubky } => self.note_deny_change(pubky, true, tx),
+            OpKind::DenyDelete { pubky } => self.note_deny_change(pubky, false, tx),
             OpKind::InviteCodePut(put) if body.app_id == Some(self.state.meta.app_id) => {
                 tx.put(&keys::code(&put.code_hash), &())
             }
             OpKind::InviteCodeDelete { code_hash } => tx.delete(&keys::code(code_hash)),
             _ => Ok(()),
+        }
+    }
+
+    /// Keep a deny list change: `pubky` denied when `added`, no longer denied otherwise.
+    pub(crate) fn note_deny_change(
+        &self,
+        pubky: &[u8; 32],
+        added: bool,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        if added {
+            tx.put(&keys::deny(pubky), &())
+        } else {
+            tx.delete(&keys::deny(pubky))
         }
     }
 

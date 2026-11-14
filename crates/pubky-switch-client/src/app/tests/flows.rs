@@ -5834,6 +5834,212 @@ async fn test_deny_list_owed_calls_at_a_restore_in_place_keep_feed_order() {
     assert!(log.windows(2).all(|pair| pair[0].1 <= pair[1].1), "{log:?}");
 }
 
+/// A reader, on `store`, whose last two deny list changes for `x` come after its backup,
+/// the second owed: `x` denied, then undenied, or, with `denied_at_end`, undenied (denied
+/// before the backup), then denied. It is restored in place from that backup, its
+/// reconcile ended, not read yet. With the second change's seq.
+async fn restored_with_a_carried_deny_change(
+    w: &World,
+    store: &Arc<MemoryStore>,
+    kinds: &Arc<KindsProtocol>,
+    x: [u8; 32],
+    denied_at_end: bool,
+) -> (App, u64) {
+    let mut manager = manager_of(w).await;
+    let mut reader = join_with(
+        w,
+        "reader",
+        &[Permission::ListsRead],
+        Arc::clone(store),
+        Arc::clone(kinds) as Arc<dyn Protocol>,
+    )
+    .await;
+    reader.receive(None).await.unwrap();
+    if denied_at_end {
+        manager.deny(&x).await.unwrap();
+        reader.receive(None).await.unwrap();
+    }
+    let backup = reader.backup().await.unwrap();
+    if denied_at_end {
+        manager.undeny(&x).await.unwrap();
+    } else {
+        manager.deny(&x).await.unwrap();
+    }
+    reader.receive(None).await.unwrap();
+    if denied_at_end {
+        manager.deny(&x).await.unwrap();
+    } else {
+        manager.undeny(&x).await.unwrap();
+    }
+    *kinds.sample.failing_deny.lock().unwrap() = 1;
+    reader.receive(None).await.unwrap();
+    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
+    assert_eq!(
+        reader.lists_copy().await.unwrap().deny.contains(&x),
+        denied_at_end
+    );
+    let seq = reader.cursor().seq;
+    drop(reader);
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(store) as Arc<dyn StateStore>),
+        Arc::clone(kinds) as Arc<dyn Protocol>,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    (restored, seq)
+}
+
+/// After the restored reader's reads: nothing owed, the copy of the lists and the
+/// protocol's state agree on `x`, and the protocol was handed the deny list changes in
+/// feed order, the carried one at `seq` last.
+async fn assert_carried_deny_change_taken(
+    restored: &App,
+    kinds: &KindsProtocol,
+    x: [u8; 32],
+    seq: u64,
+    denied_at_end: bool,
+) {
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+    let log = kinds.log.lock().unwrap().clone();
+    assert_eq!(
+        restored.lists_copy().await.unwrap().deny.contains(&x),
+        denied_at_end,
+        "the copy of the lists; log {log:?}"
+    );
+    let handed = restored
+        .protocol_get(format!("deny/{seq}").as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(handed, Some(vec![u8::from(denied_at_end)]), "{log:?}");
+    let denies: Vec<u64> = log
+        .iter()
+        .filter(|(kind, _)| *kind == "deny")
+        .map(|(_, seq)| *seq)
+        .collect();
+    assert!(denies.windows(2).all(|pair| pair[0] <= pair[1]), "{log:?}");
+    assert_eq!(denies.last(), Some(&seq), "{log:?}");
+}
+
+#[tokio::test]
+async fn test_deny_list_carried_change_keeps_the_copy_of_the_lists_right() {
+    // Deny, then an undeny the protocol couldn't take, carried by a restore in place from
+    // a backup before both: the feed hands the deny again and the queue the undeny, and the
+    // copy of the lists, which admission works from, ends with the undeny too.
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let kinds = Arc::new(KindsProtocol::default());
+    let x = [7; 32];
+    let (mut restored, seq) =
+        restored_with_a_carried_deny_change(&w, &store, &kinds, x, false).await;
+    for _ in 0..4 {
+        restored.receive(None).await.unwrap();
+    }
+    assert_carried_deny_change_taken(&restored, &kinds, x, seq, false).await;
+}
+
+#[tokio::test]
+async fn test_deny_list_carried_change_keeps_the_copy_of_the_lists_right_for_a_deny() {
+    // The mirror case: an undeny, then a deny the protocol couldn't take. The copy ends
+    // with the pubky denied, as the service and the protocol have it.
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let kinds = Arc::new(KindsProtocol::default());
+    let x = [7; 32];
+    let (mut restored, seq) =
+        restored_with_a_carried_deny_change(&w, &store, &kinds, x, true).await;
+    for _ in 0..4 {
+        restored.receive(None).await.unwrap();
+    }
+    assert_carried_deny_change_taken(&restored, &kinds, x, seq, true).await;
+}
+
+/// The restored reader's reads after a restore in place.
+async fn carried_deny_change_reads(app: &mut App) -> Result<(), AppError> {
+    for _ in 0..4 {
+        app.receive(None).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_deny_list_carried_change_crash_at_each_commit_point_keeps_the_copy_right() {
+    // A crash at each commit of the restored reader's reads, before or after it, then a
+    // restart on what the store holds: the copy of the lists and the protocol's state end
+    // the same, and nothing stays owed.
+    let x = [7; 32];
+    for denied_at_end in [false, true] {
+        let commits = {
+            let w = World::new();
+            let store = Arc::new(MemoryStore::new());
+            let kinds = Arc::new(KindsProtocol::default());
+            let (restored, _) =
+                restored_with_a_carried_deny_change(&w, &store, &kinds, x, denied_at_end).await;
+            let id = restored.app_id();
+            drop(restored);
+            let counting = Arc::new(FaultStore::new(
+                Arc::clone(&store) as Arc<dyn StateStore>,
+                StoreFault::None,
+            ));
+            let mut app = App::load(
+                w.env_on(Arc::clone(&counting) as Arc<dyn StateStore>),
+                Arc::clone(&kinds) as Arc<dyn Protocol>,
+                World::config(),
+                id,
+            )
+            .await
+            .unwrap();
+            carried_deny_change_reads(&mut app).await.unwrap();
+            counting.commits()
+        };
+        assert!(commits > 2, "the reads commit {commits} times");
+        for stop_after in [false, true] {
+            for n in 1..=commits {
+                let w = World::new();
+                let store = Arc::new(MemoryStore::new());
+                let kinds = Arc::new(KindsProtocol::default());
+                let (restored, seq) =
+                    restored_with_a_carried_deny_change(&w, &store, &kinds, x, denied_at_end).await;
+                let id = restored.app_id();
+                drop(restored);
+                let fault = Arc::new(FaultStore::new(
+                    Arc::clone(&store) as Arc<dyn StateStore>,
+                    if stop_after {
+                        StoreFault::StopAfter(n)
+                    } else {
+                        StoreFault::StopBefore(n)
+                    },
+                ));
+                if let Ok(mut app) = App::load(
+                    w.env_on(Arc::clone(&fault) as Arc<dyn StateStore>),
+                    Arc::clone(&kinds) as Arc<dyn Protocol>,
+                    World::config(),
+                    id,
+                )
+                .await
+                {
+                    let _ = carried_deny_change_reads(&mut app).await;
+                }
+                assert!(fault.stopped(), "commit {n} of {commits} is reached");
+                let mut app = App::load(
+                    w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+                    Arc::clone(&kinds) as Arc<dyn Protocol>,
+                    World::config(),
+                    id,
+                )
+                .await
+                .unwrap();
+                carried_deny_change_reads(&mut app)
+                    .await
+                    .unwrap_or_else(|e| panic!("restart after commit {n} ({stop_after}): {e}"));
+                assert_carried_deny_change_taken(&app, &kinds, x, seq, denied_at_end).await;
+            }
+        }
+    }
+}
+
 /// A reader that owes a missed-entries call past its backup's cursor, after a deny list
 /// change it was handed, restored in place from that backup and then following `changes`
 /// key changes in place, read after each; the first `failing_deny` deny list changes its
@@ -6081,6 +6287,147 @@ async fn test_deny_list_change_whose_writer_lookup_fails_is_not_lost() {
         denies(&protocol),
         reader.lists_copy().await.unwrap().deny
     );
+}
+
+/// A reader owing a deny list change for `x` not checked yet: it holds no certificate of
+/// the manager, and the directory read for it failed. With its protocol.
+async fn reader_owing_an_unchecked_deny_change(
+    w: &World,
+    x: [u8; 32],
+) -> (App, Arc<SampleProtocol>) {
+    let mut manager = manager_of(w).await;
+    let store = Arc::new(MemoryStore::new());
+    let protocol = Arc::new(SampleProtocol::default());
+    let mut reader = join_with(
+        w,
+        "reader",
+        &[Permission::ListsRead],
+        Arc::clone(&store),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+    )
+    .await;
+    reader.receive(None).await.unwrap();
+    manager.deny(&x).await.unwrap();
+    let ns = crate::store::client_namespace(&reader.app_id());
+    let mut batch = crate::store::WriteBatch::new();
+    batch.delete_prefix(&ns, b"ocert/".to_vec()).unwrap();
+    store.commit(batch).unwrap();
+    drop(reader);
+    let mut reader = App::load(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+        World::config(),
+        app_keys("reader").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/directory".into(),
+        after: 0,
+    });
+    let _ = reader.receive(None).await;
+    let owed = reader
+        .reader()
+        .scan::<crate::app::feed::OwedCall>(crate::app::state::key::OWED_PREFIX)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            owed.as_slice(),
+            [(_, crate::app::feed::OwedCall::DenyUnverified { .. })]
+        ),
+        "{owed:?}"
+    );
+    (reader, protocol)
+}
+
+/// The reader's owed deny list change not checked yet, rewritten by `edit`, then a read:
+/// it fails closed, as a corrupt store, and nothing is handed, applied or dropped.
+async fn assert_edited_unchecked_deny_change_fails_closed(
+    edit: impl FnOnce(&mut crate::app::feed::OwedCall),
+) {
+    let w = World::new();
+    let x = [7; 32];
+    let (mut reader, protocol) = reader_owing_an_unchecked_deny_change(&w, x).await;
+    let owed = reader
+        .reader()
+        .scan::<crate::app::feed::OwedCall>(crate::app::state::key::OWED_PREFIX)
+        .await
+        .unwrap();
+    let [(rest, mut call)] = <[_; 1]>::try_from(owed).unwrap();
+    edit(&mut call);
+    let mut tx = reader.tx().unwrap();
+    tx.put(
+        &format!("{}{rest}", crate::app::state::key::OWED_PREFIX),
+        &call,
+    )
+    .unwrap();
+    reader.commit(tx).await.unwrap();
+    let read = reader.receive(None).await;
+    assert!(
+        matches!(
+            read,
+            Err(AppError::Store(crate::error::StoreError::Corrupt))
+        ),
+        "{read:?}"
+    );
+    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
+    assert!(denies(&protocol).is_empty());
+    assert!(!reader.lists_copy().await.unwrap().deny.contains(&[8; 32]));
+}
+
+#[tokio::test]
+async fn test_deny_list_owed_change_whose_operation_does_not_parse_fails_closed() {
+    assert_edited_unchecked_deny_change_fails_closed(|call| {
+        if let crate::app::feed::OwedCall::DenyUnverified { op, .. } = call {
+            op.body = "not an operation".into();
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_deny_list_owed_change_other_than_its_operation_fails_closed() {
+    // The change kept beside the operation names another pubky than the operation does.
+    assert_edited_unchecked_deny_change_fails_closed(|call| {
+        if let crate::app::feed::OwedCall::DenyUnverified { pubky, .. } = call {
+            *pubky = [8; 32];
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_app_owed_call_whose_key_names_no_position_fails_closed() {
+    // Every owed call is keyed by its feed position; one whose key names none has no place
+    // in feed order: the read fails as on a corrupt store, and the call is neither made
+    // nor dropped.
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let call = crate::app::feed::OwedCall::Missed {
+        seq: 1,
+        entries: 1,
+        accepted_from_ms: 5,
+        accepted_until_ms: 6,
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(
+        &format!("{}not-a-position", crate::app::state::key::OWED_PREFIX),
+        &call,
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
+    let read = app.receive(None).await;
+    assert!(
+        matches!(
+            read,
+            Err(AppError::Store(crate::error::StoreError::Corrupt))
+        ),
+        "{read:?}"
+    );
+    assert!(w.protocol.missed.lock().unwrap().is_empty());
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
 }
 
 #[tokio::test]
