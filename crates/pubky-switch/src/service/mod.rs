@@ -130,6 +130,8 @@ pub struct Service {
     /// beside it (Switch wire 7.3 step 10), and the accounts whose refusal was logged.
     mark_refusals: std::sync::atomic::AtomicU64,
     mark_refused_accounts: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Whether a mark refusal found the logged accounts full and said so, once.
+    mark_refusals_overflowed: std::sync::atomic::AtomicBool,
     /// Requests refused because they depend on the service's time and trusted time is
     /// missing (Switch spec 10.1).
     time_refusals: std::sync::atomic::AtomicU64,
@@ -373,6 +375,7 @@ impl Service {
             judged_under_lock: std::sync::atomic::AtomicU64::new(0),
             mark_refusals: std::sync::atomic::AtomicU64::new(0),
             mark_refused_accounts: parking_lot::Mutex::default(),
+            mark_refusals_overflowed: std::sync::atomic::AtomicBool::new(false),
             time_refusals: std::sync::atomic::AtomicU64::new(0),
             erasure_sweeps: KeyedWindows::default(),
             changes: ChangeHub::new(),
@@ -469,9 +472,23 @@ impl Service {
         self.mark_refusals
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut logged = self.mark_refused_accounts.lock();
-        if logged.len() >= MARK_REFUSALS_LOGGED || !logged.insert(account.to_string()) {
+        if logged.contains(account) {
             return;
         }
+        if logged.len() >= MARK_REFUSALS_LOGGED {
+            if !self
+                .mark_refusals_overflowed
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::error!(
+                    alert = "behind_mark",
+                    "more accounts are behind their marks than this process logs: check-marks \
+                     lists them all"
+                );
+            }
+            return;
+        }
+        logged.insert(account.to_string());
         tracing::error!(
             alert = "behind_mark",
             account,
@@ -479,13 +496,6 @@ impl Service {
             "the account's state is behind its service key's mark: committed state was lost, \
              and the account is refused until its signer starts a new generation"
         );
-        if logged.len() == MARK_REFUSALS_LOGGED {
-            tracing::error!(
-                alert = "behind_mark",
-                "more accounts are behind their marks than this process logs: check-marks \
-                 lists them all"
-            );
-        }
     }
 
     /// The refusal of a request that depends on the service's time while trusted time is
@@ -520,7 +530,7 @@ impl Service {
     }
 
     /// The hub that wakes waiting feed reads. Run a [`crate::changes::ChangeListener`]
-    /// into it, so changes made by any instance wake them.
+    /// into it, so every committed change wakes them.
     pub fn changes(&self) -> Arc<ChangeHub> {
         self.changes.clone()
     }

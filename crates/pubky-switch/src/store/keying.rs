@@ -3,7 +3,8 @@
 //! key, has committed (Switch wire 7.4.16: the erasure's answer "is the last answer that key
 //! signs").
 //!
-//! Each account has a Postgres advisory lock, held across every instance of the service:
+//! Each account has a Postgres advisory lock, held in the database, so it also keeps two
+//! processes safe during an overlap in a restart or failover:
 //! - a [keyed section](Store::while_keyed) takes it shared, reads the account's key in a
 //!   statement of its own, and signs while it holds the lock;
 //! - an erasure or a change of the account's key takes it exclusive

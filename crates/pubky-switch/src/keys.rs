@@ -1432,7 +1432,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_key_store_cancelled_advance_keeps_marks_in_order() {
         let (dir, store) = open();
         let key = store.generate().await.expect("generate");
