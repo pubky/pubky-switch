@@ -311,7 +311,7 @@ impl InstanceLock {
     /// Check the lock at every check of its timing, and return at the first check that
     /// can't confirm it within what is left of two checks since the last confirmed one, so
     /// the caller stops serving. Time is read on two clocks, and a gap on either counts
-    /// ([`Stamp::until`]): a check that starts, or an answer that comes, more than two checks
+    /// (the monotonic one and the wall clock): a check that starts, or an answer that comes, more than two checks
     /// after the last confirmed check was sent, as after a pause of the process, stops it
     /// too, and an answer confirms the lock only as of the moment its check was sent. So
     /// the process serves on without a confirmed lock for at most two checks (10 seconds
