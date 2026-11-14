@@ -40,6 +40,30 @@ fn is_part(text: &str, underscore: bool) -> bool {
             .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
+/// The longest protocol name, in characters (Switch wire 3.1 "Scope roots").
+pub const MAX_PROTOCOL_NAME: usize = 32;
+
+/// Whether `name` is a protocol name: 1 to 32 characters of `a-z` and `0-9`, starting with a
+/// letter, so that no protocol's root is another's (Switch wire 3.1 "Scope roots").
+pub fn is_protocol_name(name: &str) -> bool {
+    (1..=MAX_PROTOCOL_NAME).contains(&name.len())
+        && name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Whether the protocol `name` owns the root `root`: its name, or its name followed by `_`
+/// or `-` and more characters (Switch wire 3.1 "Scope roots"). A scope's root is its name,
+/// the part before any `:`; a message kind's is its prefix, the part before its first `.`
+/// (Switch wire 5.1).
+pub fn owns_root(name: &str, root: &str) -> bool {
+    root == name
+        || root
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.len() > 1 && (rest.starts_with('_') || rest.starts_with('-')))
+}
+
 /// A scope split into its name and sub-scope: `name` is `(name, None)` and `name:<sub>` is
 /// `(name, Some(sub))`, split at the first `:`. `None` for a string that is neither (Switch
 /// spec 3.3).
@@ -188,6 +212,22 @@ mod tests {
 
     fn owned(scopes: &[&str]) -> Vec<String> {
         scopes.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn test_protocol_names_own_their_roots() {
+        assert!(is_protocol_name("tasks"));
+        assert!(is_protocol_name(&"a".repeat(MAX_PROTOCOL_NAME)));
+        for bad in ["", "9chat", "chat_x", "chat-x", "chat.x", "Chat"] {
+            assert!(!is_protocol_name(bad), "{bad}");
+        }
+        assert!(!is_protocol_name(&"a".repeat(MAX_PROTOCOL_NAME + 1)));
+        for root in ["chat", "chat_read", "chat-x"] {
+            assert!(owns_root("chat", root), "{root}");
+        }
+        for root in ["chats", "chat_", "chat-", "cha", "tasks", "xchat"] {
+            assert!(!owns_root("chat", root), "{root}");
+        }
     }
 
     #[test]
