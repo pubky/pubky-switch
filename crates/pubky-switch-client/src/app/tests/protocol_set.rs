@@ -563,9 +563,11 @@ async fn test_protocol_set_deny_change_one_protocol_fails_stops_the_read_for_all
 }
 
 #[tokio::test]
-async fn test_protocol_set_restore_gap_is_told_to_each_protocol_once() {
-    // A restore owes every protocol the deny list gap at the restored cursor; one that
-    // fails it is told it again alone, and the read holds for every protocol meanwhile.
+async fn test_protocol_set_restore_gap_one_protocol_fails_is_told_again_to_each() {
+    // A restore owes every protocol the deny list gap at the restored cursor; while one
+    // fails it, it stays owed to both, so the tell that takes the copy of the lists hands
+    // each the list the copy is taken from, and the read holds for every protocol
+    // meanwhile.
     let p = Pair::new();
     let mut app = p.join_with(&[Permission::ListsRead]).await;
     let me = app.app_id();
@@ -591,7 +593,7 @@ async fn test_protocol_set_restore_gap_is_told_to_each_protocol_once() {
     assert!(kinds(&p.tasks).is_empty());
     read(&mut restored, 2).await;
     assert_eq!(*p.chat.gaps.lock().unwrap(), [(at, true)]);
-    assert_eq!(*p.tasks.gaps.lock().unwrap(), [(at, true)]);
+    assert_eq!(*p.tasks.gaps.lock().unwrap(), [(at, true), (at, true)]);
     assert_eq!(kinds(&p.tasks), ["tasks.item"]);
     assert!(
         !restored
@@ -933,6 +935,72 @@ async fn test_protocol_set_reconcile_mode_ends_once_every_protocol_ends_it() {
     assert!(app.reconcile_mode());
     assert!(
         app.end_reconcile_for("chat", UserConfirmed::new())
+            .await
+            .unwrap()
+    );
+    assert!(!app.reconcile_mode());
+}
+
+/// The stubs after `app`'s cursor dropped behind a checkpoint, more than 30 days old, by
+/// `writer`'s chain items (Switch wire 7.4.4): `app`'s next read continues from the
+/// checkpoint with its continuity unverified.
+async fn stubs_dropped_behind(p: &Pair, writer: &mut App, app: &mut App) {
+    let deny = |n: u8| OpBatch::new().op(OpKind::DenyPut { pubky: [n; 32] });
+    for reader in [&mut *writer, &mut *app] {
+        p.send(reader.app_id(), "tasks.item");
+        reader.receive(None).await.unwrap();
+        reader.submit_batch(deny(0xee)).await.unwrap();
+    }
+    let at = p.w.switch.lock().apps[&app.app_id()].cursor;
+    for n in 1..=5 {
+        writer.submit_batch(deny(n)).await.unwrap();
+    }
+    p.send(writer.app_id(), "tasks.item");
+    writer.receive(None).await.unwrap();
+    writer.submit_batch(deny(0xee)).await.unwrap();
+    p.w.clock
+        .advance_ms(31 * pubky_switch_core::records::DAY_MS);
+    writer.submit_batch(deny(6)).await.unwrap();
+    assert!(p.w.switch.retained().1 > at, "the stubs went");
+}
+
+#[tokio::test]
+async fn test_protocol_set_reconcile_mode_started_again_asks_every_protocol_again() {
+    // `tasks` ended the reconcile mode a first continuity gap started; a second gap starts
+    // it again, so `chat` ending it doesn't end it: `tasks` reconciles again too.
+    let p = Pair::new();
+    p.w.switch.set_retention(Some(crate::testing::Retention {
+        checkpoint_behind: 3,
+        ..crate::testing::Retention::default()
+    }));
+    let mut writer = p.join_with(&[Permission::ListsManage]).await;
+    let request = p.approve("phone", &[Permission::ListsManage]);
+    let mut app = App::join(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    stubs_dropped_behind(&p, &mut writer, &mut app).await;
+    app.receive(None).await.unwrap();
+    assert!(app.reconcile_mode());
+    assert!(
+        !app.end_reconcile_for("tasks", UserConfirmed::new())
+            .await
+            .unwrap()
+    );
+    stubs_dropped_behind(&p, &mut writer, &mut app).await;
+    app.receive(None).await.unwrap();
+    assert!(
+        !app.end_reconcile_for("chat", UserConfirmed::new())
+            .await
+            .unwrap()
+    );
+    assert!(app.reconcile_mode());
+    assert!(
+        app.end_reconcile_for("tasks", UserConfirmed::new())
             .await
             .unwrap()
     );
@@ -1282,6 +1350,44 @@ async fn test_protocol_set_record_expiry_is_the_earliest_any_protocol_asked_for(
 }
 
 #[tokio::test]
+async fn test_protocol_set_record_expiry_lapsed_refuses_the_renewal_naming_its_protocol() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let now = p.w.clock.now_ms();
+    let day = pubky_switch_core::records::DAY_MS;
+    app.set_protocol_member("tasks", a_member(), Some(now + day))
+        .await
+        .unwrap();
+    app.renew_record("chat", Some(now + 30 * day))
+        .await
+        .unwrap();
+    p.w.clock.advance_ms(2 * day);
+    let record = app.record().clone();
+    let delivered = p.w.switch.app(&app.app_id()).record;
+    // `tasks`'s expiry lapsed: `chat`'s renewal is refused, naming `tasks`, and nothing is
+    // signed or sent.
+    usage(
+        app.renew_record("chat", Some(now + 60 * day)).await,
+        "`tasks`",
+    );
+    usage(
+        app.set_protocol_member("chat", a_member(), None).await,
+        "`tasks`",
+    );
+    assert_eq!(app.record(), &record);
+    assert_eq!(p.w.switch.app(&app.app_id()).record, delivered);
+    // One asked at now has lapsed too.
+    usage(
+        app.renew_record("tasks", Some(p.w.clock.now_ms())).await,
+        "`tasks`",
+    );
+    // `tasks` asking for a later one renews it.
+    let later = p.w.clock.now_ms() + day;
+    app.renew_record("tasks", Some(later)).await.unwrap();
+    assert_eq!(record_expiry(&app), Some(later));
+}
+
+#[tokio::test]
 async fn test_protocol_set_record_expiries_go_with_a_backup_and_one_of_no_protocol_refuses() {
     let p = Pair::new();
     let mut app = p.join().await;
@@ -1435,4 +1541,121 @@ async fn test_protocol_set_check_8_refuses_a_kind_no_protocol_owns_and_asks_only
         .unwrap();
     assert_eq!(*p.chat.checked.lock().unwrap(), ["chat.item"]);
     assert!(p.tasks.checked.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_protocol_set_restore_in_place_keeps_the_owners_backup_and_store_give_a_call() {
+    // A missed call both protocols fail is in a layered backup; `tasks` then takes it and
+    // `chat` fails it again. Restored in place, `tasks`'s layer is back without the call's
+    // writes: the call is owed to both again, the backup's owners with the store's.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(1),
+            ..named("tasks")
+        },
+        Named {
+            failing_missed: Mutex::new(2),
+            ..named("chat")
+        },
+    );
+    let mut app = p.join().await;
+    let now = p.w.clock.now_ms();
+    let seq = p.w.switch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    let backup = app.backup_layered().await.unwrap();
+    read(&mut app, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert!(p.chat.missed.lock().unwrap().is_empty());
+    drop(app);
+    p.tasks.missed.lock().unwrap().clear();
+    let mut restored = App::restore(p.env(), p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    let kept = restored
+        .reader()
+        .scan::<crate::app::feed::Owed>(crate::app::state::key::OWED_PREFIX)
+        .await
+        .unwrap();
+    let [(_, owed)] = <[_; 1]>::try_from(kept).unwrap();
+    assert_eq!(owed.to, ["tasks", "chat"]);
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    read(&mut restored, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert_eq!(*p.chat.missed.lock().unwrap(), [seq]);
+    assert_eq!(
+        restored
+            .protocol_get("tasks", format!("missed/{seq}").as_bytes())
+            .await
+            .unwrap(),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+}
+
+/// A duty event planted in `p`'s store for `app`, for the protocols `to`.
+fn plant_duty(p: &Pair, app: &[u8; 16], n: u64, to: &[&str]) {
+    let kept = crate::app::events::KeptDuty {
+        to: to.iter().map(|name| (*name).to_owned()).collect(),
+        duty: crate::app::events::Duty::KeptBatchDropped { batch_id: [1; 16] },
+    };
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(
+            &crate::store::client_namespace(app),
+            crate::app::state::key::duty(n).into_bytes(),
+            crate::app::state::encode(&kept).unwrap(),
+        )
+        .unwrap();
+    p.store.commit(batch).unwrap();
+}
+
+#[tokio::test]
+async fn test_protocol_set_duty_event_of_no_registered_protocol_fails_the_load() {
+    // An event for a protocol not registered, or for none, could never be acknowledged:
+    // the load fails closed. A restore in place keeps it for the registered protocols it
+    // names, and leaves one for none of them behind, counted.
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let backup = app.backup_layered().await.unwrap();
+    drop(app);
+    plant_duty(&p, &me, 900, &["chat"]);
+    p.load(me).await.unwrap();
+    for to in [&["news"][..], &[], &["tasks", "news"]] {
+        plant_duty(&p, &me, 900, to);
+        assert!(
+            matches!(
+                p.load(me).await.map(|app| app.app_id()),
+                Err(AppError::Store(StoreError::Corrupt))
+            ),
+            "{to:?}"
+        );
+    }
+    plant_duty(&p, &me, 901, &["news"]);
+    let mut restored = App::restore(p.env(), p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    let events = restored.take_events();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AppEvent::RestoreLeftBehind {
+                duty_events: 1,
+                owed_calls: 0,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    let dropped = restored
+        .unacknowledged_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|e| matches!(e, AppEvent::KeptBatchDropped { .. }).then(|| e.id()))
+        .flatten()
+        .unwrap();
+    assert_eq!(restored.event_owners(dropped).unwrap(), ["tasks"]);
+    drop(restored);
+    p.load(me).await.unwrap();
 }

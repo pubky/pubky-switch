@@ -125,8 +125,8 @@ pub(crate) const DENY_GAP: &str = "dgap";
 pub(crate) struct OwedGap {
     pub(crate) generation: u64,
     pub(crate) seq: u64,
-    /// The protocols not told of it yet, in registration order; each told one is taken out
-    /// in the commit of its writes, so none is told twice for one noting.
+    /// The protocols it is owed to, in registration order: all of them stay while one
+    /// fails it, so each is told it again with the list the copy is taken from.
     pub(crate) to: Vec<String>,
 }
 
@@ -1059,6 +1059,11 @@ impl App {
         let mut read = Read::new(self.tx()?, *blocked);
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
+        }
+        // Continuity unverified starts reconcile mode anew: every protocol reconciles again,
+        // whichever ended the mode before (Switch spec 12.4 step 2.4).
+        if history_gap.is_some() {
+            read.tx.delete(key::RECONCILED)?;
         }
         // Items behind a checkpoint never come: the deny list's history has a gap, which
         // the protocol is told, with the list read after it, before anything of the page
@@ -3040,6 +3045,10 @@ impl App {
         let Some(owed) = self.reader().get::<OwedGap>(DENY_GAP).await? else {
             return Ok(false);
         };
+        // Every writer names at least one protocol: a gap owed to none is a corrupt store.
+        if owed.to.is_empty() {
+            return Err(AppError::Store(crate::error::StoreError::Corrupt));
+        }
         let (generation, seq) = (owed.generation, owed.seq);
         let result = self.client.allow().await;
         let list = match self.take(result).await {
@@ -3066,8 +3075,8 @@ impl App {
                 .unwrap_or_default(),
             list_read: list.is_some(),
         };
-        // Each protocol still owed the gap, its writes in this commit with its name taken
-        // out; one that fails keeps the gap owed to it, and the read holds.
+        // Each protocol owed the gap, its writes in this commit; one that fails keeps the
+        // gap owed to every one of them, and the read holds.
         let mut tx = self.tx()?;
         let mut left = Vec::new();
         for name in owed.to.iter().cloned() {
@@ -3094,15 +3103,15 @@ impl App {
             }
         }
         if !left.is_empty() {
-            // A gap told without the list is owed again to the protocols told now too, so
-            // each of them gets the list once a read reads it.
-            let to = if list.is_none() { owed.to } else { left };
+            // One protocol failed it: the gap stays owed to every protocol it was owed to,
+            // those told now too, so the next tell hands each of them the list the copy of
+            // the lists is then taken from, and none keeps a list the copy isn't.
             tx.put(
                 DENY_GAP,
                 &OwedGap {
                     generation,
                     seq,
-                    to,
+                    to: owed.to,
                 },
             )?;
             self.commit(tx).await?;
@@ -3354,6 +3363,11 @@ impl App {
             .collect::<Result<Vec<_>, AppError>>()?;
         owed.sort_by_key(|(order, ..)| *order);
         for (order, (generation, seq), rest, Owed { to, call }) in owed {
+            // Every writer names at least one protocol: a call owed to none is a corrupt
+            // store, neither made nor dropped.
+            if to.is_empty() {
+                return Err(AppError::Store(crate::error::StoreError::Corrupt));
+            }
             let at = format!("{}{rest}", key::OWED_PREFIX);
             // A call past the cursor, as a restore in place carries one, waits for the
             // feed to reach its item: the feed stops before anything later.

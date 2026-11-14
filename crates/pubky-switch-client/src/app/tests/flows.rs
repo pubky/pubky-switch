@@ -8279,6 +8279,43 @@ async fn test_backup_owed_call_of_no_registered_protocol_is_counted_not_made() {
 }
 
 #[tokio::test]
+async fn test_backup_owed_deny_list_change_is_counted_not_made() {
+    // A backup carries no deny list change (the restore's own gap covers it): one in a
+    // backup's calls isn't whole, so it is left behind and counted, never handed.
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let kinds = Arc::new(KindsProtocol::default());
+    let (reader, seq) = reader_owing_a_missed_call(&w, &store, &kinds).await;
+    let mut backup = reader.backup().await.unwrap();
+    drop(reader);
+    let generation = backup.cursor.generation;
+    backup.owed[0].1["call"] = json!({ "Deny": {
+        "generation": generation,
+        "seq": seq,
+        "pubky": pubky_switch_core::enc::b64(&[7; 32]),
+        "added": true,
+        "at_ms": w.clock.now_ms(),
+    }});
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        Arc::clone(&kinds) as Arc<dyn Protocol>,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let events = restored.take_events();
+    assert!(
+        has(&events, |e| matches!(
+            e,
+            AppEvent::RestoreLeftBehind { owed_calls: 1, .. }
+        )),
+        "{events:?}"
+    );
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn test_backup_owed_call_keeps_only_the_registered_protocols() {
     let w = World::new();
     let store = Arc::new(MemoryStore::new());

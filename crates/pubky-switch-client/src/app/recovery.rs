@@ -575,6 +575,8 @@ impl App {
         });
         restore.reconcile = true;
         tx.put(key::RESTORE, restore)?;
+        // Every protocol reconciles again, whichever ended an earlier reconcile mode.
+        tx.delete(key::RECONCILED)?;
         let loss = LossRecord {
             lost_generation: lost,
             generation,

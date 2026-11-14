@@ -139,9 +139,10 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for a name no protocol of the app is registered under, a member
-    /// the switch would refuse, or a record over the operation cap, before anything is
-    /// kept; [`Refusal::Stopped`], [`Refusal::Left`] or [`Refusal::Gone`]; a store failure;
+    /// [`Refusal::Usage`] for a name no protocol of the app is registered under, an
+    /// earliest expiry asked (this protocol's or another's) at or before now, naming the
+    /// protocol that asked for it, a member the switch would refuse, or a record over the
+    /// operation cap, before anything is signed or kept; [`Refusal::Stopped`], [`Refusal::Left`] or [`Refusal::Gone`]; a store failure;
     /// the error of the delivery, after which the record is kept and goes again at the next
     /// read.
     pub async fn set_protocol_member(
@@ -197,6 +198,12 @@ impl App {
 
     /// The expiry each protocol asked of the record (`rexp`), with `protocol`'s now
     /// `expires_at`.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] when the earliest of them is at or before now, naming the
+    /// protocol that asked for it: a record signed with it would have lapsed already, so
+    /// nothing is signed or sent until that protocol asks for a later one.
     async fn asked_expiries(
         &self,
         protocol: &str,
@@ -208,6 +215,18 @@ impl App {
             .await?
             .unwrap_or_default();
         expiries.insert(protocol.to_owned(), expires_at);
+        let lapsed = expiries
+            .iter()
+            .filter_map(|(name, at)| at.map(|at| (name, at)))
+            .min_by_key(|(_, at)| *at)
+            .filter(|(_, at)| *at <= self.now());
+        if let Some((name, _)) = lapsed {
+            return Err(Refusal::Usage(format!(
+                "the record expiry `{name}` asked for is at or before now: `{name}` asks for \
+                 a later one before the record is signed"
+            ))
+            .into());
+        }
         Ok(expiries)
     }
 

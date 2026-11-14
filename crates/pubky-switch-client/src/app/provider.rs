@@ -983,6 +983,10 @@ impl App {
             if let Some(chain) = self.state.chain.as_mut() {
                 chain.write(&mut tx)?;
             }
+            // Reconcile mode starts anew, for every protocol (Switch spec 12.4 step 2.4).
+            if checked.gap.is_some() {
+                tx.delete(key::RECONCILED)?;
+            }
             self.commit(tx).await?;
             if !page.more {
                 return Ok(());

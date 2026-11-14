@@ -757,6 +757,28 @@ struct Carried {
     stored_past: u64,
 }
 
+/// An owed call both a backup and the store restored in place hold under one key: the
+/// store's value, owed to every protocol either names (`to`), in registration order
+/// (`names`). The restore puts each protocol's layer back as the backup holds it, so a
+/// protocol the backup names that answered the call since is owed it again, its writes
+/// gone with the state it had; one only the store names is owed it still. Both values were
+/// read whole, each naming registered protocols only.
+fn union_owners(
+    backup: &serde_json::Value,
+    store: &serde_json::Value,
+    names: &[String],
+) -> Result<serde_json::Value, AppError> {
+    let from_backup =
+        serde_json::from_value::<feed::Owed>(backup.clone()).map_err(|_| corrupt())?;
+    let mut owed = serde_json::from_value::<feed::Owed>(store.clone()).map_err(|_| corrupt())?;
+    owed.to = names
+        .iter()
+        .filter(|name| owed.to.contains(name) || from_backup.to.contains(name))
+        .cloned()
+        .collect();
+    serde_json::to_value(&owed).map_err(|_| corrupt())
+}
+
 /// The entry a kept effect belongs to, as a backup holds it: stored as
 /// [`ParkReason::Uncertain`], under its local ID if it was stored before (its flags kept),
 /// else under `reserved`, the ID the live store reserved for it, built from what the kept
@@ -1958,8 +1980,9 @@ impl App {
             // owed to none of them, is left behind and counted. The restore replaces each
             // protocol's local state with its layer, or with nothing, so a call the store
             // made after the backup is owed again: its writes are gone with that state. A
-            // restore in place also carries the store's own calls, the store's value winning
-            // for a key both hold.
+            // restore in place also carries the store's own calls; for a key both hold, the
+            // owners are both values' (`to`), the rest of the value the store's
+            // ([`union_owners`]).
             let from_backup = Self::owed_of_backup(backup, &protocols);
             // A restore in place keeps the store's holds beside the backup's: a hold the host
             // set after the backup still holds (`App::hold_queued`).
@@ -2078,12 +2101,16 @@ impl App {
                 carrying = true;
                 for (stored, value) in &carried.values {
                     // Written once: a key the backup carried with the same value is in.
-                    let same = from_backup
+                    let in_backup = from_backup
                         .0
                         .iter()
-                        .any(|(key, kept)| key == stored && kept == value);
-                    if !same {
-                        tx.put(stored, value)?;
+                        .find_map(|(key, kept)| (key == stored).then_some(kept));
+                    match in_backup {
+                        Some(kept) if kept == value => {}
+                        Some(kept) => {
+                            tx.put(stored, &union_owners(kept, value, &protocols_names)?)?;
+                        }
+                        None => tx.put(stored, value)?,
                     }
                 }
                 // What didn't read is left behind, and the protocol told how much.
@@ -2540,18 +2567,37 @@ impl App {
     }
 
     /// The duty events kept, by ascending ID, without handing them to the host.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupt`] for one for no protocol, or for one that isn't registered
+    /// ([`App::kept_duty_owned`]).
     pub(crate) async fn kept_duties(&self) -> Result<Vec<AppEvent>, AppError> {
         let kept = self
             .reader()
             .scan_numbered::<events::KeptDuty>(key::DUTY_PREFIX)
             .await?;
-        Ok(kept
-            .into_iter()
+        kept.into_iter()
             .map(|(n, kept)| {
-                kept.duty
-                    .event(EventId::new(self.state.duty_epoch.epoch, n))
+                self.kept_duty_owned(&kept)?;
+                Ok(kept
+                    .duty
+                    .event(EventId::new(self.state.duty_epoch.epoch, n)))
             })
-            .collect())
+            .collect()
+    }
+
+    /// Every writer names a duty event's protocols, each registered, as the load checks the
+    /// set: an event for none, or for a protocol not registered, which no acknowledgement
+    /// could ever remove, is a corrupt store (fail closed), as an owed call or a deny list
+    /// gap of either is. A restore in place is the way out: it carries such an event only
+    /// for the registered protocols it names, and leaves one for none of them behind,
+    /// counted.
+    fn kept_duty_owned(&self, kept: &events::KeptDuty) -> Result<(), AppError> {
+        if kept.to.is_empty() || kept.to.iter().any(|name| !self.protocols.contains(name)) {
+            return Err(corrupt());
+        }
+        Ok(())
     }
 
     /// The duty events kept, as [`App::kept_duties`] lists them, their owners noted for
@@ -2562,6 +2608,9 @@ impl App {
             .scan_numbered::<events::KeptDuty>(key::DUTY_PREFIX)
             .await?;
         let mut out = Vec::with_capacity(kept.len());
+        for kept in kept.values() {
+            self.kept_duty_owned(kept)?;
+        }
         for (n, kept) in kept {
             self.duty_owners.insert(n, kept.to);
             out.push(
@@ -2808,7 +2857,9 @@ impl App {
 
     /// The owed calls a backup carries, by stored key, each whole as a carried one must be
     /// and owed only to the protocols registered here ([`App::kept_for_protocol`]), and how
-    /// many are left behind: those that aren't whole and those owed to none of them.
+    /// many are left behind: those that aren't whole, those owed to none of them, and a
+    /// deny list change, which no backup carries (the restore's own gap covers it), so one
+    /// there isn't a backup's whole.
     fn owed_of_backup(
         backup: &AppBackup,
         protocols: &ProtocolSet,
@@ -2816,14 +2867,19 @@ impl App {
         let mut whole = Vec::new();
         let mut lost = 0u64;
         for (rest, value) in &backup.owed {
-            let read = feed::owed_place(rest)
-                .and_then(|_| {
-                    serde_json::from_value::<feed::Owed>(value.clone()).map_err(|_| corrupt())
-                })
-                .and_then(|owed| owed.call.kept_op_body().map(|_| owed));
+            let read = feed::owed_place(rest).and_then(|_| {
+                serde_json::from_value::<feed::Owed>(value.clone()).map_err(|_| corrupt())
+            });
             let mut owed = match read {
-                Ok(owed) => owed,
-                Err(_) => {
+                Ok(owed)
+                    if matches!(
+                        owed.call,
+                        feed::OwedCall::Resend { .. } | feed::OwedCall::Missed { .. }
+                    ) =>
+                {
+                    owed
+                }
+                _ => {
                     lost = lost.saturating_add(1);
                     continue;
                 }
