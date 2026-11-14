@@ -173,14 +173,12 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let keys = FileKeyStore::open(&key_dir)?;
     let store = Store::connect(&config.database).await?;
     let instance = store
-        .hold_instance_lock(std::time::Duration::from_millis(
-            config.database.connect_retry_ms,
-        ))
+        .hold_instance_lock(pubky_switch::store::LockTiming::SERVICE)
         .await?;
-    // The database's lock lives with its session: once another process holds it, or it
+    // The database's lock lives with its session: once another session holds it, or it
     // can't be confirmed, this one stops (docs/configuration.md, "Topology").
     tokio::spawn(async move {
-        let lost = instance.keep(std::time::Duration::from_secs(5)).await;
+        let lost = instance.keep().await;
         tracing::error!(failure = %lost, "the instance lock: stopping");
         std::process::exit(1);
     });

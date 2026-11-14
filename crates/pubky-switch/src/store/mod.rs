@@ -64,7 +64,7 @@ pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
 pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
-pub use instance::{InstanceLock, InstanceLockLost};
+pub use instance::{InstanceLock, InstanceLockLost, LockTiming};
 pub use keying::{Keyed, keying_lock_key};
 pub use ops::{
     DivergentUpload, ListName, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry,
