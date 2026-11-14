@@ -127,11 +127,11 @@ impl Inner {
         self.release_passed(&current, true);
     }
 
-    /// After a cursor moved: entries left with no current target become unreadable items,
-    /// and what every reader an item waits for has passed goes.
+    /// After a cursor moved: what every reader an item waits for has passed goes. An entry
+    /// with no current target waits: only a departure converts it (Switch wire 7.4.4
+    /// "Unreadable items").
     pub(super) fn after_cursor_move(&mut self) {
         let current = self.current_app_ids();
-        self.convert_unreadable(&current);
         self.release_passed(&current, true);
         self.forget_deleted_keys();
     }

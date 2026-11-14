@@ -14,6 +14,7 @@
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, OpKind};
 use pubky_switch_core::records::{AppCert, AppRecord, IdentityDoc, is_renewal};
+use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
 use super::events::AppEvent;
@@ -95,11 +96,23 @@ impl App {
             !self.state.cert.holds_scope(scope)
                 && collections.iter().any(|c| c.read_by_scope(scope))
         });
+        // A certificate that adds `lists.read`: the feed showed the deny list's changes
+        // before it as stubs, so neither the copy of the lists nor the protocol follows
+        // from them. The copy is marked not complete, in the same commit, and the next
+        // read tells the protocol a deny list gap with the list it takes the copy from
+        // (`App::refresh_lists_if_owed`, Switch spec 8.3). A refusal of lists too large is
+        // removed with it, so that read doesn't wait out its day for the baseline.
+        let lists_read_added = cert.has_permission(Permission::ListsRead)
+            && !self.state.cert.has_permission(Permission::ListsRead);
         self.state.cert = cert;
         self.rebuild_client()?;
         let mut tx = self.tx()?;
         if widened {
             super::records::owe_listing(&mut tx)?;
+        }
+        if lists_read_added {
+            tx.delete(super::admission::LISTS_AT)?;
+            tx.delete(super::admission::LISTS_TOO_LARGE)?;
         }
         tx.put(key::CERT, self.state.cert.signed())?;
         tx.put(key::RECORD, &record)?;

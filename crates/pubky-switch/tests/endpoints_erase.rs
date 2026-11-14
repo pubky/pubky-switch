@@ -3652,23 +3652,15 @@ async fn test_erase_after_a_purge() {
 }
 
 #[tokio::test]
-async fn test_erase_of_an_account_holding_an_older_item_that_doesnt_read() {
-    // An older chain item whose stored document doesn't read, left for the check of older
-    // documents (Switch wire 7.5): the signer can still erase the account, as step 4's check
-    // passes over the item.
+async fn test_erase_of_an_account_holding_an_item_that_doesnt_read() {
+    // A chain item whose stored document doesn't read (Switch wire 7.5): the signer can still
+    // erase the account, since nothing the erasure runs reads that document.
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     sql_on(
         &replay,
         &alice_id(),
         "UPDATE chain_items SET item_bytes = '\\x00'::BYTEA WHERE account_id = $1 AND seq = 3",
-    )
-    .await;
-    sql_on(
-        &replay,
-        &alice_id(),
-        "UPDATE accounts SET documents_checked_seq = 0, documents_check_end = last_seq \
-         WHERE id = $1",
     )
     .await;
     let answer = erase(&replay, &alice_service_key(), &revoke_time()).await;

@@ -187,7 +187,7 @@ pub struct StoredInvite {
     /// Its context.
     pub context: Value,
     /// The context's bytes as its writer wrote them, which a reader repeats (Switch wire
-    /// 1.1). A code stored before the service kept them holds a re-serialization.
+    /// 1.1).
     pub context_written: Vec<u8>,
 }
 
@@ -640,10 +640,10 @@ impl AccountTxn {
         let id = self.head().id.clone();
         sqlx::query(
             "INSERT INTO claims (account_id, claim_key, state, creator, tombstone, open_owners, \
-             delete_known, delete_after_ms, delete_after_entry_ms) \
-             VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8) \
+             delete_after_ms, delete_after_entry_ms) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (account_id, claim_key) DO UPDATE SET state = $3, creator = $4, \
-             tombstone = $5, open_owners = $6, delete_known = true, delete_after_ms = $7, \
+             tombstone = $5, open_owners = $6, delete_after_ms = $7, \
              delete_after_entry_ms = $8",
         )
         .bind(id)
@@ -698,8 +698,7 @@ impl AccountTxn {
     }
 
     /// Delete up to `bound` claims that may be deleted at `base_ms`, the time base, with
-    /// their entries (Switch wire 7.3 step 4). First, up to `bound` claims written before the
-    /// service kept when they may be deleted get it, from their state. Returns how many went.
+    /// their entries (Switch wire 7.3 step 4). Returns how many went.
     pub async fn delete_due_claims(
         &mut self,
         base_ms: u64,
@@ -707,39 +706,6 @@ impl AccountTxn {
         bound: u64,
     ) -> Result<u64, StoreError> {
         let id = self.head().id.clone();
-        let unknown = sqlx::query(
-            "SELECT claim_key, state FROM claims WHERE account_id = $1 AND NOT delete_known \
-             LIMIT $2",
-        )
-        .bind(&id)
-        .bind(to_db(bound, "bound")?)
-        .fetch_all(self.conn())
-        .await
-        .map_err(db)?;
-        for row in &unknown {
-            let key: Vec<u8> = row.try_get("claim_key")?;
-            let state: Vec<u8> = row.try_get("state")?;
-            // A state that doesn't decode is marked known with no deletion time, so it
-            // blocks nothing; the log names no content.
-            let (after, after_entry) = match claim_codec::decode(&state) {
-                Ok(claim) => claim_codec::deletion(&claim),
-                Err(error) => {
-                    tracing::warn!(%error, "a stored claim doesn't decode; it isn't deleted on time");
-                    (None, None)
-                }
-            };
-            sqlx::query(
-                "UPDATE claims SET delete_known = true, delete_after_ms = $3, \
-                 delete_after_entry_ms = $4 WHERE account_id = $1 AND claim_key = $2",
-            )
-            .bind(&id)
-            .bind(key)
-            .bind(opt_to_db(after, "delete_after_ms")?)
-            .bind(opt_to_db(after_entry, "delete_after_entry_ms")?)
-            .execute(self.conn())
-            .await
-            .map_err(db)?;
-        }
         // A last entry this long ago or more has aged out; none has before the epoch.
         let aged_before = base_ms
             .checked_sub(max_claim_age_ms)
@@ -748,7 +714,7 @@ impl AccountTxn {
         // deletion cascades to them, so their documents go too (Switch wire 7.5).
         let row = sqlx::query(
             "WITH doomed AS (SELECT claim_key FROM claims WHERE account_id = $1 \
-                 AND delete_known AND (delete_after_ms <= $2 OR delete_after_entry_ms <= $3) \
+                 AND (delete_after_ms <= $2 OR delete_after_entry_ms <= $3) \
                  LIMIT $4), \
              entries AS (SELECT seq FROM claim_entries WHERE account_id = $1 \
                  AND claim_key IN (SELECT claim_key FROM doomed)), \
