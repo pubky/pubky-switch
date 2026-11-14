@@ -150,15 +150,56 @@ impl From<StoreError> for TakeError {
     }
 }
 
+/// A moment on two clocks: the monotonic one, which a stopped VM, a system suspend or a
+/// checkpoint restore may not advance, and the wall clock, which those do advance once the
+/// host has set it again.
+#[derive(Clone, Copy, Debug)]
+struct Stamp {
+    monotonic: Instant,
+    wall: std::time::SystemTime,
+}
+
+impl Stamp {
+    fn now() -> Self {
+        Self {
+            monotonic: Instant::now(),
+            wall: std::time::SystemTime::now(),
+        }
+    }
+
+    /// The time from `self` to `later`, the longer of the two clocks: a gap on either one
+    /// counts. A wall clock set back counts nothing; one set forward only makes the gap
+    /// look longer, which stops a healthy process, never keeps a stale one serving.
+    fn until(self, later: Stamp) -> Duration {
+        let monotonic = later.monotonic.saturating_duration_since(self.monotonic);
+        let wall = later.wall.duration_since(self.wall).unwrap_or_default();
+        monotonic.max(wall)
+    }
+}
+
+/// Where the keeper reads the time: the system's clocks, or a test's.
+type Clock = std::sync::Arc<dyn Fn() -> Stamp + Send + Sync>;
+
 /// The database held by this process alone, as long as this lives.
-#[derive(Debug)]
 pub struct InstanceLock {
     conn: Option<PgConnection>,
     /// The backend of the session that holds the lock.
     pid: i32,
     timing: LockTiming,
-    /// When the session last confirmed it holds the lock, or took it.
-    confirmed: Instant,
+    /// When the check that last confirmed the lock was sent, or when the lock was taken: the
+    /// session held the lock at least until then.
+    confirmed: Stamp,
+    clock: Clock,
+}
+
+impl std::fmt::Debug for InstanceLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceLock")
+            .field("pid", &self.pid)
+            .field("timing", &self.timing)
+            .field("confirmed", &self.confirmed)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Store {
@@ -219,7 +260,8 @@ impl InstanceLock {
                 conn: Some(conn),
                 pid,
                 timing,
-                confirmed: Instant::now(),
+                confirmed: Stamp::now(),
+                clock: std::sync::Arc::new(Stamp::now),
             }),
             Err(error) => {
                 let _ = conn.close().await;
@@ -268,24 +310,39 @@ impl InstanceLock {
 
     /// Check the lock at every check of its timing, and return at the first check that
     /// can't confirm it within what is left of two checks since the last confirmed one, so
-    /// the caller stops serving: the process serves on without a confirmed lock for at most
-    /// two checks (10 seconds with the service's timing) while its timers run. It never
-    /// takes the lock again: the lock may have been free in the gap, and another process may
-    /// have held it and served. A start takes it afresh. The lock comes back with the
-    /// reason, still held if its session lives, so the caller can stop before it lets go.
+    /// the caller stops serving. Time is read on two clocks, and a gap on either counts
+    /// ([`Stamp::until`]): a check that starts, or an answer that comes, more than two checks
+    /// after the last confirmed check was sent, as after a pause of the process, stops it
+    /// too, and an answer confirms the lock only as of the moment its check was sent. So
+    /// the process serves on without a confirmed lock for at most two checks (10 seconds
+    /// with the service's timing) while its timers run, and a pause is caught at the first
+    /// timer that fires after it. It never takes the lock again: the lock may have been free
+    /// in the gap, and another process may have held it and served. A start takes it
+    /// afresh. The lock comes back with the reason, still held if its session lives, so the
+    /// caller can stop before it lets go.
     pub async fn keep(mut self) -> (InstanceLockLost, Self) {
         let every = self.timing.every;
+        let overdue = self.timing.overdue();
         loop {
             tokio::time::sleep(every).await;
-            let since = self.confirmed.elapsed();
-            let Some(left) = self.timing.overdue().checked_sub(since) else {
+            let sent = (self.clock)();
+            let since = self.confirmed.until(sent);
+            let Some(left) = overdue.checked_sub(since) else {
                 return (InstanceLockLost::Overdue(since), self);
             };
             let Some(conn) = self.conn.as_mut() else {
                 return (InstanceLockLost::Unconfirmed, self);
             };
             match tokio::time::timeout(left, Self::confirm(conn)).await {
-                Ok(Ok(true)) => self.confirmed = Instant::now(),
+                Ok(Ok(true)) => {
+                    // An answer that waited out a pause of this process says nothing about
+                    // the time since it was sent.
+                    let since = self.confirmed.until((self.clock)());
+                    if since > overdue {
+                        return (InstanceLockLost::Overdue(since), self);
+                    }
+                    self.confirmed = sent;
+                }
                 Ok(Ok(false)) | Err(_) => return (InstanceLockLost::Unconfirmed, self),
                 Ok(Err(failure)) => {
                     tracing::warn!(%failure, "checking the instance lock");
@@ -599,6 +656,7 @@ mod tests {
             pid: original.pid,
             timing: original.timing,
             confirmed: original.confirmed,
+            clock: original.clock.clone(),
         };
         let original_keeper = tokio::spawn(async move { original.keep().await.0 });
         let lost = tokio::time::timeout(Duration::from_secs(20), async { copy.keep().await.0 })
@@ -624,7 +682,7 @@ mod tests {
             return;
         };
         let mut held = db.store().hold_instance_lock(fast()).await.expect("lock");
-        held.confirmed = Instant::now() - fast().overdue() - fast().every;
+        held.confirmed.monotonic = Instant::now() - fast().overdue() - fast().every;
         let lost = tokio::time::timeout(Duration::from_secs(20), async { held.keep().await.0 })
             .await
             .expect("the keeper stops");
@@ -661,5 +719,78 @@ mod tests {
             "{waited:?}"
         );
         db.drop_database().await.expect("drop");
+    }
+
+    /// A clock that jumps `monotonic` and `wall` ahead from its `from`-th reading on, as a
+    /// pause of the process would.
+    fn jumping(from: usize, monotonic: Duration, wall: Duration) -> Clock {
+        let readings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Arc::new(move || {
+            let now = Stamp::now();
+            if readings.fetch_add(1, Ordering::SeqCst) + 1 >= from {
+                Stamp {
+                    monotonic: now.monotonic + monotonic,
+                    wall: now.wall + wall,
+                }
+            } else {
+                now
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_store_instance_lock_keeper_stops_after_a_suspension_only_the_wall_clock_saw() {
+        // The host was suspended: the monotonic clock didn't move, the wall clock did. The
+        // keeper stops at its next check, without asking.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let mut held = db.store().hold_instance_lock(fast()).await.expect("lock");
+        held.clock = jumping(1, Duration::ZERO, fast().overdue() + fast().every);
+        let lost = tokio::time::timeout(Duration::from_secs(20), async { held.keep().await.0 })
+            .await
+            .expect("the keeper stops");
+        assert!(matches!(lost, InstanceLockLost::Overdue(_)), "{lost:?}");
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_store_instance_lock_keeper_stops_after_a_stall_during_its_check() {
+        // The process stalled while its check was in flight: the answer waiting in the
+        // socket says nothing about the stall, so the keeper stops as the answer comes in,
+        // not one check later.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let mut held = db.store().hold_instance_lock(fast()).await.expect("lock");
+        // The first reading is the check's sending, the second its answer.
+        let stall = fast().overdue() + fast().every;
+        held.clock = jumping(2, stall, stall);
+        let started = Instant::now();
+        let lost = tokio::time::timeout(Duration::from_secs(20), async { held.keep().await.0 })
+            .await
+            .expect("the keeper stops");
+        assert!(matches!(lost, InstanceLockLost::Overdue(_)), "{lost:?}");
+        assert!(
+            started.elapsed() < fast().every * 2,
+            "at the answer of its first check"
+        );
+        db.drop_database().await.expect("drop");
+    }
+
+    #[test]
+    fn test_store_instance_lock_gap_counts_the_longer_clock() {
+        let then = Stamp::now();
+        let ahead = |monotonic: u64, wall: u64| Stamp {
+            monotonic: then.monotonic + Duration::from_secs(monotonic),
+            wall: then.wall + Duration::from_secs(wall),
+        };
+        assert_eq!(then.until(ahead(3, 1)), Duration::from_secs(3));
+        assert_eq!(then.until(ahead(1, 30)), Duration::from_secs(30));
+        let set_back = Stamp {
+            monotonic: then.monotonic + Duration::from_secs(2),
+            wall: then.wall - Duration::from_secs(60),
+        };
+        assert_eq!(then.until(set_back), Duration::from_secs(2));
     }
 }
