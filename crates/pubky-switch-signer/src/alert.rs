@@ -349,3 +349,62 @@ pub enum Alert {
         kept: u64,
     },
 }
+
+impl Alert {
+    /// Whether this alert is about the app `app_id`: it names that app, as its subject, among
+    /// the apps it lists, or as the app a hand-over goes to.
+    pub fn names_app(&self, app_id: &[u8; 16]) -> bool {
+        match self {
+            Self::RotationSkipped { app_id: named, .. }
+            | Self::RenewalsStopped { app_id: named, .. }
+            | Self::RenewalRefused { app_id: named, .. }
+            | Self::LapsingWithOpenAttempts { app_id: named, .. }
+            | Self::RevokedWithOpenAttempts { app_id: named, .. }
+            | Self::RenewalSkipped { app_id: named, .. }
+            | Self::GrantRevocationOwed { app_id: named }
+            | Self::RevocationUnconfirmed { app_id: named }
+            | Self::RemovedAtSwitch { app_id: named, .. }
+            | Self::RemovalTimeBounded { app_id: named, .. }
+            | Self::FullBundleRefused { app_id: named }
+            | Self::RevocationPending { app_id: named, .. }
+            | Self::HandOverRefused { to_app: named } => named == app_id,
+            Self::ReductionNotClosed { apps } => apps.contains(app_id),
+            Self::Rollback { .. }
+            | Self::Equivocation { .. }
+            | Self::ManagedByOtherInstall { .. }
+            | Self::BackupUnreadable
+            | Self::AdmissionNotEnded
+            | Self::UnreadableBackupBeforeEnrollment
+            | Self::BackupMissing
+            | Self::RecordsBehind { .. }
+            | Self::IdentityNearLimit { .. }
+            | Self::ClockOff
+            | Self::AccountNotHosted
+            | Self::BackupNotWritten
+            | Self::KeyNotInstalled
+            | Self::TakeOverRefused
+            | Self::TakenBack { .. }
+            | Self::EpochFloorBounded { .. } => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_alert_names_the_apps_it_is_about() {
+        let (app, other) = ([1; 16], [2; 16]);
+        assert!(Alert::GrantRevocationOwed { app_id: app }.names_app(&app));
+        assert!(!Alert::GrantRevocationOwed { app_id: app }.names_app(&other));
+        let reduction = Alert::ReductionNotClosed {
+            apps: vec![other, app],
+        };
+        assert!(reduction.names_app(&app) && reduction.names_app(&other));
+        assert!(Alert::HandOverRefused { to_app: app }.names_app(&app));
+        // An alert about the identity names no app, nor does one that names an install.
+        assert!(!Alert::BackupMissing.names_app(&app));
+        assert!(!Alert::ManagedByOtherInstall { install: app }.names_app(&app));
+    }
+}
