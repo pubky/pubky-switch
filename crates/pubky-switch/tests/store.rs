@@ -1835,3 +1835,160 @@ async fn test_store_forget_compares_whole_positions() {
     conn.close().await.expect("close");
     fx.finish().await;
 }
+
+/// Wait until an account's insert waits for a lock another transaction holds.
+async fn insert_waits(db: &TestDatabase, context: &str) {
+    let mut watcher = PgConnection::connect_with(db.options())
+        .await
+        .expect("conn");
+    let mut waited = 0;
+    loop {
+        let inserting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+             AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO accounts%'",
+        )
+        .fetch_one(&mut watcher)
+        .await
+        .expect("activity");
+        if inserting == 1 {
+            break;
+        }
+        waited += 1;
+        assert!(waited < 500, "{context}: the insert never waited");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    watcher.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn test_store_creation_waiting_on_an_erasure_never_commits_before_it() {
+    // An account inserted while an erasure of the same ID is still committing waits for the
+    // deletion, then is created after that erasure, which the database still owes keys for,
+    // whatever isolation level the database gives new sessions (Switch spec 6.5).
+    for level in ["read committed", "repeatable read", "serializable"] {
+        let Some(fx) = fixture().await else { return };
+        let old = fx.account(ID_A).await;
+        let mut admin = fx.db.admin().await.expect("admin");
+        admin
+            .execute(
+                format!(
+                    "ALTER DATABASE {} SET default_transaction_isolation = '{level}'",
+                    fx.db.name()
+                )
+                .as_str(),
+            )
+            .await
+            .expect("default isolation");
+        admin.close().await.expect("close");
+        let store = Store::connect_with(fx.db.options().clone(), &DatabaseConfig::default())
+            .await
+            .expect("store");
+        let erased_at = T0 + 60_000;
+        let mut erasing = PgConnection::connect_with(fx.db.options())
+            .await
+            .expect("conn");
+        erasing.execute("BEGIN").await.expect("begin");
+        sqlx::query("DELETE FROM accounts WHERE id = $1")
+            .bind(ID_A)
+            .execute(&mut erasing)
+            .await
+            .expect("delete");
+        sqlx::query(
+            "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, $3)",
+        )
+        .bind(old.service_key.as_str())
+        .bind(ID_A)
+        .bind(i64::try_from(erased_at).expect("time"))
+        .execute(&mut erasing)
+        .await
+        .expect("owed");
+        let key = fx.keys.generate().await.expect("service key");
+        let account = NewAccount {
+            service_key: key.id,
+            created_at_ms: T0 + 1_000,
+            ..old.clone()
+        };
+        let (created, ()) = tokio::join!(
+            async {
+                match store.begin_create(&account).await {
+                    Ok(Some(creation)) => creation.commit(None).await.ok(),
+                    _ => None,
+                }
+            },
+            async {
+                insert_waits(&fx.db, level).await;
+                erasing.execute("COMMIT").await.expect("commit");
+            }
+        );
+        let created = created.unwrap_or_else(|| panic!("{level}: not created"));
+        assert!(created > erased_at, "{level}: created at {created}");
+        erasing.close().await.expect("close");
+        store.close().await;
+        fx.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn test_store_creation_waiting_on_an_erasure_gives_up_at_the_lock_timeout() {
+    // An account inserted while an erasure of the same ID holds its row waits at most the
+    // configured lock timeout, then is refused, writing nothing, so the enrollment deletes
+    // its unused key and answers `503`; a retry once the erasure committed creates the
+    // account after it (Switch spec 6.5).
+    let Some(fx) = fixture().await else { return };
+    let old = fx.account(ID_A).await;
+    let config = DatabaseConfig {
+        lock_timeout_ms: 200,
+        ..DatabaseConfig::default()
+    };
+    let store = Store::connect_with(fx.db.options().clone(), &config)
+        .await
+        .expect("store");
+    let erased_at = T0 + 60_000;
+    let mut erasing = PgConnection::connect_with(fx.db.options())
+        .await
+        .expect("conn");
+    erasing.execute("BEGIN").await.expect("begin");
+    sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(ID_A)
+        .execute(&mut erasing)
+        .await
+        .expect("delete");
+    sqlx::query("INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, $3)")
+        .bind(old.service_key.as_str())
+        .bind(ID_A)
+        .bind(i64::try_from(erased_at).expect("time"))
+        .execute(&mut erasing)
+        .await
+        .expect("owed");
+    let key = fx.keys.generate().await.expect("service key");
+    let account = NewAccount {
+        service_key: key.id,
+        created_at_ms: T0 + 1_000,
+        ..old.clone()
+    };
+    let refused = tokio::time::timeout(Duration::from_secs(5), store.begin_create(&account))
+        .await
+        .expect("the creation waited past the lock timeout");
+    let error = refused.expect_err("created while the erasure held the row");
+    assert!(matches!(error, StoreError::LockTimeout), "{error:?}");
+    assert!(error.is_refused(), "nothing written");
+    erasing.execute("COMMIT").await.expect("commit");
+    erasing.close().await.expect("close");
+    assert!(store.lookup(ID_A).await.expect("lookup").is_none());
+
+    let key = fx.keys.generate().await.expect("service key");
+    let account = NewAccount {
+        service_key: key.id,
+        ..account
+    };
+    let creation = store
+        .begin_create(&account)
+        .await
+        .expect("retry")
+        .expect("no account");
+    let created = creation.commit(None).await.expect("commit");
+    assert!(created > erased_at, "created at {created}");
+    assert!(store.lookup(ID_A).await.expect("lookup").is_some());
+    store.close().await;
+    fx.finish().await;
+}
