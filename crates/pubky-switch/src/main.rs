@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use pubky_switch::{
     admin::{self, AdminState},
     changes::ChangeListener,
+    check_marks::{self, CheckOptions},
     config::Config,
     http,
     keys::{FileKeyStore, KeyStoreReadiness},
@@ -33,6 +34,16 @@ enum Command {
     Run,
     /// Check the configuration, and print it with every default written out.
     CheckConfig,
+    /// Compare every account's chain head with its service key's mark, reading only:
+    /// prints JSON lines, and exits 2 when an account needs attention.
+    CheckMarks {
+        /// Read this database instead of the configured one, against the same key store.
+        #[arg(long, env = "PUBKY_SWITCH_REPLICA_URL")]
+        replica: Option<String>,
+        /// Report every account, not only those that need attention.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -59,7 +70,40 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::CheckMarks { replica, all } => {
+            check_marks_command(&config, replica.as_deref(), all)
+        }
         Command::Run => run(config),
+    }
+}
+
+fn check_marks_command(config: &Config, replica: Option<&str>, all: bool) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("pubky-switch: check-marks: starting the runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = CheckOptions::from_config(config, replica, all)
+        .and_then(|options| runtime.block_on(check_marks::run(&options)))
+        .and_then(|report| Ok((report.to_json_lines()?, report.needs_attention())));
+    match report {
+        Ok((text, attention)) => {
+            print!("{text}");
+            if attention {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => {
+            eprintln!("pubky-switch: check-marks: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

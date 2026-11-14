@@ -28,6 +28,7 @@ mod documents;
 mod enrollments;
 mod feed;
 mod handover;
+pub mod heads;
 mod identity;
 mod inbox;
 mod instance;

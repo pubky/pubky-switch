@@ -9,6 +9,7 @@ pubky-switch check-config --config /etc/pubky-switch/config.toml
 
 - `run`, the default command, starts the service. It needs a database (`database.url` or `PUBKY_SWITCH_DATABASE_URL`) and a key store (`keys.path`), applies pending schema migrations, and stops on `SIGTERM` or Ctrl-C.
 - `check-config` checks a file and prints it with every default written out.
+- `check-marks` compares every account's state with its service key's mark and lists the accounts that need attention after a database restore or before a failover; it writes nothing (Checking marks after a restore, below).
 - `--config` may also be given as `PUBKY_SWITCH_CONFIG`. Without a file, every setting takes its default.
 
 ### Container
@@ -231,11 +232,35 @@ The service holds no per-account key in a KMS: the keys are files on that volume
 Restoring a database backup, failing over to a replica that may lag, or replaying an incomplete log is a loss of committed state (Switch spec 6.5). The service never continues from it under the same generation:
 
 1. The key's mark stops the affected accounts on their own, and the readiness answer stays up for the others.
-2. Find the accounts whose state is behind their mark; their requests answer `503 unavailable`.
+2. Find the accounts whose state is behind their mark, with `pubky-switch check-marks` (Checking marks after a restore, below); their requests answer `503 unavailable`.
 3. Tell their users, by whatever means you reach them outside the service, that a provider loss must be declared. The signer declares it, here or at another service, and the account starts a new generation with a new service key.
 4. Never serve the lost generation again, and never reuse its service key.
 
 Database backups are for disaster recovery only: after a restore, every account whose state went back takes the steps above.
+
+### Checking marks after a restore
+
+`pubky-switch check-marks [--replica <url>] [--all]` finds the accounts of step 2 above. It reads the configuration file as the service does, and then, per account, its chain head, generation, service key, creation time and held `identity.json` from the database, and the key's file, its mark and the erasure ledger from `keys.path`. It writes nothing: the database is read on one connection whose session is read only (so it also works against a hot standby), with no durability check, no migration and no instance lock, and the key store is read without creating, locking or changing a file. It can run beside the running service. It reads each page of accounts' service keys first, then their marks, then their heads: a mark moves only after its head is committed, so a running service never shows as `behind`.
+
+Each account gets one state:
+
+| State | Meaning |
+|---|---|
+| `erased_in_ledger` | the ledger holds an erasure of the identity at or after the account's creation; the service erases it again at start. Takes precedence over the others |
+| `key_missing` | the key store has no key file for the account's service key |
+| `current` | the head is at the mark |
+| `ahead` | the head extends the mark (`ahead_by` seqs), as a stop before the mark moved leaves it |
+| `behind` | the head is behind the mark: `lost` acknowledged chain positions are missing, and what they held can't be told from here |
+| `fork` | the head has another chain hash at the mark's seq |
+| `other_generation` | the mark is of another generation than the account's |
+| `unmarked` | no chain and no mark: the key has signed nothing yet |
+| `mark_lost` | the account has a chain and its key has no mark file: the mark was lost, or the mark of the account's first head never landed. The service signs on from such a state, so whether a mark was lost is the operator's to judge, from what else the loss took |
+
+An account is `serving` when its held `identity.json`, verified with the identity's key, names `server.origin` and the account's service key; without an origin configured, no account serves. Only a serving account is refused on its mark. An account needs attention when it serves and is `behind`, `fork`, `other_generation` or `mark_lost`; and when it is `erased_in_ledger` or `key_missing`, serving or not (without its key the service signs nothing for it, and whether it serves can't be told).
+
+It prints JSON lines: one object per account that needs attention (every account with `--all`), with `account`, `generation`, `serving`, `state`, `head_seq`, `mark_seq`, and `lost`, `ahead_by` or `erased_at_ms` where its state has one; then one `{"summary": ...}` line with the database read (`configured` or `replica`), the number of accounts, of serving ones, of those that need attention, and of each state. It prints no key material and no document. The exit code is 0 when no account needs attention, 2 when one does, and 1 when the check itself failed (the reason on stderr).
+
+**Choosing a database to fail over to.** `--replica <url>` (or `PUBKY_SWITCH_REPLICA_URL`) checks the same key store against that database instead of the configured one. A database on which no serving account is `behind`, `fork` or `other_generation` holds every item the service acknowledged, since an answer leaves only after its mark moved (Switch spec 6.5): it is safe to fail over to. The accounts a candidate leaves behind need their signers to start a new generation (Switch spec 12.6), as in the steps above; pick the candidate that leaves none, or the fewest.
 
 ## Known limits
 

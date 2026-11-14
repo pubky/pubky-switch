@@ -480,21 +480,7 @@ impl Inner {
         if let Some(key) = self.keys.lock().get(id) {
             return Ok(key.clone());
         }
-        let mut seed = Zeroizing::new([0u8; 32]);
-        let mut file = match File::open(self.key_path(id)) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(KeyStoreError::NotFound);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let mut rest = [0u8; 1];
-        file.read_exact(seed.as_mut())
-            .map_err(|_| KeyStoreError::Corrupt(format!("key {id}: too short")))?;
-        if file.read(&mut rest)? != 0 {
-            return Err(KeyStoreError::Corrupt(format!("key {id}: too long")));
-        }
-        let key = Arc::new(SigningKey::from_bytes(&seed));
+        let key = Arc::new(read_key_file(&self.key_path(id), id)?);
         self.keys.lock().insert(id.clone(), key.clone());
         Ok(key)
     }
@@ -503,14 +489,7 @@ impl Inner {
         if let Some(mark) = self.marks.lock().get(id) {
             return Ok(*mark);
         }
-        let mark = match fs::read(self.mark_path(id)) {
-            Ok(bytes) => Some(
-                serde_json::from_slice::<Mark>(&bytes)
-                    .map_err(|error| KeyStoreError::Corrupt(format!("mark {id}: {error}")))?,
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
+        let mark = read_mark_file(&self.mark_path(id), id)?;
         self.marks.lock().insert(id.clone(), mark);
         Ok(mark)
     }
@@ -888,6 +867,104 @@ mod hex_bytes {
         let mut bytes = [0u8; 32];
         hex::decode_to_slice(text, &mut bytes).map_err(D::Error::custom)?;
         Ok(bytes)
+    }
+}
+
+/// Read the key file of `id` at `path`: its 32-byte secret seed. [`KeyStoreError::NotFound`]
+/// when there is no such file.
+fn read_key_file(path: &Path, id: &KeyId) -> Result<SigningKey, KeyStoreError> {
+    let mut seed = Zeroizing::new([0u8; 32]);
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(KeyStoreError::NotFound);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut rest = [0u8; 1];
+    file.read_exact(seed.as_mut())
+        .map_err(|_| KeyStoreError::Corrupt(format!("key {id}: too short")))?;
+    if file.read(&mut rest)? != 0 {
+        return Err(KeyStoreError::Corrupt(format!("key {id}: too long")));
+    }
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+/// Read the mark file of `id` at `path`; `None` when there is no such file.
+fn read_mark_file(path: &Path, id: &KeyId) -> Result<Option<Mark>, KeyStoreError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice::<Mark>(&bytes).map_err(
+            |error| KeyStoreError::Corrupt(format!("mark {id}: {error}")),
+        )?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A read-only view of a [`FileKeyStore`]'s directory, for an operator's check beside a
+/// running service: it creates, writes and locks nothing, and caches nothing but the
+/// erasure ledger, read once when it opens. Each read finds the files as they are then,
+/// so a mark the service moves meanwhile is read as moved (Switch spec 6.5).
+///
+/// It hands out public keys and marks only: a key's seed is read to derive its public key
+/// and dropped.
+#[derive(Debug)]
+pub struct KeyStoreView {
+    root: PathBuf,
+    ledger: HashMap<String, u64>,
+}
+
+impl KeyStoreView {
+    /// Open the view of the key store at `root`.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyStoreError::Io`] when one of its directories (`keys`, `marks`, `erasures`) isn't
+    /// there or doesn't read; [`KeyStoreError::Corrupt`] when the erasure ledger doesn't
+    /// read whole, as the service refuses to start on it.
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, KeyStoreError> {
+        let root = root.into();
+        for dir in ["keys", "marks"] {
+            fs::read_dir(root.join(dir)).map_err(|error| {
+                KeyStoreError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("the key store's {dir} directory: {error}"),
+                ))
+            })?;
+        }
+        let ledger = read_ledger(&root.join("erasures")).map_err(|error| match error {
+            KeyStoreError::Io(error) => KeyStoreError::Io(std::io::Error::new(
+                error.kind(),
+                format!("the key store's erasures directory: {error}"),
+            )),
+            other => other,
+        })?;
+        Ok(Self { root, ledger })
+    }
+
+    /// The directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The mark of `id` as its file holds it now; `None` when there is no mark file.
+    pub fn mark(&self, id: &KeyId) -> Result<Option<Mark>, KeyStoreError> {
+        read_mark_file(&self.root.join("marks").join(id.as_str()), id)
+    }
+
+    /// The public key of `id`; `None` when there is no key file.
+    pub fn public_key(&self, id: &KeyId) -> Result<Option<[u8; 32]>, KeyStoreError> {
+        match read_key_file(&self.root.join("keys").join(id.as_str()), id) {
+            Ok(key) => Ok(Some(key.verifying_key().to_bytes())),
+            Err(KeyStoreError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// When `identity`'s account was last erased, as the ledger held it when the view
+    /// opened.
+    pub fn erasure(&self, identity: &str) -> Option<u64> {
+        self.ledger.get(identity).copied()
     }
 }
 
@@ -1415,6 +1492,60 @@ mod tests {
             FileKeyStore::open(dir.path()),
             Err(KeyStoreError::Corrupt(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_view_reads_what_the_store_wrote() {
+        let (dir, store) = open();
+        let key = store.generate().await.expect("generate");
+        let unmarked = store.generate().await.expect("generate");
+        store.advance_mark(&key.id, mark(5, 1)).await.expect("mark");
+        store.record_erasure("aaa", 1_000).await.expect("record");
+        let view = KeyStoreView::open(dir.path()).expect("view");
+        assert_eq!(view.mark(&key.id).expect("mark"), Some(mark(5, 1)));
+        assert_eq!(view.public_key(&key.id).expect("public"), Some(key.public));
+        assert_eq!(view.mark(&unmarked.id).expect("mark"), None);
+        assert_eq!(view.erasure("aaa"), Some(1_000));
+        assert_eq!(view.erasure("bbb"), None);
+        // A mark moved after the view opened is read as moved.
+        store.advance_mark(&key.id, mark(6, 2)).await.expect("mark");
+        assert_eq!(view.mark(&key.id).expect("mark"), Some(mark(6, 2)));
+        // A key file that isn't there is no key, its mark file left or not.
+        store.delete(&key.id).await.expect("delete");
+        assert_eq!(view.public_key(&key.id).expect("public"), None);
+        let id = KeyId::parse("00112233445566778899aabbccddeeff").expect("id");
+        fs::write(dir.path().join("keys").join(id.as_str()), [1u8; 31]).expect("write");
+        assert!(matches!(
+            view.public_key(&id),
+            Err(KeyStoreError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn test_key_store_view_open_refuses_a_missing_directory_and_creates_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("absent");
+        assert!(matches!(
+            KeyStoreView::open(&root),
+            Err(KeyStoreError::Io(_))
+        ));
+        assert!(!root.exists());
+        // One directory missing of three is refused too, and isn't made.
+        fs::create_dir_all(root.join("keys")).expect("keys");
+        fs::create_dir_all(root.join("marks")).expect("marks");
+        assert!(matches!(
+            KeyStoreView::open(&root),
+            Err(KeyStoreError::Io(_))
+        ));
+        assert!(!root.join("erasures").exists());
+        fs::create_dir_all(root.join("erasures")).expect("erasures");
+        let view = KeyStoreView::open(&root).expect("view");
+        assert_eq!(view.root(), root.as_path());
+        let listing: Vec<_> = fs::read_dir(&root)
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(listing.len(), 3, "{listing:?}");
     }
 
     #[test]
