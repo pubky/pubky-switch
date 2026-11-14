@@ -8,8 +8,8 @@
 //!
 //! The bounds apply at the start of every read, before entries stored locally are tried
 //! again, and before a layered backup is taken, to every such entry the store holds: those
-//! stored before too, as after an upgrade or a restore from an older backup (Switch spec
-//! 12.4), which brings dropped entries back to be dropped, and told, again. Entries stored
+//! stored before too, as after a restore from an older backup (Switch spec 12.4), which
+//! brings dropped entries back to be dropped, and told, again. Entries stored
 //! for any other reason are neither counted nor dropped.
 //!
 //! **What the total can't do.** Dropping from the identity that holds the most keeps a
