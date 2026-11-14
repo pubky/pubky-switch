@@ -504,23 +504,53 @@ impl MessagePlaintext {
         sender: &VerifiedSender,
         opaque: &[OpaqueMember<'_>],
     ) -> Result<Message> {
-        self.verify_signature(&sender.signing_key, own_identity)?;
-        let message = Message::parse(&self.json, opaque)?;
+        self.check_numbered(own_identity, entry_sender, sender, opaque)
+            .map_err(|failed| failed.error)
+    }
+
+    /// [`MessagePlaintext::check`], telling which of checks 4, 5 and 6 failed.
+    pub(crate) fn check_numbered(
+        &self,
+        own_identity: &[u8; 32],
+        entry_sender: &[u8; 32],
+        sender: &VerifiedSender,
+        opaque: &[OpaqueMember<'_>],
+    ) -> std::result::Result<Message, FailedCheck> {
+        self.verify_signature(&sender.signing_key, own_identity)
+            .map_err(|error| FailedCheck { check: 4, error })?;
+        let message =
+            Message::parse(&self.json, opaque).map_err(|error| FailedCheck { check: 5, error })?;
+        let check_6 = |rule: &str| FailedCheck {
+            check: 6,
+            error: Error::Invalid(rule.into()),
+        };
         if self.sender_app_id != message.from.app_id || message.from.app_id != sender.app_id {
-            return invalid(
+            return Err(check_6(
                 "Switch wire 5.1 check 6: the plaintext's App ID, from.app_id and the certificate's differ",
-            );
+            ));
         }
         if message.from.identity != sender.identity || message.from.identity != *entry_sender {
-            return invalid(
+            return Err(check_6(
                 "Switch wire 5.1 check 6: from.identity isn't the certificate's identity and the entry's sender",
-            );
+            ));
         }
         if message.to != *own_identity {
-            return invalid("Switch wire 5.1 check 6: the message is to another identity");
+            return Err(check_6(
+                "Switch wire 5.1 check 6: the message is to another identity",
+            ));
         }
         Ok(message)
     }
+}
+
+/// A recipient check of Switch wire 5.1 a message failed: its number, 4, 5 or 6, and the
+/// error that tells the rule.
+#[derive(Debug)]
+pub(crate) struct FailedCheck {
+    /// The check's number.
+    pub(crate) check: u8,
+    /// The error, as [`MessagePlaintext::check`] gives it.
+    pub(crate) error: Error,
 }
 
 /// Bound message JSON to the largest an envelope carries (Switch wire 5.1).
@@ -761,6 +791,42 @@ mod tests {
             not_message.check(&ALICE, &bob(), &ok, &[]),
             Err(Error::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn test_message_check_numbered_tells_each_check() {
+        let plaintext = message().sign(&app()).unwrap();
+        let ok = sender();
+        let number = |plaintext: &MessagePlaintext, own: &[u8; 32]| {
+            plaintext
+                .check_numbered(own, &bob(), &ok, &[])
+                .map(|_| ())
+                .map_err(|failed| failed.check)
+        };
+        assert_eq!(number(&plaintext, &ALICE), Ok(()));
+        // Check 4: signed for another identity.
+        assert_eq!(number(&plaintext, &[0x0b; 32]), Err(4));
+        // Check 5: a signed document that isn't a message.
+        let json = b"{\"v\":1}".to_vec();
+        let signature = app().sign(labels::sig::MSG, &[&ALICE, &json]);
+        let not_message =
+            MessagePlaintext::from_parts(app().app_id_bytes(), signature, json).unwrap();
+        assert_eq!(number(&not_message, &ALICE), Err(5));
+        // Check 6: `to` isn't the own identity, though the signature names it.
+        let mut misaddressed = message();
+        misaddressed.to = [0x0b; 32];
+        let json = misaddressed.to_json().unwrap();
+        let signature = app().sign(labels::sig::MSG, &[&ALICE, &json]);
+        let forged = MessagePlaintext::from_parts(app().app_id_bytes(), signature, json).unwrap();
+        assert_eq!(number(&forged, &ALICE), Err(6));
+        let failed = forged.check_numbered(&ALICE, &bob(), &ok, &[]).unwrap_err();
+        assert_eq!(
+            failed.error.to_string(),
+            forged
+                .check(&ALICE, &bob(), &ok, &[])
+                .unwrap_err()
+                .to_string()
+        );
     }
 
     #[test]
