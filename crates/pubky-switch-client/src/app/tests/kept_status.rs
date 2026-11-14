@@ -671,68 +671,6 @@ async fn test_kept_batch_status_end_is_not_carried_by_a_restore() {
     assert_eq!(end_keys(&app).await, 0);
 }
 
-/// A batch kept by an earlier build, with no index of its message and attempt: the load
-/// indexes it, in one commit, so neither reads as unknown while the batch is still to be
-/// sent; a load with nothing to index commits nothing.
-#[tokio::test]
-async fn test_kept_batch_status_unindexed_batch_is_indexed_at_load() {
-    let w = World::new();
-    let router = Router::of(&w);
-    let mut app = join_app(&w, &router).await;
-    let me = app.app_id();
-    w.switch.fail_next(Fault::Unreachable {
-        path: "ops".into(),
-        after: 0,
-    });
-    let (batch, signed) = batch_of(&w, &app);
-    let id = app
-        .submit_batch(batch)
-        .await
-        .unwrap_err()
-        .kept_batch()
-        .unwrap();
-    w.switch.lock().faults.clear();
-    // As an earlier build left it: kept, with no index.
-    let mut tx = app.tx().unwrap();
-    tx.delete_prefix("kbm/").unwrap();
-    tx.delete_prefix("kba/").unwrap();
-    app.commit(tx).await.unwrap();
-    drop(app);
-    // A load whose index commit fails writes none of it.
-    let failing = Arc::new(FaultStore::new(
-        Arc::clone(&w.store) as Arc<dyn StateStore>,
-        StoreFault::FailBefore(1),
-    ));
-    assert!(
-        load_on(&w, &router, Arc::clone(&failing) as Arc<dyn StateStore>, me)
-            .await
-            .is_err()
-    );
-    let counting = stopping(&w, None);
-    let app = load_on(
-        &w,
-        &router,
-        Arc::clone(&counting) as Arc<dyn StateStore>,
-        me,
-    )
-    .await
-    .unwrap();
-    assert_eq!(counting.commits(), 1, "indexed in one commit");
-    let found = app.kept_attempt(attempt()).await.unwrap().unwrap();
-    assert_eq!(found.batch_id, id);
-    assert!(matches!(found.status, KeptBatchStatus::Kept { .. }));
-    assert_eq!(
-        app.delivery(signed.msg_id()).await.unwrap(),
-        Some(Delivery::Kept { batch_id: id })
-    );
-    drop(app);
-    let again = stopping(&w, None);
-    load_on(&w, &router, Arc::clone(&again) as Arc<dyn StateStore>, me)
-        .await
-        .unwrap();
-    assert_eq!(again.commits(), 0, "nothing to index");
-}
-
 /// The load indexes only entries no index names: one a kept batch holds already stays
 /// that batch's, whichever kept batch the load meets first.
 #[tokio::test]

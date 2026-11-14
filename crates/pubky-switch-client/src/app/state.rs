@@ -480,7 +480,6 @@ pub(crate) struct ParkedEntry {
     pub(crate) reason: ParkReason,
     /// The round of retries in which it was stored ([`ParkedRound`]): only a later round
     /// tries it, whatever its `seq`.
-    #[serde(default)]
     pub(crate) round: u64,
     /// The host released it ([`super::App::release_parked`]): kept whatever reason it is
     /// stored for again, through a backup and a restore, so each later run is handed over

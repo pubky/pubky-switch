@@ -344,8 +344,7 @@ pub enum Delivery {
     Failed {
         /// Why, without content.
         reason: String,
-        /// When, app clock: when it was refused, or its batch dropped; when it was queued,
-        /// for one an earlier build refused without keeping the time.
+        /// When, app clock: when it was refused, or its batch dropped.
         failed_at_ms: u64,
     },
     /// In a kept batch, not yet in the outbox: it is queued once the batch is applied, and
@@ -392,7 +391,6 @@ struct OutNext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pass_first: Option<(u64, String)>,
     /// A pass is under way: a flush its budget stopped left messages of it untried.
-    #[serde(default)]
     open: bool,
 }
 
@@ -489,16 +487,13 @@ pub(crate) struct OutboxItem {
     record: Option<KeptJob>,
     record_done: bool,
     accepted_at_ms: Option<u64>,
-    failed: Option<String>,
+    /// Refused for good: why, without content, and when, app clock. It is forgotten after
+    /// the retention of sent messages.
+    failed: Option<(String, u64)>,
     last_error: Option<String>,
     tries: u64,
     queued_ms: u64,
-    /// When it was refused for good, app clock: it is forgotten after the retention of sent
-    /// messages.
-    #[serde(default)]
-    failed_ms: Option<u64>,
     /// An accepted message is to be sent again, sealed to the current keys (Switch spec 11).
-    #[serde(default)]
     resend: bool,
     /// The first `403 not_admitted` or `403 not_current` answer to a delivery, app clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -510,7 +505,6 @@ pub(crate) struct OutboxItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     undeliverable_last_ms: Option<u64>,
     /// The such answers counted ([`UNDELIVERABLE_TRIES`]).
-    #[serde(default)]
     undeliverable_tries: u32,
     /// A re-send queued from `sent/`: the recipient accepted the message before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1148,7 +1142,6 @@ impl App {
             last_error: None,
             tries: 0,
             queued_ms: self.now(),
-            failed_ms: None,
             resend: false,
             undeliverable_ms: None,
             undeliverable_reason: None,
@@ -1187,7 +1180,6 @@ impl App {
             last_error: None,
             tries: 0,
             queued_ms: self.now(),
-            failed_ms: None,
             resend: false,
             undeliverable_ms: None,
             undeliverable_reason: None,
@@ -1290,7 +1282,6 @@ impl App {
             last_error: None,
             tries: 0,
             queued_ms: self.now(),
-            failed_ms: None,
             resend: false,
             undeliverable_ms: None,
             undeliverable_reason: None,
@@ -1368,9 +1359,9 @@ impl App {
     pub async fn delivery(&self, msg_id: &str) -> Result<Option<Delivery>, AppError> {
         if let Some(item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? {
             return Ok(Some(match (&item.failed, item.accepted_at_ms) {
-                (Some(reason), _) => Delivery::Failed {
+                (Some((reason, failed_at_ms)), _) => Delivery::Failed {
                     reason: reason.clone(),
-                    failed_at_ms: item.failed_ms.unwrap_or(item.queued_ms),
+                    failed_at_ms: *failed_at_ms,
                 },
                 (None, Some(accepted_at_ms)) if !item.resend => {
                     Delivery::Accepted { accepted_at_ms }
@@ -1556,7 +1547,7 @@ impl App {
             for (msg_id, item) in items {
                 if item.failed.is_some() {
                     // Forgotten, plaintext and all, after the retention of sent messages.
-                    if item.failed_ms.unwrap_or(item.queued_ms) <= cutoff {
+                    if item.failed.as_ref().is_some_and(|(_, at)| *at <= cutoff) {
                         let mut tx = self.tx()?;
                         tx.delete(&out_key(&msg_id))?;
                         self.commit(tx).await?;
@@ -1770,8 +1761,7 @@ impl App {
                     }
                 }
                 Tried::Failed(why) => {
-                    item.failed = Some(why);
-                    item.failed_ms = Some(self.now());
+                    item.failed = Some((why, self.now()));
                     self.save_item(&item).await?;
                 }
             }
@@ -2418,7 +2408,6 @@ mod tests {
             last_error: None,
             tries: 1,
             queued_ms: 500,
-            failed_ms: None,
             resend: true,
             undeliverable_ms: None,
             undeliverable_reason: None,
