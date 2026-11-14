@@ -711,34 +711,6 @@ async fn test_keys_a_cursor_move_drops_the_parts_it_passes() {
 }
 
 #[tokio::test]
-async fn test_keys_a_part_passed_before_its_gap_goes_once_the_gap_is_filled() {
-    let Some(replay) = replay().await else { return };
-    replay_chain_through_revoke(&replay).await;
-    let at = revoke_time();
-    // The epoch the wallet was first listed at unknown: its keys_through starts only at a
-    // part from epoch 1.
-    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
-        .await
-        .expect("conn");
-    sqlx::query("DELETE FROM app_listings WHERE account_id = $1")
-        .bind(alice_id())
-        .execute(&mut conn)
-        .await
-        .expect("listing");
-    drop(conn);
-    // Epoch 2's part, passed: not covered while epoch 1's keys are unknown, so it stays.
-    store_parts(&replay, &[(2, 2)], 60, &at).await;
-    wallet_cursor(&replay, 10, &at).await;
-    assert_eq!(bundle_ranges(&replay, &at).await, json!([[2, 2]]));
-    // Epoch 1's part fills the gap; once the wallet passes it too, both go.
-    store_parts(&replay, &[(1, 1)], 61, &at).await;
-    assert_eq!(bundle_ranges(&replay, &at).await, json!([[1, 1], [2, 2]]));
-    wallet_cursor(&replay, 11, &at).await;
-    assert_eq!(bundle_ranges(&replay, &at).await, json!([]));
-    replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
 async fn test_keys_a_cursor_move_keeps_parts_while_a_full_bundle_is_requested() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
@@ -983,42 +955,4 @@ async fn test_keys_replacing_another_part_while_in_force_keeps_the_force_where_i
     );
     replay.db.drop_database().await.expect("drop");
     assert_eq!(at_11, (json!([[1, 1]]), json!(2)));
-}
-
-#[tokio::test]
-async fn test_keys_a_replacement_after_the_force_ended_doesnt_restart_it() {
-    // keys_through's start unknown. The request completes at seq 11 (epoch 2); epoch 1's
-    // part is replaced at seq 12 while in force. The move to 11 ends the force; epoch 2's
-    // part stays, passed above epoch 1's unpassed one. Replacing it now (seq 13) doesn't put
-    // the request back in force: the move to 12 drops epoch 1's new part.
-    let Some(replay) = replay().await else { return };
-    replay_chain_through_revoke(&replay).await;
-    let at = revoke_time();
-    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
-        .await
-        .expect("conn");
-    sqlx::query("DELETE FROM app_listings WHERE account_id = $1")
-        .bind(alice_id())
-        .execute(&mut conn)
-        .await
-        .expect("listing");
-    drop(conn);
-    let asked = keys_call(&replay, "wallet", "POST", "wallet", Vec::new(), &at).await;
-    assert_eq!(
-        asked.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&asked.body)
-    );
-    store_parts(&replay, &[(1, 1)], 60, &at).await; // seq 10
-    store_parts(&replay, &[(2, 2)], 61, &at).await; // seq 11, completes
-    store_parts(&replay, &[(1, 1)], 62, &at).await; // seq 12, replaces 10
-    wallet_cursor(&replay, 11, &at).await;
-    let at_11 = bundle_ranges(&replay, &at).await;
-    store_parts(&replay, &[(2, 3)], 63, &at).await; // seq 13, replaces 11
-    wallet_cursor(&replay, 12, &at).await;
-    let at_12 = bundle_ranges(&replay, &at).await;
-    replay.db.drop_database().await.expect("drop");
-    assert_eq!(at_11, json!([[1, 1], [2, 2]]));
-    assert_eq!(at_12, json!([[2, 3]]));
 }

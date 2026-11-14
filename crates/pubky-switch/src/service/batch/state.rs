@@ -312,9 +312,9 @@ pub struct OpsState {
     pub new_receive_keys: Vec<([u8; 16], ReceiveKeyRecord)>,
     /// The key bundle parts of the batch's targets, in `first_epoch` order.
     pub parts: BTreeMap<[u8; 16], Vec<HeldPart>>,
-    /// Where each of the batch's targets' `keys_through` starts, where it is known: the data
-    /// epoch of the first `identity.json` that listed it, raised as the key bundle parts it
-    /// passed went (Switch wire 7.4.12).
+    /// Where each of the batch's targets' `keys_through` starts: the data epoch of the first
+    /// `identity.json` that listed it, raised as the key bundle parts it passed went (Switch
+    /// wire 7.4.12). A target no document listed here, or one purged, has none.
     pub listed_epochs: BTreeMap<[u8; 16], u64>,
     /// The records the batch names that exist.
     pub records: BTreeMap<[u8; 32], HeldRecord>,

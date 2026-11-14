@@ -92,10 +92,6 @@ const ERASURE_SWEEPS_PER_MIN: u32 = 6;
 /// step 4); the rest go with the next requests.
 const DUE_CLAIMS_PER_REQUEST: u64 = 64;
 
-/// How many of the documents chained before superseded documents were deleted one request
-/// checks at most (Switch wire 7.5); the rest go with the next requests.
-const OLD_DOCUMENTS_PER_REQUEST: u64 = 64;
-
 /// The service.
 pub struct Service {
     origin: String,

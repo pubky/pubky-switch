@@ -102,7 +102,7 @@ fn reason(text: &str) -> Result<KeptReason, StoreError> {
 }
 
 /// Record that `doc` lists each of `apps` for the first time: their `keys_through` starts at
-/// its data epoch (Switch wire 7.4.12). An app already recorded keeps its first epoch.
+/// its data epoch (Switch wire 7.4.12). The first listing's epoch is kept.
 pub(super) async fn note_listings(
     conn: &mut sqlx::PgConnection,
     account: &str,
@@ -110,14 +110,8 @@ pub(super) async fn note_listings(
     epoch: u64,
 ) -> Result<(), StoreError> {
     for app in apps {
-        // An app the account holds anything of was listed before: by a document from before
-        // app_listings existed, if it has no row. Its first epoch is unknown, never this one.
         sqlx::query(
-            "INSERT INTO app_listings (account_id, app_id, listed_epoch) \
-             SELECT $1, $2, $3 WHERE NOT EXISTS \
-                 (SELECT 1 FROM apps WHERE account_id = $1 AND app_id = $2) \
-             AND NOT EXISTS \
-                 (SELECT 1 FROM key_bundle_parts WHERE account_id = $1 AND target_app_id = $2) \
+            "INSERT INTO app_listings (account_id, app_id, listed_epoch) VALUES ($1, $2, $3) \
              ON CONFLICT DO NOTHING",
         )
         .bind(account)
@@ -142,10 +136,11 @@ pub fn newly_listed(earlier: Option<&IdentityDoc>, later: &IdentityDoc) -> Vec<[
 }
 
 impl AccountTxn {
-    /// Where `app`'s `keys_through` starts, where it is known (Switch wire 7.4.12): the data
-    /// epoch of the first `identity.json` that listed it, raised as the key bundle parts it
-    /// passed went ([`Self::raise_keys_start`]). `app_listings.listed_epoch` holds it; the
-    /// column kept its first name, since migration 0009 can't change.
+    /// Where `app`'s `keys_through` starts (Switch wire 7.4.12): the data epoch of the first
+    /// `identity.json` that listed it, raised as the key bundle parts it passed went
+    /// ([`Self::raise_keys_start`]). `app_listings.listed_epoch` holds it. `None` for an App
+    /// ID no document listed here, or one purged: a batch may name either as a target, which
+    /// its rules then refuse.
     pub async fn listed_epoch(&mut self, app: &[u8; 16]) -> Result<Option<u64>, StoreError> {
         let id = self.head().id.clone();
         let epoch: Option<i64> = sqlx::query_scalar(

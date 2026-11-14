@@ -129,15 +129,6 @@ pub enum TestDatabaseError {
 impl TestDatabase {
     /// Create a database with `config`'s pool settings, and migrate it.
     pub async fn create(config: &DatabaseConfig) -> Result<Self, TestDatabaseError> {
-        Self::create_with(config, true).await
-    }
-
-    /// Create a database with `config`'s pool settings, migrated or empty, for an upgrade
-    /// test that applies the migrations itself.
-    pub async fn create_with(
-        config: &DatabaseConfig,
-        migrate: bool,
-    ) -> Result<Self, TestDatabaseError> {
         let url = match std::env::var(TEST_DATABASE_URL_ENV) {
             Ok(url) if !url.is_empty() => url,
             _ if std::env::var_os(REQUIRE_DB_ENV).is_some() => {
@@ -165,13 +156,7 @@ impl TestDatabase {
         conn.close().await.map_err(StoreError::Database)?;
         let options = admin.clone().database(&name);
         let store = Store::connect_with(options.clone(), config).await?;
-        if migrate {
-            store
-                .migrate(&crate::service::announced_limits(
-                    &crate::limits::Limits::default(),
-                ))
-                .await?;
-        }
+        store.migrate().await?;
         Ok(Self {
             admin,
             name,
