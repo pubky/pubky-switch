@@ -2,14 +2,15 @@
 //! session-level advisory lock in the database for as long as it serves, so a second process
 //! on the same database refuses to start.
 //!
-//! The lock lives with its session, and the process never ends a session, its own or another's.
-//! Instead the lock's session asks the server to close it soon after its client is gone: TCP
-//! keepalives and a user timeout for a peer that stopped answering, and an idle timeout for
-//! one that sends nothing. [`InstanceLock::keep`] asks the session every check whether it
-//! still holds the lock, so a live session is never idle that long. When it can't confirm
-//! the lock, it waits a bounded time on a new connection for the lock: long enough for the
-//! server to close a session of its own whose connection stopped answering. If another
-//! session holds the lock throughout, whoever that is, the process stops serving.
+//! The lock lives with its session. The process never terminates a backend, its own or
+//! another's, and never tells its own sessions from others'. Instead the lock's session asks
+//! the server to close it soon after its client is gone: an idle timeout for a client that
+//! sends nothing, and TCP keepalives and a user timeout for a peer that stopped answering.
+//! [`InstanceLock::keep`] asks the session at every check whether it still holds the lock,
+//! which also keeps a live session from going idle, and stops serving at the first check
+//! that can't confirm it, or that runs late: the lock may have been free in the gap, and
+//! another process may have taken it. A start takes the lock afresh, waiting a bounded time
+//! for the server to close an earlier run's session.
 
 use std::time::{Duration, Instant};
 
@@ -40,10 +41,11 @@ pub struct LockTiming {
 }
 
 impl LockTiming {
-    /// The service's: a check every 5 seconds. The server closes the lock's session 15
-    /// seconds after its client last sent anything, and within about 8 seconds once a TCP
-    /// peer stops answering its keepalives; a start or a keeper waits up to 25 seconds for
-    /// the lock (docs/configuration.md, "Topology").
+    /// The service's: a check every 5 seconds, each answered within 5, so the process stops
+    /// at most 10 seconds after the lock was last confirmed. The server closes the lock's
+    /// session 15 seconds after its last statement ended, and about 15 seconds after a TCP
+    /// peer stopped answering: after the process has stopped. A start waits up to 25
+    /// seconds for the lock (docs/configuration.md, "Topology").
     pub const SERVICE: Self = Self {
         every: Duration::from_secs(5),
     };
@@ -60,16 +62,23 @@ impl LockTiming {
         self.every.saturating_mul(3)
     }
 
-    /// How long a start or a keeper waits for the lock: past the idle close, with a check to
-    /// spare.
+    /// How long a start waits for the lock: past the idle close, with a check to spare.
     pub fn wait(self) -> Duration {
         self.every.saturating_mul(5)
     }
 
-    /// The lock session's settings, so the server closes it once its client is gone: an
-    /// idle timeout for a client that sends nothing; TCP keepalives every second after one
-    /// quiet check, three unanswered ones closing it; a user timeout of two checks for data
-    /// the client doesn't acknowledge; and no statement past one check.
+    /// The latest a check may come after the last confirmed one: its sleep and its answer.
+    /// A check later than that ran after a pause of the process, long enough for the server
+    /// to have closed the session.
+    fn overdue(self) -> Duration {
+        self.every.saturating_mul(2)
+    }
+
+    /// The lock session's settings, so the server closes it once its client is gone, but
+    /// only after the client would have stopped: an idle timeout of three checks; TCP
+    /// keepalives after one quiet check, one a second, with a user timeout of three checks,
+    /// which on Linux closes a peer that stopped answering, keepalives or data, after it;
+    /// and no statement past one check.
     fn session_settings(self) -> String {
         let every_ms = self.every.as_millis().max(1);
         let keepalive_s = self.every.as_secs().max(1);
@@ -78,21 +87,22 @@ impl LockTiming {
              SET tcp_keepalives_interval = 1; SET tcp_keepalives_count = 3; \
              SET tcp_user_timeout = {user}; SET statement_timeout = {every_ms}",
             idle = self.idle().as_millis().max(1),
-            user = every_ms.saturating_mul(2),
+            user = every_ms.saturating_mul(3),
         )
     }
 }
 
-/// Why [`InstanceLock::keep`] ended: the process no longer holds the database alone, or
-/// can't tell that it does.
+/// Why [`InstanceLock::keep`] ended: the process can no longer tell that it holds the
+/// database alone.
 #[derive(Debug, thiserror::Error)]
 pub enum InstanceLockLost {
-    /// Another session held the lock throughout the wait.
-    #[error("another process serves this database: {0}")]
-    InUse(String),
-    /// The lock couldn't be confirmed, nor taken again, within the wait.
+    /// A check got no answer in time, or found the lock gone from the session.
     #[error("the lock on this database couldn't be confirmed")]
     Unconfirmed,
+    /// A check ran late, after a pause of the process long enough for the server to have
+    /// closed the session.
+    #[error("the lock on this database went unchecked for {0:?}")]
+    Overdue(Duration),
 }
 
 /// A session that holds the lock.
@@ -138,20 +148,15 @@ impl From<StoreError> for TakeError {
     }
 }
 
-/// What a wait for the lock found when it ran out.
-enum WaitError {
-    Held(Holder),
-    Store(StoreError),
-}
-
 /// The database held by this process alone, as long as this lives.
 #[derive(Debug)]
 pub struct InstanceLock {
     conn: Option<PgConnection>,
     /// The backend of the session that holds the lock.
     pid: i32,
-    options: PgConnectOptions,
     timing: LockTiming,
+    /// When the session last confirmed it holds the lock, or took it.
+    confirmed: Instant,
 }
 
 impl Store {
@@ -162,42 +167,40 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StoreError::InUse`], naming the session that holds it, when another one still does
-    /// after the wait; a database error otherwise, also when the server refuses the lock
+    /// [`StoreError::InUse`], naming the session that holds it, when the last try that got
+    /// an answer found another one holding it; [`StoreError::LockUnanswered`] when no try got
+    /// an answer in time; a database error otherwise, also when the server refuses the lock
     /// session's settings.
     pub async fn hold_instance_lock(&self, timing: LockTiming) -> Result<InstanceLock, StoreError> {
         let options = (*self.pool.connect_options()).clone();
-        match InstanceLock::wait_for(&options, timing).await {
-            Ok(lock) => Ok(lock),
-            Err(WaitError::Held(holder)) => Err(StoreError::InUse(holder.describe())),
-            Err(WaitError::Store(error)) => Err(error),
-        }
+        let lock = InstanceLock::wait_for(&options, timing).await?;
+        tracing::info!(
+            backend_pid = lock.pid,
+            "holding the database's instance lock"
+        );
+        Ok(lock)
     }
 }
 
 impl InstanceLock {
     /// Try the lock on new connections until it is taken, or until [`LockTiming::wait`] has
-    /// passed: then what the last try found.
-    async fn wait_for(options: &PgConnectOptions, timing: LockTiming) -> Result<Self, WaitError> {
+    /// passed: then what the last try that got an answer found. No try runs past the wait.
+    async fn wait_for(options: &PgConnectOptions, timing: LockTiming) -> Result<Self, StoreError> {
         let deadline = Instant::now() + timing.wait();
-        // What the last try that got an answer found; a try cut short finds nothing new.
         let mut last = None;
         loop {
-            // No try runs past the deadline.
             let left = deadline.saturating_duration_since(Instant::now());
             let bound = timing.every.min(left).max(Duration::from_millis(1));
             match tokio::time::timeout(bound, Self::take(options, timing)).await {
                 Ok(Ok(lock)) => return Ok(lock),
-                Ok(Err(TakeError::Held(holder))) => last = Some(WaitError::Held(holder)),
-                Ok(Err(TakeError::Busy)) => {}
-                Ok(Err(TakeError::Store(error))) => last = Some(WaitError::Store(error)),
-                Err(_) if last.is_none() => {
-                    last = Some(WaitError::Store(StoreError::LockTimeout));
+                Ok(Err(TakeError::Held(holder))) => {
+                    last = Some(StoreError::InUse(holder.describe()));
                 }
-                Err(_) => {}
+                Ok(Err(TakeError::Busy)) | Err(_) => {}
+                Ok(Err(TakeError::Store(error))) => last = Some(error),
             }
             if Instant::now() >= deadline {
-                return Err(last.unwrap_or(WaitError::Store(StoreError::LockTimeout)));
+                return Err(last.unwrap_or(StoreError::LockUnanswered));
             }
             let left = deadline.saturating_duration_since(Instant::now());
             tokio::time::sleep(Duration::from_millis(200).min(timing.every).min(left)).await;
@@ -213,8 +216,8 @@ impl InstanceLock {
             Ok(pid) => Ok(Self {
                 conn: Some(conn),
                 pid,
-                options: options.clone(),
                 timing,
+                confirmed: Instant::now(),
             }),
             Err(error) => {
                 let _ = conn.close().await;
@@ -261,40 +264,32 @@ impl InstanceLock {
         .map_err(StoreError::from_db)
     }
 
-    /// Check the lock at every check of its timing: that its session still holds it, within
-    /// a check. A session that doesn't answer in time, or no longer holds it, is given up,
-    /// and the lock is waited for on new connections for up to [`LockTiming::wait`]: the
-    /// server closes a given-up session of this process within that time, and its lock goes
-    /// with it. Returns when another session holds the lock throughout the wait, whoever's
-    /// it is, or when the database couldn't be reached throughout it, so the caller stops
-    /// serving: once it held the lock, the process serves on without it for at most a check,
-    /// its answer time and the wait (35 seconds with the service's timing).
+    /// Check the lock at every check of its timing, and return at the first check that
+    /// can't confirm it within a check, or that comes later than two checks
+    /// after the last confirmed one, so the caller stops serving. It never takes the lock
+    /// again: the lock may have been free in the gap, and another process may have held it
+    /// and served. A start takes it afresh. So the process serves on without a confirmed
+    /// lock for at most two checks (10 seconds with the service's timing), while its own
+    /// timers run.
     pub async fn keep(mut self) -> InstanceLockLost {
         let every = self.timing.every;
         loop {
             tokio::time::sleep(every).await;
-            if let Some(conn) = self.conn.as_mut()
-                && matches!(
-                    tokio::time::timeout(every, Self::confirm(conn)).await,
-                    Ok(Ok(true))
-                )
-            {
-                continue;
+            let since = self.confirmed.elapsed();
+            if since > self.timing.overdue() {
+                return InstanceLockLost::Overdue(since);
             }
-            // Given up without waiting: if its session is alive on the server, the server
-            // closes it once it has been idle, and its lock goes.
-            drop(self.conn.take());
-            match Self::wait_for(&self.options, self.timing).await {
-                Ok(taken) => {
-                    tracing::warn!("the instance lock's session was lost; the lock is held again");
-                    self.conn = taken.conn;
-                    self.pid = taken.pid;
-                }
-                Err(WaitError::Held(holder)) => return InstanceLockLost::InUse(holder.describe()),
-                Err(WaitError::Store(failure)) => {
-                    tracing::warn!(%failure, "taking the instance lock again");
+            let Some(conn) = self.conn.as_mut() else {
+                return InstanceLockLost::Unconfirmed;
+            };
+            match tokio::time::timeout(every, Self::confirm(conn)).await {
+                Ok(Ok(true)) => self.confirmed = Instant::now(),
+                Ok(Ok(false)) => return InstanceLockLost::Unconfirmed,
+                Ok(Err(failure)) => {
+                    tracing::warn!(%failure, "checking the instance lock");
                     return InstanceLockLost::Unconfirmed;
                 }
+                Err(_) => return InstanceLockLost::Unconfirmed,
             }
         }
     }
@@ -329,9 +324,10 @@ mod tests {
     use super::*;
     use crate::store::testing::TestDatabase;
 
-    /// Fast timing for tests: a check every 200 ms, the idle close at 600 ms, a wait of 1 s.
+    /// Timing for tests: a check every 500 ms, the idle close at 1.5 s, a start's wait of
+    /// 2.5 s.
     fn fast() -> LockTiming {
-        LockTiming::checking_every(Duration::from_millis(200))
+        LockTiming::checking_every(Duration::from_millis(500))
     }
 
     /// The pids of the sessions that hold the lock.
@@ -427,11 +423,12 @@ mod tests {
         let timing = LockTiming::SERVICE;
         assert_eq!(timing.idle(), Duration::from_secs(15));
         assert_eq!(timing.wait(), Duration::from_secs(25));
+        assert_eq!(timing.overdue(), Duration::from_secs(10));
         assert_eq!(
             timing.session_settings(),
             "SET idle_session_timeout = 15000; SET tcp_keepalives_idle = 5; \
              SET tcp_keepalives_interval = 1; SET tcp_keepalives_count = 3; \
-             SET tcp_user_timeout = 10000; SET statement_timeout = 5000"
+             SET tcp_user_timeout = 15000; SET statement_timeout = 5000"
         );
     }
 
@@ -458,7 +455,7 @@ mod tests {
             ("tcp_keepalives_idle", "5"),
             ("tcp_keepalives_interval", "1"),
             ("tcp_keepalives_count", "3"),
-            ("tcp_user_timeout", "10000"),
+            ("tcp_user_timeout", "15000"),
             ("statement_timeout", "5s"),
         ] {
             let shown: String = sqlx::query_scalar(&format!("SHOW {name}"))
@@ -471,10 +468,10 @@ mod tests {
         db.drop_database().await.expect("drop");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_store_instance_lock_second_process_never_serves() {
-        // A second process waits out the wait and is refused, naming the session that
-        // holds the lock, which its keeper keeps live; once the first stops, a start takes it.
+        // A second process waits out its start's wait and is refused, naming the session
+        // that holds the lock, which the first's keeper keeps live; the first serves on.
         let Some(db) = crate::store::testing::test_database().await else {
             return;
         };
@@ -493,10 +490,6 @@ mod tests {
         assert!(!keeper.is_finished(), "the first serves on");
         keeper.abort();
         let _ = keeper.await;
-        db.store()
-            .hold_instance_lock(fast())
-            .await
-            .expect("free again");
         db.drop_database().await.expect("drop");
     }
 
@@ -507,7 +500,7 @@ mod tests {
         };
         let earlier = db.store().hold_instance_lock(fast()).await.expect("lock");
         let letting_go = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             drop(earlier);
         });
         db.store()
@@ -518,103 +511,11 @@ mod tests {
         db.drop_database().await.expect("drop");
     }
 
-    #[tokio::test]
-    async fn test_store_instance_lock_is_taken_again_after_its_session_ends() {
-        let Some(db) = crate::store::testing::test_database().await else {
-            return;
-        };
-        let held = db.store().hold_instance_lock(fast()).await.expect("lock");
-        end_session(&db, &held).await;
-        // The keeper takes the lock again and goes on: it is still running after several
-        // checks, and no other process can take the database.
-        let keeper = tokio::spawn(held.keep());
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(!keeper.is_finished(), "still held");
-        assert_eq!(holders(&db).await.len(), 1);
-        assert!(matches!(
-            db.store().hold_instance_lock(fast()).await,
-            Err(StoreError::InUse(_))
-        ));
-        keeper.abort();
-        let _ = keeper.await;
-        db.drop_database().await.expect("drop");
-    }
-
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_store_instance_lock_frozen_session_is_closed_by_the_server() {
-        // The lock's connection stops answering while its socket stays open, so no TCP
-        // keepalive fails: the server closes the session once it has been idle, its lock
-        // goes, and the keeper holds the lock again within the wait, ending no session. A
-        // restart after it takes the lock.
-        let Some(db) = crate::store::testing::test_database().await else {
-            return;
-        };
-        let (options, frozen) = freezing_proxy(&db).await;
-        let held = InstanceLock::wait_for(&options, fast())
-            .await
-            .unwrap_or_else(|_| panic!("lock"));
-        let old = held.pid;
-        assert_eq!(holders(&db).await, vec![old]);
-        frozen.store(true, Ordering::SeqCst);
-        let keeper = tokio::spawn(held.keep());
-        let started = Instant::now();
-        loop {
-            let now_held = holders(&db).await;
-            if now_held.len() == 1 && now_held[0] != old {
-                break;
-            }
-            assert!(
-                started.elapsed() < fast().every + fast().every + fast().wait(),
-                "the lock wasn't held again within the bound"
-            );
-            assert!(
-                !keeper.is_finished(),
-                "the keeper stopped: {:?}",
-                keeper.await
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(!keeper.is_finished(), "still serving");
-        keeper.abort();
-        let _ = keeper.await;
-        db.store()
-            .hold_instance_lock(fast())
-            .await
-            .expect("a restart takes the lock");
-        db.drop_database().await.expect("drop");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_store_instance_lock_copy_facing_a_live_original_stops() {
-        // A copy of the running process has no usable connection of its own and finds the
-        // lock held by the original's live session: it waits out the wait and stops, and
-        // the original serves on.
-        let Some(db) = crate::store::testing::test_database().await else {
-            return;
-        };
-        let original = db.store().hold_instance_lock(fast()).await.expect("lock");
-        let original_pid = original.pid;
-        let copy = InstanceLock {
-            conn: None,
-            pid: original.pid,
-            options: original.options.clone(),
-            timing: original.timing,
-        };
-        let original_keeper = tokio::spawn(original.keep());
-        let lost = tokio::time::timeout(Duration::from_secs(10), copy.keep())
-            .await
-            .expect("the copy stops");
-        assert!(matches!(lost, InstanceLockLost::InUse(_)), "{lost:?}");
-        assert!(!original_keeper.is_finished(), "the original serves on");
-        assert_eq!(holders(&db).await, vec![original_pid]);
-        original_keeper.abort();
-        let _ = original_keeper.await;
-        db.drop_database().await.expect("drop");
-    }
-
-    #[tokio::test]
-    async fn test_store_instance_lock_keeper_stops_once_another_process_holds_it() {
+    async fn test_store_instance_lock_keeper_stops_when_its_session_ends() {
+        // The database ends the lock's session, as a restart or a failover does, and another
+        // process takes the lock: the keeper stops at its next check, without taking the lock
+        // again, and the other serves on.
         let Some(db) = crate::store::testing::test_database().await else {
             return;
         };
@@ -624,33 +525,135 @@ mod tests {
             .store()
             .hold_instance_lock(fast())
             .await
-            .expect("the second process holds it");
+            .expect("the other process takes it");
         let second_pid = second.pid;
         let second_keeper = tokio::spawn(second.keep());
+        let started = Instant::now();
         let lost = tokio::time::timeout(Duration::from_secs(10), first.keep())
             .await
-            .expect("the keeper ends");
-        assert!(matches!(lost, InstanceLockLost::InUse(_)), "{lost:?}");
+            .expect("the keeper stops");
+        assert!(matches!(lost, InstanceLockLost::Unconfirmed), "{lost:?}");
+        assert!(
+            started.elapsed() <= fast().overdue() + fast().every,
+            "at its next check"
+        );
         assert_eq!(holders(&db).await, vec![second_pid]);
+        assert!(!second_keeper.is_finished(), "the other serves on");
         second_keeper.abort();
         let _ = second_keeper.await;
         db.drop_database().await.expect("drop");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_store_instance_lock_frozen_session_is_closed_by_the_server() {
+        // The lock's connection stops answering while its socket stays open, so no TCP
+        // keepalive fails. The keeper stops within two checks, ending no session; the
+        // server closes the frozen session once it has been idle, and a restart's start
+        // then takes the lock within its wait.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let (options, frozen) = freezing_proxy(&db).await;
+        let held = InstanceLock::wait_for(&options, fast())
+            .await
+            .expect("lock");
+        let old = held.pid;
+        frozen.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let lost = tokio::time::timeout(Duration::from_secs(10), held.keep())
+            .await
+            .expect("the keeper stops");
+        assert!(matches!(lost, InstanceLockLost::Unconfirmed), "{lost:?}");
+        assert!(
+            started.elapsed() <= fast().overdue() + fast().every,
+            "within two checks"
+        );
+        let restarted = db
+            .store()
+            .hold_instance_lock(fast())
+            .await
+            .expect("a restart takes the lock");
+        assert_eq!(holders(&db).await, vec![restarted.pid]);
+        assert_ne!(restarted.pid, old);
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_store_instance_lock_copy_facing_a_live_original_stops() {
+        // A copy of the running process has no usable connection of its own: its keeper
+        // stops at its first check, and its restart finds the lock held by the original's
+        // live session and is refused; the original serves on.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let original = db.store().hold_instance_lock(fast()).await.expect("lock");
+        let original_pid = original.pid;
+        let copy = InstanceLock {
+            conn: None,
+            pid: original.pid,
+            timing: original.timing,
+            confirmed: original.confirmed,
+        };
+        let original_keeper = tokio::spawn(original.keep());
+        let lost = tokio::time::timeout(Duration::from_secs(10), copy.keep())
+            .await
+            .expect("the copy stops");
+        assert!(matches!(lost, InstanceLockLost::Unconfirmed), "{lost:?}");
+        assert!(matches!(
+            db.store().hold_instance_lock(fast()).await,
+            Err(StoreError::InUse(_))
+        ));
+        assert!(!original_keeper.is_finished(), "the original serves on");
+        assert_eq!(holders(&db).await, vec![original_pid]);
+        original_keeper.abort();
+        let _ = original_keeper.await;
+        db.drop_database().await.expect("drop");
+    }
+
     #[tokio::test]
-    async fn test_store_instance_lock_keeper_stops_when_the_lock_cant_be_confirmed() {
-        // The session is gone and the database can't be reached: after the wait the keeper
-        // gives up, so the process stops serving a database it can't tell it holds.
+    async fn test_store_instance_lock_keeper_stops_after_a_pause() {
+        // The process was paused longer than two checks: the server may have closed the
+        // session and another process taken the lock, so the keeper stops without asking.
         let Some(db) = crate::store::testing::test_database().await else {
             return;
         };
         let mut held = db.store().hold_instance_lock(fast()).await.expect("lock");
-        end_session(&db, &held).await;
-        held.options = held.options.clone().host("127.0.0.1").port(1);
+        held.confirmed = Instant::now() - fast().overdue() - fast().every;
         let lost = tokio::time::timeout(Duration::from_secs(10), held.keep())
             .await
-            .expect("the keeper ends");
-        assert!(matches!(lost, InstanceLockLost::Unconfirmed), "{lost:?}");
+            .expect("the keeper stops");
+        assert!(matches!(lost, InstanceLockLost::Overdue(_)), "{lost:?}");
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_store_instance_lock_start_without_an_answer_says_so() {
+        // A server that takes the connection and never answers: the start gives up after
+        // its wait and says that no try was answered.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = silent.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = silent.accept().await {
+                held.push(socket);
+            }
+        });
+        let options = db.options().clone().host("127.0.0.1").port(port);
+        let started = Instant::now();
+        assert!(matches!(
+            InstanceLock::wait_for(&options, fast()).await,
+            Err(StoreError::LockUnanswered)
+        ));
+        let waited = started.elapsed();
+        assert!(
+            waited >= fast().wait() && waited < fast().wait() + fast().every,
+            "{waited:?}"
+        );
         db.drop_database().await.expect("drop");
     }
 }

@@ -227,6 +227,10 @@ pub enum StoreError {
     /// No database URL is configured.
     #[error("no database URL: set database.url or {DATABASE_URL_ENV}")]
     NoUrl,
+    /// No try at the instance lock got an answer within its wait
+    /// ([`Store::hold_instance_lock`]).
+    #[error("the database didn't answer a take of the instance lock in time")]
+    LockUnanswered,
     /// Another process serves this database ([`Store::hold_instance_lock`]): the session
     /// that holds its lock.
     #[error("another process serves this database: {0}")]
