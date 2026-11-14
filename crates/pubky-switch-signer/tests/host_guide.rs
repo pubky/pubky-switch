@@ -61,6 +61,15 @@ const SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
+/// The source files compiled only under `cfg(test)`, by path under `src`: a public enum in one
+/// of them is never shown to a host, so `SOURCES` needn't hold them.
+const TEST_ONLY: &[&str] = &[
+    // `#[cfg(test)] mod send_futures;` in `lib.rs`.
+    "send_futures.rs",
+    // `#[cfg(test)] mod vector_cases;` in `signer.rs`.
+    "signer/vector_cases.rs",
+];
+
 /// The public enums the guide covers: the alerts, statuses, errors, refusals, skip reasons,
 /// sources, outcomes and standings a host receives or returns.
 const COVERED: &[&str] = &[
@@ -296,6 +305,63 @@ fn test_host_guide_names_every_variant() {
         missing.is_empty(),
         "the host guide doesn't name these variants: {missing:?}"
     );
+}
+
+/// The paths under `dir`, relative to `root` and joined with `/`, of every `.rs` file in it
+/// and its subfolders.
+fn rust_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(root, &path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            let relative = path.strip_prefix(root).unwrap();
+            let parts: Vec<String> = relative
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            out.push(parts.join("/"));
+        }
+    }
+}
+
+#[test]
+fn test_host_guide_sources_cover_every_module() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_files(&root, &root, &mut files);
+    assert!(
+        files.iter().any(|f| f == "lib.rs"),
+        "no sources found under {}",
+        root.display()
+    );
+    let mut uncovered = Vec::new();
+    for file in &files {
+        if TEST_ONLY.contains(&file.as_str()) || SOURCES.iter().any(|(path, _)| path == file) {
+            continue;
+        }
+        let source = std::fs::read_to_string(root.join(file)).unwrap();
+        if !pub_enum_names(&source).is_empty() {
+            uncovered.push(file.clone());
+        }
+    }
+    assert!(
+        uncovered.is_empty(),
+        "these sources hold a `pub enum` but aren't in `SOURCES`: {uncovered:?}"
+    );
+    // Every listed path is a file that exists, so a moved module isn't silently skipped.
+    for (path, _) in SOURCES {
+        assert!(
+            files.iter().any(|f| f == path),
+            "`SOURCES` names {path}, which isn't under src"
+        );
+    }
+    for path in TEST_ONLY {
+        assert!(
+            files.iter().any(|f| f == path),
+            "`TEST_ONLY` names {path}, which isn't under src"
+        );
+    }
 }
 
 #[test]
