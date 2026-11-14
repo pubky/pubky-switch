@@ -5,9 +5,9 @@
 //! The lock lives with its session. [`InstanceLock::keep`] checks every few seconds that its
 //! session still holds it, and takes it again on a new connection when it doesn't answer, or
 //! when the database ended it at a restart or a failover. A connection that stops answering
-//! may leave its session alive on the server, holding the lock: the process knows that
-//! session by its backend's pid and start time, ends it and takes the lock again, so it never
-//! takes its own earlier session for another process. It stops serving when another process
+//! may leave its session alive on the server, holding the lock: every lock session of the
+//! process carries the process's own `application_name`, so the process knows such a session
+//! for its own, ends it and takes the lock again, never taking it for another process. It stops serving when another process
 //! holds the lock, and when the lock was neither confirmed nor taken again for three checks
 //! in a row. Every check and every new connection is bounded in time.
 
@@ -33,10 +33,11 @@ const UNCONFIRMED_CHECKS: u32 = 3;
 const SESSION_SETTINGS: &str = "SET tcp_keepalives_idle = 5; SET tcp_keepalives_interval = 5; \
      SET tcp_keepalives_count = 3; SET tcp_user_timeout = 15000; SET statement_timeout = 5000";
 
-/// The session that holds the lock, if any, among those of this key.
-const HOLDER: &str = "SELECT l.pid, a.backend_start::TEXT AS started, \
-     COALESCE(host(a.client_addr), 'a local socket') AS addr \
-     FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+/// The session that holds the lock, if any, among those of this key. A column the database
+/// hides from this role reads as null.
+const HOLDER: &str = "SELECT l.pid, a.application_name AS name, a.backend_start::TEXT AS started, \
+     host(a.client_addr) AS addr \
+     FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid \
      WHERE l.locktype = 'advisory' AND l.granted AND l.classid::BIGINT = $1 \
      AND l.objid::BIGINT = $2 AND l.objsubid = 1 \
      AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())";
@@ -53,19 +54,14 @@ pub enum InstanceLockLost {
     Unconfirmed,
 }
 
-/// A database session, named by its backend's pid and start time: a pid alone may be
-/// reused.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Session {
-    pid: i32,
-    started: String,
-}
-
-/// A session that holds the lock, with where it connected from.
+/// A session that holds the lock.
 #[derive(Clone, Debug)]
 struct Holder {
-    session: Session,
-    addr: String,
+    pid: i32,
+    /// Its `application_name`: every lock session of this process carries the process's own.
+    name: Option<String>,
+    started: Option<String>,
+    addr: Option<String>,
 }
 
 impl Holder {
@@ -74,16 +70,25 @@ impl Holder {
     fn describe(&self) -> String {
         format!(
             "the session of backend pid {} from {}, connected since {}",
-            self.session.pid, self.addr, self.session.started
+            self.pid,
+            self.addr
+                .as_deref()
+                .unwrap_or("an address not shown to this role"),
+            self.started
+                .as_deref()
+                .unwrap_or("a time not shown to this role"),
         )
     }
 }
 
 /// Why a take of the lock failed.
 enum TakeError {
-    /// Another session holds it.
+    /// Another process's session holds it.
     Held(Holder),
-    /// The database failed, or this process's own earlier session hasn't let go yet.
+    /// The lock changed hands while it was being taken, or this process's own earlier session
+    /// hasn't let go of it yet: try again.
+    Busy,
+    /// The database failed.
     Store(StoreError),
 }
 
@@ -97,9 +102,13 @@ impl From<StoreError> for TakeError {
 #[derive(Debug)]
 pub struct InstanceLock {
     conn: Option<PgConnection>,
-    /// The session that took the lock last: while it may still be alive on the server, it
-    /// is this process's, never another's.
-    session: Session,
+    /// The backend of the session that holds the lock now.
+    pid: i32,
+    /// This process's `application_name` for its lock sessions, unique to the process: a
+    /// session that carries it is this process's own, also one whose take of the lock was
+    /// given up after the lock was granted.
+    name: String,
+    /// The connection settings, with `name`.
     options: PgConnectOptions,
 }
 
@@ -114,32 +123,42 @@ impl Store {
     /// [`StoreError::InUse`], naming the session that holds it, when another one still does
     /// after `wait`; a database error otherwise.
     pub async fn hold_instance_lock(&self, wait: Duration) -> Result<InstanceLock, StoreError> {
-        let options = (*self.pool.connect_options()).clone();
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let name = format!("pubky-switch {}-{since_epoch}", std::process::id());
+        let options = (*self.pool.connect_options())
+            .clone()
+            .application_name(&name);
         let deadline = Instant::now() + wait;
         loop {
-            match InstanceLock::take(&options, None).await {
+            let refused = match InstanceLock::take(&options, &name).await {
                 Ok(lock) => return Ok(lock),
-                Err(TakeError::Held(holder)) if Instant::now() >= deadline => {
-                    return Err(StoreError::InUse(holder.describe()));
-                }
-                Err(TakeError::Held(_)) => tokio::time::sleep(Duration::from_millis(500)).await,
                 Err(TakeError::Store(error)) => return Err(error),
+                Err(TakeError::Held(holder)) => holder.describe(),
+                Err(TakeError::Busy) => "a session that let go of it while it was read".into(),
+            };
+            if Instant::now() >= deadline {
+                return Err(StoreError::InUse(refused));
             }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 }
 
 impl InstanceLock {
-    /// Take the lock on a new connection. A holder that is `own`, this process's earlier
-    /// session, is ended first.
-    async fn take(options: &PgConnectOptions, own: Option<&Session>) -> Result<Self, TakeError> {
+    /// Take the lock on a new connection, ending first a session of this process's own that
+    /// still holds it.
+    async fn take(options: &PgConnectOptions, name: &str) -> Result<Self, TakeError> {
         let mut conn = PgConnection::connect_with(options)
             .await
             .map_err(StoreError::from)?;
-        match Self::take_on(&mut conn, own).await {
-            Ok(session) => Ok(Self {
+        match Self::take_on(&mut conn, name).await {
+            Ok(pid) => Ok(Self {
                 conn: Some(conn),
-                session,
+                pid,
+                name: name.to_string(),
                 options: options.clone(),
             }),
             Err(error) => {
@@ -149,38 +168,37 @@ impl InstanceLock {
         }
     }
 
-    async fn take_on(conn: &mut PgConnection, own: Option<&Session>) -> Result<Session, TakeError> {
+    async fn take_on(conn: &mut PgConnection, name: &str) -> Result<i32, TakeError> {
         conn.execute(SESSION_SETTINGS)
             .await
             .map_err(StoreError::from_db)?;
-        if try_lock(conn).await? {
-            return Ok(this_session(conn).await?);
-        }
-        let Some(holder) = holder(conn).await? else {
-            // Let go between the two reads.
-            return if try_lock(conn).await? {
-                Ok(this_session(conn).await?)
-            } else {
-                Err(StoreError::Corrupt("the instance lock's holder").into())
-            };
-        };
-        if own != Some(&holder.session) {
-            return Err(TakeError::Held(holder));
-        }
-        // This process's own earlier session, whose connection stopped answering: end it.
-        // Its lock goes when the server has ended it, a moment later.
-        sqlx::query("SELECT pg_terminate_backend($1)")
-            .bind(holder.session.pid)
-            .execute(&mut *conn)
-            .await
-            .map_err(StoreError::from_db)?;
-        for _ in 0..20 {
+        for _ in 0..3 {
             if try_lock(conn).await? {
-                return Ok(this_session(conn).await?);
+                return Ok(this_pid(conn).await?);
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Let go between the two reads: try the lock again.
+            let Some(holder) = holder(conn).await? else {
+                continue;
+            };
+            if holder.name.as_deref() != Some(name) {
+                return Err(TakeError::Held(holder));
+            }
+            // This process's own earlier session, whose connection stopped answering or
+            // whose take was given up: end it. Its lock goes when the server has ended it,
+            // a moment later.
+            sqlx::query("SELECT pg_terminate_backend($1)")
+                .bind(holder.pid)
+                .execute(&mut *conn)
+                .await
+                .map_err(StoreError::from_db)?;
+            for _ in 0..20 {
+                if try_lock(conn).await? {
+                    return Ok(this_pid(conn).await?);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
-        Err(StoreError::Corrupt("this process's earlier session kept the instance lock").into())
+        Err(TakeError::Busy)
     }
 
     /// Whether this lock's session holds the lock, asked of the session itself: not only
@@ -201,10 +219,10 @@ impl InstanceLock {
     /// Check the lock every `every` while the process serves: that its session still holds
     /// it, within `every`. A session that doesn't answer in time, or no longer holds it, is
     /// given up and the lock is taken again on a new connection, also within `every`, ending
-    /// this process's earlier session first if it is still the holder. Returns once another
-    /// session holds the lock, or once the lock was neither confirmed nor taken again for
-    /// three checks in a row, so the caller stops serving: two processes never serve the
-    /// database at once for longer than those checks take.
+    /// first any session of this process's own that still holds it. Returns once another
+    /// process's session holds the lock, or once the lock was neither confirmed nor taken
+    /// again for three checks in a row, so the caller stops serving: two processes never
+    /// serve the database at once for longer than those checks take.
     pub async fn keep(mut self, every: Duration) -> InstanceLockLost {
         let mut unconfirmed = 0;
         loop {
@@ -218,22 +236,22 @@ impl InstanceLock {
                 unconfirmed = 0;
                 continue;
             }
-            if let Some(conn) = self.conn.take() {
-                // Closed without waiting: its session may stay on the server, and the take
-                // below ends it if it still holds the lock.
-                drop(conn);
-            }
-            let own = self.session.clone();
-            match tokio::time::timeout(every, Self::take(&self.options, Some(&own))).await {
+            // Given up without waiting: its session may stay on the server, and a take ends
+            // it while it still holds the lock.
+            drop(self.conn.take());
+            match tokio::time::timeout(every, Self::take(&self.options, &self.name)).await {
                 Ok(Ok(taken)) => {
                     tracing::warn!("the instance lock's session was lost; the lock is held again");
                     self.conn = taken.conn;
-                    self.session = taken.session;
+                    self.pid = taken.pid;
                     unconfirmed = 0;
                     continue;
                 }
                 Ok(Err(TakeError::Held(holder))) => {
                     return InstanceLockLost::InUse(holder.describe());
+                }
+                Ok(Err(TakeError::Busy)) => {
+                    tracing::warn!("taking the instance lock again: it changed hands meanwhile");
                 }
                 Ok(Err(TakeError::Store(failure))) => {
                     tracing::warn!(%failure, "taking the instance lock again");
@@ -257,19 +275,12 @@ async fn try_lock(conn: &mut PgConnection) -> Result<bool, StoreError> {
         .map_err(StoreError::from_db)
 }
 
-/// `conn`'s own session.
-async fn this_session(conn: &mut PgConnection) -> Result<Session, StoreError> {
-    let row = sqlx::query(
-        "SELECT pid, backend_start::TEXT AS started FROM pg_stat_activity \
-         WHERE pid = pg_backend_pid()",
-    )
-    .fetch_one(conn)
-    .await
-    .map_err(StoreError::from_db)?;
-    Ok(Session {
-        pid: row.try_get("pid")?,
-        started: row.try_get("started")?,
-    })
+/// The backend pid of `conn`'s session.
+async fn this_pid(conn: &mut PgConnection) -> Result<i32, StoreError> {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(conn)
+        .await
+        .map_err(StoreError::from_db)
 }
 
 /// The session that holds the lock, if one does.
@@ -282,10 +293,9 @@ async fn holder(conn: &mut PgConnection) -> Result<Option<Holder>, StoreError> {
         .map_err(StoreError::from_db)?;
     row.map(|row| {
         Ok(Holder {
-            session: Session {
-                pid: row.try_get("pid")?,
-                started: row.try_get("started")?,
-            },
+            pid: row.try_get("pid")?,
+            name: row.try_get("name")?,
+            started: row.try_get("started")?,
             addr: row.try_get("addr")?,
         })
     })
@@ -525,10 +535,12 @@ mod tests {
             return;
         };
         let (options, frozen) = freezing_proxy(&db).await;
-        let held = InstanceLock::take(&options, None)
+        let name = "pubky-switch frozen".to_string();
+        let options = options.application_name(&name);
+        let held = InstanceLock::take(&options, &name)
             .await
             .unwrap_or_else(|_| panic!("lock"));
-        let old = held.session.pid;
+        let old = held.pid;
         assert_eq!(holders(&db).await, vec![old]);
         frozen.store(true, std::sync::atomic::Ordering::SeqCst);
         let keeper = tokio::spawn(held.keep(Duration::from_millis(200)));
@@ -558,6 +570,57 @@ mod tests {
             .await
             .expect("a restart takes the lock");
         drop(restarted);
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_store_instance_lock_ends_its_own_session_from_a_take_it_gave_up() {
+        // The lock's session is gone, and a take the keeper gave up after the lock was granted
+        // left a session of this process holding it: the keeper knows that session for its
+        // own by the process's name, ends it and holds the lock again.
+        let Some(db) = super::super::testing::test_database().await else {
+            return;
+        };
+        let mut held = db
+            .store()
+            .hold_instance_lock(Duration::ZERO)
+            .await
+            .expect("lock");
+        end_session(&db, &mut held).await;
+        let mut left = PgConnection::connect_with(&held.options)
+            .await
+            .expect("conn");
+        let mut granted = false;
+        for _ in 0..50 {
+            granted = try_lock(&mut left).await.expect("try");
+            if granted {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(granted, "the left session holds the lock");
+        let left_pid = this_pid(&mut left).await.expect("pid");
+        let first_pid = held.pid;
+        let keeper = tokio::spawn(held.keep(Duration::from_millis(100)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let now_held = holders(&db).await;
+            if now_held.len() == 1 && now_held[0] != left_pid && now_held[0] != first_pid {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the lock was never taken again");
+            assert!(
+                !keeper.is_finished(),
+                "the keeper stopped: {:?}",
+                keeper.await
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!keeper.is_finished(), "still serving");
+        keeper.abort();
+        let _ = keeper.await;
+        drop(left);
         db.drop_database().await.expect("drop");
     }
 
@@ -595,7 +658,7 @@ mod tests {
             .hold_instance_lock(Duration::ZERO)
             .await
             .expect("lock");
-        let pid = other.session.pid;
+        let pid = other.pid;
         let started = Instant::now();
         let refused = db
             .store()

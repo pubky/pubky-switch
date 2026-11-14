@@ -161,7 +161,7 @@ The last rule fires on any request refused because an account's state is behind 
 
 ### `[database]`
 
-PostgreSQL.
+PostgreSQL 12 or later.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -264,7 +264,7 @@ An account is `serving` when its held `identity.json`, verified with the identit
 
 It prints JSON lines: one object per account that needs attention (every account with `--all`), with `account`, `generation`, `serving`, `state`, `head_seq`, `mark_seq`, and `lost`, `ahead_by` or `erased_at_ms` where its state has one; then one object per `account_missing` key, with `key` (the key's ID, not a secret), `state`, and its mark's `generation` and `mark_seq`; then one `{"summary": ...}` line with the database read (`configured` or `replica`), the number of accounts (the database's rows), of serving ones, of those that need attention (`account_missing` keys included), and of each state. It prints no key material and no document. The exit code is 0 when no account needs attention, 2 when one does, and 1 when the check itself failed (the reason on stderr).
 
-**Choosing a database to fail over to.** `--replica <url>` (or `PUBKY_SWITCH_REPLICA_URL`) checks the same key store against that database instead of the configured one. Prefer the variable when the URL holds a password: a command line is visible to other users of the host. A database on which the check exits 0, so that no account needs attention, holds every item the service acknowledged, since an answer leaves only after its mark moved (Switch spec 6.5): it is safe to fail over to. The accounts a candidate leaves behind need their signers to start a new generation (Switch spec 12.6), as in the steps above; pick the candidate that leaves none, or the fewest.
+**Choosing a database to fail over to.** `--replica <url>` (or `PUBKY_SWITCH_REPLICA_URL`) checks the same key store against that database instead of the configured one. Prefer the variable when the URL holds a password: a command line is visible to other users of the host. A database on which the check exits 0, so that no account needs attention, holds every chain item and signed head the service acknowledged, since such an answer leaves only after its mark moved (Switch spec 6.5): it is safe to fail over to. An enrollment answer moves no mark, so an enrollment such a database lost isn't seen here: its account is missing, or its new key isn't named, and its signer enrolls again. The accounts a candidate leaves behind need their signers to start a new generation (Switch spec 12.6), as in the steps above; pick the candidate that leaves none, or the fewest.
 
 ## Known limits
 
