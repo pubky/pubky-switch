@@ -19,7 +19,7 @@ fn retention(behind: u64) -> Option<Retention> {
 
 /// An app of the account that may change its lists, so it can write chain items.
 async fn writer(w: &World, name: &str) -> App {
-    let spec = sample_app(&["scope-a"]).with_permissions(&[Permission::ListsManage]);
+    let spec = sample_app(&["sample-a"]).with_permissions(&[Permission::ListsManage]);
     let request = w.signer.approve(&app_keys(name), &spec).unwrap();
     App::join(w.env(), w.protocol.clone(), World::config(), request)
         .await

@@ -69,6 +69,10 @@ impl ParkingProtocol {
 }
 
 impl Protocol for ParkingProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -142,15 +146,11 @@ impl Protocol for ParkingProtocol {
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
         self.sample.missed(missed)
     }
-
-    fn backup_name(&self) -> Option<String> {
-        Some("sample.parking".into())
-    }
 }
 
 /// Alice's wallet with `protocol`, on `store`.
 async fn wallet_on(w: &World, protocol: &Arc<ParkingProtocol>, store: Arc<dyn StateStore>) -> App {
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     App::join(w.env_on(store), protocol.clone(), World::config(), request)
         .await
         .unwrap()
@@ -800,7 +800,7 @@ async fn test_parked_forget_while_its_effect_is_kept_is_refused_until_a_read_set
 /// his that isn't listed: stored as unverifiable while his Homeserver can't be reached.
 async fn forged_copy(w: &World, app: &mut App, message: &Message) -> ParkedSummary {
     let keys = app_keys("removed-app");
-    let cert = cert_for(&w.bob, &keys, w.clock.now_ms(), &["scope-a"]);
+    let cert = cert_for(&w.bob, &keys, w.clock.now_ms(), &["sample-a"]);
     let mut forged = message.clone();
     forged.from = pubky_switch_core::message::Sender::of_app(w.bob.public(), &keys);
     forged
@@ -1147,9 +1147,9 @@ async fn test_parked_backup_of_a_kept_effect_leaves_the_live_store_to_settle_it(
     let backup = app.backup_layered().await.unwrap();
     assert!(
         backup
-            .protocol
+            .beyond_cursor
             .as_ref()
-            .is_some_and(|layer| layer.seen.contains(&seq)),
+            .is_some_and(|beyond| beyond.seen.contains(&seq)),
         "the backup's seen lacks the kept effect's seq"
     );
     assert_eq!(app.state.seen, seen_before);

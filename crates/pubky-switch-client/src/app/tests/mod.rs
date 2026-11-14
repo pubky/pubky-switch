@@ -15,6 +15,7 @@ mod parked;
 mod passed;
 mod protocol_api;
 mod protocol_reads;
+mod protocol_set;
 mod push;
 mod received_position;
 mod retention;
@@ -68,15 +69,16 @@ pub(crate) fn app_keys(name: &str) -> AppKeys {
     identity("alice").app_keys(name)
 }
 
-/// What the signer needs of the sample protocol: `scope-a` has keys.
+/// What the signer needs of the sample protocol: `sample-a` has keys.
 pub(crate) fn sample_spec() -> ProtocolSpec {
     ProtocolSpec {
-        keyed_scopes: vec!["scope-a".into()],
+        name: "sample".into(),
+        keyed_scopes: vec!["sample-a".into(), "tasks".into(), "chat".into()],
         ..ProtocolSpec::default()
     }
 }
 
-/// A neutral protocol: scope `scope-a` has keys and sends and receives `sample.note`;
+/// A neutral protocol: scope `sample-a` has keys and sends and receives `sample.note`;
 /// `sample.notice` goes between own apps. A note writes a conversation entry for its sender
 /// with the cursor move, and keeps its text locally.
 #[derive(Default)]
@@ -108,8 +110,12 @@ impl SampleProtocol {
 }
 
 impl Protocol for SampleProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
-        scope == "scope-a" || scope.starts_with("scope-a:")
+        scope == "sample-a" || scope.starts_with("sample-a:")
     }
 
     fn sent_between_own_apps(&self, kind: &str) -> bool {
@@ -123,14 +129,16 @@ impl Protocol for SampleProtocol {
         own: &AppCert,
     ) -> Result<(), String> {
         match message.kind.as_str() {
-            "sample.note" if sender.holds_scope("scope-a") && own.holds_scope("scope-a") => Ok(()),
+            "sample.note" if sender.holds_scope("sample-a") && own.holds_scope("sample-a") => {
+                Ok(())
+            }
             "sample.notice" => Ok(()),
             _ => Err("sample: a kind these scopes don't send or receive".into()),
         }
     }
 
     fn accepts(&self, cert: &AppCert) -> Vec<String> {
-        if cert.holds_scope("scope-a") {
+        if cert.holds_scope("sample-a") {
             vec!["sample.note".into(), "sample.notice".into()]
         } else {
             Vec::new()
@@ -267,7 +275,7 @@ impl World {
         let alice = identity("alice");
         let bob = identity("bob");
         let bob_keys = bob.app_keys("shop");
-        let bob_cert = cert_for(bob.key(), &bob_keys, START - 1000, &["scope-a"]);
+        let bob_cert = cert_for(bob.key(), &bob_keys, START - 1000, &["sample-a"]);
         let homeserver = Arc::new(TestHomeserver::new());
         let mut bob_body = IdentityBody::first(
             bob.public(),
@@ -331,13 +339,13 @@ impl World {
     /// [`ScriptedSwitch::app_op`].
     pub(crate) fn other_app(&self, name: &str, permissions: &[Permission]) -> AppKeys {
         let keys = app_keys(name);
-        let spec = AppSpec::new(&["scope-a"]).with_permissions(permissions);
+        let spec = AppSpec::new(&["sample-a"]).with_permissions(permissions);
         self.signer.register_app(&keys, &spec).unwrap();
         keys
     }
 
     pub(crate) async fn join(&self, name: &str) -> App {
-        let request = self.approve(&app_keys(name), &["scope-a"]);
+        let request = self.approve(&app_keys(name), &["sample-a"]);
         App::join(self.env(), self.protocol.clone(), Self::config(), request)
             .await
             .unwrap()

@@ -19,7 +19,7 @@ use crate::HarnessError;
 pub const NOTES: &str = "notes";
 
 /// The message kind the notes apps accept.
-pub const NOTE_KIND: &str = "example.note";
+pub const NOTE_KIND: &str = "notes.note";
 
 /// A scope of the [`Notes`] protocol without keys, whose apps hold `lists.manage` alone:
 /// they change the lists and can't read them.
@@ -104,6 +104,7 @@ impl Protocol for Notes {
 /// The app's side of the [`Notes`] protocol: a protocol that records what it receives.
 pub fn notes_protocol() -> Arc<TestProtocol> {
     Arc::new(TestProtocol::new(ProtocolSpec {
+        name: NOTES.to_owned(),
         keyed_scopes: vec![NOTES.to_owned()],
         accepts: vec![NOTE_KIND.to_owned()],
         ..ProtocolSpec::default()
@@ -129,6 +130,7 @@ pub fn journal_collection() -> Collection {
 /// holds the keyed scopes `keyed`: it lists, when it joins, the collections it may read.
 pub fn notes_protocol_with_both_collections(keyed: &[&str]) -> Arc<TestProtocol> {
     Arc::new(TestProtocol::new(ProtocolSpec {
+        name: NOTES.to_owned(),
         keyed_scopes: keyed.iter().map(|scope| (*scope).to_owned()).collect(),
         accepts: vec![NOTE_KIND.to_owned()],
         collections: vec![notes_collection(), journal_collection()],
@@ -139,6 +141,7 @@ pub fn notes_protocol_with_both_collections(keyed: &[&str]) -> Arc<TestProtocol>
 /// lists the collection's records when it joins.
 pub fn notes_protocol_with_records() -> Arc<TestProtocol> {
     Arc::new(TestProtocol::new(ProtocolSpec {
+        name: NOTES.to_owned(),
         keyed_scopes: vec![NOTES.to_owned()],
         accepts: vec![NOTE_KIND.to_owned()],
         collections: vec![notes_collection()],

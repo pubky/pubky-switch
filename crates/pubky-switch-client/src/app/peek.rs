@@ -14,8 +14,6 @@
 //! records, change the chain view or count towards the receive key's rotation (Switch spec
 //! 3.6). The app processes the messages when it next reads.
 
-use std::sync::Arc;
-
 use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::ops::Position;
@@ -27,7 +25,8 @@ use pubky_switch_core::records::IdentityDoc;
 use super::App;
 use super::error::{AppError, Refusal};
 use super::identity::{self, DOC_CACHE_MS};
-use super::protocol::{ReceivedMessage, Rules};
+use super::protocol::ReceivedMessage;
+use super::protocols::Rules;
 use super::state::{Processed, key};
 use crate::client::answers::{EntryItem, FeedItem, FeedQuery};
 
@@ -190,9 +189,9 @@ impl App {
             cert: &entry.cert,
             accepted_at_ms: entry.accepted_at,
         };
-        let protocol = Arc::clone(&self.protocol);
-        let opaque = protocol.opaque_members();
-        let rules = Rules::new(protocol.as_ref(), &self.state.cert, &opaque);
+        let protocols = self.protocols.clone();
+        let opaque = protocols.opaque_of_json(plaintext.json());
+        let rules = Rules::new(&protocols, &self.state.cert, &opaque);
         let received = match check_opened(
             plaintext,
             &opened,
@@ -226,7 +225,7 @@ impl App {
             released: false,
             conflict: None,
         };
-        if protocol.check_body(&message).is_err() {
+        if protocols.check_body(&message).is_err() {
             return generic;
         }
         Ok(Some(Peeked::Show {

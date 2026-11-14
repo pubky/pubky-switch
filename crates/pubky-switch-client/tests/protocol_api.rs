@@ -31,7 +31,7 @@ use serde_json::{Map, Value, json};
 
 const ALICE_ORIGIN: &str = "https://alice-switch.example";
 const BOB_ORIGIN: &str = "https://bob-switch.example";
-const NOTE: &str = "example.note";
+const NOTE: &str = "notes.note";
 
 /// The sample protocol's one collection: a record per message, keyed by the message's hash,
 /// under `notes`, or under `notes:<sub>` for an app that holds only a sub-scope.
@@ -46,13 +46,14 @@ fn note_record(hash: &[u8; 32]) -> RecordTarget {
 
 fn spec() -> ProtocolSpec {
     ProtocolSpec {
+        name: "notes".into(),
         keyed_scopes: vec!["notes".into()],
         collections: vec![notes()],
         accepts: vec![NOTE.into()],
     }
 }
 
-/// A neutral protocol: apps holding `notes` send and receive `example.note`, and an app
+/// A neutral protocol: apps holding `notes` send and receive `notes.note`, and an app
 /// that receives one writes the message's record, keyed by its hash, in the batch that moves
 /// its cursor, unless the record holds it already.
 #[derive(Default)]
@@ -61,6 +62,10 @@ struct NotesProtocol {
 }
 
 impl Protocol for NotesProtocol {
+    fn name(&self) -> String {
+        "notes".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         spec().has_keys(scope)
     }
@@ -278,7 +283,7 @@ async fn test_protocol_api_two_identities_message_and_record_each_message() {
     assert_eq!(value["msg_id"], json!(msg_id));
     assert_eq!(bob_protocol.received.lock().unwrap().clone(), vec![msg_id]);
     let local = desk
-        .protocol_scan(b"seen/")
+        .protocol_scan("notes", b"seen/")
         .await
         .unwrap()
         .into_iter()
@@ -405,7 +410,7 @@ fn test_restore_context_for_a_protocols_own_tests() {
     let cert = pubky_switch_client::testing::issue_cert(
         identity.key(),
         &keys,
-        &AppSpec::new(&["scope-a"]),
+        &AppSpec::new(&["sample-a"]),
         START_MS,
     )
     .unwrap();
@@ -418,7 +423,7 @@ fn test_restore_context_for_a_protocols_own_tests() {
     assert_eq!(restoring.identity(), identity.public());
     assert_eq!(restoring.app_id(), cert.app_id());
     assert_eq!(restoring.cert(), &cert);
-    assert!(restoring.cert().holds_scope("scope-a"));
+    assert!(restoring.cert().holds_scope("sample-a"));
     assert_eq!(restoring.blind(b"input"), naming.blind(b"input"));
     let layer = ProtocolLayer {
         protocol: "example".into(),

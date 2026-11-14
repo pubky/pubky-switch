@@ -103,6 +103,10 @@ impl ReadsProtocol {
 }
 
 impl Protocol for ReadsProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.items.has_keys(scope)
     }
@@ -180,7 +184,7 @@ async fn join_on(
     name: &str,
     store: Arc<dyn StateStore>,
 ) -> App {
-    let app = AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL);
+    let app = AppSpec::new(&["sample-a"]).with_permissions(&Permission::ALL);
     let request = w.signer.approve(&app_keys(name), &app).unwrap();
     App::join(w.env_on(store), protocol, config(), request)
         .await
@@ -401,7 +405,7 @@ async fn need_scenario(
         match App::load(env.clone(), protocol.clone(), config(), keys.app_id_bytes()).await {
             Ok(app) => app,
             Err(AppError::Refused(Refusal::NotJoined)) => {
-                let app = AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL);
+                let app = AppSpec::new(&["sample-a"]).with_permissions(&Permission::ALL);
                 let request = approval
                     .get_or_insert_with(|| w.signer.approve(&keys, &app).unwrap())
                     .clone();
@@ -557,7 +561,7 @@ async fn test_submit_batch_stale_epoch_seals_again_and_sends_once_more() {
     let key = app.record_key(&inbox()).unwrap();
     raise_epoch(&w, &app);
     app.submit_batch(
-        OpBatch::new()
+        OpBatch::for_protocol("sample")
             .entry(entry)
             .op(OpKind::DenyPut { pubky: [9; 32] })
             .local(local("written")),
@@ -568,7 +572,12 @@ async fn test_submit_batch_stale_epoch_seals_again_and_sends_once_more() {
     assert_eq!(sealed_epoch(&w, &key), Some(2));
     let record = app.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(record.content.value()), vec!["a"]);
-    assert!(app.protocol_get(b"written").await.unwrap().is_some());
+    assert!(
+        app.protocol_get("sample", b"written")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -609,13 +618,22 @@ async fn test_submit_batch_stale_epoch_behind_a_failing_condition_is_the_conflic
         .unwrap();
     raise_epoch(&w, &app);
     let error = app
-        .submit_batch(OpBatch::new().entry(entry).local(local("written")))
+        .submit_batch(
+            OpBatch::for_protocol("sample")
+                .entry(entry)
+                .local(local("written")),
+        )
         .await
         .unwrap_err();
     // Conditions come before the operation's own rules (Switch wire 6.4 steps 8 and 9).
     assert_eq!(error.code(), Some(ErrorCode::Conflict));
     assert!(w.switch.record(&key).is_none());
-    assert!(app.protocol_get(b"written").await.unwrap().is_none());
+    assert!(
+        app.protocol_get("sample", b"written")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -628,7 +646,11 @@ async fn test_submit_batch_stale_epoch_without_the_new_key_is_not_now() {
         .unwrap();
     w.next_doc(|body| body.data_epoch = 2);
     let error = app
-        .submit_batch(OpBatch::new().entry(entry).local(local("written")))
+        .submit_batch(
+            OpBatch::for_protocol("sample")
+                .entry(entry)
+                .local(local("written")),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -637,7 +659,12 @@ async fn test_submit_batch_stale_epoch_without_the_new_key_is_not_now() {
     );
     let key = app.record_key(&inbox()).unwrap();
     assert!(w.switch.record(&key).is_none());
-    assert!(app.protocol_get(b"written").await.unwrap().is_none());
+    assert!(
+        app.protocol_get("sample", b"written")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -680,7 +707,7 @@ async fn epoch_scenario(
         match App::load(env.clone(), protocol.clone(), config(), keys.app_id_bytes()).await {
             Ok(app) => app,
             Err(AppError::Refused(Refusal::NotJoined)) => {
-                let spec = AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL);
+                let spec = AppSpec::new(&["sample-a"]).with_permissions(&Permission::ALL);
                 let request = approval
                     .get_or_insert_with(|| w.signer.approve(&keys, &spec).unwrap())
                     .clone();
@@ -1242,14 +1269,20 @@ async fn test_sends_to_reads_the_local_state() {
     shop.invite(&p.alice.identity().public()).await.unwrap();
     let alice = p.alice.identity().public();
     // The rule refuses every recipient while `mute` is held: nothing reaches bob.
-    wallet.protocol_commit(&[local("mute")]).await.unwrap();
+    wallet
+        .protocol_commit("sample", &[local("mute")])
+        .await
+        .unwrap();
     let (_, muted) = wallet.send(Pair::note(&p.bob, "one")).await.unwrap();
     assert!(!matches!(muted, Delivery::Accepted { .. }), "{muted:?}");
     assert_eq!(p.bob.switch().entries_from(&alice), 0);
     wallet
-        .protocol_commit(&[LocalWrite::Delete {
-            key: b"mute".to_vec(),
-        }])
+        .protocol_commit(
+            "sample",
+            &[LocalWrite::Delete {
+                key: b"mute".to_vec(),
+            }],
+        )
         .await
         .unwrap();
     let (_, sent) = wallet.send(Pair::note(&p.bob, "two")).await.unwrap();

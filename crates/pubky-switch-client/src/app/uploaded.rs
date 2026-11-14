@@ -126,7 +126,7 @@ impl App {
                 keys.sort_unstable();
                 keys.dedup();
                 let listed: Vec<String> = self
-                    .protocol
+                    .protocols
                     .collections()
                     .into_iter()
                     .map(|collection| collection.name)

@@ -33,6 +33,10 @@ impl PositionProtocol {
 }
 
 impl Protocol for PositionProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }

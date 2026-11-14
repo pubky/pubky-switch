@@ -102,6 +102,10 @@ pub(crate) struct LossProtocol {
 }
 
 impl Protocol for LossProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn collections(&self) -> Vec<Collection> {
         self.collections.lock().unwrap().clone()
     }
@@ -174,9 +178,9 @@ impl Protocol for LossProtocol {
     }
 }
 
-/// The signer approves the wallet's keys for `scope-a` with `permissions`.
+/// The signer approves the wallet's keys for `sample-a` with `permissions`.
 pub(crate) fn approve_with(w: &World, permissions: &[Permission]) -> JoinRequest {
-    let app = AppSpec::new(&["scope-a"]).with_permissions(permissions);
+    let app = AppSpec::new(&["sample-a"]).with_permissions(permissions);
     w.signer.approve(&app_keys("wallet"), &app).unwrap()
 }
 
@@ -818,7 +822,7 @@ async fn test_move_with_kept_batches_at_the_cap_completes() {
     // others are refused, not kept.
     let mut results = Vec::new();
     for n in 0..7u8 {
-        let batch = crate::app::OpBatch::new()
+        let batch = crate::app::OpBatch::for_protocol("sample")
             .op(OpKind::AllowPut {
                 pubky: [n + 40; 32],
                 kind: AllowKind::Contact,
@@ -1000,7 +1004,14 @@ async fn test_move_keeps_an_owed_call_and_makes_it_at_the_next_service() {
         unreadable: false,
     };
     let mut tx = app.tx().unwrap();
-    tx.put(&crate::app::state::key::owed(1, 7), &call).unwrap();
+    tx.put(
+        &crate::app::state::key::owed(1, 7),
+        &(crate::app::feed::Owed {
+            to: vec!["sample".into()],
+            call,
+        }),
+    )
+    .unwrap();
     app.commit(tx).await.unwrap();
     drop(app);
     follow_move(&w, &router, Arc::clone(&store) as Arc<dyn StateStore>)
@@ -1231,7 +1242,7 @@ async fn test_loss_local_writes_over_the_bound_are_refused_with_the_loss_as_call
     assert!(loss.declared_at_ms > 0 && loss.uncertain_until_ms > loss.declared_at_ms);
     // Its writes, over the bound with their overhead, weren't committed; the protocol is
     // told, durably, of the very loss it was called with; and the recovery went on.
-    assert_eq!(app.protocol_get(b"lost/1").await.unwrap(), None);
+    assert_eq!(app.protocol_get("sample", b"lost/1").await.unwrap(), None);
     let refused = |events: &[AppEvent]| {
         has(events, |e| {
             matches!(
@@ -1302,7 +1313,7 @@ async fn test_loss_recovers_at_the_new_generation() {
     assert_eq!(losses[0].accepted_from_ms, lost.note_at_ms);
     assert!(losses[0].uncertain_until_ms > losses[0].declared_at_ms);
     assert_eq!(
-        app.protocol_get(b"lost/1").await.unwrap(),
+        app.protocol_get("sample", b"lost/1").await.unwrap(),
         Some(b"1".to_vec())
     );
     // Bob's conversation entry was added back.
@@ -1378,7 +1389,7 @@ async fn test_loss_call_the_protocol_fails_is_made_again() {
     assert_eq!(losses[0].lost_generation, 1);
     assert_eq!(losses[0].accepted_from_ms, lost.note_at_ms);
     assert_eq!(
-        app.protocol_get(b"lost/1").await.unwrap(),
+        app.protocol_get("sample", b"lost/1").await.unwrap(),
         Some(b"1".to_vec())
     );
     assert_eq!(conversations_at(&lost.next), 1);
@@ -1397,7 +1408,14 @@ async fn test_loss_keeps_an_owed_call_from_the_lost_generation_and_makes_it() {
         accepted_until_ms: lost.note_at_ms + 1,
     };
     let mut tx = app.tx().unwrap();
-    tx.put(&crate::app::state::key::owed(1, 9), &call).unwrap();
+    tx.put(
+        &crate::app::state::key::owed(1, 9),
+        &(crate::app::feed::Owed {
+            to: vec!["sample".into()],
+            call,
+        }),
+    )
+    .unwrap();
     app.commit(tx).await.unwrap();
     drop(app);
     // Recovered at generation 2, the call is still made, with what it named then: the
@@ -1981,7 +1999,7 @@ async fn test_loss_crash_at_each_commit_point_resumes() {
             // protocol asked again only when the commit that carries them didn't happen.
             assert_eq!(lost.next.app(&me).receive_n, Some(1), "commit {n}");
             assert_eq!(
-                app.protocol_get(b"lost/1").await.unwrap(),
+                app.protocol_get("sample", b"lost/1").await.unwrap(),
                 Some(b"1".to_vec()),
                 "commit {n} ({stop_after})"
             );
@@ -2569,7 +2587,7 @@ async fn test_claim_entry_of_an_earlier_generation_in_the_feed_is_kept() {
         w.signer
             .approve(
                 &app_keys("phone"),
-                &AppSpec::new(&["scope-a"]).with_permissions(&[Permission::ClaimsRead]),
+                &AppSpec::new(&["sample-a"]).with_permissions(&[Permission::ClaimsRead]),
             )
             .unwrap(),
     )
@@ -3368,7 +3386,7 @@ async fn test_move_settles_an_effect_the_old_service_applied() {
     assert_eq!(w.effects(), 1);
     assert!(app.cursor().seq >= seq);
     assert_eq!(
-        app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+        app.protocol_get("sample", format!("notes/{}", message.msg_id).as_bytes())
             .await
             .unwrap(),
         Some(b"before".to_vec())
@@ -3395,7 +3413,7 @@ async fn test_key_change_sends_a_kept_effect_again_and_settles_it_once() {
     assert_eq!(w.effects(), 1);
     assert!(app.cursor().seq >= seq);
     assert_eq!(
-        app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+        app.protocol_get("sample", format!("notes/{}", message.msg_id).as_bytes())
             .await
             .unwrap(),
         Some(b"before".to_vec())
@@ -3506,7 +3524,7 @@ async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
         Some(ParkReason::Uncertain)
     );
     assert_eq!(
-        app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+        app.protocol_get("sample", format!("notes/{}", message.msg_id).as_bytes())
             .await
             .unwrap(),
         None
@@ -3763,6 +3781,10 @@ async fn test_kept_batch_resend_refused_before_the_lookup_stays_kept() {
 struct AttemptingProtocol(SampleProtocol);
 
 impl Protocol for AttemptingProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.0.has_keys(scope)
     }

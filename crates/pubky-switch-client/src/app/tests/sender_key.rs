@@ -27,8 +27,13 @@ impl Setup {
             Arc::clone(&w.clock),
             Arc::clone(&w.homeserver),
         );
-        peer.add_app("shop", &AppSpec::new(&["scope-a"]), &["sample.note"], false)
-            .unwrap();
+        peer.add_app(
+            "shop",
+            &AppSpec::new(&["sample-a"]),
+            &["sample.note"],
+            false,
+        )
+        .unwrap();
         let router = Arc::new(Router::new());
         router.add_switch(crate::testing::SWITCH_ORIGIN, &w.switch);
         router.add(PEER_ORIGIN, peer.transport());
@@ -36,7 +41,7 @@ impl Setup {
     }
 
     async fn join(&self) -> App {
-        let request = self.w.approve(&app_keys("wallet"), &["scope-a"]);
+        let request = self.w.approve(&app_keys("wallet"), &["sample-a"]);
         let env = self.w.signer.env_with(
             Arc::clone(&self.w.store) as Arc<dyn StateStore>,
             Arc::clone(&self.router) as Arc<dyn Transport>,

@@ -821,7 +821,7 @@ impl App {
         let plaintext = built.sign(&self.state.keys)?;
         Ok(SignedMessage {
             to: message.to,
-            conversation: message.to != me && self.protocol.adds_conversation(&message.kind),
+            conversation: message.to != me && self.protocols.adds_conversation(&message.kind),
             kind: message.kind,
             msg_id: built.msg_id,
             plaintext,
@@ -1104,7 +1104,7 @@ impl App {
         if plaintext.sender_app_id() != app_id {
             return Err(not_ours());
         }
-        let rules = self.protocol.opaque_members();
+        let rules = self.protocols.opaque_of_json(plaintext.json());
         let opaque: Vec<OpaqueMember<'_>> = rules
             .iter()
             .map(|rule| OpaqueMember {
@@ -1128,7 +1128,7 @@ impl App {
             .saturating_add(SENT_RETENTION_MS);
         Ok(OutboxItem {
             to: message.to,
-            conversation: message.to != me && self.protocol.adds_conversation(&message.kind),
+            conversation: message.to != me && self.protocols.adds_conversation(&message.kind),
             kind: message.kind,
             msg_id: message.msg_id,
             plaintext: plaintext.encode(),
@@ -1559,6 +1559,12 @@ impl App {
                 let key = (item.queued_ms, msg_id.clone());
                 // Tried already in this pass, or no pass of the messages in this flush.
                 if !run_messages || !in_pass(&key) {
+                    report.queued.push(msg_id);
+                    continue;
+                }
+                // A message its protocol holds back now stays queued, with its bytes, and
+                // the others go on ([`super::Protocol::may_send`]).
+                if !self.may_send(&item) {
                     report.queued.push(msg_id);
                     continue;
                 }
@@ -2188,11 +2194,34 @@ impl App {
         }
     }
 
+    /// Whether the protocol of an outbox message's kind lets it go out now
+    /// ([`super::Protocol::may_send`]); a message whose kind no protocol owns, or whose
+    /// plaintext doesn't read, goes to its try, which settles it.
+    fn may_send(&self, item: &OutboxItem) -> bool {
+        let Ok(plaintext) = item.plaintext() else {
+            return true;
+        };
+        let rules = self.protocols.opaque_of_json(plaintext.json());
+        let opaque: Vec<OpaqueMember<'_>> = rules
+            .iter()
+            .map(|rule| OpaqueMember {
+                kind: rule.kind.as_deref(),
+                member: rule.member.as_str(),
+            })
+            .collect();
+        let Ok(message) = Message::parse(plaintext.json(), &opaque) else {
+            return true;
+        };
+        self.protocols
+            .of_kind(&message.kind)
+            .is_none_or(|owner| owner.protocol.may_send(&message))
+    }
+
     /// Seal the item's signed plaintext to the recipient apps, and commit the envelope
     /// before it is sent.
     async fn seal(&mut self, item: &mut OutboxItem, invite: Option<&str>) -> Result<(), AppError> {
         let plaintext = item.plaintext()?;
-        let rules = self.protocol.opaque_members();
+        let rules = self.protocols.opaque_of_json(plaintext.json());
         let opaque: Vec<pubky_switch_core::json::OpaqueMember<'_>> = rules
             .iter()
             .map(|rule| pubky_switch_core::json::OpaqueMember {
@@ -2254,9 +2283,9 @@ impl App {
                 .unwrap_or_default(),
         };
         let job = job.job();
-        let protocol = std::sync::Arc::clone(&self.protocol);
+        let protocols = self.protocols.clone();
         self.update_record(&job.target, Vec::new(), |current| {
-            protocol.sent_record(&job, &sent, current)
+            protocols.sent_record(&job, &sent, current)
         })
         .await?;
         Ok(())

@@ -81,6 +81,12 @@ pub(crate) mod key {
     use super::{b64, pubky_id, zbase32_encode};
 
     pub(crate) const META: &str = "meta";
+    /// The names of the protocols the app was set up with (`protos`), which every load
+    /// registers.
+    pub(crate) const PROTOCOLS: &str = "protos";
+    /// The protocols that ended the reconcile mode under way (`rcd`,
+    /// [`super::App::end_reconcile_for`]); the mode ends when the last of them does.
+    pub(crate) const RECONCILED: &str = "rcd";
     pub(crate) const KEYS: &str = "keys";
     pub(crate) const CERT: &str = "cert";
     pub(crate) const CERT_RENEWAL: &str = "cert/renewal";

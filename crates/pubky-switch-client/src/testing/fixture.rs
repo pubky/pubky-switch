@@ -55,10 +55,13 @@ impl AppSpec {
 }
 
 /// The details a protocol supplies, which the Switch treats as opaque strings (Switch spec
-/// 1): the scopes that have keys, the collections and their policies, and the kinds an
-/// app's record accepts.
+/// 1): its name, the scopes that have keys, the collections and their policies, and the
+/// kinds an app's record accepts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProtocolSpec {
+    /// The protocol's name ([`Protocol::name`]): the prefix of its kinds and the root of
+    /// its scopes (Switch wire 3.1 "Scope roots").
+    pub name: String,
     /// The scopes with Shared Data Keys (Switch spec 3.5). A sub-scope (`<scope>:<sub>`) of
     /// a listed scope has keys too.
     pub keyed_scopes: Vec<String>,
@@ -378,6 +381,10 @@ impl TestProtocol {
 }
 
 impl Protocol for TestProtocol {
+    fn name(&self) -> String {
+        self.spec.name.clone()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.spec.has_keys(scope)
     }

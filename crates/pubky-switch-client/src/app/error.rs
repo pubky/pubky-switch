@@ -102,6 +102,14 @@ pub enum Refusal {
     NotNow(String),
     /// A value the protocol or the host gave breaks a rule: the text names it.
     Usage(String),
+    /// A protocol of the app refuses the app's own certificate
+    /// ([`super::Protocol::check_own_certificate`]): nothing was written.
+    Certificate {
+        /// The protocol's name.
+        protocol: String,
+        /// The rule the certificate breaks, without content.
+        reason: String,
+    },
     /// A restore in place ([`super::App::restore`]) would carry more of what the store
     /// still owes its protocol than one commit takes beside the backup, which fits on its
     /// own: the duty events not acknowledged and the protocol calls owed, counted here.
@@ -182,6 +190,12 @@ impl std::fmt::Display for Refusal {
             }
             Refusal::NotNow(why) => write!(f, "not now: {why}"),
             Refusal::Usage(why) => write!(f, "usage: {why}"),
+            Refusal::Certificate { protocol, reason } => {
+                write!(
+                    f,
+                    "the protocol `{protocol}` refuses the certificate: {reason}"
+                )
+            }
             Refusal::WontDeliver(WontDeliver::PastReplayWindow { until_ms }) => {
                 write!(
                     f,

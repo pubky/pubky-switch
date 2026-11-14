@@ -145,6 +145,7 @@ pub struct OpBatch {
     deadlines: Vec<([u8; 32], ObligationDeadline)>,
     local: Vec<LocalWrite>,
     queued: Vec<SignedMessage>,
+    protocol: Option<String>,
 }
 
 /// An invite code registered in a batch, kept by the app once the switch takes it.
@@ -165,6 +166,16 @@ impl OpBatch {
     /// An empty batch.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty batch of the protocol `name`: its local writes ([`OpBatch::local`]) are
+    /// that protocol's, and its duty events are for it. A batch with local writes needs a
+    /// protocol: [`App::submit_batch`] refuses one without.
+    pub fn for_protocol(name: &str) -> Self {
+        Self {
+            protocol: Some(name.to_owned()),
+            ..Self::default()
+        }
     }
 
     /// Add an operation without conditions.
@@ -204,8 +215,9 @@ impl OpBatch {
         self
     }
 
-    /// A write of the protocol's own local state, committed once the switch applies the
-    /// batch, with what its answer settles; never if the batch is refused (`STATE.md`).
+    /// A write of the local state of the batch's protocol ([`OpBatch::for_protocol`]),
+    /// committed once the switch applies the batch, with what its answer settles; never if
+    /// the batch is refused (`STATE.md`).
     pub fn local(mut self, write: LocalWrite) -> Self {
         self.local.push(write);
         self
@@ -265,7 +277,8 @@ pub(crate) struct PendingBatch {
     pub(crate) body: Vec<u8>,
     pub(crate) invites: Vec<InviteNote>,
     pub(crate) deadlines: Vec<(String, ObligationDeadline)>,
-    /// The protocol's local writes, committed with the answer, kept in base64
+    /// The protocol's local writes, qualified under its prefix
+    /// ([`super::protocols::qualify`]), committed with the answer, kept in base64
     /// ([`super::state::kept_local`]).
     #[serde(
         default,
@@ -273,6 +286,9 @@ pub(crate) struct PendingBatch {
         with = "super::state::kept_local"
     )]
     pub(crate) local: Vec<LocalWrite>,
+    /// The protocol the batch is of ([`OpBatch::for_protocol`]), whose duty events it
+    /// gives; `None` for a batch of the host's own.
+    pub(crate) protocol: Option<String>,
     /// The messages put in the outbox with the answer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) queued: Vec<OutboxItem>,
@@ -565,6 +581,23 @@ impl App {
             ))
             .into());
         }
+        // Local writes are a protocol's, under its prefix: a batch carrying some names its
+        // registered protocol.
+        let local = match &batch.protocol {
+            Some(name) if self.protocols.contains(name) => {
+                super::protocols::qualify(name, batch.local)
+            }
+            Some(name) => {
+                return Err(Refusal::Usage(format!("no protocol `{name}` is registered")).into());
+            }
+            None if batch.local.is_empty() => Vec::new(),
+            None => {
+                return Err(Refusal::Usage(
+                    "a batch with local writes names its protocol (`OpBatch::for_protocol`)".into(),
+                )
+                .into());
+            }
+        };
         let carry = (batch.ops.len() < MAX_BATCH_ENTRIES)
             .then_some(self.state.cursor.seq)
             .filter(|_| self.state.cursor.deferred_since_ms.is_some());
@@ -587,7 +620,8 @@ impl App {
                 .iter()
                 .map(|(claim_key, deadline)| (b64(claim_key), *deadline))
                 .collect(),
-            local: batch.local,
+            local,
+            protocol: batch.protocol,
             queued,
             // Stamped at its first send ([`App::run_pending`]): kept now, it goes out with
             // the next call that writes when this one can't reach the service.
@@ -1026,8 +1060,10 @@ impl App {
             code: code.as_str().to_owned(),
         };
         self.end_kept_batch(id, pending, Ended::Dropped(reason), &mut tx)?;
-        self.keep_duty(
+        let to = self.batch_owners(pending);
+        self.keep_duty_for(
             &mut tx,
+            to,
             super::events::Duty::BatchRefused {
                 batch_id: *id,
                 code: code.as_str().to_owned(),

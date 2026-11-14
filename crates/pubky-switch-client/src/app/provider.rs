@@ -1345,7 +1345,8 @@ impl App {
             KeptBatchDrop::Unsent
         };
         self.end_kept_batch(id, pending, Ended::Dropped(reason), tx)?;
-        self.keep_duty(tx, Duty::KeptBatchDropped { batch_id: *id })?;
+        let to = self.batch_owners(pending);
+        self.keep_duty_for(tx, to, Duty::KeptBatchDropped { batch_id: *id })?;
         self.attempts_dropped(batch, tx)
     }
 
@@ -1779,10 +1780,10 @@ impl App {
         }
         let gone_duties: Vec<u64> = self
             .reader()
-            .scan_numbered::<Duty>(key::DUTY_PREFIX)
+            .scan_numbered::<super::events::KeptDuty>(key::DUTY_PREFIX)
             .await?
             .into_iter()
-            .filter(|(_, duty)| *duty == Duty::AccountGone)
+            .filter(|(_, kept)| kept.duty == Duty::AccountGone)
             .map(|(n, _)| n)
             .collect();
         // `gone` and its duty events go with the copy, in its commit: a copy that fails

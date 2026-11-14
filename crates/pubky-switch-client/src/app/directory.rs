@@ -1073,17 +1073,22 @@ impl App {
             }
             // Switch spec 3.4: the certificate allows the kind and `accepts` lists it, and
             // the protocol's narrower rule holds.
-            if !self.protocol.receives(&message.kind, cert) || !record.accepts(&message.kind) {
+            if !self.protocols.receives(&message.kind, cert) || !record.accepts(&message.kind) {
                 continue;
             }
+            // The kind's protocol has `receives` above; its narrower rule reads its own state.
+            let Some(owner) = self.protocols.of_kind(&message.kind).cloned() else {
+                continue;
+            };
             let store = std::sync::Arc::clone(self.env.store.store());
             let view = LocalView::new(
                 self.state.meta.identity,
                 self.state.meta.app_id,
                 store.as_ref(),
                 &self.ns,
+                &owner.name,
             );
-            if !self.protocol.sends_to(message, &record, &view) {
+            if !owner.protocol.sends_to(message, &record, &view) {
                 continue;
             }
             let checked = match &app.receive_key {

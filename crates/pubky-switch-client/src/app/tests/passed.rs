@@ -46,6 +46,10 @@ impl PassProtocol {
 }
 
 impl Protocol for PassProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -102,7 +106,7 @@ impl Protocol for PassProtocol {
 }
 
 async fn join_with(w: &World, protocol: &Arc<PassProtocol>) -> App {
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap()

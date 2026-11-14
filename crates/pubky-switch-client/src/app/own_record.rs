@@ -183,7 +183,7 @@ impl App {
     pub async fn update_accepts(&mut self) -> Result<Publication, AppError> {
         Box::pin(async move {
             let mut body = self.own_record_body().await?;
-            body.accepts = self.protocol.accepts(&self.state.cert);
+            body.accepts = self.protocols.accepts(&self.state.cert);
             self.put_own_record(body, false).await
         })
         .await

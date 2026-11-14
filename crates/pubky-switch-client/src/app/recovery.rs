@@ -635,53 +635,64 @@ impl App {
                 loss.step = LossStep::Resend;
             }
             LossStep::Resend => {
-                // The protocol's local writes commit with the step: asked once.
-                let actions = {
+                // Every protocol is asked, all or nothing: one that fails leaves the step
+                // to the next call, which asks each again. Their local writes commit with
+                // the step, each under its own prefix: asked once.
+                let mut asked = Vec::new();
+                {
                     let store = std::sync::Arc::clone(self.env.store.store());
-                    let view = LocalView::new(
-                        self.state.meta.identity,
-                        self.state.meta.app_id,
-                        store.as_ref(),
-                        &self.ns,
-                    );
-                    self.protocol.provider_lost(&loss.view(), &view)
+                    for registered in self.protocols.iter() {
+                        let view = LocalView::new(
+                            self.state.meta.identity,
+                            self.state.meta.app_id,
+                            store.as_ref(),
+                            &self.ns,
+                            &registered.name,
+                        );
+                        // The step stays `Resend` in the record: the next call asks again.
+                        let actions = registered
+                            .protocol
+                            .provider_lost(&loss.view(), &view)
+                            .map_err(AppError::Protocol)?;
+                        asked.push((registered.name.clone(), actions));
+                    }
                 }
-                // The step stays `Resend` in the record: the next call asks again.
-                .map_err(AppError::Protocol)?;
                 let copy = self.lists_copy().await?;
                 let me = self.state.meta.identity;
                 let may_add = self.state.cert.has_permission(Permission::ConversationAdd);
+                // The protocols' conversations together, each once, in key order.
                 loss.keep_conversations(
-                    actions
-                        .conversations
+                    asked
                         .iter()
+                        .flat_map(|(_, actions)| actions.conversations.iter())
                         .filter(|who| may_add && **who != me && !copy.deny.contains(who))
                         .map(pubky_id)
                         .collect(),
                 );
                 loss.step = LossStep::Conversations;
                 let mut tx = self.tx()?;
-                if local_writes_bytes(&actions.local) > MAX_STEP_LOCAL_BYTES {
-                    // Over the bound: not committed, and not asked again, since the same
-                    // answer would come and the recovery would never go on; the protocol is
-                    // told, and the loss goes on.
-                    self.keep_duty(
-                        &mut tx,
-                        Duty::LocalWritesRefused {
-                            call: {
-                                let view = loss.view();
-                                KeptRefusal::Loss {
+                for (name, actions) in asked {
+                    if local_writes_bytes(&actions.local) > MAX_STEP_LOCAL_BYTES {
+                        // Over the bound: not committed, and not asked again, since the same
+                        // answer would come and the recovery would never go on; the protocol
+                        // is told, and the loss goes on.
+                        let view = loss.view();
+                        self.keep_duty_for(
+                            &mut tx,
+                            vec![name],
+                            Duty::LocalWritesRefused {
+                                call: KeptRefusal::Loss {
                                     lost_generation: view.lost_generation,
                                     generation: view.generation,
                                     declared_at_ms: view.declared_at_ms,
                                     accepted_from_ms: view.accepted_from_ms,
                                     uncertain_until_ms: view.uncertain_until_ms,
-                                }
+                                },
                             },
-                        },
-                    )?;
-                } else {
-                    tx.local(&actions.local)?;
+                        )?;
+                    } else {
+                        tx.local(&super::protocols::qualify(&name, actions.local))?;
+                    }
                 }
                 tx.put(keys::LOSS, &*loss)?;
                 return self.commit(tx).await;

@@ -72,6 +72,10 @@ fn note_target(msg_id: &str) -> RecordTarget {
 }
 
 impl Protocol for Keyed {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.items.has_keys(scope)
     }
@@ -113,7 +117,7 @@ impl Protocol for Keyed {
             Mode::Await(epoch) => Some(epoch),
         };
         if let Some(data_epoch) = waits_for
-            && !cx.holds_scope_key("scope-a", data_epoch)
+            && !cx.holds_scope_key("sample-a", data_epoch)
         {
             return Outcome::AwaitKey { data_epoch };
         }
@@ -137,16 +141,12 @@ impl Protocol for Keyed {
     fn collections(&self) -> Vec<Collection> {
         vec![items()]
     }
-
-    fn backup_name(&self) -> Option<String> {
-        Some("keyed".into())
-    }
 }
 
 /// alice's wallet with `protocol`, talking through `transport`, read once so the join's
 /// listing is done.
 async fn wallet(w: &World, protocol: &Arc<Keyed>, transport: &Arc<MockTransport>) -> App {
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let env = w.signer.env_with(
         Arc::new(MemoryStore::new()),
         Arc::clone(transport) as Arc<dyn crate::transport::Transport>,
@@ -222,7 +222,7 @@ struct Peer {
 fn published_peer(w: &World, name: &str) -> Peer {
     let peer = super::identity(name);
     let keys = peer.app_keys("app");
-    let cert = cert_for(peer.key(), &keys, w.clock.now_ms() - 1000, &["scope-a"]);
+    let cert = cert_for(peer.key(), &keys, w.clock.now_ms() - 1000, &["sample-a"]);
     let mut body = IdentityBody::first(
         peer.public(),
         peer.signer_id(),
@@ -756,7 +756,7 @@ async fn wallet_on(
     transport: &Arc<MockTransport>,
     store: Arc<dyn StateStore>,
 ) -> App {
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let env = w.signer.env_with(
         store,
         Arc::clone(transport) as Arc<dyn crate::transport::Transport>,
@@ -1023,6 +1023,10 @@ struct Unkeyed {
 }
 
 impl Protocol for Unkeyed {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.items.has_keys(scope)
     }
@@ -1051,7 +1055,7 @@ impl Protocol for Unkeyed {
     fn receive(&self, _: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         *self.runs.lock().unwrap() += 1;
         let data_epoch = self.epoch.unwrap_or(cx.data_epoch());
-        if !cx.holds_scope_key("scope-z", data_epoch) {
+        if !cx.holds_scope_key("sample-z", data_epoch) {
             return Outcome::AwaitKey { data_epoch };
         }
         Outcome::Apply(Effect::default())
@@ -1084,7 +1088,7 @@ async fn test_awaiting_key_for_a_scope_not_given_runs_the_step_only_once() {
         epoch: None,
     });
     let transport = w.switch.transport();
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let env = w.signer.env_with(
         Arc::new(MemoryStore::new()),
         Arc::clone(&transport) as Arc<dyn crate::transport::Transport>,
@@ -1108,7 +1112,7 @@ async fn test_awaiting_key_for_a_scope_not_given_runs_the_step_only_once() {
 }
 
 fn unkeyed_wallet_request(w: &World) -> JoinRequest {
-    w.approve(&app_keys("wallet"), &["scope-a"])
+    w.approve(&app_keys("wallet"), &["sample-a"])
 }
 
 async fn unkeyed_wallet(w: &World, protocol: &Arc<Unkeyed>, transport: &Arc<MockTransport>) -> App {
@@ -1160,7 +1164,7 @@ async fn test_awaiting_key_waiting_again_for_the_same_epoch_is_not_stored_again(
         w.clock.advance_ms(MAX_CURSOR_DEFER_MS + 1);
         events.extend(app.receive(None).await.unwrap().events);
     }
-    assert!(app.scope_key(2, "scope-a").is_some());
+    assert!(app.scope_key(2, "sample-a").is_some());
     assert_eq!(*protocol.runs.lock().unwrap(), 2);
     assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(1));
     assert_eq!(parked_events(&events), 1, "{events:?}");
@@ -1237,7 +1241,7 @@ async fn test_awaiting_key_of_a_later_epoch_isnt_due_for_an_earlier_epochs_keys(
         w.clock.advance_ms(MAX_CURSOR_DEFER_MS + 1);
         app.receive(None).await.unwrap();
     }
-    assert!(app.scope_key(2, "scope-a").is_some());
+    assert!(app.scope_key(2, "sample-a").is_some());
     assert_eq!(protocol.runs_of(&note.msg_id), 1);
     assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(3));
 }

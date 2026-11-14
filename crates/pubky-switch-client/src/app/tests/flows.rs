@@ -50,7 +50,7 @@ async fn test_app_join_registers_and_receives_a_note() {
     assert_eq!(w.effects(), 1);
     assert!(app.cursor().seq >= seq);
     let note = app
-        .protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+        .protocol_get("sample", format!("notes/{}", message.msg_id).as_bytes())
         .await
         .unwrap();
     assert_eq!(note, Some(b"hello".to_vec()));
@@ -65,7 +65,7 @@ async fn test_app_join_registers_and_receives_a_note() {
 #[tokio::test]
 async fn test_app_join_refuses_an_approval_for_other_keys() {
     let w = World::new();
-    let mut request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut request = w.approve(&app_keys("wallet"), &["sample-a"]);
     request.keys = app_keys("phone");
     let error = App::join(w.env(), w.protocol.clone(), World::config(), request)
         .await
@@ -110,7 +110,7 @@ async fn scenario(
         Ok(app) => app,
         Err(AppError::Refused(Refusal::NotJoined)) => {
             let request = approval
-                .get_or_insert_with(|| w.approve(&keys, &["scope-a"]))
+                .get_or_insert_with(|| w.approve(&keys, &["sample-a"]))
                 .clone();
             App::join(env, w.protocol.clone(), World::config(), request).await?
         }
@@ -724,7 +724,10 @@ async fn test_app_missed_call_the_protocol_fails_is_made_again() {
     assert!(app.cursor().seq >= seq);
     assert!(w.protocol.missed.lock().unwrap().is_empty());
     let mark = format!("missed/{seq}");
-    assert_eq!(app.protocol_get(mark.as_bytes()).await.unwrap(), None);
+    assert_eq!(
+        app.protocol_get("sample", mark.as_bytes()).await.unwrap(),
+        None
+    );
     // Made again by the next read, after a load too, with what the item gave.
     let mut app = w.load(me).await;
     app.receive(None).await.unwrap();
@@ -735,7 +738,7 @@ async fn test_app_missed_call_the_protocol_fails_is_made_again() {
     assert_eq!(missed[0].accepted_from_ms, now - CLOCK_TOLERANCE_MS);
     assert_eq!(missed[0].accepted_until_ms, now);
     assert_eq!(
-        app.protocol_get(mark.as_bytes()).await.unwrap(),
+        app.protocol_get("sample", mark.as_bytes()).await.unwrap(),
         Some(b"1".to_vec())
     );
     // Once.
@@ -790,7 +793,8 @@ async fn test_missed_entries_last_time_unparsable_asks_for_nothing() {
 #[tokio::test]
 async fn test_app_owed_call_failing_for_good_holds_the_later_ones() {
     // Switch spec 8.3: every notice the protocol can't take yet is kept in feed order, and
-    // the read hands nothing after it. The host is told after a few reads.
+    // the read hands the protocol nothing after it, without stopping: the protocol's later
+    // calls are owed behind it. The host is told after a few reads.
     let w = World::new();
     let mut app = w.join("wallet").await;
     w.note(app.app_id(), "first");
@@ -799,13 +803,13 @@ async fn test_app_owed_call_failing_for_good_holds_the_later_ones() {
     let stuck = w.switch.push_missed(1, now - HOUR, now);
     w.protocol.failing_missed.lock().unwrap().push(stuck);
     let later = w.switch.push_missed(2, now - HOUR, now);
-    // The first call fails: owed, and the page stops after it.
-    assert!(app.receive(None).await.unwrap().stopped);
-    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    // The first call fails: owed, and the later one owed behind it.
+    assert!(!app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 2);
     let mut events = Vec::new();
     for _ in 0..3 {
         let report = app.receive(None).await.unwrap();
-        assert!(report.stopped);
+        assert!(!report.stopped);
         events.extend(report.events);
     }
     assert!(w.protocol.missed.lock().unwrap().is_empty());
@@ -983,8 +987,14 @@ async fn test_app_restore_in_place_leaves_behind_an_owed_call_that_isnt_whole() 
         &missed,
     )
     .unwrap();
-    tx.put(&crate::app::state::key::owed(1, 1), &unchecked)
-        .unwrap();
+    tx.put(
+        &crate::app::state::key::owed(1, 1),
+        &(crate::app::feed::Owed {
+            to: vec!["sample".into()],
+            call: unchecked,
+        }),
+    )
+    .unwrap();
     app.commit(tx).await.unwrap();
     assert_eq!(app.owed_protocol_calls().await.unwrap(), 2);
     drop(app);
@@ -1049,7 +1059,13 @@ async fn test_app_resend_call_the_protocol_fails_is_made_again() {
     wallet.receive(None).await.unwrap();
     assert!(w.protocol.resends.lock().unwrap().is_empty());
     let mark = format!("resend/{accepted}");
-    assert_eq!(wallet.protocol_get(mark.as_bytes()).await.unwrap(), None);
+    assert_eq!(
+        wallet
+            .protocol_get("sample", mark.as_bytes())
+            .await
+            .unwrap(),
+        None
+    );
     // Then it answers: the same request, once.
     wallet.receive(None).await.unwrap();
     wallet.receive(None).await.unwrap();
@@ -1060,7 +1076,10 @@ async fn test_app_resend_call_the_protocol_fails_is_made_again() {
     assert_eq!(resends[0].accepted_until_ms, accepted);
     assert_eq!(resends[0].reason, crate::app::ResendReason::Unreadable);
     assert_eq!(
-        wallet.protocol_get(mark.as_bytes()).await.unwrap(),
+        wallet
+            .protocol_get("sample", mark.as_bytes())
+            .await
+            .unwrap(),
         Some(b"1".to_vec())
     );
 }
@@ -1339,7 +1358,7 @@ async fn test_app_renewal_is_picked_up_once_listed() {
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms() + 1000,
-        &["scope-a"],
+        &["sample-a"],
     );
     w.switch
         .signer_op(OpKind::CertPut {
@@ -1448,7 +1467,7 @@ async fn test_app_restore_takes_no_listed_certificate_it_cant_verify() {
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms() + 1000,
-        &["scope-a"],
+        &["sample-a"],
     );
     w.next_doc(|body| {
         body.apps.retain(|a| a.app_id != me);
@@ -1593,7 +1612,7 @@ async fn test_app_expired_certificate_is_renewed_by_the_signer_alone() {
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms(),
-        &["scope-a"],
+        &["sample-a"],
     );
     let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
     let epoch = w.switch.identity_doc().unwrap().data_epoch();
@@ -1644,8 +1663,8 @@ async fn test_app_expired_certificate_is_renewed_by_the_signer_alone() {
     // The app goes on with it, and holds the keys the renewal's bundle gave.
     app.receive(None).await.unwrap();
     assert_eq!(
-        app.scope_key(epoch, "scope-a"),
-        Some(w.alice.scope_key(epoch, "scope-a"))
+        app.scope_key(epoch, "sample-a"),
+        Some(w.alice.scope_key(epoch, "sample-a"))
     );
 }
 
@@ -1655,7 +1674,7 @@ async fn app_with_its_own_clock(w: &World, offset_ms: i64) -> (App, Arc<TestCloc
     let clock = Arc::new(TestClock::new(start));
     let mut env = w.env();
     env.clock = Arc::clone(&clock) as Arc<dyn Clock>;
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let app = App::join(env, w.protocol.clone(), World::config(), request)
         .await
         .unwrap();
@@ -2009,7 +2028,7 @@ pub(super) fn renew_listed(w: &World, app: &App) -> pubky_switch_core::records::
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms(),
-        &["scope-a"],
+        &["sample-a"],
     );
     let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
     let epoch = w.switch.identity_doc().unwrap().data_epoch();
@@ -2323,7 +2342,7 @@ async fn test_app_kept_effect_refused_for_an_expired_certificate_waits_for_the_r
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms(),
-        &["scope-a"],
+        &["sample-a"],
     );
     let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
     let epoch = w.switch.identity_doc().unwrap().data_epoch();
@@ -2443,6 +2462,10 @@ struct LifecycleProtocol {
 }
 
 impl Protocol for LifecycleProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -2530,7 +2553,7 @@ async fn test_app_lifecycle_operation_in_an_effect_doesnt_stall_the_feed() {
         answers: std::sync::Mutex::new(Vec::new()),
         active: std::sync::atomic::AtomicBool::new(true),
     });
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap();
@@ -2559,7 +2582,7 @@ async fn test_app_lifecycle_operation_in_a_stored_entrys_effect_stores_it_for_go
         answers: std::sync::Mutex::new(Vec::new()),
         active: std::sync::atomic::AtomicBool::new(false),
     });
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap();
@@ -2597,7 +2620,7 @@ async fn test_app_entry_stored_for_good_drops_its_retry_count() {
         answers: std::sync::Mutex::new(Vec::new()),
         active: std::sync::atomic::AtomicBool::new(true),
     });
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap();
@@ -2636,7 +2659,7 @@ async fn test_app_refuses_lifecycle_operations_in_a_protocol_effect() {
                 answers: std::sync::Mutex::new(Vec::new()),
                 active: std::sync::atomic::AtomicBool::new(true),
             });
-            let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+            let request = w.approve(&app_keys("wallet"), &["sample-a"]);
             let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
                 .await
                 .unwrap();
@@ -2666,7 +2689,7 @@ async fn test_app_ignores_a_cert_put_of_other_keys() {
         &w.alice,
         &app_keys("phone"),
         w.clock.now_ms() + 1000,
-        &["scope-a"],
+        &["sample-a"],
     );
     // A compliant switch refuses this cert.put; a faulty one chains it.
     w.switch
@@ -2712,8 +2735,8 @@ async fn test_app_key_bundle_with_a_missing_epoch_asks_for_a_full_bundle() {
         "{:?}",
         report.events
     );
-    assert!(app.scope_key(3, "scope-a").is_some());
-    assert!(app.scope_key(2, "scope-a").is_none());
+    assert!(app.scope_key(3, "sample-a").is_some());
+    assert!(app.scope_key(2, "sample-a").is_none());
     assert_eq!(app.keys_through(), 1);
     assert!(w.switch.app(&me).full_requested.is_some());
     // The signer stores a full bundle: every epoch held, the request done.
@@ -2730,8 +2753,8 @@ async fn test_app_key_bundle_with_a_missing_epoch_asks_for_a_full_bundle() {
     app.receive(None).await.unwrap();
     assert_eq!(app.keys_through(), 3);
     assert_eq!(
-        app.scope_key(2, "scope-a"),
-        Some(w.alice.scope_key(2, "scope-a"))
+        app.scope_key(2, "sample-a"),
+        Some(w.alice.scope_key(2, "sample-a"))
     );
 }
 
@@ -2786,7 +2809,7 @@ async fn test_app_restore_asks_again_for_a_full_bundle_a_later_part_left_short()
     let report = restored.receive(None).await.unwrap();
     assert!(asked(&report.events), "{:?}", report.events);
     assert!(w.switch.app(&me).full_requested.is_some());
-    assert!(restored.scope_key(3, "scope-a").is_some());
+    assert!(restored.scope_key(3, "sample-a").is_some());
     assert_eq!(restored.keys_through(), 1);
     // Once per part stored: a read without one asks nothing more.
     let report = restored.receive(None).await.unwrap();
@@ -2796,8 +2819,8 @@ async fn test_app_restore_asks_again_for_a_full_bundle_a_later_part_left_short()
     restored.receive(None).await.unwrap();
     assert_eq!(restored.keys_through(), 3);
     assert_eq!(
-        restored.scope_key(2, "scope-a"),
-        Some(w.alice.scope_key(2, "scope-a"))
+        restored.scope_key(2, "sample-a"),
+        Some(w.alice.scope_key(2, "sample-a"))
     );
 }
 
@@ -3059,7 +3082,7 @@ async fn test_app_keys_calls_without_a_record_are_not_current() {
     // request for a full bundle is kept for it (Switch wire 7.2, 7.4.11).
     let w = World::new();
     let keys = app_keys("phone");
-    let cert = cert_for(&w.alice, &keys, START, &["scope-a"]);
+    let cert = cert_for(&w.alice, &keys, START, &["sample-a"]);
     w.next_doc(|body| {
         body.apps.push(ListedApp {
             app_id: cert.app_id(),
@@ -3099,7 +3122,7 @@ async fn test_app_skips_a_bundle_part_with_another_naming_key() {
         &mallory,
         &app_keys("wallet"),
         w.clock.now_ms(),
-        &["scope-a"],
+        &["sample-a"],
     );
     let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
     let part = seal_bundle_parts(&mallory, &fake_cert, 1, 1, &has_keys)
@@ -3123,8 +3146,8 @@ async fn test_app_skips_a_bundle_part_with_another_naming_key() {
         AppEvent::BundlePartSkipped { .. }
     )));
     assert_eq!(
-        app.scope_key(1, "scope-a"),
-        Some(w.alice.scope_key(1, "scope-a"))
+        app.scope_key(1, "sample-a"),
+        Some(w.alice.scope_key(1, "sample-a"))
     );
 }
 
@@ -3522,7 +3545,7 @@ async fn test_app_refresh_identity_confirms_at_the_time_of_the_read() {
         clock: Arc::clone(&w.clock),
         delay_ms: std::sync::atomic::AtomicU64::new(0),
     });
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(
         w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
         w.protocol.clone(),
@@ -3730,7 +3753,7 @@ fn notice(
 #[tokio::test]
 async fn test_app_held_entry_doesnt_hold_up_later_pages() {
     let w = World::new();
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let config = AppConfig {
         page_size: 2,
         ..World::config()
@@ -4354,6 +4377,10 @@ async fn test_app_effect_kept_on_a_retryable_refusal_and_sent_again() {
 struct WideProtocol(SampleProtocol);
 
 impl Protocol for WideProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.0.has_keys(scope)
     }
@@ -4413,7 +4440,7 @@ impl Protocol for WideProtocol {
 #[tokio::test]
 async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
     let w = World::new();
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let protocol = Arc::new(WideProtocol(SampleProtocol::default()));
     let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
         .await
@@ -4469,6 +4496,10 @@ impl BigProtocol {
 }
 
 impl Protocol for BigProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -4551,7 +4582,7 @@ async fn big_effect_is_parked(ops: bool, sizes: Vec<usize>) {
 
 async fn big_effect_is_parked_with(protocol: Arc<BigProtocol>) {
     let w = World::new();
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap();
@@ -4570,7 +4601,12 @@ async fn big_effect_is_parked_with(protocol: Arc<BigProtocol>) {
     assert!(app.cursor().seq >= plain);
     // Only the plain note's conversation entry went.
     assert_eq!(w.effects(), 1);
-    assert!(app.protocol_get(b"big/0").await.unwrap().is_none());
+    assert!(
+        app.protocol_get("sample", b"big/0")
+            .await
+            .unwrap()
+            .is_none()
+    );
     app.receive(None).await.unwrap();
 }
 
@@ -4585,7 +4621,7 @@ async fn test_effect_at_the_bound_with_operations_is_kept_and_applied() {
     // Local writes at the bound, of the bytes that took the most room in the earlier kept
     // form (`255,` each, over 16 MiB): in base64 the kept effect fits one value.
     let w = World::new();
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let protocol = Arc::new(BigProtocol {
         ops: true,
         sizes: vec![AT_THE_BOUND],
@@ -4599,7 +4635,10 @@ async fn test_effect_at_the_bound_with_operations_is_kept_and_applied() {
     assert!(received(&report.events, seq), "{:?}", report.events);
     assert_eq!(w.effects(), 1);
     assert_eq!(
-        app.protocol_get(b"big/0").await.unwrap().map(|v| v.len()),
+        app.protocol_get("sample", b"big/0")
+            .await
+            .unwrap()
+            .map(|v| v.len()),
         Some(AT_THE_BOUND)
     );
 }
@@ -4607,7 +4646,7 @@ async fn test_effect_at_the_bound_with_operations_is_kept_and_applied() {
 #[tokio::test]
 async fn test_step_local_writes_at_the_bound_are_applied() {
     let w = World::new();
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let protocol = Arc::new(BigProtocol {
         sizes: vec![AT_THE_BOUND],
         ..BigProtocol::default()
@@ -4619,7 +4658,10 @@ async fn test_step_local_writes_at_the_bound_are_applied() {
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq), "{:?}", report.events);
     assert_eq!(
-        app.protocol_get(b"big/0").await.unwrap().map(|v| v.len()),
+        app.protocol_get("sample", b"big/0")
+            .await
+            .unwrap()
+            .map(|v| v.len()),
         Some(AT_THE_BOUND)
     );
 }
@@ -4833,6 +4875,10 @@ struct FillProtocol {
 }
 
 impl Protocol for FillProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -4923,7 +4969,7 @@ impl Protocol for FillProtocol {
 }
 
 async fn fill_app(w: &World, protocol: &Arc<FillProtocol>) -> App {
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap()
@@ -4953,7 +4999,12 @@ async fn test_page_full_of_effects_near_the_bound_and_entries_stored_goes_on() {
     assert!(app.cursor().seq >= plain, "the feed goes on");
     for seq in &filled {
         let key = format!("fill/{seq}");
-        assert!(app.protocol_get(key.as_bytes()).await.unwrap().is_some());
+        assert!(
+            app.protocol_get("sample", key.as_bytes())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
     for seq in &huge {
         assert!(has(&report.events, |e| matches!(
@@ -4983,7 +5034,12 @@ async fn test_missed_local_writes_near_the_bound_on_one_page_go_on() {
     assert!(app.cursor().seq >= plain, "the feed goes on");
     for seq in missed {
         let key = format!("missed/{seq}");
-        assert!(app.protocol_get(key.as_bytes()).await.unwrap().is_some());
+        assert!(
+            app.protocol_get("sample", key.as_bytes())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
     assert!(received(&report.events, plain));
 }
@@ -5051,7 +5107,12 @@ async fn test_missed_local_writes_over_the_bound_are_refused_and_the_feed_goes_o
     let report = app.receive(None).await.unwrap();
     assert!(app.cursor().seq >= plain, "the feed goes on");
     let key = format!("missed/{seq}");
-    assert!(app.protocol_get(key.as_bytes()).await.unwrap().is_none());
+    assert!(
+        app.protocol_get("sample", key.as_bytes())
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(
         has(&report.events, |e| matches!(
             e,
@@ -5102,7 +5163,12 @@ async fn test_owed_call_local_writes_over_the_bound_are_refused_once() {
         } if missed.seq == seq
     )));
     let key = format!("missed/{seq}");
-    assert!(app.protocol_get(key.as_bytes()).await.unwrap().is_none());
+    assert!(
+        app.protocol_get("sample", key.as_bytes())
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -5128,7 +5194,7 @@ async fn join_holding(w: &World, name: &str, permissions: &[Permission]) -> App 
         .signer
         .approve(
             &app_keys(name),
-            &AppSpec::new(&["scope-a"]).with_permissions(permissions),
+            &AppSpec::new(&["sample-a"]).with_permissions(permissions),
         )
         .unwrap();
     App::join(
@@ -5225,7 +5291,7 @@ async fn test_scripted_feed_visibility_follows_a_listed_renewal() {
     let renewed = crate::testing::issue_cert(
         &w.alice,
         &app_keys("wallet"),
-        &AppSpec::new(&["scope-a"])
+        &AppSpec::new(&["sample-a"])
             .with_permissions(&[Permission::ListsRead, Permission::ConversationAdd]),
         w.clock.now_ms() + 1000,
     )
@@ -5311,7 +5377,7 @@ async fn test_deny_list_changes_reach_the_protocol_in_feed_order() {
     assert!(changes[1].at_ms >= changes[0].at_ms + 1000);
     assert!(changes.iter().all(|change| change.generation == 1));
     let local = reader
-        .protocol_get(format!("deny/{}", changes[2].seq).as_bytes())
+        .protocol_get("sample", format!("deny/{}", changes[2].seq).as_bytes())
         .await
         .unwrap();
     assert_eq!(local, Some(vec![0]));
@@ -5400,6 +5466,10 @@ struct OrderedProtocol {
 }
 
 impl Protocol for OrderedProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -5470,7 +5540,7 @@ async fn join_with(
         .signer
         .approve(
             &app_keys(name),
-            &AppSpec::new(&["scope-a"]).with_permissions(permissions),
+            &AppSpec::new(&["sample-a"]).with_permissions(permissions),
         )
         .unwrap();
     App::join(
@@ -5640,6 +5710,10 @@ struct KindsProtocol {
 }
 
 impl Protocol for KindsProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -5927,7 +6001,7 @@ async fn assert_carried_deny_change_taken(
         "the copy of the lists; log {log:?}"
     );
     let handed = restored
-        .protocol_get(format!("deny/{seq}").as_bytes())
+        .protocol_get("sample", format!("deny/{seq}").as_bytes())
         .await
         .unwrap();
     assert_eq!(handed, Some(vec![u8::from(denied_at_end)]), "{log:?}");
@@ -6275,7 +6349,7 @@ async fn owed_across_a_restore_and_key_changes(
         .signer
         .approve(
             &app_keys("reader"),
-            &AppSpec::new(&["scope-a"]).with_permissions(&[Permission::ListsRead]),
+            &AppSpec::new(&["sample-a"]).with_permissions(&[Permission::ListsRead]),
         )
         .unwrap();
     let mut reader = App::join(
@@ -6391,7 +6465,14 @@ async fn test_deny_list_owed_call_of_a_generation_not_followed_yet_waits() {
         accepted_until_ms: 6,
     };
     let mut tx = reader.tx().unwrap();
-    tx.put(&crate::app::state::key::owed(5, 1), &call).unwrap();
+    tx.put(
+        &crate::app::state::key::owed(5, 1),
+        &(crate::app::feed::Owed {
+            to: vec!["sample".into()],
+            call,
+        }),
+    )
+    .unwrap();
     reader.commit(tx).await.unwrap();
     let _ = reader.receive(None).await;
     assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
@@ -6546,13 +6627,19 @@ async fn reader_owing_an_unchecked_deny_change(
     let _ = reader.receive(None).await;
     let owed = reader
         .reader()
-        .scan::<crate::app::feed::OwedCall>(crate::app::state::key::OWED_PREFIX)
+        .scan::<crate::app::feed::Owed>(crate::app::state::key::OWED_PREFIX)
         .await
         .unwrap();
     assert!(
         matches!(
             owed.as_slice(),
-            [(_, crate::app::feed::OwedCall::DenyUnverified { .. })]
+            [(
+                _,
+                crate::app::feed::Owed {
+                    call: crate::app::feed::OwedCall::DenyUnverified { .. },
+                    ..
+                }
+            )]
         ),
         "{owed:?}"
     );
@@ -6569,11 +6656,11 @@ async fn assert_edited_unchecked_deny_change_fails_closed(
     let (mut reader, protocol) = reader_owing_an_unchecked_deny_change(&w, x).await;
     let owed = reader
         .reader()
-        .scan::<crate::app::feed::OwedCall>(crate::app::state::key::OWED_PREFIX)
+        .scan::<crate::app::feed::Owed>(crate::app::state::key::OWED_PREFIX)
         .await
         .unwrap();
     let [(rest, mut call)] = <[_; 1]>::try_from(owed).unwrap();
-    edit(&mut call);
+    edit(&mut call.call);
     let mut tx = reader.tx().unwrap();
     tx.put(
         &format!("{}{rest}", crate::app::state::key::OWED_PREFIX),
@@ -6760,14 +6847,25 @@ async fn test_deny_list_gap_told_after_an_older_owed_change() {
         .put(
             &ns,
             crate::app::state::key::owed(change.generation, change.seq).into_bytes(),
-            crate::app::state::encode(&owed).unwrap(),
+            crate::app::state::encode(
+                &(crate::app::feed::Owed {
+                    to: vec!["sample".into()],
+                    call: owed,
+                }),
+            )
+            .unwrap(),
         )
         .unwrap();
     batch
         .put(
             &ns,
             crate::app::feed::DENY_GAP.as_bytes().to_vec(),
-            crate::app::state::encode(&(through.generation, through.seq)).unwrap(),
+            crate::app::state::encode(&json!({
+                "generation": through.generation,
+                "seq": through.seq,
+                "to": ["sample"],
+            }))
+            .unwrap(),
         )
         .unwrap();
     batch

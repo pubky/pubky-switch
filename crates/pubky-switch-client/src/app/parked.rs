@@ -190,7 +190,7 @@ impl App {
             };
             let plaintext = MessagePlaintext::decode(&stored.plaintext)
                 .map_err(|_| AppError::Store(StoreError::Corrupt))?;
-            let rules = self.protocol.opaque_members();
+            let rules = self.protocols.opaque_of_json(plaintext.json());
             let opaque: Vec<OpaqueMember<'_>> = rules
                 .iter()
                 .map(|rule| OpaqueMember {

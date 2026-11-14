@@ -55,7 +55,7 @@ impl App {
         let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
         let mut body = old.body().clone();
         body.cert = renewal.signed().clone();
-        body.accepts = self.protocol.accepts(&renewal);
+        body.accepts = self.protocols.accepts(&renewal);
         body.updated_at = self.now().max(old.updated_at().saturating_add(1));
         let record = AppRecord::sign(&self.state.keys, body)?;
         self.take_cert(renewal, record.signed().clone(), true, None)
@@ -90,7 +90,7 @@ impl App {
         // Member by member: a scope of the new certificate that reads a collection's member,
         // its fixed read scope or a sub-scope of its family, and that the one before doesn't
         // hold (Switch spec 3.3).
-        let collections = self.protocol.collections();
+        let collections = self.protocols.collections();
         let widened = cert.scopes().iter().any(|scope| {
             !self.state.cert.holds_scope(scope)
                 && collections.iter().any(|c| c.read_by_scope(scope))
@@ -435,7 +435,7 @@ impl App {
                 let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
                 let mut body = old.body().clone();
                 body.cert = cert.signed().clone();
-                body.accepts = self.protocol.accepts(&cert);
+                body.accepts = self.protocols.accepts(&cert);
                 body.updated_at = self
                     .now()
                     .max(old.updated_at().saturating_add(1))
