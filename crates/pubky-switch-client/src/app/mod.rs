@@ -429,6 +429,12 @@ pub struct AppBackup {
     /// The protocol's layer, if it added one; absent from the bytes otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     protocol: Option<LayerOut>,
+    /// The re-send and missed-entries calls the protocol was owed when the backup was
+    /// taken (`owed/`), each by its key after the prefix, with its value as stored: their
+    /// items are at or behind the backup's cursor, so the restored feed never shows them
+    /// again. A deny list call is left out: every restore tells the protocol a deny list
+    /// gap at the restored cursor, whose full list covers it.
+    owed: Vec<(String, serde_json::Value)>,
 }
 
 /// The version a backup with a protocol layer carries, in place of [`SCHEMA_VERSION`]: a
@@ -643,7 +649,11 @@ pub struct App {
     /// The first owed call past the cursor, by its item's `seq` in the cursor's sequence,
     /// which a move or a key change in place continues under the next generation, as a
     /// restore in place carries it: the feed stops before any later item, so the call
-    /// goes in feed order, once. Set at each read's start. In memory only.
+    /// goes in feed order, once. It may be any distance ahead: a restore in place from a
+    /// backup older than the store carries the calls the store owed past the backup's
+    /// cursor. Reading on up to it is safe: the feed hands each item before it, in order,
+    /// and passes its item without handing it, the call being that item's notice. Set at
+    /// each read's start. In memory only.
     owed_ahead: Option<u64>,
     /// The read (by [`App::receive`]'s count) the own directory was read in for a deny list
     /// change's writer, and whether it answered: once a read. In memory only.
@@ -1199,8 +1209,9 @@ impl App {
 
     /// The app's backup (Switch spec 12.4): its keys, certificate and record, scope keys
     /// and naming key, its receive keys and the kids it knows, its cursor and chain view,
-    /// and its outbox. The app should take one at every rotation, replacing the previous one
-    /// (Switch spec 3.6).
+    /// its outbox, and the re-send and missed-entries calls it owes its protocol, whose items
+    /// the cursor passed. The app should take one at every rotation, replacing the previous
+    /// one (Switch spec 3.6).
     ///
     /// The outbox goes in whole, but for the messages refused for good: each message with
     /// its signed plaintext and the envelope sealed for its last try, so a restore delivers
@@ -1305,6 +1316,7 @@ impl App {
             outbox_left_out: Vec::new(),
             held_counterparties: Vec::new(),
             protocol: None,
+            owed: Vec::new(),
         })
     }
 
@@ -1360,6 +1372,22 @@ impl App {
             .await?
             .into_iter()
             .map(|(rest, _)| rest)
+            .collect();
+        // The owed re-send and missed-entries calls, as stored. One that doesn't read as a
+        // call fails every read of this store already; it isn't a call to carry.
+        backup.owed = reader
+            .scan_raw(key::OWED_PREFIX)
+            .await?
+            .into_iter()
+            .filter_map(|(rest, bytes)| {
+                let call = state::decode::<feed::OwedCall>(&bytes).ok()?;
+                let carried = matches!(
+                    call,
+                    feed::OwedCall::Resend { .. } | feed::OwedCall::Missed { .. }
+                );
+                let value = state::decode::<serde_json::Value>(&bytes).ok()?;
+                carried.then_some((rest, value))
+            })
             .collect();
         Ok(())
     }
@@ -1560,9 +1588,14 @@ impl App {
     /// What the store holds that the app still owes its protocol stays, a layered restore's
     /// included: the duty events
     /// not acknowledged, with their IDs, delivered again as after [`App::load`], and the
-    /// protocol calls it couldn't answer, made again by the next read. A backup carries
-    /// neither, so a restore on another device starts without them, under a new event epoch
-    /// ([`EventId`]). For an app holding `lists.read`, the commit also owes the protocol a
+    /// protocol calls it couldn't answer, made again by the next read. A backup carries no
+    /// duty event, so a restore onto a store without an epoch, on another device or wiped,
+    /// starts a new event epoch ([`EventId`]); it takes the re-send and missed-entries
+    /// calls the backup carries instead ([`App::backup`]), each checked as a carried call
+    /// is, one that isn't whole left behind and counted in
+    /// [`AppEvent::RestoreLeftBehind`]. A restore in place keeps the store's own calls and
+    /// not the backup's: a call leaves the store's queue only in the commit that makes it,
+    /// so the backup's copy of one made since would make it twice. For an app holding `lists.read`, the commit also owes the protocol a
     /// deny list gap at the backup's position, whatever the backup held, told by the next
     /// read with the full list ([`Protocol::deny_list_gap`], Switch spec 8.3).
     ///
@@ -1816,7 +1849,19 @@ impl App {
                 ns: ns.clone(),
                 store: env.store.clone(),
             };
-            let carried = Self::kept_for_protocol(&old).await?.unwrap_or_default();
+            let carried = Self::kept_for_protocol(&old).await?;
+            // A store with an epoch keeps its own queue, and the backup's owed calls are
+            // left: the store is the queue's later history, where a call leaves only in the
+            // commit that makes it, so every call the backup holds is either still owed
+            // there, and carried, or made since, and the backup's copy would make it twice.
+            // A store without one, on another device or wiped, takes the backup's calls,
+            // each checked as a carried one is; one that isn't whole is left behind and
+            // counted.
+            let from_backup = match &carried {
+                Some(_) => (Vec::new(), 0),
+                None => Self::owed_of_backup(backup),
+            };
+            let carried = carried.unwrap_or_default();
             // A restore in place keeps the store's holds beside the backup's: a hold the host
             // set after the backup still holds (`App::hold_queued`).
             let old_holds: Vec<String> = old
@@ -1915,17 +1960,21 @@ impl App {
                 }
                 tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
+                for (stored, value) in &from_backup.0 {
+                    tx.put(stored, value)?;
+                }
                 carrying = true;
                 for (stored, value) in &carried.values {
                     tx.put(stored, value)?;
                 }
                 // What didn't read is left behind, and the protocol told how much.
-                if carried.lost_duties > 0 || carried.lost_owed > 0 {
+                let lost_owed = carried.lost_owed.saturating_add(from_backup.1);
+                if carried.lost_duties > 0 || lost_owed > 0 {
                     app.keep_duty(
                         &mut tx,
                         events::Duty::RestoreLeftBehind {
                             duty_events: carried.lost_duties,
-                            owed_calls: carried.lost_owed,
+                            owed_calls: lost_owed,
                         },
                     )?;
                 }
@@ -2401,6 +2450,25 @@ impl App {
             _ => carried.next_duty = past_kept,
         }
         Ok(Some(carried))
+    }
+
+    /// The owed calls a backup carries, by stored key, each whole as a carried one must be
+    /// ([`App::kept_for_protocol`]), and how many aren't.
+    fn owed_of_backup(backup: &AppBackup) -> (Vec<(String, serde_json::Value)>, u64) {
+        let mut whole = Vec::new();
+        let mut lost = 0u64;
+        for (rest, value) in &backup.owed {
+            let read = feed::owed_place(rest)
+                .and_then(|_| {
+                    serde_json::from_value::<feed::OwedCall>(value.clone()).map_err(|_| corrupt())
+                })
+                .and_then(|call| call.kept_op_body());
+            match read {
+                Ok(_) => whole.push((format!("{}{rest}", key::OWED_PREFIX), value.clone())),
+                Err(_) => lost = lost.saturating_add(1),
+            }
+        }
+        (whole, lost)
     }
 
     /// The local ID the store's next entry stored locally would take, for a restore in

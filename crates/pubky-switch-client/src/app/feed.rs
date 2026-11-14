@@ -262,6 +262,23 @@ impl From<&ResendNeeded> for OwedCall {
     }
 }
 
+/// Whether a call that failed with `error` may pass later unchanged: a transport failure,
+/// or an answer that asks to try again later (`503 unavailable`, `staged`, `429
+/// rate_limited`, `quota_exceeded`; Switch spec 6.4). A wait on such a failure holds the
+/// read; any other failure is the read's error.
+fn may_pass_unchanged(error: &AppError) -> bool {
+    match error {
+        AppError::Transport(_) => true,
+        AppError::Switch(ClientError::Switch { code, .. }) => matches!(
+            code.retry(),
+            pubky_switch_core::http::Retry::Yes
+                | pubky_switch_core::http::Retry::AfterRetryAfter
+                | pubky_switch_core::http::Retry::WhenLimitFrees
+        ),
+        _ => false,
+    }
+}
+
 /// The feed position an owed call's key names (`owed/<generation>/<seq>`, given without
 /// its prefix). Every call is keyed so: a key that names none has no place in feed order,
 /// and the store is corrupt.
@@ -2929,18 +2946,42 @@ impl App {
     /// Note a gap in the deny list's history after `generation` and `seq`, in `tx`, for an
     /// app holding `lists.read`: the protocol is told of it, with the lists read after it,
     /// before anything later ([`Protocol::deny_list_gap`]). The earliest gap owed is kept;
-    /// one told already isn't noted again. Whether one was noted now.
+    /// one told already at the same position, as a checkpoint a page shows again, isn't
+    /// noted again. Whether one was noted now.
     pub(crate) async fn note_deny_gap(
         &self,
         generation: u64,
         seq: u64,
         tx: &mut Tx,
     ) -> Result<bool, AppError> {
+        self.note_gap_at(generation, seq, true, tx).await
+    }
+
+    /// [`App::note_deny_gap`] for a change that can't be checked, at the position before
+    /// it, noted even where a gap was told at that very position: that gap's list may have
+    /// been read before the change was accepted, so it may lack it. The protocol is then
+    /// told the full list once more, which only sets the same state again.
+    async fn note_unverifiable_gap(
+        &self,
+        generation: u64,
+        seq: u64,
+        tx: &mut Tx,
+    ) -> Result<bool, AppError> {
+        self.note_gap_at(generation, seq, false, tx).await
+    }
+
+    async fn note_gap_at(
+        &self,
+        generation: u64,
+        seq: u64,
+        skip_told: bool,
+        tx: &mut Tx,
+    ) -> Result<bool, AppError> {
         if !self.state.cert.has_permission(Permission::ListsRead) {
             return Ok(false);
         }
         let reader = self.reader();
-        if reader.get::<(u64, u64)>(DENY_GAP_TOLD).await? == Some((generation, seq)) {
+        if skip_told && reader.get::<(u64, u64)>(DENY_GAP_TOLD).await? == Some((generation, seq)) {
             return Ok(false);
         }
         let at = match reader.get::<(u64, u64)>(DENY_GAP).await? {
@@ -2975,10 +3016,13 @@ impl App {
                 AppError::Switch(crate::error::ClientError::InvalidResponse(_))
                 | AppError::InvalidData(_),
             ) => None,
-            Err(error @ (AppError::Alarm(_) | AppError::Store(_))) => return Err(error),
-            // A failure or a refusal, `503 unavailable` or `429` among them: the gap stays
-            // owed, and the read holds.
-            Err(_) => return Ok(true),
+            // What may pass later unchanged, a transport failure, `503`, `429` or a limit
+            // that frees: the gap stays owed, and the read holds.
+            Err(error) if may_pass_unchanged(&error) => return Ok(true),
+            // Anything else is the read's error, as for the feed's own call, so the read's
+            // handling of it runs: a revocation, a key change, an erasure or a move is
+            // followed, never held as a call the protocol owes (`App::take_over`).
+            Err(error) => return Err(error),
         };
         let gap = super::protocol::DenyListGap {
             generation,
@@ -3047,7 +3091,14 @@ impl App {
             let answered = match self.deny_directory_read {
                 Some((read, answered)) if read == self.reads_begun => answered,
                 _ => {
-                    let answered = self.refresh_own_apps().await.is_ok();
+                    // Only what may pass later unchanged leaves the change to be checked
+                    // again; anything else is the read's error, so a revocation, a key
+                    // change, an erasure or a move is followed (`App::take_over`).
+                    let answered = match self.refresh_own_apps().await {
+                        Ok(()) => true,
+                        Err(error) if may_pass_unchanged(&error) => false,
+                        Err(error) => return Err(error),
+                    };
                     self.deny_directory_read = Some((self.reads_begun, answered));
                     answered
                 }
@@ -3134,7 +3185,7 @@ impl App {
             }
             DenyCheck::Unverifiable => {
                 if self
-                    .note_deny_gap(
+                    .note_unverifiable_gap(
                         change.generation,
                         change.seq.saturating_sub(1),
                         &mut read.tx,
@@ -3325,7 +3376,7 @@ impl App {
                             break;
                         }
                         DenyCheck::Unverifiable => {
-                            self.note_deny_gap(generation, seq.saturating_sub(1), &mut tx)
+                            self.note_unverifiable_gap(generation, seq.saturating_sub(1), &mut tx)
                                 .await?;
                             tx.delete(&at)?;
                             self.commit(tx).await?;

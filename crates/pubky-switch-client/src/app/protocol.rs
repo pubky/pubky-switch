@@ -748,7 +748,7 @@ pub trait Protocol: Send + Sync {
     /// - **After a restore:** a backup holds the protocol's layer as committed when it was
     ///   taken, and none of the changes or gaps owed then. So every restore tells the
     ///   protocol a gap at the backup's position, with the full list, whatever the backup
-    ///   held, after the owed calls a restore in place carries up to that position; the
+    ///   held, after the owed calls the restore carries up to that position; the
     ///   changes after it come as the feed hands them.
     /// - **Again:** a change may come twice, after a crash before its commit and after a
     ///   restore, whose feed hands it again; its writes commit once. A protocol keys what it
