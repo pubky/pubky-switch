@@ -505,6 +505,12 @@ pub struct SharedRecord {
     /// The switch's current write is one the app refused: the content is what the app
     /// trusts, and its next write builds on the refused write's version (Switch spec 8.2).
     pub flagged: bool,
+    /// The switch's current write is one the app didn't take on the service's word only, a
+    /// missing date or the certificate the service chose: it names nobody and isn't
+    /// flagged, the content is what the app trusts, and its next write builds on that
+    /// write's version (Switch spec 8.2). A protocol that pauses a record over a write it
+    /// can't trust sees the pause here; it lasts until a write the app takes replaces it.
+    pub not_taken: bool,
     /// The latest view the app read shows uploads after a provider loss that conflict with
     /// the current write, kept at the switch until a writer writes a newer version there
     /// (Switch spec 12.6 step 3). The content is still the current write's, taken by the
@@ -692,6 +698,7 @@ impl HeldRecord {
             },
             doubtful: self.doubtful,
             flagged: self.follow.is_some() && self.follow_named,
+            not_taken: self.follow.is_some() && !self.follow_named,
             divergent,
         }
     }
@@ -2846,6 +2853,7 @@ pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
         "sentt/",
         "outgone/",
         "outhold/",
+        "outheld/",
         "invite/",
         "opq/",
         "kb/",
@@ -2906,7 +2914,7 @@ fn store_corrupt() -> AppError {
 }
 
 /// A protocol's rule, cut to [`MAX_REGRESSION_REASON_BYTES`] at a character boundary.
-fn cut_reason(mut reason: String) -> String {
+pub(crate) fn cut_reason(mut reason: String) -> String {
     if reason.len() > MAX_REGRESSION_REASON_BYTES {
         let mut end = MAX_REGRESSION_REASON_BYTES;
         while !reason.is_char_boundary(end) {

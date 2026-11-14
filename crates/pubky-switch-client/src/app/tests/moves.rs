@@ -1128,7 +1128,7 @@ fn lists_copy_in(store: &MemoryStore) -> (bool, Option<u64>) {
 /// An app with the list permissions, a contact and a deny entry in its copy, a note
 /// processed, and kept evidence; then the signer declares generation 1 lost at a new
 /// service, and the old one is gone.
-async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
+pub(crate) async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
     let permissions = [
         Permission::ListsRead,
         Permission::ListsManage,

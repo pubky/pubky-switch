@@ -125,6 +125,33 @@ pub struct ReceivedMessage {
     pub conflict: Option<Value>,
 }
 
+impl ReceivedMessage {
+    /// The entry's position in the inbox: [`ReceivedMessage::generation`] and
+    /// [`ReceivedMessage::seq`]. Two positions compare in feed order with
+    /// [`super::App::received_order`] or [`super::ReceiveContext::received_order`], not as
+    /// a plain pair.
+    pub fn position(&self) -> FeedPosition {
+        FeedPosition {
+            generation: self.generation,
+            seq: self.seq,
+        }
+    }
+}
+
+/// A position in the app's feed: the generation an item was read at and its `seq` there
+/// (Switch spec 8.3 "One order per generation"). It has no order of its own: a cooperative
+/// move and a key change in place continue the sequence under the next generation, and only
+/// a provider loss starts a new one, so a plain `(generation, seq)` comparison puts an
+/// entry read before a move after one read since. [`super::App::received_order`] compares
+/// two in feed order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct FeedPosition {
+    /// The generation the item was read at.
+    pub generation: u64,
+    /// The item's `seq` in that generation.
+    pub seq: u64,
+}
+
 /// The most bytes of local writes a protocol or host hands over at once: one receive step,
 /// one [`Protocol::resend_needed`], [`Protocol::missed`] or [`Protocol::deny_list_changed`]
 /// answer, or one

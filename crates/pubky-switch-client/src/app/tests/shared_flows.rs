@@ -7951,6 +7951,10 @@ async fn test_scripted_records_refused_delete_is_written_over_after_a_forget() {
     let held = phone.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(held.content.value()), vec!["a"]);
     assert!(held.flagged);
+    assert!(
+        !held.not_taken,
+        "a write naming its writer is flagged instead"
+    );
     let forgotten = !held_at_switch(&s, &key);
     let written = phone.put_record(&target, &value(&["a"]), vec![]).await;
     assert!(written.is_ok(), "forgotten: {forgotten}; {written:?}");
@@ -9877,7 +9881,8 @@ async fn test_records_failing_directory_is_asked_once_a_minute() {
 /// The wallet's honest write under its renewed certificate, served with the earlier one, a
 /// proof that gives its version, and a view whose version the service raised, read by a
 /// phone that holds only the earlier certificate while the directory fails: the write
-/// names nobody, and the phone follows the version the proof gives, not the view's.
+/// names nobody, and the phone follows the version the proof gives, not the view's. The
+/// record reads as not flagged, but as one whose current write the phone didn't take.
 #[tokio::test]
 async fn test_records_unnamed_write_follows_the_version_its_proof_gives() {
     let s = Setup::new();
@@ -9885,7 +9890,8 @@ async fn test_records_unnamed_write_follows_the_version_its_proof_gives() {
     let (mut wallet, target, key, earlier) = own_write_under_a_closed_renewal(&s).await;
     phone.refresh_identity().await.unwrap();
     phone.read_record(&target).await.unwrap();
-    assert!(phone.shared_record(&key).await.unwrap().is_some());
+    let taken = phone.shared_record(&key).await.unwrap().unwrap();
+    assert!(!taken.not_taken && !taken.flagged);
     wallet
         .put_record(&target, &value(&["a", "b"]), vec![])
         .await
@@ -9909,4 +9915,5 @@ async fn test_records_unnamed_write_follows_the_version_its_proof_gives() {
     let shared = phone.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(shared.content.value()), vec!["a"]);
     assert!(!shared.flagged);
+    assert!(shared.not_taken);
 }

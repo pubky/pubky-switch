@@ -1306,6 +1306,18 @@ impl App {
 // -------------------------------------------------------------------------------------
 // Kept batches at a provider change (`provider.rs`, `recovery.rs`)
 
+/// The messages the batches `reader` keeps under `opq/` put in the outbox once they settle.
+pub(crate) async fn kept_queued(
+    reader: &super::state::Reader,
+) -> Result<Vec<super::send::OutboxItem>, AppError> {
+    Ok(reader
+        .scan::<PendingBatch>(PENDING_PREFIX)
+        .await?
+        .into_iter()
+        .flat_map(|(_, pending)| pending.queued)
+        .collect())
+}
+
 impl App {
     /// The batches kept under `opq/`, by ID.
     pub(crate) async fn kept_batches(&self) -> Result<Vec<([u8; 16], PendingBatch)>, AppError> {
