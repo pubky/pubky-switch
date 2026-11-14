@@ -856,8 +856,7 @@ impl App {
     ///   hold doesn't carry it: restored on another store, the message isn't held. The client
     ///   delivers nothing during [`App::restore`], [`App::load`] or [`App::receive`], only in
     ///   [`App::flush_outbox`], [`App::flush_message`], [`App::send`] and [`App::resend`], so a
-    ///   host that holds again before it calls any of those leaves no window. A build older
-    ///   than holds reads such a backup and drops them.
+    ///   host that holds again before it calls any of those leaves no window.
     ///
     /// # Errors
     ///

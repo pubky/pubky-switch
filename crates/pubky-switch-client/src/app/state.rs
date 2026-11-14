@@ -1130,11 +1130,15 @@ mod tests {
 
     #[test]
     fn test_record_of_another_schema_is_corrupt() {
-        let bytes = br#"{"v":4,"d":{"generation":1}}"#;
-        assert_eq!(
-            decode::<Floor>(bytes).unwrap_err(),
-            AppError::Store(StoreError::Corrupt)
-        );
+        for bytes in [
+            &br#"{"v":0,"d":{"generation":1}}"#[..],
+            &br#"{"v":4,"d":{"generation":1}}"#[..],
+        ] {
+            assert_eq!(
+                decode::<Floor>(bytes).unwrap_err(),
+                AppError::Store(StoreError::Corrupt)
+            );
+        }
         assert_eq!(
             decode::<Floor>(b"not json").unwrap_err(),
             AppError::Store(StoreError::Corrupt)

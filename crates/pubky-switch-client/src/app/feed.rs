@@ -2176,7 +2176,6 @@ impl App {
                 id,
                 ParkedEntry {
                     reason,
-                    released: stored.released,
                     ..stored
                 },
             ),

@@ -732,7 +732,6 @@ fn uncertain_copy(
             id,
             ParkedEntry {
                 reason: ParkReason::Uncertain,
-                released: stored.released,
                 ..stored.clone()
             },
         ));
