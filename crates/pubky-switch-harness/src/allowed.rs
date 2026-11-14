@@ -14,7 +14,7 @@ use crate::compare::Difference;
 /// One accepted difference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Allowed {
-    /// The flow it shows in; [`EVERY_FLOW`] for a difference of the two switches as a whole.
+    /// The flow it shows in.
     pub flow: &'static str,
     /// The line's label, as [`crate::trace::Line::label`] gives it. `*` stands for any run
     /// of characters, here and in the next three.
@@ -23,8 +23,7 @@ pub struct Allowed {
     pub fact: &'static str,
     /// What the service shows; `(nothing)` when it shows nothing there.
     pub service: &'static str,
-    /// What the scripted switch shows; `(nothing)` when it shows nothing there, and
-    /// [`ONE_MORE`] for a number one above the service's.
+    /// What the scripted switch shows; `(nothing)` when it shows nothing there.
     pub scripted: &'static str,
     /// Why the difference is accepted.
     pub reason: &'static str,
@@ -32,44 +31,18 @@ pub struct Allowed {
     pub reference: &'static str,
 }
 
-/// In [`Allowed::flow`]: the entry holds in every flow. Such an entry must show in one flow
-/// at least.
-pub const EVERY_FLOW: &str = "*";
-
 /// What stands for a fact one run didn't show.
 pub const NOTHING: &str = "(nothing)";
-
-/// In [`Allowed::scripted`]: the scripted switch shows a number one above the service's, as a
-/// counter does that starts one higher and moves at the same events.
-pub const ONE_MORE: &str = "one more than the service";
 
 impl Allowed {
     /// Whether this entry allows `difference`.
     pub fn allows(&self, difference: &Difference) -> bool {
         let shown = |value: &Option<String>| value.clone().unwrap_or_else(|| NOTHING.to_owned());
-        let (service, scripted) = (shown(&difference.service), shown(&difference.scripted));
-        let scripted_allowed = if self.scripted == ONE_MORE {
-            match (number_of(&service), number_of(&scripted)) {
-                (Some(service), Some(scripted)) => service.checked_add(1) == Some(scripted),
-                _ => false,
-            }
-        } else {
-            matches(self.scripted, &scripted)
-        };
         matches(self.label, &difference.label)
             && matches(self.fact, &difference.fact)
-            && matches(self.service, &service)
-            && scripted_allowed
+            && matches(self.service, &shown(&difference.service))
+            && matches(self.scripted, &shown(&difference.scripted))
     }
-}
-
-/// The number a fact shows: of a JSON number, or of a short string of digits, as a query
-/// parameter carries one.
-fn number_of(fact: &str) -> Option<u64> {
-    fact.strip_prefix("number ")
-        .or_else(|| fact.strip_prefix("text "))?
-        .parse()
-        .ok()
 }
 
 /// Whether `text` matches `pattern`, where each `*` stands for any run of characters.
@@ -97,18 +70,9 @@ fn matches(pattern: &str, text: &str) -> bool {
     true
 }
 
-/// Every accepted difference: those of the two switches as a whole, then by flow.
-pub static ALLOWED: &[Allowed] = &[Allowed {
-    flow: EVERY_FLOW,
-    label: "*",
-    fact: "* (member order)",
-    service: "*",
-    scripted: "*",
-    reason: "The service writes an answer's members in the order of the wire format's \
-                 tables and examples; the scripted switch writes them sorted by name. A writer \
-                 may use any order, and no reader depends on it.",
-    reference: "Switch wire 1.1, \"Exact bytes\"",
-}];
+/// Every accepted difference, by flow. Empty while the two switches answer every flow
+/// alike.
+pub static ALLOWED: &[Allowed] = &[];
 
 #[cfg(test)]
 mod tests {
@@ -126,37 +90,6 @@ mod tests {
         assert!(!matches("body.*.seq", "body.seq"));
         assert!(matches("a*b*c", "a-b-b-c"));
         assert!(!matches("a*b*c", "a-c"));
-    }
-
-    #[test]
-    fn test_allowed_one_more_takes_only_a_number_one_above() {
-        let entry = Allowed {
-            flow: "example",
-            label: "*",
-            fact: "body.apps_version",
-            service: "number *",
-            scripted: ONE_MORE,
-            reason: "an example",
-            reference: "nowhere",
-        };
-        let difference = |service: &str, scripted: &str| Difference {
-            line: 0,
-            label: "{bob/shop} GET /v1/{alice}/directory".into(),
-            fact: "body.apps_version".into(),
-            service: Some(service.into()),
-            scripted: Some(scripted.into()),
-        };
-        assert!(entry.allows(&difference("number 1", "number 2")));
-        assert!(entry.allows(&difference("number 9", "number 10")));
-        assert!(
-            !entry.allows(&difference("number 1", "number 3")),
-            "two more"
-        );
-        assert!(
-            !entry.allows(&difference("number 2", "number 1")),
-            "one less"
-        );
-        assert!(!entry.allows(&difference("number 1", "null")), "no number");
     }
 
     #[test]
