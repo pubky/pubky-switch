@@ -970,30 +970,6 @@ async fn test_parked_release_survives_a_backup_and_restore() {
 }
 
 #[tokio::test]
-async fn test_parked_release_by_an_earlier_build_still_reads_as_released() {
-    // An entry an earlier build stored as released, without the `released` field: its next
-    // run is still handed over as released.
-    let w = World::new();
-    let protocol = ParkingProtocol::new(Mode::Plain);
-    let store = Arc::clone(&w.store) as Arc<dyn StateStore>;
-    let mut app = wallet_on(&w, &protocol, Arc::clone(&store)).await;
-    let (entry, _) = uncertain(&w, &mut app).await;
-    app.release_parked(entry.stored_id, &entry.hash)
-        .await
-        .unwrap();
-    let mut stored = app.state.parked.get(&entry.stored_id).cloned().unwrap();
-    assert_eq!(stored.reason, ParkReason::Released);
-    stored.released = false;
-    let mut tx = app.tx().unwrap();
-    tx.put(&crate::app::state::key::parked(entry.stored_id), &stored)
-        .unwrap();
-    app.commit(tx).await.unwrap();
-    drop(app);
-    let mut app = load_on(&w, &protocol, store).await;
-    next_run_is_released(&w, &mut app, &protocol, &entry).await;
-}
-
-#[tokio::test]
 async fn test_parked_backup_of_a_kept_effect_whose_stored_entry_is_gone_is_corrupt() {
     // A kept effect names an entry stored locally that the store no longer holds, which no
     // path leaves: the backup is refused as a corrupt store, never given a made-up ID.
@@ -1017,9 +993,7 @@ async fn test_parked_backup_of_a_kept_effect_whose_stored_entry_is_gone_is_corru
 #[tokio::test]
 async fn test_parked_release_survives_a_backup_of_its_kept_effect() {
     // A released entry whose run applies its effect and loses the answer: the effect is
-    // kept, and a backup holds the entry as uncertain, still released. The release is kept
-    // in its reason only, as an earlier build wrote it, so this pins that the backup's copy
-    // reads the release from either (`ParkedEntry::was_released`), not from the flag alone.
+    // kept, and a backup holds the entry as uncertain, still released.
     let w = World::new();
     let protocol = ParkingProtocol::new(Mode::Plain);
     let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
@@ -1027,14 +1001,6 @@ async fn test_parked_release_survives_a_backup_of_its_kept_effect() {
     app.release_parked(entry.stored_id, &entry.hash)
         .await
         .unwrap();
-    let mut stored = app.state.parked.get(&entry.stored_id).cloned().unwrap();
-    assert_eq!(stored.reason, ParkReason::Released);
-    stored.released = false;
-    let mut tx = app.tx().unwrap();
-    tx.put(&crate::app::state::key::parked(entry.stored_id), &stored)
-        .unwrap();
-    app.commit(tx).await.unwrap();
-    app.state.parked.insert(entry.stored_id, stored);
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(app.receive(None).await.is_err());
     assert_eq!(

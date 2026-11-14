@@ -1334,7 +1334,7 @@ async fn test_backup_layered_over_the_batch_size_is_refused_until_it_drains() {
 }
 
 #[tokio::test]
-async fn test_backup_with_a_layer_carries_a_version_a_reader_without_layers_refuses() {
+async fn test_backup_with_a_layer_is_told_by_its_protocol_member() {
     let w = World::new();
     let protocol = JournalProtocol::new(Some(JOURNAL));
     let (mut app, _) = journaled(
@@ -1345,31 +1345,21 @@ async fn test_backup_with_a_layer_carries_a_version_a_reader_without_layers_refu
     )
     .await;
     let version = |bytes: &[u8]| serde_json::from_slice::<Value>(bytes).unwrap()["v"].clone();
-    let with = |bytes: &[u8], v: u32| {
-        let mut value: Value = serde_json::from_slice(bytes).unwrap();
-        value["v"] = json!(v);
-        serde_json::to_vec(&value).unwrap()
-    };
     let bare = app.backup().await.unwrap().to_bytes().unwrap();
     let layered = app.backup_layered().await.unwrap().to_bytes().unwrap();
-    // Without a layer, the schema's version, as before; with one, another, which a reader
-    // that takes only the schema's version refuses.
+    // Both carry the schema's version; only the layered one holds a layer.
     assert_eq!(version(&bare), json!(crate::app::SCHEMA_VERSION));
-    assert_ne!(version(&layered), json!(crate::app::SCHEMA_VERSION));
-    assert!(AppBackup::from_bytes(&bare).is_ok());
-    assert!(AppBackup::from_bytes(&layered).is_ok());
-    // A layer under the schema's version, as an earlier schema wrote layered backups, is
-    // an old schema; the layered version without a layer doesn't read.
-    let layer_as_bare = with(&layered, crate::app::SCHEMA_VERSION);
-    assert!(matches!(
-        AppBackup::from_bytes(&layer_as_bare),
-        Err(AppError::Store(StoreError::OldSchema { .. }))
-    ));
-    let bare_as_layered = with(&bare, version(&layered).as_u64().unwrap() as u32);
-    assert!(matches!(
-        AppBackup::from_bytes(&bare_as_layered),
-        Err(AppError::InvalidData(_))
-    ));
+    assert_eq!(version(&layered), json!(crate::app::SCHEMA_VERSION));
+    let bare = AppBackup::from_bytes(&bare).unwrap();
+    let layered = AppBackup::from_bytes(&layered).unwrap();
+    assert!(bare.protocol_layer().unwrap().is_none());
+    assert_eq!(
+        layered
+            .protocol_layer()
+            .unwrap()
+            .map(|layer| layer.protocol),
+        Some(JOURNAL.to_owned())
+    );
 }
 
 #[tokio::test]

@@ -577,6 +577,8 @@ impl App {
         let id = signed
             .id()
             .ok_or_else(|| AppError::InvalidData("a batch of operations has an ID".into()))?;
+        // The creation number, given out in the commit that keeps it, below.
+        let queued_n: u64 = self.reader().get(KEPT_NEXT).await?.unwrap_or(0);
         let pending = PendingBatch {
             body: signed.body().to_vec(),
             invites: batch.invites,
@@ -590,8 +592,7 @@ impl App {
             // Stamped at its first send ([`App::run_pending`]): kept now, it goes out with
             // the next call that writes when this one can't reach the service.
             kept_ms: None,
-            // Given in the commit that keeps it, below.
-            queued_n: 0,
+            queued_n,
         };
         // The kept batches together stay within what a provider change carries in its one
         // commit ([`MAX_KEPT_BATCHES_BYTES`]).
@@ -610,11 +611,6 @@ impl App {
             ))
             .into());
         }
-        let queued_n: u64 = self.reader().get(KEPT_NEXT).await?.unwrap_or(0);
-        let pending = PendingBatch {
-            queued_n,
-            ..pending
-        };
         let mut tx = self.tx()?;
         tx.put(KEPT_NEXT, &queued_n.saturating_add(1))?;
         tx.put(&pending_key(&id), &pending)?;

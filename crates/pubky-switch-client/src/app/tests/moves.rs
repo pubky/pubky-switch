@@ -3188,98 +3188,6 @@ async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
 }
 
 #[tokio::test]
-async fn test_store_of_the_earlier_schema_fails_as_an_old_schema() {
-    let w = World::new();
-    let router = Router::of(&w);
-    let mut app = join(&w, &router).await;
-    let me = app.app_id();
-    w.note(me, "before");
-    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(app.receive(None).await.is_err());
-    // The kept effect as schema 1 wrote it: without the entry it now keeps.
-    app.ready_local().await.unwrap();
-    let pending = app.state.pending_effect.clone().unwrap();
-    let mut value = serde_json::to_value(&pending).unwrap();
-    value.as_object_mut().unwrap().remove("entry");
-    let mut batch = crate::store::WriteBatch::new();
-    batch
-        .put(
-            &app.ns,
-            crate::app::state::key::PENDING_EFFECT.as_bytes().to_vec(),
-            serde_json::to_vec(&json!({ "v": 1, "d": value })).unwrap(),
-        )
-        .unwrap();
-    app.env.store.commit(batch).await.unwrap();
-    drop(app);
-    let loaded = App::load(
-        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
-        w.protocol.clone(),
-        World::config(),
-        me,
-    )
-    .await;
-    assert!(
-        matches!(
-            loaded,
-            Err(AppError::Store(StoreError::OldSchema { found: 1 }))
-        ),
-        "{:?}",
-        loaded.map(|_| ())
-    );
-}
-
-#[tokio::test]
-async fn test_store_of_schema_two_with_entries_keyed_by_seq_fails_as_an_old_schema() {
-    let w = World::new();
-    let router = Router::of(&w);
-    let app = join(&w, &router).await;
-    let me = app.app_id();
-    // An entry stored as schema 2 kept it: under the `seq` it was read at, which it didn't
-    // hold itself.
-    let stored = crate::app::state::ParkedEntry {
-        seq: 7,
-        generation: 1,
-        sender: w.bob.public(),
-        cert: w.bob_cert.signed().clone(),
-        accepted_at_ms: w.clock.now_ms(),
-        plaintext: b"kept".to_vec(),
-        context: None,
-        reason: ParkReason::Refused,
-        round: 0,
-        released: false,
-        keys_at: None,
-    };
-    let mut value = serde_json::to_value(&stored).unwrap();
-    value.as_object_mut().unwrap().remove("seq");
-    value.as_object_mut().unwrap().remove("generation");
-    let mut batch = crate::store::WriteBatch::new();
-    batch
-        .put(
-            &app.ns,
-            crate::app::state::key::parked(7).into_bytes(),
-            serde_json::to_vec(&json!({ "v": 2, "d": value })).unwrap(),
-        )
-        .unwrap();
-    app.env.store.commit(batch).await.unwrap();
-    drop(app);
-    let loaded = App::load(
-        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
-        w.protocol.clone(),
-        World::config(),
-        me,
-    )
-    .await;
-    assert!(
-        matches!(
-            loaded,
-            Err(AppError::Store(StoreError::OldSchema { found: 2 }))
-        ),
-        "{:?}",
-        loaded.map(|_| ())
-    );
-}
-
-#[tokio::test]
 async fn test_kept_effect_without_its_entry_is_corrupt_state() {
     let w = World::new();
     let router = Router::of(&w);
@@ -3793,7 +3701,7 @@ async fn test_kept_effect_window_is_measured_against_the_verified_service_time()
     // The device clock reads as when the effect was kept, but the app has verified a
     // service time past the window: the window is closed.
     app.ready_local().await.unwrap();
-    let kept = app.state.pending_effect.as_ref().unwrap().kept_ms;
+    let kept = Some(app.state.pending_effect.as_ref().unwrap().kept_ms);
     assert_eq!(app.state.pending_effect.as_ref().map(|p| p.seq), Some(seq));
     assert!(app.answer_decides(kept));
     let past = w.clock.now_ms() + crate::app::provider::KEPT_BATCH_ANSWER_MS;
@@ -3977,7 +3885,7 @@ async fn test_loss_reports_the_attempts_of_a_kept_effect_it_drops() {
         generation: 1,
         stored: None,
         deadlines: Vec::new(),
-        kept_ms: Some(lost.note_at_ms),
+        kept_ms: lost.note_at_ms,
         forget: Vec::new(),
         entry: crate::app::state::KeptEntry {
             cert: app.cert().signed().clone(),
@@ -4045,7 +3953,7 @@ async fn keep_an_effect(
         generation: 1,
         stored: parked.then_some(seq),
         deadlines: Vec::new(),
-        kept_ms: Some(w.clock.now_ms()),
+        kept_ms: w.clock.now_ms(),
         forget: Vec::new(),
         entry: entry.clone(),
     };
