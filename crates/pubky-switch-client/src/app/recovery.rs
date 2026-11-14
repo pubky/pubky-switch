@@ -205,6 +205,9 @@ pub(crate) struct LossRecord {
     pub(crate) conversations_left_out: u64,
     /// How many kept claim entries the upload left out, without a certificate.
     pub(crate) claim_entries_left_out: u64,
+    /// The protocols whose answers to the loss the re-send step committed so far, in
+    /// registration order: the step asks only the others, so no protocol is asked twice.
+    pub(crate) asked: Vec<String>,
 }
 
 impl LossRecord {
@@ -212,16 +215,22 @@ impl LossRecord {
         self.step == LossStep::Done
     }
 
-    /// Keep the counterparties the loss adds back, sorted and once each, at most
-    /// [`MAX_LOSS_CONVERSATIONS`] of them, so the record and its batches stay within the
-    /// store's sizes; and how many it leaves out, with them, in the same commit.
-    fn keep_conversations(&mut self, mut conversations: Vec<String>) {
+    /// Add one protocol's counterparties to those the loss adds back: all of them sorted and
+    /// once each, at most [`MAX_LOSS_CONVERSATIONS`], so the record and its batches stay
+    /// within the store's sizes; and how many are left out, added to those left out
+    /// before, in the same commit. A counterparty past the bound that two protocols name
+    /// is counted for each.
+    fn add_conversations(&mut self, named: Vec<String>) {
+        let mut conversations = std::mem::take(&mut self.conversations);
+        conversations.extend(named);
         conversations.sort();
         conversations.dedup();
         let left_out = conversations.len().saturating_sub(MAX_LOSS_CONVERSATIONS);
         conversations.truncate(MAX_LOSS_CONVERSATIONS);
         self.conversations = conversations;
-        self.conversations_left_out = u64::try_from(left_out).unwrap_or(u64::MAX);
+        self.conversations_left_out = self
+            .conversations_left_out
+            .saturating_add(u64::try_from(left_out).unwrap_or(u64::MAX));
     }
 
     fn view(&self) -> ProviderLoss {
@@ -566,6 +575,8 @@ impl App {
         });
         restore.reconcile = true;
         tx.put(key::RESTORE, restore)?;
+        // Every protocol reconciles again, whichever ended an earlier reconcile mode.
+        tx.delete(key::RECONCILED)?;
         let loss = LossRecord {
             lost_generation: lost,
             generation,
@@ -580,6 +591,7 @@ impl App {
             conversations: Vec::new(),
             conversations_left_out: 0,
             claim_entries_left_out: 0,
+            asked: Vec::new(),
         };
         tx.put(keys::LOSS, &loss)?;
         tx.put(key::META, &self.state.meta)?;
@@ -635,56 +647,83 @@ impl App {
                 loss.step = LossStep::Resend;
             }
             LossStep::Resend => {
-                // The protocol's local writes commit with the step: asked once.
-                let actions = {
-                    let store = std::sync::Arc::clone(self.env.store.store());
-                    let view = LocalView::new(
-                        self.state.meta.identity,
-                        self.state.meta.app_id,
-                        store.as_ref(),
-                        &self.ns,
-                    );
-                    self.protocol.provider_lost(&loss.view(), &view)
-                }
-                // The step stays `Resend` in the record: the next call asks again.
-                .map_err(AppError::Protocol)?;
-                let copy = self.lists_copy().await?;
+                // Each protocol is asked in registration order, and its answer committed
+                // with its name in `asked`, its local writes under its own prefix: one that
+                // fails leaves the step to the next call, which asks only those not asked
+                // yet, so no protocol's answer is lost or asked for twice. The last one's
+                // commit ends the step, with every protocol's conversations merged.
+                let store = std::sync::Arc::clone(self.env.store.store());
+                let left: Vec<(String, std::sync::Arc<dyn super::Protocol>)> = self
+                    .protocols
+                    .iter()
+                    .filter(|registered| !loss.asked.contains(&registered.name))
+                    .map(|registered| {
+                        (
+                            registered.name.clone(),
+                            std::sync::Arc::clone(&registered.protocol),
+                        )
+                    })
+                    .collect();
                 let me = self.state.meta.identity;
                 let may_add = self.state.cert.has_permission(Permission::ConversationAdd);
-                loss.keep_conversations(
-                    actions
-                        .conversations
-                        .iter()
-                        .filter(|who| may_add && **who != me && !copy.deny.contains(who))
-                        .map(pubky_id)
-                        .collect(),
-                );
-                loss.step = LossStep::Conversations;
-                let mut tx = self.tx()?;
-                if local_writes_bytes(&actions.local) > MAX_STEP_LOCAL_BYTES {
-                    // Over the bound: not committed, and not asked again, since the same
-                    // answer would come and the recovery would never go on; the protocol is
-                    // told, and the loss goes on.
-                    self.keep_duty(
-                        &mut tx,
-                        Duty::LocalWritesRefused {
-                            call: {
-                                let view = loss.view();
-                                KeptRefusal::Loss {
+                for (n, (name, protocol)) in left.iter().enumerate() {
+                    let actions = {
+                        let view = LocalView::new(
+                            me,
+                            self.state.meta.app_id,
+                            store.as_ref(),
+                            &self.ns,
+                            name,
+                        );
+                        // The step stays `Resend` in the record: the next call asks again.
+                        protocol
+                            .provider_lost(&loss.view(), &view)
+                            .map_err(AppError::Protocol)?
+                    };
+                    let copy = self.lists_copy().await?;
+                    loss.add_conversations(
+                        actions
+                            .conversations
+                            .iter()
+                            .filter(|who| may_add && **who != me && !copy.deny.contains(who))
+                            .map(pubky_id)
+                            .collect(),
+                    );
+                    loss.asked.push(name.clone());
+                    if n.saturating_add(1) == left.len() {
+                        loss.step = LossStep::Conversations;
+                        loss.asked.clear();
+                    }
+                    let mut tx = self.tx()?;
+                    if local_writes_bytes(&actions.local) > MAX_STEP_LOCAL_BYTES {
+                        // Over the bound: not committed, and not asked again, since the same
+                        // answer would come and the recovery would never go on; the protocol
+                        // is told, and the loss goes on.
+                        let view = loss.view();
+                        self.keep_duty_for(
+                            &mut tx,
+                            vec![name.clone()],
+                            Duty::LocalWritesRefused {
+                                call: KeptRefusal::Loss {
                                     lost_generation: view.lost_generation,
                                     generation: view.generation,
                                     declared_at_ms: view.declared_at_ms,
                                     accepted_from_ms: view.accepted_from_ms,
                                     uncertain_until_ms: view.uncertain_until_ms,
-                                }
+                                },
                             },
-                        },
-                    )?;
-                } else {
-                    tx.local(&actions.local)?;
+                        )?;
+                    } else {
+                        tx.local(&super::protocols::qualify(name, actions.local))?;
+                    }
+                    tx.put(keys::LOSS, &*loss)?;
+                    self.commit(tx).await?;
                 }
-                tx.put(keys::LOSS, &*loss)?;
-                return self.commit(tx).await;
+                if !left.is_empty() {
+                    return Ok(());
+                }
+                loss.step = LossStep::Conversations;
+                loss.asked.clear();
             }
             LossStep::Conversations => {
                 self.loss_conversations(loss).await?;
@@ -989,6 +1028,7 @@ mod tests {
             conversations: Vec::new(),
             conversations_left_out: 0,
             claim_entries_left_out: 0,
+            asked: Vec::new(),
         }
     }
 
@@ -1000,7 +1040,7 @@ mod tests {
             .chain(std::iter::once(format!("{:08}", 0)))
             .collect();
         let mut record = loss();
-        record.keep_conversations(named);
+        record.add_conversations(named);
         assert_eq!(record.conversations.len(), MAX_LOSS_CONVERSATIONS);
         assert_eq!(record.conversations_left_out, 3);
         // The first in key order, once each.
@@ -1013,9 +1053,11 @@ mod tests {
         let bytes = serde_json::to_vec(&record).unwrap();
         let read: LossRecord = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(read.conversations_left_out, 3);
-        // Within the cap, none is left out.
-        record.keep_conversations(vec!["b".into(), "a".into(), "a".into()]);
-        assert_eq!(record.conversations, ["a", "b"]);
+        // Within the cap, none is left out; a second protocol's names are merged in.
+        let mut record = loss();
+        record.add_conversations(vec!["b".into(), "a".into(), "a".into()]);
+        record.add_conversations(vec!["c".into(), "a".into()]);
+        assert_eq!(record.conversations, ["a", "b", "c"]);
         assert_eq!(record.conversations_left_out, 0);
     }
 }

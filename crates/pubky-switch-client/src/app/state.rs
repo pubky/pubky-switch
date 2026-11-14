@@ -81,9 +81,22 @@ pub(crate) mod key {
     use super::{b64, pubky_id, zbase32_encode};
 
     pub(crate) const META: &str = "meta";
+    /// The names of the protocols the app was set up with (`protos`), which every load
+    /// registers.
+    pub(crate) const PROTOCOLS: &str = "protos";
+    /// The protocols that ended the reconcile mode under way (`rcd`,
+    /// [`super::App::end_reconcile_for`]); the mode ends when the last of them does.
+    pub(crate) const RECONCILED: &str = "rcd";
+    /// The expiry each protocol asked of the app's record (`rexp`), by name, `None` for none:
+    /// the record's `expires_at` is the earliest.
+    pub(crate) const RECORD_EXPIRIES: &str = "rexp";
     pub(crate) const KEYS: &str = "keys";
     pub(crate) const CERT: &str = "cert";
     pub(crate) const CERT_RENEWAL: &str = "cert/renewal";
+    /// The hash of the newest renewed certificate the app's protocols refused
+    /// (`cert/refused`, [`super::events::AppEvent::CertificateRefused`]): never taken, and
+    /// never refused with a second event.
+    pub(crate) const CERT_REFUSED: &str = "cert/refused";
     pub(crate) const RECORD: &str = "record";
     pub(crate) const NAMING: &str = "naming";
     pub(crate) const BUNDLE: &str = "bundle";

@@ -43,6 +43,10 @@ impl EpochNotes {
 }
 
 impl Protocol for EpochNotes {
+    fn name(&self) -> String {
+        "notes".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.spec.has_keys(scope)
     }

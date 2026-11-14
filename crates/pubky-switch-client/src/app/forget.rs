@@ -97,12 +97,20 @@ impl App {
     /// which nothing was written.
     pub async fn forget_processed(
         &mut self,
+        protocol: &str,
         sender: [u8; 32],
         msg_id: &str,
         local: &[LocalWrite],
     ) -> Result<bool, AppError> {
         let msg_id = msg_id.to_owned();
+        let local = super::protocols::qualify(protocol, local.iter().cloned());
+        let protocol = protocol.to_owned();
         Box::pin(async move {
+            if !self.protocols.contains(&protocol) {
+                return Err(
+                    Refusal::Usage(format!("no protocol `{protocol}` is registered")).into(),
+                );
+            }
             self.ready_local().await?;
             self.refuse_when_halted()?;
             let processed = self
@@ -114,7 +122,7 @@ impl App {
             for key in keys.iter().flatten() {
                 tx.delete(key)?;
             }
-            tx.local(local)?;
+            tx.local(&local)?;
             self.commit(tx).await?;
             Ok(keys.is_some())
         })

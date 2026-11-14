@@ -27,13 +27,14 @@ use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sealed::SealedValue;
 use serde_json::json;
 
-/// A neutral sample protocol: scope `notes` has keys, apps accept `example.note`, and one
+/// A neutral sample protocol: scope `notes` has keys, apps accept `notes.note`, and one
 /// collection, `example.items`, is read and written under `notes`.
 fn sample_spec() -> ProtocolSpec {
     ProtocolSpec {
+        name: "notes".into(),
         keyed_scopes: vec!["notes".into()],
         collections: vec![items()],
-        accepts: vec!["example.note".into()],
+        accepts: vec!["notes.note".into()],
     }
 }
 
@@ -69,7 +70,7 @@ impl Setup {
             Arc::clone(&homeserver),
         );
         let shop = bob
-            .add_app("shop", &AppSpec::new(&["notes"]), &["example.note"], false)
+            .add_app("shop", &AppSpec::new(&["notes"]), &["notes.note"], false)
             .unwrap();
         let router = Arc::new(Router::new());
         router.add_switch(SWITCH_ORIGIN, alice.switch());
@@ -152,7 +153,7 @@ async fn test_testing_app_joins_and_receives_a_peer_message() {
         .send_to(
             s.alice.switch(),
             s.shop,
-            "example.note",
+            "notes.note",
             json!({ "text": "hello" }),
             &[me],
         )
@@ -169,7 +170,7 @@ async fn test_testing_app_joins_and_receives_a_peer_message() {
     let received = s.protocol.received();
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].sender, s.bob.identity());
-    assert_eq!(received[0].message.kind, "example.note");
+    assert_eq!(received[0].message.kind, "notes.note");
     assert_eq!(received[0].message.body["text"], json!("hello"));
     assert!(app.cursor().seq >= seq);
 }
@@ -424,7 +425,7 @@ async fn test_testing_holding_transport_holds_a_waiting_read_until_an_item_comes
         .send_to(
             switch,
             s.shop,
-            "example.note",
+            "notes.note",
             json!({ "text": "hello" }),
             &[me],
         )
@@ -525,7 +526,7 @@ async fn test_testing_waiting_read_is_not_held_without_cause() {
         .send_to(
             switch,
             s.shop,
-            "example.note",
+            "notes.note",
             json!({ "text": "hello" }),
             &[me],
         )
@@ -573,7 +574,7 @@ fn note(s: &Setup, to: &[[u8; 16]]) -> u64 {
         .send_to(
             s.alice.switch(),
             s.shop,
-            "example.note",
+            "notes.note",
             json!({ "text": "hello" }),
             to,
         )

@@ -17,12 +17,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use pubky_switch_core::records::{IDENTITY_PATH, SIGNER_BACKUP_PATH};
-use pubky_switch_core::scopes::{self, Permission};
+use pubky_switch_core::scopes::{self, Permission, is_protocol_name, owns_root};
 
 use crate::error::{Refusal, Result};
 
-/// The longest protocol name, in characters (Switch wire 3.1 "Scope roots").
-pub const MAX_PROTOCOL_NAME: usize = 32;
+pub use pubky_switch_core::scopes::MAX_PROTOCOL_NAME;
 
 /// The Switch's own Homeserver folders. Only the Switch's formats live there, so a protocol
 /// adds no grant path inside them (Switch spec 3.4, 4.1).
@@ -477,25 +476,6 @@ impl Protocols {
         }
         Ok(())
     }
-}
-
-/// Whether `name` is a protocol name: 1 to 32 characters of `a-z` and `0-9`, starting with a
-/// letter, so that no protocol's root is another's (Switch wire 3.1 "Scope roots").
-fn is_protocol_name(name: &str) -> bool {
-    (1..=MAX_PROTOCOL_NAME).contains(&name.len())
-        && name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-}
-
-/// Whether the protocol `name` may claim the root `root`: its name, or its name followed by
-/// `_` or `-` and more characters (Switch wire 3.1 "Scope roots").
-fn owns_root(name: &str, root: &str) -> bool {
-    root == name
-        || root
-            .strip_prefix(name)
-            .is_some_and(|rest| rest.len() > 1 && (rest.starts_with('_') || rest.starts_with('-')))
 }
 
 /// Whether `path`, a capability's path, covers `target`: it is that path, or a folder it lies

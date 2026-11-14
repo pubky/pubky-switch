@@ -71,7 +71,7 @@ async fn test_sender_document_renewed_certificate_before_the_copy_ages_is_kept()
     let w = World::new();
     let mut app = app_holding_bobs_document(&w).await;
     w.clock.advance_ms(60_000);
-    let renewed = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["scope-a"]);
+    let renewed = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["sample-a"]);
     publish_renewal(&w, &renewed);
     let seq = note_under(&w, &renewed, app.app_id(), "after the renewal");
     let report = app.receive(None).await.unwrap();
@@ -86,7 +86,7 @@ async fn test_sender_document_unlisted_certificate_is_read_again_once_then_dropp
     let w = World::new();
     let mut app = app_holding_bobs_document(&w).await;
     w.clock.advance_ms(60_000);
-    let unlisted = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["scope-a"]);
+    let unlisted = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["sample-a"]);
     let seq = note_under(&w, &unlisted, app.app_id(), "unlisted");
     let reads = w.homeserver.identity_reads(&w.bob.public());
     let report = app.receive(None).await.unwrap();
@@ -127,7 +127,7 @@ async fn test_sender_document_unlisted_certificates_are_read_again_once_per_wind
     w.clock.advance_ms(60_000);
     let me = app.app_id();
     let bob = w.bob.public();
-    let unlisted = |n: u64| cert_for(&w.bob, &w.bob_keys, w.clock.now_ms() + n, &["scope-a"]);
+    let unlisted = |n: u64| cert_for(&w.bob, &w.bob_keys, w.clock.now_ms() + n, &["sample-a"]);
     let first: Vec<u64> = (0..5)
         .map(|n| note_under(&w, &unlisted(n), me, &format!("unlisted {n}")))
         .collect();
@@ -178,7 +178,7 @@ async fn test_sender_document_newly_listed_certificate_within_the_window_is_kept
     w.clock.advance_ms(60_000);
     let me = app.app_id();
     let bob = w.bob.public();
-    let unlisted = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["scope-a"]);
+    let unlisted = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["sample-a"]);
     let dropped = note_under(&w, &unlisted, me, "unlisted");
     let reads = w.homeserver.identity_reads(&bob);
     let report = app.receive(None).await.unwrap();
@@ -189,7 +189,7 @@ async fn test_sender_document_newly_listed_certificate_within_the_window_is_kept
     );
     assert_eq!(w.homeserver.identity_reads(&bob), reads + 1);
     w.clock.advance_ms(10_000);
-    let listed = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["scope-a"]);
+    let listed = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["sample-a"]);
     publish_renewal(&w, &listed);
     let seq = note_under(&w, &listed, me, "newly listed");
     let report = app.receive(None).await.unwrap();
@@ -211,7 +211,7 @@ async fn test_sender_document_unreachable_when_read_again_holds_the_entry() {
     let w = World::new();
     let mut app = app_holding_bobs_document(&w).await;
     w.clock.advance_ms(60_000);
-    let renewed = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["scope-a"]);
+    let renewed = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["sample-a"]);
     publish_renewal(&w, &renewed);
     w.homeserver.set_down(true);
     // Two entries in one read: the second meets the failed read of the first, held too.
@@ -255,7 +255,7 @@ async fn test_sender_document_older_copy_served_again_lists_nothing_back() {
     let mut app = app_holding_bobs_document(&w).await;
     let older = w.homeserver.identity_doc(&w.bob.public()).unwrap();
     w.clock.advance_ms(60_000);
-    let renewed = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["scope-a"]);
+    let renewed = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["sample-a"]);
     publish_renewal(&w, &renewed);
     let seq = note_under(&w, &renewed, app.app_id(), "under the renewal");
     let report = app.receive(None).await.unwrap();

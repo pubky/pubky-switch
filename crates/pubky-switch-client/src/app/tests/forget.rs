@@ -26,6 +26,10 @@ struct Evicting {
 }
 
 impl Protocol for Evicting {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -40,9 +44,6 @@ impl Protocol for Evicting {
     }
     fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
         self.sample.check_body(message)
-    }
-    fn backup_name(&self) -> Option<String> {
-        Some("sample".into())
     }
     fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         if let Some(evict) = message.message.body.get("evict").and_then(Value::as_str) {
@@ -125,7 +126,7 @@ impl Setup {
     }
 
     async fn wallet_on(&self, store: Arc<dyn StateStore>) -> App {
-        let request = self.w.approve(&app_keys("wallet"), &["scope-a"]);
+        let request = self.w.approve(&app_keys("wallet"), &["sample-a"]);
         App::join(
             self.w.env_on(store),
             self.protocol.clone(),
@@ -167,7 +168,7 @@ impl Setup {
 }
 
 async fn note_kept(app: &App, msg_id: &str) -> bool {
-    app.protocol_get(format!("notes/{msg_id}").as_bytes())
+    app.protocol_get("sample", format!("notes/{msg_id}").as_bytes())
         .await
         .unwrap()
         .is_some()
@@ -262,7 +263,7 @@ async fn test_forget_processed_refused_while_its_effect_is_kept() {
         .fail_next(Fault::LoseAnswer { path: "ops".into() });
     app.receive(None).await.unwrap_err();
     let error = app
-        .forget_processed(s.w.bob.public(), &note.msg_id, &[])
+        .forget_processed("sample", s.w.bob.public(), &note.msg_id, &[])
         .await
         .unwrap_err();
     assert!(
@@ -284,12 +285,13 @@ async fn test_forget_processed_outside_a_step_commits_with_the_eviction() {
     }];
     // Another sender's pair, or an unknown msg_id: nothing is held, only the writes go.
     assert!(
-        !app.forget_processed(s.w.alice.public(), &kept.msg_id, &[])
+        !app.forget_processed("sample", s.w.alice.public(), &kept.msg_id, &[])
             .await
             .unwrap()
     );
     assert!(
         !app.forget_processed(
+            "sample",
             s.w.bob.public(),
             "00000000-0000-4000-8000-000000000000",
             &[]
@@ -302,7 +304,7 @@ async fn test_forget_processed_outside_a_step_commits_with_the_eviction() {
     assert!(duplicate(&report.events, again), "{:?}", report.events);
     // The forget and the eviction in one commit.
     assert!(
-        app.forget_processed(s.w.bob.public(), &kept.msg_id, &evict)
+        app.forget_processed("sample", s.w.bob.public(), &kept.msg_id, &evict)
             .await
             .unwrap()
     );
@@ -319,7 +321,7 @@ async fn test_forget_processed_outside_a_step_commits_with_the_eviction() {
     assert!(left.is_empty());
     // Forgetting it again finds nothing.
     assert!(
-        !app.forget_processed(s.w.bob.public(), &kept.msg_id, &[])
+        !app.forget_processed("sample", s.w.bob.public(), &kept.msg_id, &[])
             .await
             .unwrap()
     );
@@ -360,7 +362,7 @@ async fn test_forget_processed_and_its_writes_fail_together() {
     let evict = [LocalWrite::Delete {
         key: format!("notes/{}", kept.msg_id).into_bytes(),
     }];
-    app.forget_processed(s.w.bob.public(), &kept.msg_id, &evict)
+    app.forget_processed("sample", s.w.bob.public(), &kept.msg_id, &evict)
         .await
         .unwrap_err();
     // Neither went: the note is kept and its re-send is a duplicate.
@@ -379,7 +381,7 @@ async fn test_forget_processed_stays_forgotten_across_a_reload_and_a_restore() {
     let (_, other) = s.note(me, json!({ "text": "other" }));
     app.receive(None).await.unwrap();
     assert!(
-        app.forget_processed(s.w.bob.public(), &kept.msg_id, &[])
+        app.forget_processed("sample", s.w.bob.public(), &kept.msg_id, &[])
             .await
             .unwrap()
     );
@@ -438,7 +440,7 @@ async fn test_forget_processed_refused_while_an_entry_stored_locally_holds_it() 
         .unwrap();
     assert!(app.state.pending_effect.is_none() && app.state.parked.contains_key(&id));
     let error = app
-        .forget_processed(s.w.bob.public(), &note.msg_id, &[])
+        .forget_processed("sample", s.w.bob.public(), &note.msg_id, &[])
         .await
         .unwrap_err();
     assert!(

@@ -821,7 +821,7 @@ impl App {
         let plaintext = built.sign(&self.state.keys)?;
         Ok(SignedMessage {
             to: message.to,
-            conversation: message.to != me && self.protocol.adds_conversation(&message.kind),
+            conversation: message.to != me && self.protocols.adds_conversation(&message.kind),
             kind: message.kind,
             msg_id: built.msg_id,
             plaintext,
@@ -944,6 +944,7 @@ impl App {
             let mut withdrawn = Vec::new();
             for item in items {
                 let msg_id = item.msg_id.clone();
+                let to = self.owners_of_kind(&item.kind);
                 let (kept, duty) = item.give_up_delivery();
                 let mut tx = self.tx()?;
                 match &kept {
@@ -952,7 +953,7 @@ impl App {
                     None => tx.delete(&out_key(&msg_id))?,
                 }
                 note_given_up(&mut tx, &msg_id, now)?;
-                self.keep_duty(&mut tx, duty)?;
+                self.keep_duty_for(&mut tx, to, duty)?;
                 self.commit(tx).await?;
                 withdrawn.push(msg_id);
             }
@@ -967,8 +968,10 @@ impl App {
                     }
                     let mut tx = self.tx()?;
                     note_given_up(&mut tx, &msg_id, now)?;
-                    self.keep_duty(
+                    let to = self.owners_of_kind(&item.kind);
+                    self.keep_duty_for(
                         &mut tx,
+                        to,
                         Duty::MessageUndelivered {
                             msg_id: msg_id.clone(),
                             resend: false,
@@ -1103,7 +1106,7 @@ impl App {
         if plaintext.sender_app_id() != app_id {
             return Err(not_ours());
         }
-        let rules = self.protocol.opaque_members();
+        let rules = self.protocols.opaque_of_json(plaintext.json());
         let opaque: Vec<OpaqueMember<'_>> = rules
             .iter()
             .map(|rule| OpaqueMember {
@@ -1127,7 +1130,7 @@ impl App {
             .saturating_add(SENT_RETENTION_MS);
         Ok(OutboxItem {
             to: message.to,
-            conversation: message.to != me && self.protocol.adds_conversation(&message.kind),
+            conversation: message.to != me && self.protocols.adds_conversation(&message.kind),
             kind: message.kind,
             msg_id: message.msg_id,
             plaintext: plaintext.encode(),
@@ -1571,8 +1574,7 @@ impl App {
                 }
                 // A held message makes no request for its delivery: it doesn't count towards
                 // the four.
-                let held =
-                    item.delivery_owed() && self.reader().exists(&hold_key(&item.to)).await?;
+                let held = self.delivery_waits(&item).await?;
                 if !held {
                     tried += 1;
                 }
@@ -1664,8 +1666,10 @@ impl App {
             } else {
                 tx.put(&out_key(msg_id), &item)?;
             }
-            self.keep_duty(
+            let to = self.owners_of_kind(&item.kind);
+            self.keep_duty_for(
                 &mut tx,
+                to,
                 Duty::MessageUndelivered {
                     msg_id: msg_id.to_owned(),
                     resend,
@@ -1692,9 +1696,10 @@ impl App {
         if item.failed.is_some() {
             return Ok(false);
         }
-        // A delivery to a counterparty the host holds isn't tried, a first one or a re-send
-        // ([`App::hold_queued`]); its replay deadline still runs, and its record job goes.
-        let held = item.delivery_owed() && self.reader().exists(&hold_key(&item.to)).await?;
+        // A delivery to a counterparty the host holds, or one its protocol holds back, isn't
+        // tried, a first one or a re-send ([`App::hold_queued`], [`super::Protocol::may_send`]);
+        // its replay deadline still runs, and its record job goes.
+        let held = self.delivery_waits(&item).await?;
         // A delivery with a replay deadline, one a restore put back, one `queue_stored`
         // queued, or a re-send of either, goes only by it, judged at the later of the device
         // clock and a service time verified in this call (Switch spec 11).
@@ -1708,6 +1713,7 @@ impl App {
                 }
             }
             if self.kept_window_now() > deadline {
+                let to = self.owners_of_kind(&item.kind);
                 let (kept, duty) = item.give_up_delivery();
                 let mut tx = self.tx()?;
                 match &kept {
@@ -1717,7 +1723,7 @@ impl App {
                         note_given_up(&mut tx, msg_id, self.now())?;
                     }
                 }
-                self.keep_duty(&mut tx, duty)?;
+                self.keep_duty_for(&mut tx, to, duty)?;
                 self.commit(tx).await?;
                 return Ok(true);
             }
@@ -1820,9 +1826,12 @@ impl App {
         } else {
             tx.put(&out_key(&item.msg_id), &*item)?;
         }
-        // A duty event, kept in the commit that gives the delivery up.
-        self.keep_duty(
+        // A duty event for the protocol of the message's kind, kept in the commit that
+        // gives the delivery up.
+        let to = self.owners_of_kind(&item.kind);
+        self.keep_duty_for(
             &mut tx,
+            to,
             Duty::MessageUndelivered {
                 msg_id: item.msg_id.clone(),
                 resend,
@@ -1913,8 +1922,10 @@ impl App {
         } else {
             tx.put(&out_key(&item.msg_id), &item)?;
         }
-        self.keep_duty(
+        let to = self.owners_of_kind(&item.kind);
+        self.keep_duty_for(
             &mut tx,
+            to,
             Duty::RecordJobDropped {
                 msg_id: item.msg_id.clone(),
                 batch_id: item.record_batch.clone(),
@@ -2188,11 +2199,44 @@ impl App {
         }
     }
 
+    /// Whether the delivery of an outbox message waits: one is owed, and the host holds its
+    /// counterparty ([`App::hold_queued`]) or its protocol holds it back
+    /// ([`super::Protocol::may_send`]). Every call that tries a delivery ([`App::send`],
+    /// [`App::flush_message`], [`App::resend`], [`App::flush_outbox`]) goes through
+    /// `try_item`, which asks this, so no call passes either hold.
+    async fn delivery_waits(&self, item: &OutboxItem) -> Result<bool, AppError> {
+        Ok(item.delivery_owed()
+            && (!self.may_send(item) || self.reader().exists(&hold_key(&item.to)).await?))
+    }
+
+    /// Whether the protocol of an outbox message's kind lets it go out now
+    /// ([`super::Protocol::may_send`]); a message whose kind no protocol owns, or whose
+    /// plaintext doesn't read, goes to its try, which settles it.
+    fn may_send(&self, item: &OutboxItem) -> bool {
+        let Ok(plaintext) = item.plaintext() else {
+            return true;
+        };
+        let rules = self.protocols.opaque_of_json(plaintext.json());
+        let opaque: Vec<OpaqueMember<'_>> = rules
+            .iter()
+            .map(|rule| OpaqueMember {
+                kind: rule.kind.as_deref(),
+                member: rule.member.as_str(),
+            })
+            .collect();
+        let Ok(message) = Message::parse(plaintext.json(), &opaque) else {
+            return true;
+        };
+        self.protocols
+            .of_kind(&message.kind)
+            .is_none_or(|owner| owner.protocol.may_send(&message))
+    }
+
     /// Seal the item's signed plaintext to the recipient apps, and commit the envelope
     /// before it is sent.
     async fn seal(&mut self, item: &mut OutboxItem, invite: Option<&str>) -> Result<(), AppError> {
         let plaintext = item.plaintext()?;
-        let rules = self.protocol.opaque_members();
+        let rules = self.protocols.opaque_of_json(plaintext.json());
         let opaque: Vec<pubky_switch_core::json::OpaqueMember<'_>> = rules
             .iter()
             .map(|rule| pubky_switch_core::json::OpaqueMember {
@@ -2254,9 +2298,9 @@ impl App {
                 .unwrap_or_default(),
         };
         let job = job.job();
-        let protocol = std::sync::Arc::clone(&self.protocol);
+        let protocols = self.protocols.clone();
         self.update_record(&job.target, Vec::new(), |current| {
-            protocol.sent_record(&job, &sent, current)
+            protocols.sent_record(&job, &sent, current)
         })
         .await?;
         Ok(())

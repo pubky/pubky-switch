@@ -51,7 +51,7 @@ pub(crate) struct ItemsProtocol {
 }
 
 pub(crate) fn items() -> Collection {
-    Collection::new("sample.items", Policy::new("scope-a", &["scope-a"]))
+    Collection::new("sample.items", Policy::new("sample-a", &["sample-a"]))
 }
 
 pub(crate) fn value(ids: &[&str]) -> Vec<u8> {
@@ -69,6 +69,10 @@ pub(crate) fn ids(bytes: Option<&[u8]>) -> Vec<String> {
 }
 
 impl Protocol for ItemsProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -203,7 +207,7 @@ impl Setup {
         );
         peer.add_app(
             "shop",
-            &AppSpec::new(&["scope-a"]),
+            &AppSpec::new(&["sample-a"]),
             &["sample.note", "sample.resend"],
             false,
         )
@@ -231,7 +235,7 @@ impl Setup {
 
     /// The signer approves `keys` with `permissions`.
     fn approve(&self, keys: &AppKeys, permissions: &[Permission]) -> JoinRequest {
-        let app = AppSpec::new(&["scope-a"]).with_permissions(permissions);
+        let app = AppSpec::new(&["sample-a"]).with_permissions(permissions);
         self.w.signer.approve(keys, &app).unwrap()
     }
 
@@ -422,7 +426,7 @@ async fn test_directory_naming_an_app_twice_is_refused() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     s.peer
-        .add_app("till", &AppSpec::new(&["scope-a"]), &["sample.note"], true)
+        .add_app("till", &AppSpec::new(&["sample-a"]), &["sample.note"], true)
         .unwrap();
     {
         let mut inner = s.peer.lock();
@@ -453,7 +457,7 @@ async fn test_send_added_app_joins_the_recipients_after_stale_key() {
     app.send(s.note("one")).await.unwrap();
     let till = s
         .peer
-        .add_app("till", &AppSpec::new(&["scope-a"]), &["sample.note"], true)
+        .add_app("till", &AppSpec::new(&["sample-a"]), &["sample.note"], true)
         .unwrap();
     let (_, delivery) = app.send(s.note("two")).await.unwrap();
     assert!(accepted(&delivery), "{delivery:?}");
@@ -1731,7 +1735,7 @@ async fn test_records_listed_at_join_and_other_collections_left_alone() {
     assert_eq!(ids(held.content.value()), vec!["a"]);
     // A collection the protocol doesn't name: the phone takes nothing of it.
     let other = RecordTarget::new(
-        Collection::new("sample.other", Policy::new("scope-a", &["scope-a"])),
+        Collection::new("sample.other", Policy::new("sample-a", &["sample-a"])),
         b"n2",
     );
     wallet
@@ -1939,7 +1943,7 @@ fn flagged_rules(events: &[AppEvent]) -> Vec<String> {
 #[tokio::test]
 async fn test_scripted_record_view_keeps_the_certificate_the_write_was_checked_against() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     let phone = s.join("phone").await;
     let target = s.target("n1");
     wallet
@@ -1949,7 +1953,7 @@ async fn test_scripted_record_view_keeps_the_certificate_the_write_was_checked_a
     let key = wallet.record_key(&target).unwrap();
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
@@ -1975,7 +1979,7 @@ async fn test_scripted_record_view_keeps_the_certificate_the_write_was_checked_a
 #[tokio::test]
 async fn test_records_write_before_a_reduction_is_kept_by_every_reader() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     let mut phone = s.join("phone").await;
     let target = s.target("n1");
     wallet
@@ -1989,7 +1993,7 @@ async fn test_records_write_before_a_reduction_is_kept_by_every_reader() {
 
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
@@ -2045,13 +2049,13 @@ async fn test_records_write_before_a_reduction_is_kept_by_every_reader() {
 #[tokio::test]
 async fn test_records_write_after_a_reduction_closed_is_flagged_by_every_reader() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
 
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewal_of(&s, "wallet", &["scope-c"]);
+    let renewed = renewal_of(&s, "wallet", &["sample-c"]);
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     let opened =
         s.w.signer
@@ -2129,7 +2133,7 @@ async fn test_records_write_after_a_reduction_closed_is_flagged_by_every_reader(
 #[tokio::test]
 async fn test_records_feed_write_before_a_reduction_is_taken() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
     phone.refresh_own_apps().await.unwrap();
@@ -2142,7 +2146,7 @@ async fn test_records_feed_write_before_a_reduction_is_taken() {
 
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
@@ -2166,7 +2170,7 @@ async fn test_records_feed_write_before_a_reduction_is_taken() {
 #[tokio::test]
 async fn test_records_feed_write_keeps_the_best_standing_certificate_in_force() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
     phone.refresh_own_apps().await.unwrap();
@@ -2178,7 +2182,7 @@ async fn test_records_feed_write_keeps_the_best_standing_certificate_in_force() 
 
     s.w.clock.advance_ms(HOUR);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-a", "scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-a", "sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     wallet.receive(None).await.unwrap();
     assert_eq!(wallet.cert().hash(), renewed.hash());
@@ -2203,7 +2207,7 @@ async fn test_records_feed_write_keeps_the_best_standing_certificate_in_force() 
 #[tokio::test]
 async fn test_records_feed_write_after_an_expiry_renewal_is_taken() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a"]).await;
     let earlier = wallet.cert().clone();
     s.w.clock.set_ms(earlier.expires_at() - HOUR);
     let mut phone = s.join("phone").await;
@@ -2211,7 +2215,7 @@ async fn test_records_feed_write_after_an_expiry_renewal_is_taken() {
     phone.refresh_own_apps().await.unwrap();
 
     s.w.clock.set_ms(earlier.expires_at() + 1);
-    let renewed = renewed_cert(&s, "wallet", &["scope-a"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-a"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     wallet.receive(None).await.unwrap();
     assert_eq!(wallet.cert().hash(), renewed.hash());
@@ -2241,14 +2245,14 @@ async fn test_records_feed_write_after_an_expiry_renewal_is_taken() {
 #[tokio::test]
 async fn test_records_feed_write_after_a_renewal_closed_is_taken() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
     phone.refresh_own_apps().await.unwrap();
 
     s.w.clock.advance_ms(HOUR);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-a", "scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-a", "sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     wallet.receive(None).await.unwrap();
     assert_eq!(wallet.cert().hash(), renewed.hash());
@@ -2280,14 +2284,14 @@ async fn test_records_feed_write_after_a_renewal_closed_is_taken() {
 #[tokio::test]
 async fn test_records_feed_write_under_a_scope_a_renewal_added_is_taken() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-c"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
     phone.refresh_own_apps().await.unwrap();
 
     s.w.clock.advance_ms(HOUR);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-a", "scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-a", "sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     wallet.receive(None).await.unwrap();
     assert_eq!(wallet.cert().hash(), renewed.hash());
@@ -2313,7 +2317,7 @@ async fn test_records_feed_write_under_a_scope_a_renewal_added_is_taken() {
 #[tokio::test]
 async fn test_records_renewal_adding_a_read_scope_lists_the_collection() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-c"]).await;
     let mut phone = s.join("phone").await;
     let target = s.target("n1");
     phone
@@ -2326,7 +2330,7 @@ async fn test_records_renewal_adding_a_read_scope_lists_the_collection() {
 
     s.w.clock.advance_ms(HOUR);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-a", "scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-a", "sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     wallet.receive(None).await.unwrap();
     assert_eq!(wallet.cert().hash(), renewed.hash());
@@ -2359,9 +2363,10 @@ fn store_parts_for(s: &Setup, cert: &AppCert) {
 #[tokio::test]
 async fn test_records_renewal_adding_a_sub_scope_lists_its_records() {
     let s = Setup::new();
-    let family = Collection::with_sub_scopes("sample.items", Policy::new("scope-a", &["scope-a"]));
+    let family =
+        Collection::with_sub_scopes("sample.items", Policy::new("sample-a", &["sample-a"]));
     *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a:kiosk"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a:kiosk"]).await;
     let mut phone = s.join("phone").await;
     let target = RecordTarget::new(family.sub_scope("till").unwrap(), b"t1");
     phone
@@ -2373,7 +2378,7 @@ async fn test_records_renewal_adding_a_sub_scope_lists_its_records() {
     assert!(wallet.shared_record(&key).await.unwrap().is_none());
     s.w.clock.advance_ms(HOUR);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-a:kiosk", "scope-a:till"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-a:kiosk", "sample-a:till"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     wallet.receive(None).await.unwrap();
     assert_eq!(wallet.cert().hash(), renewed.hash());
@@ -2394,7 +2399,7 @@ async fn test_records_renewal_adding_no_read_scope_lists_nothing() {
 
     s.w.clock.advance_ms(HOUR);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-a", "scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-a", "sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     wallet.receive(None).await.unwrap();
     wallet.receive(None).await.unwrap();
@@ -2411,7 +2416,7 @@ async fn test_records_renewal_adding_no_read_scope_lists_nothing() {
 #[tokio::test]
 async fn test_records_feed_write_under_a_certificate_never_held_is_judged_by_its_view() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
     let target = s.target("n1");
@@ -2423,7 +2428,7 @@ async fn test_records_feed_write_under_a_certificate_never_held_is_judged_by_its
 
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
@@ -2451,7 +2456,7 @@ async fn test_records_feed_write_under_a_certificate_never_held_is_judged_by_its
 #[tokio::test]
 async fn test_records_feed_write_whose_view_lacks_the_write_scope_names_no_app() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
     let target = s.target("n1");
@@ -2463,7 +2468,7 @@ async fn test_records_feed_write_whose_view_lacks_the_write_scope_names_no_app()
 
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
@@ -2493,7 +2498,7 @@ async fn test_records_feed_write_whose_view_lacks_the_write_scope_names_no_app()
 #[tokio::test]
 async fn test_records_undated_write_is_judged_with_a_certificate_holding_a_write_scope() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
     phone.refresh_own_apps().await.unwrap();
@@ -2506,7 +2511,7 @@ async fn test_records_undated_write_is_judged_with_a_certificate_holding_a_write
 
     s.w.clock.advance_ms(HOUR);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     wallet.receive(None).await.unwrap();
     assert_eq!(wallet.cert().hash(), renewed.hash());
@@ -2529,7 +2534,7 @@ async fn test_records_undated_write_is_judged_with_a_certificate_holding_a_write
 /// day before the renewal, whose keys it returns. The phone joined before the writes and
 /// keeps none of the wallet's certificates.
 async fn writes_before_a_reduction(s: &Setup, count: usize) -> (App, App, Vec<[u8; 32]>, AppCert) {
-    let mut wallet = join_scoped(s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(s, "wallet", &["sample-a", "sample-c"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
     let mut keys = Vec::new();
@@ -2543,7 +2548,7 @@ async fn writes_before_a_reduction(s: &Setup, count: usize) -> (App, App, Vec<[u
     }
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(s, "wallet", &["scope-c"]);
+    let renewed = renewed_cert(s, "wallet", &["sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
@@ -2744,7 +2749,7 @@ async fn test_records_proofless_view_of_a_removed_writers_late_feed_write_is_fla
 #[tokio::test]
 async fn test_records_feed_write_whose_view_is_of_a_later_write_judges_only_that_write() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
     let target = s.target("n1");
@@ -2761,7 +2766,7 @@ async fn test_records_feed_write_whose_view_is_of_a_later_write_judges_only_that
     let later = s.w.switch.record(&key).unwrap();
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
@@ -2799,13 +2804,13 @@ async fn test_records_feed_write_whose_view_is_of_a_later_write_judges_only_that
 #[tokio::test]
 async fn test_records_feed_write_under_held_certificates_reads_no_view() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
     phone.refresh_own_apps().await.unwrap();
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewal_of(&s, "wallet", &["scope-c"]);
+    let renewed = renewal_of(&s, "wallet", &["sample-c"]);
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     let opened =
         s.w.signer
@@ -3000,12 +3005,12 @@ async fn test_records_removed_writer_is_judged_by_distrust_from_by_every_reader(
 #[tokio::test]
 async fn test_records_write_within_a_reductions_tolerance_is_taken_by_every_reader() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewal_of(&s, "wallet", &["scope-c"]);
+    let renewed = renewal_of(&s, "wallet", &["sample-c"]);
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     let opened =
         s.w.signer
@@ -3060,12 +3065,12 @@ async fn test_records_write_within_a_reductions_tolerance_is_taken_by_every_read
 #[tokio::test]
 async fn test_records_view_cert_no_identity_json_lists_is_refused() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     let mut phone = s.join("phone").await;
     phone.receive(None).await.unwrap();
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewal_of(&s, "wallet", &["scope-c"]);
+    let renewed = renewal_of(&s, "wallet", &["sample-c"]);
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     let opened =
         s.w.signer
@@ -3082,7 +3087,7 @@ async fn test_records_view_cert_no_identity_json_lists_is_refused() {
         .await
         .unwrap();
     let key = wallet.record_key(&target).unwrap();
-    let unlisted = renewal_of(&s, "wallet", &["scope-a", "scope-c"]);
+    let unlisted = renewal_of(&s, "wallet", &["sample-a", "sample-c"]);
     s.w.switch.lock().shared.records.get_mut(&key).unwrap().cert = Some(unlisted.signed().clone());
     s.w.switch
         .signer_op(OpKind::CertPut {
@@ -3124,10 +3129,10 @@ async fn test_records_view_cert_no_identity_json_lists_is_refused() {
 /// the failure path above: what a tablet that joins afterwards flags of it from the list.
 async fn rules_for_a_write_before_until(before: u64) -> (Vec<String>, bool) {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewal_of(&s, "wallet", &["scope-c"]);
+    let renewed = renewal_of(&s, "wallet", &["sample-c"]);
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     let opened =
         s.w.signer
@@ -4882,7 +4887,12 @@ async fn test_send_slow_failing_peer_doesnt_starve_the_others() {
         Arc::clone(&s.w.homeserver),
     );
     published
-        .add_app("shop", &AppSpec::new(&["scope-a"]), &["sample.note"], false)
+        .add_app(
+            "shop",
+            &AppSpec::new(&["sample-a"]),
+            &["sample.note"],
+            false,
+        )
         .unwrap();
     s.router.add(
         SLOW,
@@ -4977,7 +4987,7 @@ async fn test_directory_bad_app_is_skipped_and_the_others_used() {
     let mut app = s.join("wallet").await;
     let till = s
         .peer
-        .add_app("till", &AppSpec::new(&["scope-a"]), &["sample.note"], true)
+        .add_app("till", &AppSpec::new(&["sample-a"]), &["sample.note"], true)
         .unwrap();
     {
         let mut inner = s.peer.lock();
@@ -5067,7 +5077,7 @@ async fn test_records_listing_pages_by_bytes() {
 /// renewal closed; the wallet takes the renewal. Returns the wallet, the record's key and
 /// the earlier certificate.
 async fn own_write_under_a_closed_renewal(s: &Setup) -> (App, RecordTarget, [u8; 32], AppCert) {
-    write_under_a_renewal_closed_to(s, &["scope-a", "scope-c"]).await
+    write_under_a_renewal_closed_to(s, &["sample-a", "sample-c"]).await
 }
 
 /// As [`own_write_under_a_closed_renewal`], with a renewed certificate holding `scopes`.
@@ -5075,7 +5085,7 @@ async fn write_under_a_renewal_closed_to(
     s: &Setup,
     scopes: &[&str],
 ) -> (App, RecordTarget, [u8; 32], AppCert) {
-    let mut wallet = join_scoped(s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(s, "wallet", &["sample-a", "sample-c"]).await;
     let target = s.target("n1");
     wallet
         .put_record(&target, &value(&["a"]), vec![])
@@ -5194,7 +5204,7 @@ async fn test_records_other_apps_write_after_its_renewal_entry_is_purged_is_take
 async fn test_records_other_apps_write_after_its_renewal_entry_is_purged_is_flagged() {
     let s = Setup::new();
     let mut phone = s.join("phone").await;
-    let (wallet, target, _key, earlier) = write_under_a_renewal_closed_to(&s, &["scope-c"]).await;
+    let (wallet, target, _key, earlier) = write_under_a_renewal_closed_to(&s, &["sample-c"]).await;
     let purged =
         s.w.signer
             .sign_next(|body| body.renewed.retain(|entry| entry.cert != earlier.hash()))
@@ -5436,7 +5446,7 @@ fn items_id(s: &Setup) -> String {
 #[tokio::test]
 async fn test_scripted_records_by_key_needs_the_read_scope() {
     let s = Setup::new();
-    let wallet = join_scoped(&s, "wallet", &["scope-c"]).await;
+    let wallet = join_scoped(&s, "wallet", &["sample-c"]).await;
     let mut phone = s.join("phone").await;
     let key = phone_record(&s, &mut phone).await;
     let rest = format!("records/{key}");
@@ -5631,19 +5641,19 @@ async fn test_scripted_peer_identity_needed_carries_known_version() {
 #[tokio::test]
 async fn test_records_listing_after_a_widening_waits_for_the_keys() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-c"]).await;
     let mut phone = s.join("phone").await;
     let key =
         pubky_switch_core::enc::unb64_array::<32>(&phone_record(&s, &mut phone).await).unwrap();
     wallet.receive(None).await.unwrap();
     s.w.clock.advance_ms(HOUR);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-a", "scope-c"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-a", "sample-c"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     wallet.receive(None).await.unwrap();
     assert_eq!(wallet.cert().hash(), renewed.hash());
     // The renewal's part came before the document listing it and was skipped: the key of
-    // scope-a is missing, so the listing waits.
+    // sample-a is missing, so the listing waits.
     let listings = s.w.switch.lock().shared.listings;
     wallet.receive(None).await.unwrap();
     assert_eq!(
@@ -5787,7 +5797,7 @@ async fn test_records_reopening_that_fails_is_made_at_the_next_read() {
         report.events
     );
     assert!(
-        wallet.scope_key(2, "scope-a").is_some(),
+        wallet.scope_key(2, "sample-a").is_some(),
         "the key was taken"
     );
     let held = wallet.shared_record(&key).await.unwrap().unwrap();
@@ -5849,7 +5859,7 @@ async fn test_records_unopenable_with_its_key_held_is_tried_once() {
         &[3; 32],
         &s.w.alice.public(),
         2,
-        "scope-a",
+        "sample-a",
         &put.key,
         &value(&["a"]),
     )
@@ -5894,7 +5904,7 @@ async fn test_records_unopenable_with_its_key_held_is_tried_once() {
     s.w.next_doc(|body| body.data_epoch = 3);
     store_parts_for(&s, &wallet.cert().clone());
     let report = wallet.receive(None).await.unwrap();
-    assert!(wallet.scope_key(3, "scope-a").is_some());
+    assert!(wallet.scope_key(3, "sample-a").is_some());
     assert!(
         flagged_rules(&report.events).is_empty(),
         "{:?}",
@@ -5986,7 +5996,7 @@ async fn test_records_read_fresh_keeps_a_copy_past_a_write_that_fails_a_check() 
         &[3; 32],
         &s.w.alice.public(),
         1,
-        "scope-a",
+        "sample-a",
         &put.key,
         &value(&["a", "b"]),
     )
@@ -6204,8 +6214,8 @@ async fn record_waiting_for_an_older_key(
             .unwrap();
     }
     wallet.receive(None).await.unwrap();
-    assert!(wallet.scope_key(3, "scope-a").is_some());
-    assert!(wallet.scope_key(2, "scope-a").is_none());
+    assert!(wallet.scope_key(3, "sample-a").is_some());
+    assert!(wallet.scope_key(2, "sample-a").is_none());
     let target = s.target("n1");
     let key = wallet.record_key(&target).unwrap();
     assert_eq!(
@@ -6289,7 +6299,7 @@ async fn test_records_sent_record_job_waits_for_the_key_of_a_held_value() {
 #[tokio::test]
 async fn test_records_read_fresh_tells_a_refusal_from_an_unreachable_switch() {
     let s = Setup::new();
-    let mut wallet = join_scoped(&s, "wallet", &["scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-c"]).await;
     let mut phone = s.join("phone").await;
     let target = s.target("n1");
     phone
@@ -6826,7 +6836,7 @@ async fn test_records_missed_item_listing_failure_consumes_nothing_after_it() {
     // committed with the item, and the listing stays owed.
     assert_eq!(s.protocol.sample.missed.lock().unwrap().len(), 1);
     assert!(
-        app.protocol_get(format!("missed/{missed}").as_bytes())
+        app.protocol_get("sample", format!("missed/{missed}").as_bytes())
             .await
             .unwrap()
             .is_some()
@@ -7347,6 +7357,10 @@ struct SharedReader {
 }
 
 impl Protocol for SharedReader {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.items.has_keys(scope)
     }
@@ -7810,7 +7824,7 @@ async fn test_records_key_on_the_same_page_as_the_unreadable_write_opens_it() {
     store_parts_for(&s, &wallet.cert().clone());
     wallet.receive(None).await.unwrap();
     assert!(
-        wallet.scope_key(2, "scope-a").is_some(),
+        wallet.scope_key(2, "sample-a").is_some(),
         "the key was taken"
     );
     for _ in 0..2 {
@@ -8053,10 +8067,11 @@ async fn test_records_renewal_widening_after_a_whole_listing_lists_again() {
 
 async fn renewal_widening_a_listing(split: bool) {
     let s = Setup::new();
-    let family = Collection::with_sub_scopes("sample.items", Policy::new("scope-a", &["scope-a"]));
-    let big = Collection::with_sub_scopes("sample.big", Policy::new("scope-a", &["scope-a"]));
+    let family =
+        Collection::with_sub_scopes("sample.items", Policy::new("sample-a", &["sample-a"]));
+    let big = Collection::with_sub_scopes("sample.big", Policy::new("sample-a", &["sample-a"]));
     *s.protocol.collections.lock().unwrap() = Some(vec![family.clone(), big.clone()]);
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a:kiosk"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a:kiosk"]).await;
     let mut phone = s.join("phone").await;
     let till = RecordTarget::new(family.sub_scope("till").unwrap(), b"t1");
     phone
@@ -8079,7 +8094,7 @@ async fn renewal_widening_a_listing(split: bool) {
     // The renewal is stored at the switch: the wallet sees it in its feed and keeps it.
     s.w.clock.advance_ms(HOUR);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-a:kiosk", "scope-a:till"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-a:kiosk", "sample-a:till"]);
     wallet.receive(None).await.unwrap();
     assert_eq!(wallet.cert().hash(), earlier.hash());
     // A missed item owes a listing; with one record a page, the family's one page, then
@@ -8450,9 +8465,10 @@ fn renewal_another_device_took(s: &Setup, earlier: &AppCert, renewed: &AppCert) 
 #[tokio::test]
 async fn test_records_renewal_another_device_took_that_widens_lists_the_family() {
     let s = Setup::new();
-    let family = Collection::with_sub_scopes("sample.items", Policy::new("scope-a", &["scope-a"]));
+    let family =
+        Collection::with_sub_scopes("sample.items", Policy::new("sample-a", &["sample-a"]));
     *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a:kiosk"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a:kiosk"]).await;
     let mut phone = s.join("phone").await;
     let till = RecordTarget::new(family.sub_scope("till").unwrap(), b"t1");
     phone
@@ -8466,7 +8482,7 @@ async fn test_records_renewal_another_device_took_that_widens_lists_the_family()
     assert!(wallet.shared_record(&key).await.unwrap().is_none());
     s.w.clock.advance_ms(HOUR);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-a:kiosk", "scope-a:till"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-a:kiosk", "sample-a:till"]);
     store_parts_for(&s, &renewed);
     renewal_another_device_took(&s, &earlier, &renewed);
     for _ in 0..4 {
@@ -8486,16 +8502,17 @@ async fn test_records_renewal_another_device_took_that_widens_lists_the_family()
 #[tokio::test]
 async fn test_records_renewal_another_device_took_that_narrows_owes_no_listing() {
     let s = Setup::new();
-    let family = Collection::with_sub_scopes("sample.items", Policy::new("scope-a", &["scope-a"]));
+    let family =
+        Collection::with_sub_scopes("sample.items", Policy::new("sample-a", &["sample-a"]));
     *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a:kiosk", "scope-a:till"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a:kiosk", "sample-a:till"]).await;
     wallet.receive(None).await.unwrap();
     s.w.clock.advance_ms(3_000);
     wallet.receive(None).await.unwrap();
     assert!(!wallet.listing_owed().await.unwrap());
     s.w.clock.advance_ms(HOUR);
     let earlier = wallet.cert().clone();
-    let renewed = renewed_cert(&s, "wallet", &["scope-a:kiosk"]);
+    let renewed = renewed_cert(&s, "wallet", &["sample-a:kiosk"]);
     store_parts_for(&s, &renewed);
     renewal_another_device_took(&s, &earlier, &renewed);
     for _ in 0..3 {
@@ -9385,7 +9402,12 @@ async fn test_send_two_slow_failing_peers_dont_starve_the_others() {
             Arc::clone(&s.w.homeserver),
         );
         published
-            .add_app("shop", &AppSpec::new(&["scope-a"]), &["sample.note"], false)
+            .add_app(
+                "shop",
+                &AppSpec::new(&["sample-a"]),
+                &["sample.note"],
+                false,
+            )
             .unwrap();
         s.router.add(
             &origin,
@@ -9661,7 +9683,7 @@ async fn test_records_write_under_a_closed_renewal_served_without_its_proof_name
 async fn test_records_one_write_shown_at_new_versions_is_flagged_once() {
     let s = Setup::new();
     let mut phone = s.join("phone").await;
-    let (wallet, target, key, earlier) = write_under_a_renewal_closed_to(&s, &["scope-c"]).await;
+    let (wallet, target, key, earlier) = write_under_a_renewal_closed_to(&s, &["sample-c"]).await;
     let purged =
         s.w.signer
             .sign_next(|body| body.renewed.retain(|entry| entry.cert != earlier.hash()))
@@ -9729,7 +9751,7 @@ async fn test_records_flagged_writes_are_bounded_per_record() {
 async fn test_records_upload_under_a_reduced_renewal_is_written_over() {
     let s = Setup::new();
     let mut phone = s.join("phone").await;
-    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
     let target = s.target("n1");
     wallet
         .put_record(&target, &value(&["a"]), vec![])
@@ -9744,7 +9766,7 @@ async fn test_records_upload_under_a_reduced_renewal_is_written_over() {
         .unwrap();
     s.w.clock.advance_ms(DAY_MS);
     let earlier = wallet.cert().clone();
-    let renewed = renewal_of(&s, "wallet", &["scope-c"]);
+    let renewed = renewal_of(&s, "wallet", &["sample-c"]);
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     let opened =
         s.w.signer

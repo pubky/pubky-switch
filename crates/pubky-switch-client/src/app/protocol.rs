@@ -29,10 +29,8 @@
 //! The protocol's local state lives in the app's namespace under [`LocalWrite`] keys, which
 //! the app keeps apart from its own (`STATE.md`).
 
-use pubky_switch_core::json::OpaqueMember;
 use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::ops::{Condition, OpKind, RecordVersion};
-use pubky_switch_core::receive::KindRules;
 use pubky_switch_core::records::{AppCert, AppRecord, Standing};
 use serde_json::Value;
 
@@ -72,7 +70,8 @@ pub struct WriteBase {
 /// checked against the integer range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpaqueRule {
-    /// The kind the rule applies to, or `None` for every kind.
+    /// The kind the rule applies to, or `None` for every kind of the protocol that gives
+    /// the rule.
     pub kind: Option<String>,
     /// The member of `body`.
     pub member: String,
@@ -136,17 +135,19 @@ pub struct ReceivedMessage {
 /// ([`crate::store::MAX_VALUE_BYTES`] 16 MiB per value, [`crate::store::MAX_BATCH_BYTES`]
 /// 32 MiB per commit):
 ///
-/// - **Kept, in base64:** each write is kept as `{"Put":{"key":"…","value":"…"}},`, its
-///   key and value in base64url, at most `4/3 (k + v) + 40` bytes, which is under
-///   `4/3 (k + v + 64)` since 4/3 x 64 > 40. So writes at the bound keep in at most
-///   4/3 x 4 MiB = 5.34 MiB.
+/// - **Kept, in base64:** each write is kept qualified, its key or prefix after the
+///   protocol's name and `/` (at most 33 bytes), as `{"Put":{"key":"...","value":"..."}},`,
+///   its key and value in base64url: at most `4/3 (k + 33 + v) + 40 = 4/3 (k + v) + 84`
+///   bytes, which is under `4/3 (k + v + 72)` since 4/3 x 72 = 96. So writes at the bound
+///   keep in at most 4/3 x 4 MiB = 5.34 MiB.
 /// - **A kept effect** (`pending/effect`) adds its batch, at most the 4 MiB `POST /ops`
 ///   body (Switch wire 7.1), 5.34 MiB in base64, and its entry: the plaintext (at most the
 ///   64 KiB envelope, 87 KiB in base64), the certificate (under 33 KiB) and a context (1
 ///   KiB), with under 8 KiB of other fields: under 10.9 MiB, below the 16 MiB value size.
 ///   A kept batch (`opq/`) carries the same body and writes, and the messages it queues.
-/// - **Committed:** each write takes its key and value, the namespace (at most 33 bytes)
-///   and the `p/` prefix, under `k + v + 64`: at most 4 MiB. An applied effect's outcome
+/// - **Committed:** each write takes its key and value, the namespace (at most 33 bytes),
+///   the `p/` prefix and the protocol's name and `/` (at most 33 bytes), under
+///   `k + v + 72`: at most 4 MiB. An applied effect's outcome
 ///   adds at most 7 cached record writes (each under 1.2 MiB with its proof and opened
 ///   value), under 13 MiB in all, below the 32 MiB batch size.
 pub const MAX_STEP_LOCAL_BYTES: usize = 4 * 1024 * 1024;
@@ -172,7 +173,7 @@ pub const MAX_LOSS_CONVERSATIONS: usize = 100_000;
 
 /// What each write counts against [`MAX_STEP_LOCAL_BYTES`] beside its key and value: the
 /// room its stored and kept forms take around them.
-pub const LOCAL_WRITE_OVERHEAD_BYTES: usize = 64;
+pub const LOCAL_WRITE_OVERHEAD_BYTES: usize = 72;
 
 /// The bytes `writes` count against [`MAX_STEP_LOCAL_BYTES`]: for each write, the raw
 /// length of its key (a prefix for [`LocalWrite::DeletePrefix`]) and of its value, plus
@@ -231,16 +232,16 @@ impl std::fmt::Debug for LocalWrite {
     }
 }
 
-/// The protocol's layer of an app backup (Switch spec 12.4): its own local state, such as
+/// A protocol's layer of an app backup (Switch spec 12.4): its own local state, such as
 /// its journal, in a form it chooses ([`Protocol::backup_layer`]), carried in the
-/// [`super::AppBackup`] ([`super::App::backup_layered`]) and installed by
-/// [`super::App::restore`] in
-/// the same commit as the app's own state ([`Protocol::restore_layer`]). Opaque to the app.
+/// [`super::AppBackup`] ([`super::App::backup_layered`]), one layer per protocol, and
+/// installed by [`super::App::restore`] in the same commit as the app's own state
+/// ([`Protocol::restore_layer`]). Opaque to the app.
 /// Sensitive: its `Debug` shows only the protocol's name and the data's size.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProtocolLayer {
-    /// The protocol that made it, as its [`Protocol::backup_name`] gives it: a restore takes
-    /// the layer only with a protocol of that name.
+    /// The protocol that made it, as its [`Protocol::name`] gives it: a restore hands the
+    /// layer only to the protocol registered under that name.
     pub protocol: String,
     /// The protocol's data.
     pub data: Vec<u8>,
@@ -597,8 +598,41 @@ pub struct DenyListGap {
     pub list_read: bool,
 }
 
-/// A protocol on the Switch, as the app layer uses it. Object-safe; the app holds an
-/// `Arc<dyn Protocol>`.
+/// A protocol on the Switch, as the app layer uses it. Object-safe; the app holds each
+/// protocol it runs as an `Arc<dyn Protocol>` in its [`super::ProtocolSet`].
+///
+/// # Several protocols on one app
+///
+/// One app may run several protocols, each registered under its [`Protocol::name`]
+/// (Switch spec 3.2, wire 3.1 "Several protocols"); the app routes each callback to one of
+/// them, or hands it to each ([`super::ProtocolSet`]). A protocol keeps to these rules, so
+/// that no protocol's answer reaches another's messages, keys or state:
+///
+/// - **Kinds** are prefixed by the protocol's name, or by one of its roots (Switch wire
+///   3.1 "Scope roots", 5.1): the app routes a message by its kind's prefix, and drops a
+///   kind no registered protocol owns at check 8.
+/// - **[`Protocol::accepts`] and [`Protocol::check_scopes`]** cover only the protocol's own
+///   kinds: the app leaves out of its record a kind another protocol owns, and never asks
+///   one protocol about another's kinds.
+/// - **An [`OpaqueRule`] for every kind** (`kind: None`) covers every kind of this
+///   protocol, and no other's.
+/// - **[`Protocol::has_keys`]** is asked only about the protocol's own roots.
+/// - **Collection names** are unique across the protocols of one app: the set refuses two
+///   protocols giving one name, and routes marks, regressions and sent records by it.
+/// - **Inputs to `blind`** are domain-separated, such as by a label naming the protocol,
+///   so two protocols never derive the same record or claim key from their own inputs.
+/// - **Local state**: each protocol reads and writes only its own key space, which the app
+///   keeps under `p/<name>/`; a `DeletePrefix` of the empty prefix clears that protocol's
+///   state alone.
+/// - **What carries no kind**, such as [`Protocol::resend_needed`], [`Protocol::missed`],
+///   the deny list calls and [`Protocol::provider_lost`], is handed to every protocol, and
+///   each protocol's failure is owed to it alone. Until it takes a re-send or missed call
+///   it owes, it is handed nothing later, its records' writes wait with its entries, and a
+///   deny list gap waits for every protocol; a call every protocol owes stops the read, as
+///   with one protocol.
+/// - **Duty events** name the protocols they are for ([`super::App::ack_events_for`]): the
+///   protocol of the kind, collection, stored entry or kept batch they name, every protocol
+///   otherwise.
 ///
 /// # Callbacks and the store
 ///
@@ -640,6 +674,41 @@ pub struct DenyListGap {
 /// ([`super::App::ack_events`]), so a protocol tolerates seeing one twice, and acts on it
 /// by its [`super::EventId`] or by the state it names.
 pub trait Protocol: Send + Sync {
+    /// The protocol's name (Switch wire 3.1 "Scope roots"): 1 to 32 characters of `a-z`
+    /// and `0-9`, starting with a letter, the prefix of its kinds and the root of its
+    /// scopes. The app keeps the protocol's local state under it (`p/<name>/`), names the
+    /// protocol's backup layer by it ([`ProtocolLayer::protocol`]), and keeps the names
+    /// it was set up with, so a later [`super::App::load`] takes only a set that registers
+    /// each of them. It never changes for a protocol.
+    fn name(&self) -> String;
+
+    /// Whether the app's own certificate is one the protocol runs with, beyond the
+    /// Switch's checks, such as scopes or permissions it requires: checked by
+    /// [`super::App::join`] and [`super::App::restore`] before they write anything, and by
+    /// [`super::App::load`]. Every certificate by default.
+    ///
+    /// # Errors
+    ///
+    /// The rule the certificate breaks, without content: the call is refused
+    /// ([`super::Refusal::Certificate`]) and nothing is written.
+    fn check_own_certificate(&self, cert: &AppCert) -> Result<(), String> {
+        let _ = cert;
+        Ok(())
+    }
+
+    /// Whether a message of the protocol's that the outbox holds goes out now: asked before
+    /// every try of its delivery, a first one or a re-send, whichever call makes it
+    /// ([`super::App::send`], [`super::App::flush_message`], [`super::App::resend`],
+    /// [`super::App::flush_outbox`]). `false` keeps it queued, with its `msg_id` and bytes,
+    /// for a later try, as a hold of its counterparty does ([`super::App::hold_queued`]):
+    /// its conversation entry waits with it, its replay deadline still runs, and the
+    /// messages of the app's other protocols go on. Asked only about the protocol's own
+    /// messages; every message by default.
+    fn may_send(&self, message: &Message) -> bool {
+        let _ = message;
+        true
+    }
+
     /// The opaque members of the protocol's message bodies (Switch wire 1.1). None by
     /// default.
     fn opaque_members(&self) -> Vec<OpaqueRule> {
@@ -713,10 +782,11 @@ pub trait Protocol: Send + Sync {
     ///
     /// A [`StoreFailure`] when the protocol can't build its writes now, such as when its own
     /// state can't be read, of either kind. The cursor still passes the entries, and the app
-    /// keeps `needed` in that same commit and calls this again with it at the start of each
-    /// later read, across loads, before anything else is handed, until it returns writes;
-    /// while it fails, the read hands nothing after it, of any kind (Switch spec 8.3)
-    /// ([`super::App::owed_protocol_calls`]).
+    /// keeps `needed` in that same commit, owed to this protocol alone, and calls this again
+    /// with it at the start of each later read, across loads, before anything else is
+    /// handed to this protocol, until it returns writes; while it fails, the read hands
+    /// this protocol nothing after it, of any kind, and goes on for the app's other
+    /// protocols (Switch spec 8.3) ([`super::App::owed_protocol_calls`]).
     fn resend_needed(&self, needed: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure>;
 
     /// Entries missed while lagging: as [`Protocol::resend_needed`], failure included.
@@ -744,7 +814,7 @@ pub trait Protocol: Send + Sync {
     ///   once the app reads the next, isn't made: it would come after later changes, so
     ///   the protocol is told a gap at that position instead.
     /// - **After a restore:** a backup holds the protocol's layer as committed when it was
-    ///   taken, and none of the changes or gaps owed then. So every restore tells the
+    ///   taken, and none of the changes or gaps owed then. So every restore tells every
     ///   protocol a gap at the backup's position, with the full list, whatever the backup
     ///   held, after the owed calls the restore carries up to that position; the
     ///   changes after it come as the feed hands them.
@@ -756,9 +826,10 @@ pub trait Protocol: Send + Sync {
     ///
     /// # Errors
     ///
-    /// As [`Protocol::resend_needed`]. A failed change is owed and made again at the start
-    /// of each later read, before anything else is handed; the read stops there while it
-    /// fails, and after [`RETRY_EVENT_READS`] such reads the app tells the host
+    /// As [`Protocol::resend_needed`], but for every protocol: a failed change is owed to
+    /// the protocol that failed it, and made again for it alone at the start of each later
+    /// read, before anything else is handed; the read stops there for every protocol while
+    /// it fails, and after [`RETRY_EVENT_READS`] such reads the app tells the host
     /// ([`super::AppEvent::OwedCallHeld`]). Writes over [`MAX_STEP_LOCAL_BYTES`] aren't
     /// committed and the change isn't made again, with
     /// [`super::AppEvent::LocalWritesRefused`].
@@ -775,14 +846,21 @@ pub trait Protocol: Send + Sync {
     /// A gap comes after a restore, a provider loss, a checkpoint past the cursor, a change
     /// whose writer the directory no longer lists, a join, a renewal that adds `lists.read`
     /// and every [`super::App::allow_list`]: whenever the app's copy of
-    /// the lists is taken whole from a list read, the protocol is given that list as a gap.
-    /// The writes are committed on their own, with the owed gap deleted; the copy of the
-    /// lists is then replaced from the same answer in a commit of its own, best effort,
-    /// which lists too large for one commit leave as it was, not known complete.
+    /// the lists is taken whole from a list read, every protocol is given that list as a
+    /// gap. It is told to every protocol in turn, and all their writes go in one commit:
+    /// when every protocol took it, that commit deletes the gap, and the copy of the lists
+    /// is then replaced from the same answer in a commit of its own, best effort, which
+    /// lists too large for one commit leave as it was, not known complete. When one fails,
+    /// the writes of those that took it are committed with the gap still owed to every
+    /// protocol, so a later read tells it to each again, with the list the copy is then
+    /// taken from, and the read holds meanwhile. A gap waits, and the read holds, while a
+    /// protocol owes a call from before it.
     ///
     /// A gap may be told again at the same position, each time with the full list, which
-    /// sets the same state. One told with `list_read` false, the answer not readable, is
-    /// owed again at the next read, as long as the answer can't be read. Writes over
+    /// sets the same state: every gap noted is told to every protocol, one that took an
+    /// earlier gap still owed to another included. One told with `list_read` false, the
+    /// answer not readable, is owed again at the next read, as long as the answer can't be
+    /// read, also while another protocol still owes it. Writes over
     /// [`MAX_STEP_LOCAL_BYTES`] aren't committed: the gap is refused with
     /// [`super::AppEvent::LocalWritesRefused`] and counts as told, and no further gap
     /// follows for it. Nothing by default.
@@ -802,7 +880,9 @@ pub trait Protocol: Send + Sync {
     /// counterparties whose conversation entries the app adds back, at most
     /// [`MAX_LOSS_CONVERSATIONS`]: how many past it were left out is kept with the loss
     /// ([`super::RecoveryInfo::conversations_left_out`]). The app commits the local writes
-    /// once, with that step; a crash before that commit calls it again. Writes over
+    /// once, with the protocol's name as asked; a crash before that commit calls it again.
+    /// Each protocol of the app is asked in registration order, its answer committed on its
+    /// own, and the counterparties all of them name are added back together. Writes over
     /// [`MAX_STEP_LOCAL_BYTES`] aren't committed and the loss goes on, with
     /// [`super::AppEvent::LocalWritesRefused`]. `view` reads the protocol's local state,
     /// read-only, such as to find the counterparties of its unfinished activity; a protocol
@@ -813,7 +893,7 @@ pub trait Protocol: Send + Sync {
     /// A [`StoreFailure`] when the protocol can't build its actions now, such as when its own
     /// state can't be read. The recovery stays at this step, which its record keeps, and the
     /// app's call fails with [`super::AppError::Protocol`], apart from the app's own store
-    /// failing; the next call asks again.
+    /// failing; the next call asks again, the protocols that answered before it not.
     fn provider_lost(
         &self,
         loss: &ProviderLoss,
@@ -913,15 +993,6 @@ pub trait Protocol: Send + Sync {
         None
     }
 
-    /// The name of the layers the protocol adds to app backups ([`ProtocolLayer`]):
-    /// [`super::App::restore`] takes a backup's layer only with a protocol that gives the
-    /// same name, and refuses a backup whose layer another protocol, or a protocol without a
-    /// name, made, rather than drop that data. `None` by default: the protocol takes no
-    /// layer, and [`super::App::backup_layered`] refuses.
-    fn backup_name(&self) -> Option<String> {
-        None
-    }
-
     /// The bytes of the protocol's backup layer from its local state as committed: every
     /// key and value it holds, in key order, read by [`super::App::backup_layered`] in the
     /// same call as the app's own state. [`Protocol::restore_layer`] reads them back. By
@@ -989,50 +1060,6 @@ pub trait Protocol: Send + Sync {
     ) -> Option<Vec<u8>> {
         let _ = (job, sent, current);
         None
-    }
-}
-
-/// The protocol's kind rules as the core's recipient checks take them, with the own
-/// certificate for check 8.
-pub(crate) struct Rules<'a> {
-    pub(crate) protocol: &'a dyn Protocol,
-    pub(crate) own: &'a AppCert,
-    pub(crate) opaque: Vec<OpaqueMember<'a>>,
-}
-
-impl<'a> Rules<'a> {
-    pub(crate) fn new(
-        protocol: &'a dyn Protocol,
-        own: &'a AppCert,
-        rules: &'a [OpaqueRule],
-    ) -> Self {
-        Self {
-            protocol,
-            own,
-            opaque: rules
-                .iter()
-                .map(|rule| OpaqueMember {
-                    kind: rule.kind.as_deref(),
-                    member: rule.member.as_str(),
-                })
-                .collect(),
-        }
-    }
-}
-
-impl KindRules for Rules<'_> {
-    fn opaque_members(&self) -> &[OpaqueMember<'_>] {
-        &self.opaque
-    }
-
-    fn sent_between_own_apps(&self, kind: &str) -> bool {
-        self.protocol.sent_between_own_apps(kind)
-    }
-
-    fn check_scopes(&self, message: &Message, sender: &AppCert) -> pubky_switch_core::Result<()> {
-        self.protocol
-            .check_scopes(message, sender, self.own)
-            .map_err(pubky_switch_core::Error::Invalid)
     }
 }
 

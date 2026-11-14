@@ -1302,7 +1302,7 @@ impl App {
     ) -> Result<bool, AppError> {
         let mut progress: ListProgress = self.reader().get(LIST_AT).await?.unwrap_or_default();
         let collections: Vec<Collection> = self
-            .protocol
+            .protocols
             .collections()
             .into_iter()
             .filter(|c| c.readable_by(&self.state.cert))
@@ -1337,9 +1337,9 @@ impl App {
     /// holds that reads a collection of the protocol (Switch spec 3.5).
     fn listing_lacks_keys(&self) -> bool {
         let epoch = self.state.own_doc.data_epoch();
-        let collections = self.protocol.collections();
+        let collections = self.protocols.collections();
         self.state.cert.scopes().iter().any(|scope| {
-            self.protocol.has_keys(scope)
+            self.protocols.has_keys(scope)
                 && self.state.scope_keys.get(epoch, scope).is_none()
                 && collections.iter().any(|c| c.read_by_scope(scope))
         })
@@ -2003,7 +2003,7 @@ impl App {
     /// collection's family: the member it names.
     fn collection_of(&self, put: &RecordPut) -> Option<Collection> {
         let identity = self.state.meta.identity;
-        self.protocol
+        self.protocols
             .collections()
             .into_iter()
             .find(|c| c.id(&identity) == put.collection && c.admits(&put.policy))
@@ -2327,7 +2327,7 @@ impl App {
         let own = own || accepted.writer == self.state.meta.app_id;
         if !own
             && let Some(mark) = &seen
-            && let Some(reason) = self.protocol.record_regression(
+            && let Some(reason) = self.protocols.record_regression(
                 &accepted.collection.name,
                 &mark.mark,
                 new_value,
@@ -2355,7 +2355,7 @@ impl App {
         let marked = if keeps_mark {
             None
         } else {
-            self.protocol.record_seen(
+            self.protocols.record_seen(
                 &accepted.collection.name,
                 if own {
                     None
@@ -2374,8 +2374,10 @@ impl App {
                 if own {
                     tx.delete(&seen_key(&key))?;
                 }
-                self.keep_duty(
+                let to = self.owners_of_collection(&accepted.collection.name);
+                self.keep_duty_for(
                     tx,
+                    to,
                     Duty::RecordUncheckable {
                         key,
                         writer: accepted.writer,
@@ -2513,7 +2515,7 @@ impl App {
             if self.state.scope_keys.get(epoch, read_scope).is_none() {
                 self.ensure_scope_keys().await?;
             }
-            refuse_unmarkable(self.protocol.as_ref(), target, value)?;
+            refuse_unmarkable(&self.protocols, target, value)?;
             let key = self.record_key(target)?;
             let held = self.held_record(&key).await?;
             let put = record_put(&self.state, target, value, held.as_ref())?;
@@ -2687,6 +2689,21 @@ impl App {
         }
     }
 
+    /// The protocol whose collection holds the record at `key`, as far as the app knows: the
+    /// collection of the record it holds, or the one it noted for a record it creates;
+    /// `None` when it knows neither, or no registered protocol owns the collection.
+    pub(crate) async fn record_protocol(&self, key: &[u8; 32]) -> Result<Option<String>, AppError> {
+        let collection = match self.held_record(key).await? {
+            Some(held) => Some(held.collection),
+            None => self.reader().get::<String>(&pending_name_key(key)).await?,
+        };
+        Ok(collection.and_then(|name| {
+            self.protocols
+                .of_collection(&name)
+                .map(|registered| registered.name.clone())
+        }))
+    }
+
     /// Remember the collection name of a record the app creates, until its write is
     /// answered: the switch knows only the collection ID.
     async fn note_pending_name(
@@ -2703,7 +2720,7 @@ impl App {
     }
 
     pub(crate) fn collection_of_name(&self, collection: &Collection) -> bool {
-        self.protocol
+        self.protocols
             .collections()
             .iter()
             .any(|c| c.name == collection.name && c.admits(&collection.policy))
@@ -2733,7 +2750,7 @@ pub(crate) fn refuse_non_json(value: Option<&[u8]>) -> Result<(), AppError> {
 /// keep it, and the record couldn't be checked from that write on. An own delete keeps the
 /// mark held and makes none, so it is never refused here.
 pub(crate) fn refuse_unmarkable(
-    protocol: &dyn super::Protocol,
+    protocol: &super::ProtocolSet,
     target: &RecordTarget,
     value: Option<&[u8]>,
 ) -> Result<(), AppError> {

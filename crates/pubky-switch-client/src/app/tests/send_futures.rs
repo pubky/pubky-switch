@@ -27,10 +27,10 @@ fn futures_are_send(
     assert_send(&app.finish_leave());
     assert_send(&app.backup_layered());
     assert_send(&app.set_protocol_member("sample", Some(Map::new()), None));
-    assert_send(&app.renew_record(None));
+    assert_send(&app.renew_record("sample", None));
     assert_send(&app.update_accepts());
     assert_send(&app.publish_record());
-    assert_send(&app.forget_processed([0; 32], "", &[]));
+    assert_send(&app.forget_processed("sample", [0; 32], "", &[]));
     assert_send(&app.flush_outbox());
     assert_send(&app.listing_owed());
     assert_send(&app.send(OutgoingMessage::new([0; 32], "sample.note", Map::new())));

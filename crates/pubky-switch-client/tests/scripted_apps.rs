@@ -21,6 +21,7 @@ use pubky_switch_core::scopes::Permission;
 
 fn spec() -> ProtocolSpec {
     ProtocolSpec {
+        name: "notes".into(),
         keyed_scopes: vec!["notes".into()],
         collections: Vec::new(),
         accepts: Vec::new(),

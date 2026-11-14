@@ -12,7 +12,8 @@
 //! (Switch spec 12.5 "Kept batches", 12.6 step 5); a kept batch refused for good, with its
 //! local writes and outbox messages (Switch spec 6.4); a message deleted from the outbox
 //! undelivered (Switch spec 11), or the record write a sent message named given up; a
-//! shared record a view first shows divergent after a provider loss (Switch spec 12.6); the
+//! shared record a view first shows divergent after a provider loss (Switch spec 12.6); a
+//! renewed certificate the app's protocols can't run with, not taken (Switch spec 3.2); the
 //! account taken as erased (Switch spec 12.7). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
 //! the two. It is reported once that commit is done, or, for a commit whose answer can't
@@ -225,6 +226,7 @@ pub enum AppEvent {
     /// An entry was stored locally and the cursor moved past it (Switch spec 8.2), for
     /// `reason`. A duty event when the entry isn't tried again
     /// ([`ParkReason::tried_again`]): then nothing but the protocol brings it back.
+    #[non_exhaustive]
     Parked {
         /// The duty event's ID; `None` for an entry that later reads try again.
         id: Option<EventId>,
@@ -241,6 +243,7 @@ pub enum AppEvent {
     /// commit ([`ParkReason::EffectTooLarge`]): its entry was stored locally and passed
     /// ([`AppEvent::Parked`]), and the effect isn't sent again (Switch spec 8.2). The
     /// protocol may build it again in another form. A duty event.
+    #[non_exhaustive]
     EffectRefused {
         /// The duty event's ID.
         id: EventId,
@@ -268,6 +271,7 @@ pub enum AppEvent {
     /// from the current state of what the effect writes, and treats each `attempt` the
     /// effect carried as of unknown fate (Switch spec 12.5 "Kept batches", 12.6 step 5). A
     /// duty event.
+    #[non_exhaustive]
     EffectUncertain {
         /// The duty event's ID.
         id: EventId,
@@ -290,6 +294,7 @@ pub enum AppEvent {
     /// ran: the message was processed in the meantime, such as from a re-send that arrived
     /// first, so the released entry went without its effect. A duty event, so the host
     /// that released it learns how it ended.
+    #[non_exhaustive]
     ReleasedDuplicate {
         /// The duty event's ID.
         id: EventId,
@@ -495,6 +500,20 @@ pub enum AppEvent {
         /// The new certificate's `issued_at`.
         issued_at: u64,
     },
+    /// A renewed certificate the app's protocols can't run with wasn't taken: the app
+    /// keeps presenting the one it holds, which still loads, and the certificate refused
+    /// is never taken (Switch spec 3.2 step 3). The signer renews again with a certificate
+    /// they run with, or the host registers the protocol it names at a restore. A duty
+    /// event, for every protocol: raised once per certificate refused.
+    #[non_exhaustive]
+    CertificateRefused {
+        /// The duty event's ID.
+        id: EventId,
+        /// The refused certificate's `issued_at`.
+        issued_at: u64,
+        /// Why it was refused.
+        refusal: CertificateRefusal,
+    },
     /// The switch holds the app's record and its Homeserver write failed: it stays owed,
     /// and goes again at the next read or with the next change (Switch spec 4.2). Or the
     /// delete of an immediate leave, or of a leave after a compromise, failed: the app left
@@ -649,6 +668,7 @@ pub enum AppEvent {
     /// [`AppEvent::AttemptDropped`]. The protocol decides what to write instead. A duty
     /// event, in the commit that drops the batch and writes its end
     /// ([`super::App::kept_batch`]).
+    #[non_exhaustive]
     KeptBatchDropped {
         /// The duty event's ID.
         id: EventId,
@@ -659,6 +679,7 @@ pub enum AppEvent {
     /// is never signed again, and whether it was applied can't be known, so its obligation
     /// is uncertain (Switch spec 12.5 "Kept batches", 12.6 step 5). The protocol treats it
     /// so; the claim shows no such attempt for one that was never sent. A duty event.
+    #[non_exhaustive]
     AttemptDropped {
         /// The duty event's ID.
         id: EventId,
@@ -668,9 +689,10 @@ pub enum AppEvent {
         attempt_id: [u8; 16],
     },
     /// A restore left behind kept duty events and owed protocol calls whose values didn't
-    /// read, the store's at a restore in place, the backup's on a store without an epoch:
-    /// what they said is lost, and the protocol learns only how many (`STATE.md`, "What the
-    /// app owes its protocol"). A duty event.
+    /// read, the store's at a restore in place, the backup's at every restore, and those
+    /// owed to no protocol it registers: what they said is lost, and the protocol learns
+    /// only how many (`STATE.md`, "What the app owes its protocol"). A duty event.
+    #[non_exhaustive]
     RestoreLeftBehind {
         /// The duty event's ID.
         id: EventId,
@@ -686,6 +708,7 @@ pub enum AppEvent {
     /// its account is gone, at least once, whenever the host next takes its events. Once
     /// the account is seen alive again ([`AppEvent::AccountBack`]), an `AccountGone` not yet
     /// acknowledged no longer holds: it goes in that commit, and no later load delivers it.
+    #[non_exhaustive]
     AccountGone {
         /// The duty event's ID.
         id: EventId,
@@ -723,6 +746,7 @@ pub enum AppEvent {
     /// [`super::App::queue_stored`] queued, or a re-send of either (Switch spec 11). Once a
     /// delivery is given up, `queue_stored` refuses the message
     /// ([`super::WontDeliver::GivenUp`]), so a protocol hears of it once. A duty event.
+    #[non_exhaustive]
     MessageUndelivered {
         /// The duty event's ID.
         id: EventId,
@@ -741,6 +765,7 @@ pub enum AppEvent {
     /// `batch_id` names it, and [`super::App::kept_batch`] tells what became of it. The
     /// outbox no longer keeps the message, plaintext and all, once nothing else of it is
     /// owed. A duty event, in the commit that gives the write up.
+    #[non_exhaustive]
     RecordJobDropped {
         /// The duty event's ID.
         id: EventId,
@@ -754,6 +779,7 @@ pub enum AppEvent {
     /// again, since the same answer would come. The read went on. The protocol acts on what
     /// the call said from its own state, such as asking for the re-send with writes that
     /// fit. A duty event.
+    #[non_exhaustive]
     LocalWritesRefused {
         /// The duty event's ID.
         id: EventId,
@@ -799,6 +825,7 @@ pub enum AppEvent {
     /// what was seen before is still checked; for an own write the mark held goes. A duty
     /// event, of the class of [`AppEvent::WriteFlagged`]. There is one per such write, not
     /// per record: a writer that keeps the mark over the bound raises one at each write.
+    #[non_exhaustive]
     RecordUncheckable {
         /// The duty event's ID.
         id: EventId,
@@ -827,6 +854,7 @@ pub enum AppEvent {
     /// order against the informational events of the same commit, such as the
     /// [`AppEvent::RecordChanged`] of a newer write that already cleared the flag: read
     /// [`super::SharedRecord::divergent`] for the record's state now.
+    #[non_exhaustive]
     RecordDivergent {
         /// The duty event's ID.
         id: EventId,
@@ -851,6 +879,7 @@ pub enum AppEvent {
     /// applied, and the app no longer keeps it, nor the local writes and outbox messages it
     /// carried (Switch spec 6.4, Switch wire 6.4). A duty event, in the commit that drops
     /// the batch and writes its end ([`super::App::kept_batch`]).
+    #[non_exhaustive]
     BatchRefused {
         /// The duty event's ID.
         id: EventId,
@@ -889,6 +918,7 @@ impl AppEvent {
             | Self::RecordUncheckable { id, .. }
             | Self::RecordDivergent { id, .. }
             | Self::LocalWritesRefused { id, .. }
+            | Self::CertificateRefused { id, .. }
             | Self::AccountGone { id } => Some(*id),
             _ => None,
         }
@@ -928,6 +958,23 @@ pub enum RefusedCall {
     /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at this loss;
     /// the loss went on without them.
     ProviderLost(ProviderLoss),
+}
+
+/// Why a renewed certificate wasn't taken ([`AppEvent::CertificateRefused`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum CertificateRefusal {
+    /// It holds a scope of this root, which no registered protocol owns: an app with it
+    /// would never load with its protocols (Switch wire 3.1 "Scope roots").
+    UnownedRoot(String),
+    /// The registered protocol `protocol` refused it
+    /// ([`super::Protocol::check_own_certificate`]).
+    Protocol {
+        /// The protocol's name.
+        protocol: String,
+        /// Its reason, without content.
+        reason: String,
+    },
 }
 
 /// A [`RefusedCall`] as a duty event keeps it.
@@ -983,7 +1030,18 @@ pub struct ClaimAttempt {
     pub attempt_id: [u8; 16],
 }
 
-/// `duty/<id>`: a duty event as the store keeps it, its ID in its key.
+/// `duty/<id>`: a duty event as the store keeps it, its ID in its key, with the names of
+/// the protocols it is for that haven't acknowledged it yet ([`super::App::ack_events_for`]).
+/// Every writer names them; the event goes once the last of them acknowledges it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct KeptDuty {
+    /// The protocols it is for, in registration order, each once.
+    pub(crate) to: Vec<String>,
+    /// The event.
+    pub(crate) duty: Duty,
+}
+
+/// A duty event, as [`KeptDuty`] keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Duty {
     Parked {
@@ -1075,6 +1133,10 @@ pub(crate) enum Duty {
     RecordDivergent {
         #[serde(with = "serde_b64")]
         key: [u8; 32],
+    },
+    CertificateRefused {
+        issued_at: u64,
+        refusal: CertificateRefusal,
     },
 }
 
@@ -1216,6 +1278,11 @@ impl Duty {
                 owed_calls,
             },
             Self::AccountGone => AppEvent::AccountGone { id },
+            Self::CertificateRefused { issued_at, refusal } => AppEvent::CertificateRefused {
+                id,
+                issued_at,
+                refusal,
+            },
         }
     }
 }

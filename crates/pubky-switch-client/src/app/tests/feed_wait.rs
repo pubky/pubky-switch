@@ -131,7 +131,12 @@ impl Setup {
             Arc::clone(&w.homeserver),
         );
         let shop = peer
-            .add_app("shop", &AppSpec::new(&["scope-a"]), &["sample.note"], false)
+            .add_app(
+                "shop",
+                &AppSpec::new(&["sample-a"]),
+                &["sample.note"],
+                false,
+            )
             .unwrap();
         let inner = if holding {
             w.switch.holding_transport()
@@ -153,7 +158,7 @@ impl Setup {
     }
 
     async fn join_on(&self, name: &str, store: Arc<dyn StateStore>) -> App {
-        let app = AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL);
+        let app = AppSpec::new(&["sample-a"]).with_permissions(&Permission::ALL);
         let request = self.w.signer.approve(&app_keys(name), &app).unwrap();
         let env = self
             .w
@@ -1736,7 +1741,12 @@ async fn test_receive_with_its_time_spent_still_retries_every_stored_entry() {
         Arc::clone(&s.w.homeserver),
     );
     let carol_shop = carol
-        .add_app("shop", &AppSpec::new(&["scope-a"]), &["sample.note"], false)
+        .add_app(
+            "shop",
+            &AppSpec::new(&["sample-a"]),
+            &["sample.note"],
+            false,
+        )
         .unwrap();
     s.w.homeserver.set_down(true);
     let mut carols = 0;
@@ -2176,7 +2186,12 @@ impl Setup {
             Arc::clone(&self.w.homeserver),
         );
         published
-            .add_app("shop", &AppSpec::new(&["scope-a"]), &["sample.note"], false)
+            .add_app(
+                "shop",
+                &AppSpec::new(&["sample-a"]),
+                &["sample.note"],
+                false,
+            )
             .unwrap();
         self.router.add(
             &origin,

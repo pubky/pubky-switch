@@ -48,6 +48,7 @@ mod own_record;
 mod parked;
 mod peek;
 mod protocol;
+mod protocols;
 mod provider;
 mod push;
 mod recovery;
@@ -73,8 +74,8 @@ mod tests;
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
-    AppEvent, BackupRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId, EventIdError,
-    ParkReason, RefusedCall,
+    AppEvent, BackupRefusal, CertificateRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId,
+    EventIdError, ParkReason, RefusedCall,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
 pub use held_cursor::HeldCursor;
@@ -90,6 +91,7 @@ pub use protocol::{
     RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, WriteBase,
     decode_local_state, encode_local_state, local_writes_bytes,
 };
+pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
 pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
@@ -425,27 +427,43 @@ pub struct AppBackup {
     /// a restore holds them too, so it delivers none of their messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     held_counterparties: Vec<String>,
-    /// The protocol's layer, if it added one; absent from the bytes otherwise.
+    /// The expiry each protocol asked of the app's record (`rexp`), by name, `None` for
+    /// none: a restore keeps them, so the record's next `expires_at` is still the earliest
+    /// of them. Absent while no protocol asked for one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    record_expiries: Vec<(String, Option<u64>)>,
+    /// The protocols' layers of a layered backup ([`App::backup_layered`]), one per
+    /// protocol, in registration order; absent from a plain backup's bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    layers: Vec<LayerOut>,
+    /// What the app's feed held beyond its cursor when a layered backup was taken; absent
+    /// from a plain backup's bytes, present in every layered one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    protocol: Option<LayerOut>,
-    /// The re-send and missed-entries calls the protocol was owed when the backup was
-    /// taken (`owed/`), each by its key after the prefix, with its value as stored. Most
-    /// are at or behind the backup's cursor, which the restored feed never shows again;
-    /// one may be ahead of it, carried ahead by an earlier restore in place, and waits for
-    /// the feed to reach its item. A deny list call is left out: every restore tells the
-    /// protocol a deny list gap at the restored cursor, whose full list covers it.
+    beyond_cursor: Option<BeyondCursor>,
+    /// The re-send and missed-entries calls owed when the backup was taken (`owed/`), each
+    /// by its key after the prefix, with its value as stored, the protocols it is owed to
+    /// among it. Most are at or behind the backup's cursor, which the restored feed never
+    /// shows again; one may be ahead of it, carried ahead by an earlier restore in place,
+    /// and waits for the feed to reach its item. A deny list call is left out: every
+    /// restore tells every protocol a deny list gap at the restored cursor, whose full list
+    /// covers it.
     owed: Vec<(String, serde_json::Value)>,
 }
 
-/// A [`ProtocolLayer`] as a backup's bytes carry it, with what the app's feed holds beyond
-/// its cursor at the same moment: the entries processed past a held one, the entries
-/// stored locally, and the processed pairs (Switch spec 11). The layer reflects those
-/// entries, so a restore that brought it back without them would hand them to the protocol
-/// again.
+/// A [`ProtocolLayer`] as a backup's bytes carry it: the protocol's name and its data in
+/// base64.
 #[derive(Clone, Serialize, Deserialize)]
 struct LayerOut {
     name: String,
     data: String,
+}
+
+/// What the app's feed holds beyond its cursor at the moment of a layered backup: the
+/// entries processed past a held one, the entries stored locally, and the processed pairs
+/// (Switch spec 11). The protocols' layers reflect those entries, so a restore that brought
+/// them back without these would hand the entries to the protocols again.
+#[derive(Clone, Serialize, Deserialize)]
+struct BeyondCursor {
     seen: Vec<u64>,
     parked: Vec<(u64, ParkedEntry)>,
     /// Each pair's key after `proc/`, and its record.
@@ -469,8 +487,8 @@ impl AppBackup {
             .map_err(|_| AppError::Store(StoreError::Other("the backup can't be written".into())))
     }
 
-    /// Read a backup's bytes. A backup with a protocol layer is told by its `protocol`
-    /// member, under the same version as one without.
+    /// Read a backup's bytes. A layered backup is told by its `layers` and `beyond_cursor`
+    /// members, under the same version as a plain one.
     ///
     /// # Errors
     ///
@@ -492,23 +510,29 @@ impl AppBackup {
             .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))
     }
 
-    /// The protocol's layer, if the backup holds one.
+    /// The protocols' layers the backup holds, one per protocol, in the order they were
+    /// registered when it was taken; none for a plain backup.
     ///
     /// # Errors
     ///
-    /// [`AppError::InvalidData`] if its data doesn't read.
-    pub fn protocol_layer(&self) -> Result<Option<ProtocolLayer>, AppError> {
-        self.protocol
-            .as_ref()
-            .map(|layer| {
-                Ok(ProtocolLayer {
-                    protocol: layer.name.clone(),
-                    data: pubky_switch_core::enc::unb64(&layer.data).map_err(|_| {
-                        AppError::InvalidData("the backup: its protocol layer doesn't read".into())
-                    })?,
-                })
-            })
-            .transpose()
+    /// [`AppError::InvalidData`] if a layer's data doesn't read, or two layers name one
+    /// protocol.
+    pub fn layers(&self) -> Result<Vec<ProtocolLayer>, AppError> {
+        let mut out: Vec<ProtocolLayer> = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            if out.iter().any(|held| held.protocol == layer.name) {
+                return Err(AppError::InvalidData(
+                    "the backup: two layers name one protocol".into(),
+                ));
+            }
+            out.push(ProtocolLayer {
+                protocol: layer.name.clone(),
+                data: pubky_switch_core::enc::unb64(&layer.data).map_err(|_| {
+                    AppError::InvalidData("the backup: a protocol layer doesn't read".into())
+                })?,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -599,7 +623,7 @@ pub(crate) struct AppState {
 /// One app of an identity, on top of the Switch.
 pub struct App {
     env: AppEnv,
-    protocol: Arc<dyn Protocol>,
+    protocols: ProtocolSet,
     config: AppConfig,
     ns: String,
     state: AppState,
@@ -621,6 +645,10 @@ pub struct App {
     /// Whether an owed call holds the read, as the last retry of `owed/` left it, and set as
     /// calls are owed. In memory only.
     owed_known: Option<bool>,
+    /// The protocols owed a call about a feed item at or before the cursor, as the last
+    /// retry of `owed/` left them, and as calls are owed: each is handed nothing later until
+    /// it takes its calls (Switch spec 8.3). In memory only.
+    owing: BTreeSet<String>,
     /// How many reads in a row stopped at an owed call or deny list gap the protocol didn't
     /// take ([`AppEvent::OwedCallHeld`]). In memory only.
     owed_held_reads: u32,
@@ -642,6 +670,9 @@ pub struct App {
     /// The highest duty event counter handed to the host since the app was made: no
     /// acknowledgement removes one above it.
     duty_handed: u64,
+    /// The protocols each duty event reported or listed by this app value is for, by its
+    /// counter, until they acknowledge it ([`App::event_owners`]). In memory only.
+    duty_owners: BTreeMap<u64, Vec<String>>,
     /// When, by the device clock, an answer in this call last brought a verified service
     /// time ([`App::fresh_service_time`]).
     time_fresh_at: Option<u64>,
@@ -726,6 +757,38 @@ struct Carried {
     stored_past: u64,
 }
 
+/// An owed call both a backup and the store restored in place hold under one key: the
+/// store's value, owed to every protocol either names (`to`), in registration order
+/// (`names`). The restore puts each protocol's layer back as the backup holds it, so a
+/// protocol the backup names that answered the call since is owed it again, its writes
+/// gone with the state it had; one only the store names is owed it still. Both values were
+/// read whole, each naming registered protocols only.
+fn union_owners(
+    backup: &serde_json::Value,
+    store: &serde_json::Value,
+    names: &[String],
+) -> Result<serde_json::Value, AppError> {
+    let from_backup =
+        serde_json::from_value::<feed::Owed>(backup.clone()).map_err(|_| corrupt())?;
+    let mut owed = serde_json::from_value::<feed::Owed>(store.clone()).map_err(|_| corrupt())?;
+    owed.to = names
+        .iter()
+        .filter(|name| owed.to.contains(name) || from_backup.to.contains(name))
+        .cloned()
+        .collect();
+    serde_json::to_value(&owed).map_err(|_| corrupt())
+}
+
+/// A carried owed call `value`, owed to every protocol of `names`.
+fn owed_to_every(
+    value: &serde_json::Value,
+    names: &[String],
+) -> Result<serde_json::Value, AppError> {
+    let mut owed = serde_json::from_value::<feed::Owed>(value.clone()).map_err(|_| corrupt())?;
+    owed.to = names.to_vec();
+    serde_json::to_value(&owed).map_err(|_| corrupt())
+}
+
 /// The entry a kept effect belongs to, as a backup holds it: stored as
 /// [`ParkReason::Uncertain`], under its local ID if it was stored before (its flags kept),
 /// else under `reserved`, the ID the live store reserved for it, built from what the kept
@@ -770,6 +833,26 @@ fn missing() -> AppError {
     AppError::Store(StoreError::Corrupt)
 }
 
+/// Refuse a set of protocols that isn't the one the app was set up with (`protos`): one
+/// that lacks a protocol the app runs would leave that protocol's state, owed calls and
+/// duty events unattended, and one with another protocol would start it without a join.
+fn check_protocol_names(stored: &[String], protocols: &ProtocolSet) -> Result<(), AppError> {
+    if let Some(name) = stored.iter().find(|name| !protocols.contains(name)) {
+        return Err(Refusal::Usage(format!(
+            "the app runs the protocol `{name}`, which the set doesn't register"
+        ))
+        .into());
+    }
+    if let Some(name) = protocols.names().into_iter().find(|n| !stored.contains(n)) {
+        return Err(Refusal::Usage(format!(
+            "the set registers the protocol `{name}`, which the app wasn't set up with: a \
+             restore adds it"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 impl App {
     // ---------------------------------------------------------------------------------
     // Joining, loading and restoring (Switch spec 12.1, 12.4)
@@ -790,22 +873,43 @@ impl App {
     /// error the registration is kept and resent on the next call.
     pub async fn join(
         env: AppEnv,
-        protocol: Arc<dyn Protocol>,
+        protocols: impl Into<ProtocolSet>,
         config: AppConfig,
         request: JoinRequest,
     ) -> Result<App, AppError> {
         Box::pin(async move {
+            let protocols: ProtocolSet = protocols.into();
+            protocols.validate()?;
             own_record::check_publisher(&env, &config)?;
-            let approved = Approval::read(
-                &request.approval,
-                &request.request,
-                &request.identity,
-                &request.keys.bundle_secret(),
-                &|scope| protocol.has_keys(scope),
-            )
-            .map_err(|error| Refusal::Approval(error.to_string()))?;
+            let read = |has_keys: &dyn Fn(&str) -> bool| {
+                Approval::read(
+                    &request.approval,
+                    &request.request,
+                    &request.identity,
+                    &request.keys.bundle_secret(),
+                    has_keys,
+                )
+            };
+            let approved = match read(&|scope| protocols.has_keys(scope)) {
+                Ok(approved) => approved,
+                Err(error) => {
+                    // An approval whose bundle holds keys of a root no registered protocol
+                    // owns reads once those roots are taken as keyed: the set lacks a
+                    // protocol, and the refusal names its root.
+                    if let Ok(approved) = read(&|scope| {
+                        protocols.has_keys(scope) || protocols.of_scope(scope).is_none()
+                    }) {
+                        protocols.check_cert(&approved.cert)?;
+                    }
+                    return Err(Refusal::Approval(error.to_string()).into());
+                }
+            };
             let keys = request.keys;
             let cert = approved.cert;
+            // Every scope of the certificate is a registered protocol's, and each protocol
+            // runs with it, before anything is written.
+            protocols.check_cert(&cert)?;
+            protocols.check_own_certificate(&cert)?;
             let doc = approved.identity;
             let now = env.clock.now_ms();
             let inbox = doc.inbox().clone();
@@ -827,7 +931,7 @@ impl App {
             let first = ReceiveKey::generate(0)?;
             let key_record =
                 ReceiveKeyRecord::sign(&keys, &cert, ReceiveKeyBody::new(&cert, &first))?;
-            let mut body = AppRecordBody::new(&cert, protocol.accepts(&cert), now);
+            let mut body = AppRecordBody::new(&cert, protocols.accepts(&cert), now);
             body.label = config.label.clone();
             let record = AppRecord::sign(&keys, body)?;
             let client = Self::client_for(&env, &meta, &keys, &cert)?;
@@ -907,7 +1011,7 @@ impl App {
             };
             let mut app = App {
                 env,
-                protocol,
+                protocols,
                 config,
                 ns,
                 state,
@@ -919,11 +1023,13 @@ impl App {
                 directory_failed_ms: None,
                 events: Vec::new(),
                 owed_known: None,
+                owing: BTreeSet::new(),
                 owed_held_reads: 0,
                 owed_ahead: None,
                 deny_directory_read: None,
                 duty_queued: 0,
                 duty_handed: 0,
+                duty_owners: BTreeMap::new(),
                 time_fresh_at: None,
                 kept_rate_limited: None,
                 loss_upload_wait: None,
@@ -944,6 +1050,7 @@ impl App {
             app.events.clear();
             let mut tx = Tx::new(&app.ns);
             tx.put(key::META, &meta)?;
+            tx.put(key::PROTOCOLS, &app.protocols.names())?;
             tx.put(key::KEYS, &keys)?;
             tx.put(key::CERT, cert.signed())?;
             tx.put(key::RECORD, record.signed())?;
@@ -1040,11 +1147,13 @@ impl App {
     /// deleted its keys, and [`AppError::Store`] for a store failure or a corrupt record.
     pub async fn load(
         env: AppEnv,
-        protocol: Arc<dyn Protocol>,
+        protocols: impl Into<ProtocolSet>,
         config: AppConfig,
         app_id: [u8; 16],
     ) -> Result<App, AppError> {
         Box::pin(async move {
+            let protocols: ProtocolSet = protocols.into();
+            protocols.validate()?;
             own_record::check_publisher(&env, &config)?;
             let ns = client_namespace(&app_id);
             let reader = Reader {
@@ -1052,10 +1161,17 @@ impl App {
                 store: env.store.clone(),
             };
             let state = Self::read_state(&reader).await?;
+            // The protocols the app was set up with are all registered, and nothing else:
+            // a protocol joins an app only at a join or a restore. Refused before anything
+            // is written.
+            let names: Vec<String> = reader.get(key::PROTOCOLS).await?.ok_or_else(missing)?;
+            check_protocol_names(&names, &protocols)?;
+            protocols.check_cert(&state.cert)?;
+            protocols.check_own_certificate(&state.cert)?;
             let client = Self::client_for(&env, &state.meta, &state.keys, &state.cert)?;
             let mut app = App {
                 env,
-                protocol,
+                protocols,
                 config,
                 ns,
                 state,
@@ -1067,11 +1183,13 @@ impl App {
                 directory_failed_ms: None,
                 events: Vec::new(),
                 owed_known: None,
+                owing: BTreeSet::new(),
                 owed_held_reads: 0,
                 owed_ahead: None,
                 deny_directory_read: None,
                 duty_queued: 0,
                 duty_handed: 0,
+                duty_owners: BTreeMap::new(),
                 time_fresh_at: None,
                 kept_rate_limited: None,
                 loss_upload_wait: None,
@@ -1089,7 +1207,7 @@ impl App {
                 reopen_failures: 0,
             };
             // Duty events not acknowledged before are delivered again (`events` module).
-            let kept = app.kept_duties().await?;
+            let kept = app.kept_duties_noted().await?;
             app.queue_duties(kept);
             Ok(app)
         })
@@ -1220,7 +1338,7 @@ impl App {
         // layered backup: the sizes are checked with no layer writes then.
         let restorable = Self::restore_commit(
             self.env.clone(),
-            Arc::clone(&self.protocol),
+            self.protocols.clone(),
             self.config.clone(),
             &backup,
             LayerCheck::SizesOnly,
@@ -1282,7 +1400,9 @@ impl App {
             outbox: Vec::new(),
             outbox_left_out: Vec::new(),
             held_counterparties: Vec::new(),
-            protocol: None,
+            record_expiries: Vec::new(),
+            layers: Vec::new(),
+            beyond_cursor: None,
             owed: Vec::new(),
         })
     }
@@ -1327,6 +1447,7 @@ impl App {
     /// Put the outbox in `backup`, as `reader` holds it (Switch spec 11): every message the
     /// app still owes a job, so a restore delivers what was queued before the backup with
     /// the same `msg_id` and bytes.
+    /// The expiries the protocols asked of the record go with it.
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
         let carried = send::carried_outbox(reader).await?;
         backup.outbox = carried.items;
@@ -1337,16 +1458,23 @@ impl App {
             .into_iter()
             .map(|(rest, _)| rest)
             .collect();
-        // The owed re-send and missed-entries calls, as stored. One that doesn't read as a
-        // call fails every read of this store already; it isn't a call to carry.
+        backup.record_expiries = reader
+            .get::<std::collections::BTreeMap<String, Option<u64>>>(key::RECORD_EXPIRIES)
+            .await?
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        // The owed re-send and missed-entries calls, as stored, each with its owners. One
+        // that doesn't read as a call fails every read of this store already; it isn't a
+        // call to carry.
         backup.owed = reader
             .scan_raw(key::OWED_PREFIX)
             .await?
             .into_iter()
             .filter_map(|(rest, bytes)| {
-                let call = state::decode::<feed::OwedCall>(&bytes).ok()?;
+                let owed = state::decode::<feed::Owed>(&bytes).ok()?;
                 let carried = matches!(
-                    call,
+                    owed.call,
                     feed::OwedCall::Resend { .. } | feed::OwedCall::Missed { .. }
                 );
                 let value = state::decode::<serde_json::Value>(&bytes).ok()?;
@@ -1356,14 +1484,14 @@ impl App {
         Ok(())
     }
 
-    /// The app's backup with the protocol's layer (Switch spec 12.4), the layer taken by
-    /// the app itself, so it is always of the same moment as the rest. In this one call,
-    /// which holds the app exclusively so no other call writes its store meanwhile, the app
-    /// reads from its store: its committed state (never memory that a failed commit left
-    /// ahead of the store), the protocol's whole local state, which
-    /// [`Protocol::backup_layer`] turns into the layer's bytes under
-    /// [`Protocol::backup_name`], and what the feed holds beyond the cursor that the layer
-    /// may reflect: the entries processed past a held one, the entries stored locally, and
+    /// The app's backup with one layer per protocol (Switch spec 12.4), the layers taken
+    /// by the app itself, so they are always of the same moment as the rest. In this one
+    /// call, which holds the app exclusively so no other call writes its store meanwhile,
+    /// the app reads from its store: its committed state (never memory that a failed commit
+    /// left ahead of the store), each protocol's whole local state, which its
+    /// [`Protocol::backup_layer`] turns into its layer's bytes under its
+    /// [`Protocol::name`], and what the feed holds beyond the cursor that the layers may
+    /// reflect: the entries processed past a held one, the entries stored locally, and
     /// the processed pairs, so a restore hands none of those messages to the protocol
     /// again. It carries the outbox of the same moment, as [`App::backup`] does.
     /// [`App::restore`] installs it all in one commit.
@@ -1408,16 +1536,12 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::NotNow`] for a protocol with no backup name; [`Refusal::Left`] or
-    /// [`Refusal::NotNow`] when there is nothing to back up; a store failure; as
+    /// [`Refusal::Left`] or [`Refusal::NotNow`] when there is nothing to back up; a store failure; as
     /// [`App::restore`] for a backup it would refuse, such as a layer the protocol refuses
     /// ([`AppError::InvalidData`]) or one over the store's sizes ([`AppError::Store`], with
     /// [`AppEvent::BackupRefused`]).
     pub async fn backup_layered(&mut self) -> Result<AppBackup, AppError> {
         Box::pin(async move {
-            let Some(name) = self.protocol.backup_name() else {
-                return Err(Refusal::NotNow("the protocol names no backup layer".into()).into());
-            };
             // The bounds on entries stored unverified first, as at a read, so a pile stored
             // during the last read doesn't go into the backup (Switch spec 8.2). An app a read
             // wouldn't run on, halted by an alarm, left, or no longer current here, commits
@@ -1450,7 +1574,6 @@ impl App {
             let state = Self::read_state(&reader).await?;
             let mut backup = self.backup_of(&state)?;
             self.carry_outbox(&reader, &mut backup).await?;
-            let local = self.protocol_scan(b"").await?;
             let mut processed = reader.scan::<Processed>("proc/").await?;
             let mut parked = state.parked.clone();
             let mut seen = state.seen.clone();
@@ -1483,12 +1606,21 @@ impl App {
                     },
                 ));
             }
-            let data = self.protocol.backup_layer(local).map_err(|why| {
-                AppError::InvalidData(format!("the protocol's backup layer: {why}"))
-            })?;
-            backup.protocol = Some(LayerOut {
-                name,
-                data: pubky_switch_core::enc::b64(&data),
+            // One layer per protocol, each over its own local state, read in this call.
+            for registered in self.protocols.iter() {
+                let local = self.protocol_scan(&registered.name, b"").await?;
+                let data = registered.protocol.backup_layer(local).map_err(|why| {
+                    AppError::InvalidData(format!(
+                        "the backup layer of `{}`: {why}",
+                        registered.name
+                    ))
+                })?;
+                backup.layers.push(LayerOut {
+                    name: registered.name.clone(),
+                    data: pubky_switch_core::enc::b64(&data),
+                });
+            }
+            backup.beyond_cursor = Some(BeyondCursor {
                 seen: seen.into_iter().collect(),
                 parked: parked.into_iter().collect(),
                 processed,
@@ -1500,7 +1632,7 @@ impl App {
             // until the host acknowledges, or restores onto an empty store.
             let restorable = Self::restore_commit(
                 self.env.clone(),
-                Arc::clone(&self.protocol),
+                self.protocols.clone(),
                 self.config.clone(),
                 &backup,
                 LayerCheck::Full,
@@ -1536,56 +1668,64 @@ impl App {
     /// `msg_id` and bytes; past [`SENT_RETENTION_MS`] from the backup, a delivery still
     /// owed is given up instead, with [`AppEvent::MessageUndelivered`] ([`App::backup`]).
     ///
-    /// The protocol's layer ([`App::backup_layered`]) is installed with the
-    /// app's own state, and with the entries and processed pairs of the same moment that
-    /// the backup carries beside it, in one commit: the app checks its own state, then the
-    /// layer's name
-    /// against [`Protocol::backup_name`], then has [`Protocol::restore_layer`] check the
-    /// layer, with the backup's identity and `blind` under its naming key ([`RestoreContext`]), and give its
-    /// writes, all before it writes anything. When this returns `Ok`,
-    /// both layers are in the store; on `Err`, neither is, and the store holds what it held
+    /// The protocols' layers ([`App::backup_layered`]) are installed with the app's own
+    /// state, and with the entries and processed pairs of the same moment that the backup
+    /// carries beside them, in one commit: the app checks its own state, that every scope
+    /// of the certificate is a registered protocol's and each protocol runs with it
+    /// ([`Protocol::check_own_certificate`]), that each layer names a registered protocol,
+    /// then has each registered protocol's [`Protocol::restore_layer`] check its own layer,
+    /// or `None` when the backup has none for it, with the backup's identity and `blind`
+    /// under its naming key ([`RestoreContext`]), and give its writes, which land under its
+    /// own prefix, all before it writes anything. The app keeps the names it registers
+    /// (`protos`) for later loads. When this returns `Ok`, every layer is in the store; on
+    /// `Err`, none is, and the store holds what it held
     /// before. The one exception is a commit whose outcome the store can't tell
     /// ([`StoreError::Unknown`]): it landed whole or not at all, and the host loads the app
     /// ([`App::load`]) to learn which.
     ///
-    /// What the store holds that the app still owes its protocol stays, a layered restore's
-    /// included: the duty events
-    /// not acknowledged, with their IDs, delivered again as after [`App::load`], and the
-    /// protocol calls it couldn't answer, made again by the next read. A backup carries no
-    /// duty event, so a restore onto a store without an epoch, on another device or wiped,
-    /// starts a new event epoch ([`EventId`]). Every restore takes the re-send and
-    /// missed-entries calls the backup carries ([`App::backup`]), each checked as a carried
-    /// call is, one that isn't whole left behind and counted in
-    /// [`AppEvent::RestoreLeftBehind`]. A call the store made after the backup is made
-    /// again: the restore replaces the protocol's state with the backup's layer, or with
-    /// none, which lacks its writes. A restore in place adds the store's own calls, the store's value winning for
-    /// a key both hold. For an app holding `lists.read`, the commit also owes the protocol a
-    /// deny list gap at the backup's position, whatever the backup held, told by the next
-    /// read with the full list ([`Protocol::deny_list_gap`], Switch spec 8.3).
+    /// What the store holds that the app still owes its protocols stays, a layered
+    /// restore's included, for the protocols it registers: the duty events not
+    /// acknowledged, with their IDs, delivered again as after [`App::load`], and the
+    /// protocol calls they couldn't answer, made again by the next read. One owed to none
+    /// of them is left behind and counted in [`AppEvent::RestoreLeftBehind`]. A backup
+    /// carries no duty event, so a restore onto a store without an epoch, on another device
+    /// or wiped, starts a new event epoch ([`EventId`]). Every restore takes the re-send
+    /// and missed-entries calls the backup carries ([`App::backup`]), each checked as a
+    /// carried call is and kept for the protocols it registers, one that isn't whole or is
+    /// owed to none of them left behind and counted in [`AppEvent::RestoreLeftBehind`]. A
+    /// call the store made after the backup is made again: the restore replaces each
+    /// protocol's state with its layer, or with none, which lacks its writes. A restore in
+    /// place adds the store's own calls, the store's value winning for a key both hold. For
+    /// an app holding `lists.read`, the commit also owes every protocol a deny list gap at
+    /// the backup's position, whatever the backup held, told by the next read with the
+    /// full list ([`Protocol::deny_list_gap`], Switch spec 8.3).
     ///
     /// # Errors
     ///
-    /// [`AppError::InvalidData`] for a backup that doesn't verify, for a protocol layer that
-    /// another protocol, or a protocol without a backup name, made, or for one the protocol
-    /// refuses; [`Refusal::CarriedTooLarge`] for a restore in place whose backup fits one
+    /// [`AppError::InvalidData`] for a backup that doesn't verify, for a layer of a protocol
+    /// not registered, or for one its protocol refuses; [`Refusal::Usage`] for a certificate
+    /// holding a scope root no registered protocol owns; [`Refusal::Certificate`] for one a
+    /// protocol refuses; [`Refusal::CarriedTooLarge`] for a restore in place whose backup fits one
     /// commit but not with the duty events and owed calls the store would carry beside it;
     /// [`Refusal::Usage`] for an app that publishes its record without a Homeserver writer
     /// ([`AppEnv::homeserver_writer`]); a store failure, writes over the store's sizes
     /// included. Nothing is written on any of them.
     pub async fn restore(
         env: AppEnv,
-        protocol: Arc<dyn Protocol>,
+        protocols: impl Into<ProtocolSet>,
         config: AppConfig,
         backup: &AppBackup,
     ) -> Result<App, AppError> {
         Box::pin(async move {
-            match Self::restore_commit(env, protocol, config, backup, LayerCheck::Full).await? {
+            let protocols: ProtocolSet = protocols.into();
+            protocols.validate()?;
+            match Self::restore_commit(env, protocols, config, backup, LayerCheck::Full).await? {
                 Restorable::Ready(app, tx) => {
                     tx.commit(&app.env.store).await?;
                     let mut app = *app;
                     // Committed: a failure here leaves the rest to the next read.
                     let _ = app.retell_restored().await;
-                    let kept = app.kept_duties().await?;
+                    let kept = app.kept_duties_noted().await?;
                     app.queue_duties(kept);
                     Ok(app)
                 }
@@ -1607,7 +1747,7 @@ impl App {
     /// within the store's sizes; nothing is written.
     async fn restore_commit(
         env: AppEnv,
-        protocol: Arc<dyn Protocol>,
+        protocols: ProtocolSet,
         config: AppConfig,
         backup: &AppBackup,
         layer_check: LayerCheck,
@@ -1687,27 +1827,55 @@ impl App {
             // The service may hold a later cursor: the first move after the restore is sent.
             cursor.at_service = 0;
             cursor.deferred_since_ms = Some(env.clock.now_ms());
-            // The protocol's layer, checked before anything is written: a layer that another
-            // protocol made, or that this one refuses, refuses the restore.
-            let layer = backup.protocol_layer()?;
-            if let Some(layer) = &layer
-                && protocol.backup_name().as_deref() != Some(layer.protocol.as_str())
-            {
-                return Err(invalid("its protocol layer is another protocol's"));
+            // Every scope of the certificate is a registered protocol's, and each protocol
+            // runs with it, before anything is written.
+            protocols.check_cert(&cert)?;
+            protocols.check_own_certificate(&cert)?;
+            // The layers, checked before anything is written: a layer of a protocol not
+            // registered here refuses the restore, rather than drop that data, and so does
+            // a layer its protocol refuses. A registered protocol without a layer is handed
+            // none.
+            let layers = backup.layers()?;
+            if let Some(layer) = layers.iter().find(|l| !protocols.contains(&l.protocol)) {
+                return Err(invalid(&format!(
+                    "its layer of `{}` is of no registered protocol",
+                    layer.protocol
+                )));
             }
-            // The protocol checks its layer against the identity's naming key, the one the
-            // restored app goes on with, before anything is written.
+            // So is an expiry of the record a protocol not registered here asked for.
+            if let Some((name, _)) = backup
+                .record_expiries
+                .iter()
+                .find(|(name, _)| !protocols.contains(name))
+            {
+                return Err(invalid(&format!(
+                    "its record expiry of `{name}` is of no registered protocol"
+                )));
+            }
+            if !layers.is_empty() && backup.beyond_cursor.is_none() {
+                return Err(invalid(
+                    "its layers come without the feed beyond its cursor",
+                ));
+            }
+            // Each protocol checks its layer against the identity's naming key, the one the
+            // restored app goes on with, before anything is written; its writes land under
+            // its own prefix.
             let restoring = RestoreContext::new(meta.identity, meta.app_id, &backup.naming, &cert);
-            let layer_writes = match protocol.restore_layer(layer.as_ref(), &restoring) {
-                Ok(writes) => writes,
-                Err(_) if layer_check == LayerCheck::SizesOnly => Vec::new(),
-                Err(why) => {
-                    return Err(AppError::InvalidData(format!(
-                        "the backup's protocol layer: {why}"
-                    )));
+            let mut layer_writes = Vec::new();
+            for registered in protocols.iter() {
+                let layer = layers.iter().find(|l| l.protocol == registered.name);
+                match registered.protocol.restore_layer(layer, &restoring) {
+                    Ok(writes) => layer_writes.extend(protocols::qualify(&registered.name, writes)),
+                    Err(_) if layer_check == LayerCheck::SizesOnly => {}
+                    Err(why) => {
+                        return Err(AppError::InvalidData(format!(
+                            "the backup layer of `{}`: {why}",
+                            registered.name
+                        )));
+                    }
                 }
-            };
-            let (seen, parked, processed) = match &backup.protocol {
+            }
+            let (seen, parked, processed) = match &backup.beyond_cursor {
                 Some(layer) => (
                     layer.seen.iter().copied().collect::<BTreeSet<u64>>(),
                     layer.parked.iter().cloned().collect::<BTreeMap<_, _>>(),
@@ -1813,15 +1981,18 @@ impl App {
                 ns: ns.clone(),
                 store: env.store.clone(),
             };
-            let carried = Self::kept_for_protocol(&old).await?;
-            // Every restore takes the backup's owed calls, each checked as a carried one is;
-            // one that isn't whole is left behind and counted. The restore replaces the
-            // protocol's local state with the backup's layer, or with nothing, so a call the
-            // store made after the backup is owed again: its writes are gone with that
-            // state. A restore in place also carries the store's own calls, the store's
-            // value winning for a key both hold.
-            let from_backup = Self::owed_of_backup(backup);
-            let carried = carried.unwrap_or_default();
+            let carried = Self::kept_for_protocol(&old, &protocols)
+                .await?
+                .unwrap_or_default();
+            // Every restore takes the backup's owed calls, each checked as a carried one is
+            // and keeping only the protocols registered here; one that isn't whole, or is
+            // owed to none of them, is left behind and counted. The restore replaces each
+            // protocol's local state with its layer, or with nothing, so a call the store
+            // made after the backup is owed again: its writes are gone with that state. A
+            // restore in place also carries the store's own calls; for a key both hold, the
+            // owners are both values' (`to`), the rest of the value the store's
+            // ([`union_owners`]).
+            let from_backup = Self::owed_of_backup(backup, &protocols);
             // A restore in place keeps the store's holds beside the backup's: a hold the host
             // set after the backup still holds (`App::hold_queued`).
             let old_holds: Vec<String> = old
@@ -1846,9 +2017,10 @@ impl App {
                 ..state
             };
             let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
+            let protocols_names = protocols.names();
             let mut app = App {
                 env,
-                protocol,
+                protocols,
                 config,
                 ns,
                 state,
@@ -1860,11 +2032,13 @@ impl App {
                 directory_failed_ms: None,
                 events: Vec::new(),
                 owed_known: None,
+                owing: BTreeSet::new(),
                 owed_held_reads: 0,
                 owed_ahead: None,
                 deny_directory_read: None,
                 duty_queued: 0,
                 duty_handed: 0,
+                duty_owners: BTreeMap::new(),
                 time_fresh_at: None,
                 kept_rate_limited: None,
                 loss_upload_wait: None,
@@ -1904,18 +2078,28 @@ impl App {
                     }
                 }
                 tx.local(&layer_writes)?;
-                // The protocol's layer is its state as committed when the backup was taken,
+                tx.put(key::PROTOCOLS, &protocols_names)?;
+                if !backup.record_expiries.is_empty() {
+                    let expiries: std::collections::BTreeMap<String, Option<u64>> =
+                        backup.record_expiries.iter().cloned().collect();
+                    tx.put(key::RECORD_EXPIRIES, &expiries)?;
+                }
+                // Each protocol's layer is its state as committed when the backup was taken,
                 // which may lack a deny list change or gap it was owed then: a backup
                 // carries no deny list call and no gap, and the feed doesn't hand again what
                 // the backup's cursor passed. So every restore by an app holding
                 // `lists.read` notes a gap in the deny list's history at the restored
-                // cursor, in this commit, and the protocol is told the full list after the
-                // carried calls (Switch spec 8.3). The namespace's delete above takes the
-                // `dgap` the store held, so no earlier gap moves it.
+                // cursor, owed to every protocol, in this commit, and each is told the full
+                // list after the carried calls (Switch spec 8.3). The namespace's delete
+                // above takes the `dgap` the store held, so no earlier gap moves it.
                 if app.state.cert.has_permission(Permission::ListsRead) {
                     tx.put(
                         feed::DENY_GAP,
-                        &(backup.cursor.generation, backup.cursor.seq),
+                        &feed::OwedGap {
+                            generation: backup.cursor.generation,
+                            seq: backup.cursor.seq,
+                            to: protocols_names.clone(),
+                        },
                     )?;
                 }
                 tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
@@ -1926,12 +2110,23 @@ impl App {
                 carrying = true;
                 for (stored, value) in &carried.values {
                     // Written once: a key the backup carried with the same value is in.
-                    let same = from_backup
+                    let in_backup = from_backup
                         .0
                         .iter()
-                        .any(|(key, kept)| key == stored && kept == value);
-                    if !same {
-                        tx.put(stored, value)?;
+                        .find_map(|(key, kept)| (key == stored).then_some(kept));
+                    match in_backup {
+                        Some(kept) if kept == value => {}
+                        Some(kept) => {
+                            tx.put(stored, &union_owners(kept, value, &protocols_names)?)?;
+                        }
+                        // A call only the store holds, past the backup's cursor, came after
+                        // the backup: every layer is put back to a moment before it, so a
+                        // protocol that took it lost its writes with that state and is owed
+                        // it again. Every registered protocol is (Switch spec 8.3).
+                        None if app.owed_after(stored, backup.cursor) => {
+                            tx.put(stored, &owed_to_every(value, &protocols_names)?)?;
+                        }
+                        None => tx.put(stored, value)?,
                     }
                 }
                 // What didn't read is left behind, and the protocol told how much.
@@ -2180,8 +2375,57 @@ impl App {
         Some(time.offset_ms.unsigned_abs().max(ahead))
     }
 
+    /// The protocol `protocol` finished its reconciliation (Switch spec 12.4 step 2.4):
+    /// reconcile mode is the app's, so it ends, as [`App::end_reconcile`] ends it, once
+    /// every registered protocol has ended it; until then the app stays in it, and the
+    /// protocols that ended it are kept across loads. Whether the mode ended. Outside
+    /// reconcile mode nothing is kept, and it returns `true`.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a protocol not registered; as [`App::end_reconcile`].
+    pub async fn end_reconcile_for(
+        &mut self,
+        protocol: &str,
+        confirmed: UserConfirmed,
+    ) -> Result<bool, AppError> {
+        Box::pin(async move {
+            self.check_registered(protocol)?;
+            self.ready_local().await?;
+            if !self.reconcile_mode() {
+                return Ok(true);
+            }
+            if !self.restore_question().is_empty() {
+                return Err(Refusal::RestoreQuestionOpen.into());
+            }
+            self.refuse_before_upload().await?;
+            let mut ended: Vec<String> = self
+                .reader()
+                .get(key::RECONCILED)
+                .await?
+                .unwrap_or_default();
+            if !ended.iter().any(|name| name == protocol) {
+                ended.push(protocol.to_owned());
+            }
+            if self
+                .protocols
+                .names()
+                .iter()
+                .all(|name| ended.contains(name))
+            {
+                self.end_reconcile(confirmed).await?;
+                return Ok(true);
+            }
+            let mut tx = self.tx()?;
+            tx.put(key::RECONCILED, &ended)?;
+            self.commit(tx).await?;
+            Ok(false)
+        })
+        .await
+    }
+
     /// Reconciliation finished (Switch spec 12.4 step 2.4): reconcile mode ends, and with it
-    /// the unverified continuity, if any.
+    /// the unverified continuity, if any, for every protocol at once.
     ///
     /// # Errors
     ///
@@ -2210,6 +2454,7 @@ impl App {
                 chain.gap = None;
                 chain.write(&mut tx)?;
             }
+            tx.delete(key::RECONCILED)?;
             self.commit(tx).await?;
             if over {
                 self.state.restore = None;
@@ -2252,7 +2497,7 @@ impl App {
     async fn queue_unreported_duties(&mut self) -> Result<(), AppError> {
         let queued = self.duty_queued;
         let kept: Vec<AppEvent> = self
-            .kept_duties()
+            .kept_duties_noted()
             .await?
             .into_iter()
             .filter(|event| event.id().is_some_and(|id| id.counter() > queued))
@@ -2286,7 +2531,7 @@ impl App {
     pub async fn unacknowledged_events(&mut self) -> Result<Vec<AppEvent>, AppError> {
         // A reload owed first, so what it queues is listed here, once.
         self.ready_local().await?;
-        let kept = self.kept_duties().await?;
+        let kept = self.kept_duties_noted().await?;
         for id in kept.iter().filter_map(AppEvent::id) {
             self.duty_handed = self.duty_handed.max(id.counter());
         }
@@ -2297,15 +2542,99 @@ impl App {
         Ok(kept)
     }
 
-    /// The duty events kept, by ascending ID, without handing them to the host.
-    pub(crate) async fn kept_duties(&self) -> Result<Vec<AppEvent>, AppError> {
-        Ok(self
-            .reader()
-            .scan_numbered::<events::Duty>(key::DUTY_PREFIX)
-            .await?
+    /// The duty events kept for `protocol` and not acknowledged by it yet, by ascending
+    /// ID ([`App::ack_events_for`]). Listing them hands every kept duty event to the host,
+    /// as [`App::unacknowledged_events`] does, so a host that lists by protocol lists for
+    /// each of its protocols.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a protocol not registered; a failed store read.
+    pub async fn unacknowledged_events_for(
+        &mut self,
+        protocol: &str,
+    ) -> Result<Vec<AppEvent>, AppError> {
+        self.check_registered(protocol)?;
+        let all = self.unacknowledged_events().await?;
+        Ok(all
             .into_iter()
-            .map(|(n, duty)| duty.event(EventId::new(self.state.duty_epoch.epoch, n)))
+            .filter(|event| self.event_is_for(event, protocol))
             .collect())
+    }
+
+    /// Whether `event` is for `protocol`: an informational event is for every protocol,
+    /// and a duty event for those it names ([`App::event_owners`]).
+    pub fn event_is_for(&self, event: &AppEvent, protocol: &str) -> bool {
+        match event.id() {
+            None => true,
+            Some(id) => self
+                .event_owners(id)
+                .is_some_and(|to| to.iter().any(|name| name == protocol)),
+        }
+    }
+
+    /// The protocols a duty event this app value reported or listed is for and that
+    /// haven't acknowledged it yet; `None` for an ID it doesn't know.
+    pub fn event_owners(&self, id: EventId) -> Option<&[String]> {
+        if id.epoch() != self.state.duty_epoch.epoch {
+            return None;
+        }
+        self.duty_owners.get(&id.counter()).map(Vec::as_slice)
+    }
+
+    /// The duty events kept, by ascending ID, without handing them to the host.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupt`] for one for no protocol, or for one that isn't registered
+    /// ([`App::kept_duty_owned`]).
+    pub(crate) async fn kept_duties(&self) -> Result<Vec<AppEvent>, AppError> {
+        let kept = self
+            .reader()
+            .scan_numbered::<events::KeptDuty>(key::DUTY_PREFIX)
+            .await?;
+        kept.into_iter()
+            .map(|(n, kept)| {
+                self.kept_duty_owned(&kept)?;
+                Ok(kept
+                    .duty
+                    .event(EventId::new(self.state.duty_epoch.epoch, n)))
+            })
+            .collect()
+    }
+
+    /// Every writer names a duty event's protocols, each registered, as the load checks the
+    /// set: an event for none, or for a protocol not registered, which no acknowledgement
+    /// could ever remove, is a corrupt store (fail closed), as an owed call or a deny list
+    /// gap of either is. A restore in place is the way out: it carries such an event only
+    /// for the registered protocols it names, and leaves one for none of them behind,
+    /// counted.
+    fn kept_duty_owned(&self, kept: &events::KeptDuty) -> Result<(), AppError> {
+        if kept.to.is_empty() || kept.to.iter().any(|name| !self.protocols.contains(name)) {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
+
+    /// The duty events kept, as [`App::kept_duties`] lists them, their owners noted for
+    /// [`App::event_owners`].
+    pub(crate) async fn kept_duties_noted(&mut self) -> Result<Vec<AppEvent>, AppError> {
+        let kept = self
+            .reader()
+            .scan_numbered::<events::KeptDuty>(key::DUTY_PREFIX)
+            .await?;
+        let mut out = Vec::with_capacity(kept.len());
+        for kept in kept.values() {
+            self.kept_duty_owned(kept)?;
+        }
+        for (n, kept) in kept {
+            self.duty_owners.insert(n, kept.to);
+            out.push(
+                kept.duty
+                    .event(EventId::new(self.state.duty_epoch.epoch, n)),
+            );
+        }
+        Ok(out)
     }
 
     /// Acknowledge every duty event up to and including `up_to`: the host and its protocol
@@ -2316,6 +2645,10 @@ impl App {
     /// store ([`EventId::cmp_same_store`]). Only events this app value handed to the host,
     /// by [`App::take_events`] or a call's report, are removed: one kept but not yet taken,
     /// such as one queued after a reload, stays until it is taken and acknowledged.
+    ///
+    /// It acknowledges for every protocol at once: each event goes for all the protocols
+    /// it is for, whichever of them acted on it. A host that hands its protocols their
+    /// events apart acknowledges each protocol's with [`App::ack_events_for`] instead.
     ///
     /// The host must call this once it has handed the events to its protocol and the
     /// protocol has kept what they say: nothing else removes a kept duty event, so a host
@@ -2343,7 +2676,61 @@ impl App {
             for n in kept.range(..=through) {
                 tx.delete(&key::duty(*n))?;
             }
-            self.commit(tx).await
+            self.commit(tx).await?;
+            self.duty_owners.retain(|n, _| *n > through);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Acknowledge, for the protocol `protocol` alone, every duty event up to and including
+    /// `up_to` that is for it: as [`App::ack_events`], but each event stays kept for the
+    /// other protocols it is for until each of them acknowledges it, across loads. An event
+    /// that isn't for `protocol` is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a protocol not registered, or an ID of another store: nothing
+    /// is acknowledged. A failed store read or commit; nothing is acknowledged then either.
+    pub async fn ack_events_for(&mut self, protocol: &str, up_to: EventId) -> Result<(), AppError> {
+        Box::pin(async move {
+            self.check_registered(protocol)?;
+            self.ready_local().await?;
+            if up_to.epoch() != self.state.duty_epoch.epoch {
+                return Err(Refusal::Usage(
+                    "an event ID of another store: nothing acknowledged".into(),
+                )
+                .into());
+            }
+            let through = up_to.counter().min(self.duty_handed);
+            let kept = self
+                .reader()
+                .scan_numbered::<events::KeptDuty>(key::DUTY_PREFIX)
+                .await?;
+            let mut tx = self.tx()?;
+            let mut left = Vec::new();
+            for (n, mut kept) in kept.into_iter().filter(|(n, _)| *n <= through) {
+                let before = kept.to.len();
+                kept.to.retain(|name| name != protocol);
+                if kept.to.len() == before {
+                    continue;
+                }
+                if kept.to.is_empty() {
+                    tx.delete(&key::duty(n))?;
+                } else {
+                    tx.put(&key::duty(n), &kept)?;
+                }
+                left.push((n, kept.to));
+            }
+            self.commit(tx).await?;
+            for (n, to) in left {
+                if to.is_empty() {
+                    self.duty_owners.remove(&n);
+                } else {
+                    self.duty_owners.insert(n, to);
+                }
+            }
+            Ok(())
         })
         .await
     }
@@ -2351,20 +2738,86 @@ impl App {
     /// Keep a duty event in `tx`, under the next ID: written in the commit of the change it
     /// reports, and reported once that commit is done (`events` module, "Duty events").
     pub(crate) fn keep_duty(&mut self, tx: &mut Tx, duty: events::Duty) -> Result<(), AppError> {
+        let to = self.duty_to(&duty);
+        self.keep_duty_for(tx, to, duty)
+    }
+
+    /// Keep a duty event for the protocols `to`, as [`App::keep_duty`] does.
+    pub(crate) fn keep_duty_for(
+        &mut self,
+        tx: &mut Tx,
+        to: Vec<String>,
+        duty: events::Duty,
+    ) -> Result<(), AppError> {
         let n = self.state.next_duty;
         let next = n.checked_add(1).ok_or_else(corrupt)?;
-        tx.put(&key::duty(n), &duty)?;
+        let kept = events::KeptDuty { to, duty };
+        tx.put(&key::duty(n), &kept)?;
         tx.put(key::DUTY_NEXT, &next)?;
         self.state.next_duty = next;
-        tx.report(duty.event(EventId::new(self.state.duty_epoch.epoch, n)));
+        self.duty_owners.insert(n, kept.to);
+        tx.report(
+            kept.duty
+                .event(EventId::new(self.state.duty_epoch.epoch, n)),
+        );
         Ok(())
+    }
+
+    /// The protocols a kept batch's duty events are for: its protocol, or every protocol
+    /// for a batch of the host's own.
+    pub(crate) fn batch_owners(&self, pending: &batch::PendingBatch) -> Vec<String> {
+        match &pending.protocol {
+            Some(name) => vec![name.clone()],
+            None => self.protocols.names(),
+        }
+    }
+
+    /// The protocols a duty event about an item of `kind` is for: the kind's owner, or
+    /// every protocol when none owns it.
+    pub(crate) fn owners_of_kind(&self, kind: &str) -> Vec<String> {
+        match self.protocols.of_kind(kind) {
+            Some(owner) => vec![owner.name.clone()],
+            None => self.protocols.names(),
+        }
+    }
+
+    /// The protocols a duty event about a record of the collection `name` is for: the
+    /// collection's owner, or every protocol when none owns it.
+    pub(crate) fn owners_of_collection(&self, name: &str) -> Vec<String> {
+        match self.protocols.of_collection(name) {
+            Some(owner) => vec![owner.name.clone()],
+            None => self.protocols.names(),
+        }
+    }
+
+    /// The protocols a duty event is for: the protocol of the kind it names, or of the
+    /// message of the entry stored locally it names; every protocol otherwise.
+    fn duty_to(&self, duty: &events::Duty) -> Vec<String> {
+        let kind = match duty {
+            events::Duty::EffectRefused { kind, .. }
+            | events::Duty::EffectUncertain { kind, .. } => Some(kind.clone()),
+            _ => duty
+                .stored_id()
+                .and_then(|id| self.state.parked.get(&id))
+                .and_then(|stored| protocols::kind_of_plaintext(&stored.plaintext)),
+        };
+        match kind
+            .as_deref()
+            .and_then(|kind| self.protocols.of_kind(kind))
+        {
+            Some(owner) => vec![owner.name.clone()],
+            None => self.protocols.names(),
+        }
     }
 
     /// What a restore in place carries across. `None` for a store that holds no epoch. A
     /// failed store read is the error: the restore can be tried again. A value that reads
     /// but doesn't decode is left behind and counted; a damaged epoch or counter starts a
     /// new epoch, since the kept counters may then be below IDs the host acknowledged.
-    async fn kept_for_protocol(reader: &Reader) -> Result<Option<Carried>, AppError> {
+    async fn kept_for_protocol(
+        reader: &Reader,
+        protocols: &ProtocolSet,
+    ) -> Result<Option<Carried>, AppError> {
         let Some(epoch) = reader.get_raw(key::DUTY_EPOCH.as_bytes()).await? else {
             return Ok(None);
         };
@@ -2377,15 +2830,23 @@ impl App {
         let mut past_kept = FIRST_DUTY;
         for (rest, bytes) in reader.scan_raw(key::DUTY_PREFIX).await? {
             let read = state::parse_num(&rest).and_then(|n| {
-                let duty = state::decode::<events::Duty>(&bytes)?;
-                Ok((n, duty, state::decode::<serde_json::Value>(&bytes)?))
+                let kept = state::decode::<events::KeptDuty>(&bytes)?;
+                Ok((n, kept))
             });
             match read {
-                Ok((n, duty, value)) => {
+                Ok((n, mut kept)) => {
                     past_kept = past_kept.max(n.checked_add(1).ok_or_else(corrupt)?);
-                    if let Some(id) = duty.stored_id() {
+                    if let Some(id) = kept.duty.stored_id() {
                         carried.stored_past = carried.stored_past.max(id.saturating_add(1));
                     }
+                    // An event goes on only for the protocols registered here; one for none
+                    // of them is left behind, and counted.
+                    kept.to.retain(|name| protocols.contains(name));
+                    if kept.to.is_empty() {
+                        carried.lost_duties = carried.lost_duties.saturating_add(1);
+                        continue;
+                    }
+                    let value = serde_json::to_value(&kept).map_err(|_| corrupt())?;
                     carried
                         .values
                         .push((format!("{}{rest}", key::DUTY_PREFIX), value));
@@ -2398,14 +2859,23 @@ impl App {
             // position, and a change not checked yet that keeps its own operation. One that
             // isn't would fail every read of the restored store; it is counted as left
             // behind instead, so the restore repairs the store.
+            // Each keeps only the protocols registered here; one owed to none of them is
+            // left behind, and counted.
             let read = feed::owed_place(&rest)
-                .and_then(|_| state::decode::<feed::OwedCall>(&bytes))
-                .and_then(|call| call.kept_op_body())
-                .and_then(|_| state::decode::<serde_json::Value>(&bytes));
+                .and_then(|_| state::decode::<feed::Owed>(&bytes))
+                .and_then(|owed| owed.call.kept_op_body().map(|_| owed));
             match read {
-                Ok(value) => carried
-                    .values
-                    .push((format!("{}{rest}", key::OWED_PREFIX), value)),
+                Ok(mut owed) => {
+                    owed.to.retain(|name| protocols.contains(name));
+                    if owed.to.is_empty() {
+                        carried.lost_owed = carried.lost_owed.saturating_add(1);
+                        continue;
+                    }
+                    let value = serde_json::to_value(&owed).map_err(|_| corrupt())?;
+                    carried
+                        .values
+                        .push((format!("{}{rest}", key::OWED_PREFIX), value));
+                }
                 Err(_) => carried.lost_owed = carried.lost_owed.saturating_add(1),
             }
         }
@@ -2420,18 +2890,41 @@ impl App {
     }
 
     /// The owed calls a backup carries, by stored key, each whole as a carried one must be
-    /// ([`App::kept_for_protocol`]), and how many aren't.
-    fn owed_of_backup(backup: &AppBackup) -> (Vec<(String, serde_json::Value)>, u64) {
+    /// and owed only to the protocols registered here ([`App::kept_for_protocol`]), and how
+    /// many are left behind: those that aren't whole, those owed to none of them, and a
+    /// deny list change, which no backup carries (the restore's own gap covers it), so one
+    /// there isn't a backup's whole.
+    fn owed_of_backup(
+        backup: &AppBackup,
+        protocols: &ProtocolSet,
+    ) -> (Vec<(String, serde_json::Value)>, u64) {
         let mut whole = Vec::new();
         let mut lost = 0u64;
         for (rest, value) in &backup.owed {
-            let read = feed::owed_place(rest)
-                .and_then(|_| {
-                    serde_json::from_value::<feed::OwedCall>(value.clone()).map_err(|_| corrupt())
-                })
-                .and_then(|call| call.kept_op_body());
-            match read {
-                Ok(_) => whole.push((format!("{}{rest}", key::OWED_PREFIX), value.clone())),
+            let read = feed::owed_place(rest).and_then(|_| {
+                serde_json::from_value::<feed::Owed>(value.clone()).map_err(|_| corrupt())
+            });
+            let mut owed = match read {
+                Ok(owed)
+                    if matches!(
+                        owed.call,
+                        feed::OwedCall::Resend { .. } | feed::OwedCall::Missed { .. }
+                    ) =>
+                {
+                    owed
+                }
+                _ => {
+                    lost = lost.saturating_add(1);
+                    continue;
+                }
+            };
+            owed.to.retain(|name| protocols.contains(name));
+            if owed.to.is_empty() {
+                lost = lost.saturating_add(1);
+                continue;
+            }
+            match serde_json::to_value(&owed) {
+                Ok(value) => whole.push((format!("{}{rest}", key::OWED_PREFIX), value)),
                 Err(_) => lost = lost.saturating_add(1),
             }
         }
@@ -2476,28 +2969,45 @@ impl App {
         self.state.service_time.map(|time| time.highest_ms)
     }
 
-    /// A value of the protocol's own local state, under its key space.
+    /// [`Refusal::Usage`] for a name no protocol of the app is registered under.
+    fn check_registered(&self, protocol: &str) -> Result<(), AppError> {
+        if self.protocols.contains(protocol) {
+            Ok(())
+        } else {
+            Err(Refusal::Usage(format!("no protocol `{protocol}` is registered")).into())
+        }
+    }
+
+    /// A value of the local state of the protocol `protocol`, under its key space.
     ///
     /// # Errors
     ///
-    /// A store failure.
-    pub async fn protocol_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
+    /// [`Refusal::Usage`] for a protocol not registered; a store failure.
+    pub async fn protocol_get(
+        &self,
+        protocol: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        self.check_registered(protocol)?;
         self.reader()
-            .get_raw(&[PROTOCOL_PREFIX, key].concat())
+            .get_raw(&[PROTOCOL_PREFIX, &protocols::qualified_key(protocol, key)].concat())
             .await
     }
 
-    /// Every value of the protocol's own local state whose key starts with `prefix`, with
-    /// its key in the protocol's key space, in key order.
+    /// Every value of the local state of the protocol `protocol` whose key starts with
+    /// `prefix`, with its key in the protocol's key space, in key order.
     ///
     /// # Errors
     ///
-    /// A store failure.
+    /// [`Refusal::Usage`] for a protocol not registered; a store failure.
     pub async fn protocol_scan(
         &self,
+        protocol: &str,
         prefix: &[u8],
     ) -> Result<Vec<crate::store::KeyValue>, AppError> {
-        let full = [PROTOCOL_PREFIX, prefix].concat();
+        self.check_registered(protocol)?;
+        let own = [PROTOCOL_PREFIX, &protocols::qualified_key(protocol, b"")].concat();
+        let full = [own.as_slice(), prefix].concat();
         let mut out = Vec::new();
         let mut after: Option<Vec<u8>> = None;
         loop {
@@ -2508,7 +3018,7 @@ impl App {
                 .await?;
             let more = page.len() >= usize::try_from(PROTOCOL_SCAN_PAGE).unwrap_or(usize::MAX);
             for (key, value) in page {
-                if let Some(rest) = key.get(PROTOCOL_PREFIX.len()..) {
+                if let Some(rest) = key.get(own.len()..) {
                     out.push((rest.to_vec(), value.clone()));
                 }
                 after = Some(key);
@@ -2519,17 +3029,23 @@ impl App {
         }
     }
 
-    /// Commit writes of the protocol's own local state on their own, in one store commit.
+    /// Commit writes of the local state of the protocol `protocol` on their own, in one
+    /// store commit, under that protocol's prefix.
     /// Writes that go with a batch's outcome go in the batch instead
     /// ([`OpBatch::local`]), and those of a received message's effect with it
     /// ([`Effect::local`], [`ReceiveContext::local`]).
     ///
     /// # Errors
     ///
-    /// [`Refusal::Left`] once the app deleted its keys; a store failure, after which nothing
-    /// was written.
-    pub async fn protocol_commit(&mut self, writes: &[LocalWrite]) -> Result<(), AppError> {
+    /// [`Refusal::Usage`] for a protocol not registered; [`Refusal::Left`] once the app
+    /// deleted its keys; a store failure, after which nothing was written.
+    pub async fn protocol_commit(
+        &mut self,
+        protocol: &str,
+        writes: &[LocalWrite],
+    ) -> Result<(), AppError> {
         Box::pin(async move {
+            self.check_registered(protocol)?;
             self.ready_local().await?;
             if self
                 .state
@@ -2539,10 +3055,15 @@ impl App {
                 return Err(Refusal::Left.into());
             }
             let mut tx = self.tx()?;
-            tx.local(writes)?;
+            tx.local(&protocols::qualify(protocol, writes.iter().cloned()))?;
             self.commit(tx).await
         })
         .await
+    }
+
+    /// The protocols the app runs.
+    pub fn protocols(&self) -> &ProtocolSet {
+        &self.protocols
     }
 
     // ---------------------------------------------------------------------------------

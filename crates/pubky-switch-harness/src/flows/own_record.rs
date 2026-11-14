@@ -74,7 +74,7 @@ pub async fn own_record(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
 
     let renewed = wallet
-        .renew_record(Some(world.now_ms() + 30 * DAY_MS))
+        .renew_record(NOTES, Some(world.now_ms() + 30 * DAY_MS))
         .await;
     world.outcome("renewed", &changed(world, &mut wallet, renewed));
     on_the_homeserver(world, &wallet, true, "the renewal")?;

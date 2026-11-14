@@ -55,10 +55,13 @@ impl AppSpec {
 }
 
 /// The details a protocol supplies, which the Switch treats as opaque strings (Switch spec
-/// 1): the scopes that have keys, the collections and their policies, and the kinds an
-/// app's record accepts.
+/// 1): its name, the scopes that have keys, the collections and their policies, and the
+/// kinds an app's record accepts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProtocolSpec {
+    /// The protocol's name ([`Protocol::name`]): the prefix of its kinds and the root of
+    /// its scopes (Switch wire 3.1 "Scope roots").
+    pub name: String,
     /// The scopes with Shared Data Keys (Switch spec 3.5). A sub-scope (`<scope>:<sub>`) of
     /// a listed scope has keys too.
     pub keyed_scopes: Vec<String>,
@@ -338,10 +341,12 @@ impl TestSigner {
 /// A [`Protocol`] built from a [`ProtocolSpec`], for tests that need one without a
 /// protocol of their own. It accepts the spec's kinds from any app, sends none between own
 /// apps, and records every message it receives; a received message has no lasting effect
-/// beyond the cursor move.
+/// beyond the cursor move, but for one built with [`TestProtocol::keeping`].
 #[derive(Debug, Default)]
 pub struct TestProtocol {
     spec: ProtocolSpec,
+    /// It keeps each message it receives in its local state.
+    keeps: bool,
     received: Mutex<Vec<ReceivedMessage>>,
     resends: Mutex<Vec<ResendNeeded>>,
     missed: Mutex<Vec<MissedEntries>>,
@@ -352,6 +357,16 @@ impl TestProtocol {
     pub fn new(spec: ProtocolSpec) -> Self {
         Self {
             spec,
+            ..Self::default()
+        }
+    }
+
+    /// The protocol `spec` describes, keeping the kind of each message it receives in its
+    /// local state, under the message's `msg_id`, so its backup layer holds them.
+    pub fn keeping(spec: ProtocolSpec) -> Self {
+        Self {
+            spec,
+            keeps: true,
             ..Self::default()
         }
     }
@@ -378,6 +393,10 @@ impl TestProtocol {
 }
 
 impl Protocol for TestProtocol {
+    fn name(&self) -> String {
+        self.spec.name.clone()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.spec.has_keys(scope)
     }
@@ -413,7 +432,18 @@ impl Protocol for TestProtocol {
         _: &mut crate::app::ReceiveContext<'_>,
     ) -> Outcome {
         lock(&self.received).push(message.clone());
-        Outcome::Apply(Effect::default())
+        let local = if self.keeps {
+            vec![LocalWrite::Put {
+                key: message.message.msg_id.clone().into_bytes(),
+                value: message.message.kind.clone().into_bytes(),
+            }]
+        } else {
+            Vec::new()
+        };
+        Outcome::Apply(Effect {
+            local,
+            ..Effect::default()
+        })
     }
 
     fn resend_needed(

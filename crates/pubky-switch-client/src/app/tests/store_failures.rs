@@ -77,6 +77,10 @@ impl FlakyProtocol {
 }
 
 impl Protocol for FlakyProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -145,11 +149,6 @@ impl Protocol for FlakyProtocol {
         self.sample.receive(message, cx)
     }
 
-    /// Backs up its whole local state, as the default hooks write and read it.
-    fn backup_name(&self) -> Option<String> {
-        Some(JOURNAL.into())
-    }
-
     fn resend_needed(
         &self,
         needed: &ResendNeeded,
@@ -173,7 +172,7 @@ fn flaky_config() -> AppConfig {
 }
 
 async fn join_flaky(w: &World, protocol: &Arc<FlakyProtocol>, name: &str) -> App {
-    let request = w.approve(&app_keys(name), &["scope-a"]);
+    let request = w.approve(&app_keys(name), &["sample-a"]);
     App::join(w.env(), protocol.clone(), flaky_config(), request)
         .await
         .unwrap()
@@ -197,7 +196,7 @@ fn store_failing(events: &[AppEvent]) -> Vec<(u64, u32)> {
 
 /// The note's text the protocol stored locally once it was applied.
 async fn note_kept(app: &App, message: &Message) -> Option<Vec<u8>> {
-    app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+    app.protocol_get("sample", format!("notes/{}", message.msg_id).as_bytes())
         .await
         .unwrap()
 }
@@ -221,7 +220,7 @@ async fn test_receive_retry_keeps_the_entry_and_applies_it_at_the_next_read() {
     assert!(w.switch.app(&app.app_id()).cursor < seq);
     // Nothing of the failed step committed: no operation, no local write, no note.
     assert_eq!(w.effects(), 0);
-    assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
+    assert_eq!(app.protocol_get("sample", FAILED_STEP).await.unwrap(), None);
     assert_eq!(note_kept(&app, &message).await, None);
     assert_eq!(app.retry_reads_at(seq), Some(1));
     // A peek still shows it: it runs no receive step.
@@ -250,7 +249,7 @@ async fn test_receive_retry_keeps_the_entry_and_applies_it_at_the_next_read() {
         note_kept(&app, &message).await,
         Some(FLAKY.as_bytes().to_vec())
     );
-    assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
+    assert_eq!(app.protocol_get("sample", FAILED_STEP).await.unwrap(), None);
     assert!(app.no_retries(), "the count goes with the entry");
     // Reloaded from the store: nothing of the retry is left.
     let app = load_flaky(&w, &protocol, app.app_id()).await;
@@ -363,7 +362,7 @@ async fn test_receive_retry_after_a_need_commits_nothing_and_applies_later() {
     assert_eq!(protocol.calls(), 2);
     assert!(report.cursor.seq < seq);
     assert_eq!(w.effects(), 0);
-    assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
+    assert_eq!(app.protocol_get("sample", FAILED_STEP).await.unwrap(), None);
     assert_eq!(app.retry_reads_at(seq), Some(1));
     // The next read asks again, and applies.
     let report = app.receive(None).await.unwrap();
@@ -393,7 +392,7 @@ async fn test_receive_retry_after_a_conflict_commits_nothing_and_applies_later()
     assert!(report.cursor.seq < seq);
     assert!(app.state.pending_effect.is_none());
     assert_eq!(w.effects(), 0);
-    assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
+    assert_eq!(app.protocol_get("sample", FAILED_STEP).await.unwrap(), None);
     assert_eq!(note_kept(&app, &message).await, None);
     let report = app.receive(None).await.unwrap();
     assert!(report.cursor.seq >= seq);
@@ -446,7 +445,7 @@ async fn test_receive_retry_unavailable_is_held_for_the_wait_then_parked_and_pro
             .iter()
             .any(|e| matches!(e, AppEvent::Unparked { .. }))
     );
-    assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
+    assert_eq!(app.protocol_get("sample", FAILED_STEP).await.unwrap(), None);
     // Once the store works it is processed, once.
     protocol.heal();
     let report = app.receive(None).await.unwrap();
@@ -636,7 +635,7 @@ async fn test_receive_retry_of_the_entry_is_parked_at_once() {
     assert!(report.cursor.seq >= later);
     assert!(app.no_retries());
     assert_eq!(w.effects(), 1, "the later note only");
-    assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
+    assert_eq!(app.protocol_get("sample", FAILED_STEP).await.unwrap(), None);
     // Tried again at the next read, in case the host repaired the store.
     let report = app.receive(None).await.unwrap();
     assert!(
@@ -652,7 +651,7 @@ async fn test_receive_retry_of_the_entry_is_parked_at_once() {
 // Restoring the protocol's layer with the app's (Switch spec 12.4)
 
 /// The backup name of [`JournalProtocol`].
-const JOURNAL: &str = "journal-protocol";
+const JOURNAL: &str = "sample";
 
 /// The local key the protocol keeps its journal under.
 const JOURNAL_KEY: &[u8] = b"journal";
@@ -702,6 +701,10 @@ impl JournalProtocol {
 }
 
 impl Protocol for JournalProtocol {
+    fn name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| "sample".into())
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -736,10 +739,6 @@ impl Protocol for JournalProtocol {
 
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
-    }
-
-    fn backup_name(&self) -> Option<String> {
-        self.name.clone()
     }
 
     /// The journal's value, empty without one; a journal of [`HUGE`] stands for one over
@@ -800,7 +799,7 @@ async fn journaled(
     store: &Arc<MemoryStore>,
     journal: &[u8],
 ) -> (App, AppBackup) {
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(
         w.env_on(Arc::clone(store) as Arc<dyn StateStore>),
         protocol.clone(),
@@ -809,10 +808,13 @@ async fn journaled(
     )
     .await
     .unwrap();
-    app.protocol_commit(&[LocalWrite::Put {
-        key: JOURNAL_KEY.to_vec(),
-        value: journal.to_vec(),
-    }])
+    app.protocol_commit(
+        "sample",
+        &[LocalWrite::Put {
+            key: JOURNAL_KEY.to_vec(),
+            value: journal.to_vec(),
+        }],
+    )
     .await
     .unwrap();
     let backup = app.backup_layered().await.unwrap();
@@ -1017,8 +1019,8 @@ async fn test_restore_installs_the_protocol_layer_with_the_app_state() {
     )
     .await;
     assert_eq!(
-        backup.protocol_layer().unwrap(),
-        Some(journal_layer(JOURNAL, b"at the backup"))
+        backup.layers().unwrap(),
+        vec![journal_layer(JOURNAL, b"at the backup")]
     );
     let store = Arc::new(MemoryStore::new());
     let restored = restore_on(
@@ -1031,7 +1033,7 @@ async fn test_restore_installs_the_protocol_layer_with_the_app_state() {
     .unwrap();
     assert!(restored.reconcile_mode());
     assert_eq!(
-        restored.protocol_get(JOURNAL_KEY).await.unwrap(),
+        restored.protocol_get("sample", JOURNAL_KEY).await.unwrap(),
         Some(b"at the backup".to_vec())
     );
     // Both layers load from the store.
@@ -1045,7 +1047,7 @@ async fn test_restore_installs_the_protocol_layer_with_the_app_state() {
     .unwrap();
     assert!(loaded.reconcile_mode());
     assert_eq!(
-        loaded.protocol_get(JOURNAL_KEY).await.unwrap(),
+        loaded.protocol_get("sample", JOURNAL_KEY).await.unwrap(),
         Some(b"at the backup".to_vec())
     );
 }
@@ -1056,10 +1058,13 @@ async fn test_restore_failed_commit_writes_neither_layer() {
     let protocol = JournalProtocol::new(Some(JOURNAL));
     let store = Arc::new(MemoryStore::new());
     let (mut app, backup) = journaled(&w, &protocol, &store, b"from the backup").await;
-    app.protocol_commit(&[LocalWrite::Put {
-        key: JOURNAL_KEY.to_vec(),
-        value: b"before the restore".to_vec(),
-    }])
+    app.protocol_commit(
+        "sample",
+        &[LocalWrite::Put {
+            key: JOURNAL_KEY.to_vec(),
+            value: b"before the restore".to_vec(),
+        }],
+    )
     .await
     .unwrap();
     let before = snapshot(&store, &app.app_id());
@@ -1089,7 +1094,7 @@ async fn test_restore_failed_commit_writes_neither_layer() {
     .unwrap();
     assert!(!loaded.reconcile_mode());
     assert_eq!(
-        loaded.protocol_get(JOURNAL_KEY).await.unwrap(),
+        loaded.protocol_get("sample", JOURNAL_KEY).await.unwrap(),
         Some(b"before the restore".to_vec())
     );
 }
@@ -1125,7 +1130,7 @@ async fn test_restore_commit_of_unknown_outcome_holds_both_layers_or_neither() {
     .unwrap();
     assert!(loaded.reconcile_mode());
     assert_eq!(
-        loaded.protocol_get(JOURNAL_KEY).await.unwrap(),
+        loaded.protocol_get("sample", JOURNAL_KEY).await.unwrap(),
         Some(b"at the backup".to_vec())
     );
 }
@@ -1160,7 +1165,7 @@ async fn test_restore_refused_protocol_layer_writes_nothing() {
     assert_eq!(snapshot(&store, &app.app_id()), before);
     // A backup without the layer the protocol needs is refused the same way.
     let bare = AppBackup::from_bytes(&app.backup().await.unwrap().to_bytes().unwrap()).unwrap();
-    assert_eq!(bare.protocol_layer().unwrap(), None);
+    assert!(bare.layers().unwrap().is_empty());
     let error = restore_on(&w, protocol, fault.clone() as Arc<dyn StateStore>, &bare)
         .await
         .unwrap_err();
@@ -1173,15 +1178,18 @@ async fn test_restore_refused_protocol_layer_writes_nothing() {
 async fn test_restore_layer_is_given_the_identitys_naming_key() {
     let w = World::new();
     let protocol = JournalProtocol::bound();
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap();
     let journal = app.blind(JOURNAL_BINDING);
-    app.protocol_commit(&[LocalWrite::Put {
-        key: JOURNAL_KEY.to_vec(),
-        value: journal.to_vec(),
-    }])
+    app.protocol_commit(
+        "sample",
+        &[LocalWrite::Put {
+            key: JOURNAL_KEY.to_vec(),
+            value: journal.to_vec(),
+        }],
+    )
     .await
     .unwrap();
     // The layered backup checks the restore, with the same key.
@@ -1196,7 +1204,7 @@ async fn test_restore_layer_is_given_the_identitys_naming_key() {
     .await
     .unwrap();
     assert_eq!(
-        restored.protocol_get(JOURNAL_KEY).await.unwrap(),
+        restored.protocol_get("sample", JOURNAL_KEY).await.unwrap(),
         Some(journal.to_vec())
     );
     let expected = (app.identity(), journal);
@@ -1263,7 +1271,7 @@ fn test_restore_build_error_is_labelled_too_large_only_for_its_size() {
 async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
     let w = World::new();
     let protocol = JournalProtocol::new(Some(JOURNAL));
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap();
@@ -1281,7 +1289,7 @@ async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
     );
     assert!(app.take_events().is_empty());
     // A layer whose value is over the store's value size: refused, and the host told.
-    app.protocol_commit(&journal(HUGE)).await.unwrap();
+    app.protocol_commit("sample", &journal(HUGE)).await.unwrap();
     let error = app.backup_layered().await.unwrap_err();
     assert!(
         matches!(&error, AppError::Store(StoreError::TooLarge { cap, .. }) if *cap == MAX_VALUE_BYTES),
@@ -1294,7 +1302,9 @@ async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
         }]
     );
     // Within the sizes, it backs up.
-    app.protocol_commit(&journal(b"fits")).await.unwrap();
+    app.protocol_commit("sample", &journal(b"fits"))
+        .await
+        .unwrap();
     app.backup_layered().await.unwrap();
     assert!(app.take_events().is_empty());
 }
@@ -1307,10 +1317,13 @@ async fn test_backup_layered_over_the_batch_size_is_refused_until_it_drains() {
     // Three values, each within the value size, together over the batch size.
     let part = usize::try_from(MAX_BATCH_BYTES / 3).unwrap() + 1;
     for n in 0..3u8 {
-        app.protocol_commit(&[LocalWrite::Put {
-            key: vec![b'b', n],
-            value: vec![n; part],
-        }])
+        app.protocol_commit(
+            "sample",
+            &[LocalWrite::Put {
+                key: vec![b'b', n],
+                value: vec![n; part],
+            }],
+        )
         .await
         .unwrap();
     }
@@ -1326,7 +1339,7 @@ async fn test_backup_layered_over_the_batch_size_is_refused_until_it_drains() {
         }]
     );
     // Once the state drains below it, the backup goes through.
-    app.protocol_commit(&[LocalWrite::Delete { key: vec![b'b', 0] }])
+    app.protocol_commit("sample", &[LocalWrite::Delete { key: vec![b'b', 0] }])
         .await
         .unwrap();
     app.backup_layered().await.unwrap();
@@ -1352,13 +1365,15 @@ async fn test_backup_with_a_layer_is_told_by_its_protocol_member() {
     assert_eq!(version(&layered), json!(crate::app::SCHEMA_VERSION));
     let bare = AppBackup::from_bytes(&bare).unwrap();
     let layered = AppBackup::from_bytes(&layered).unwrap();
-    assert!(bare.protocol_layer().unwrap().is_none());
+    assert!(bare.layers().unwrap().is_empty());
     assert_eq!(
         layered
-            .protocol_layer()
+            .layers()
             .unwrap()
-            .map(|layer| layer.protocol),
-        Some(JOURNAL.to_owned())
+            .into_iter()
+            .map(|layer| layer.protocol)
+            .collect::<Vec<_>>(),
+        vec![JOURNAL.to_owned()]
     );
 }
 
@@ -1376,21 +1391,18 @@ async fn test_restore_layer_of_a_protocol_not_registered_is_refused() {
         Arc::clone(&store) as Arc<dyn StateStore>,
         StoreFault::None,
     ));
-    // A protocol with no backup name, and one of another name: the layer isn't theirs, and
-    // the restore is refused rather than drop it.
-    let others: [Arc<dyn Protocol>; 2] = [
-        w.protocol.clone(),
-        JournalProtocol::new(Some("another-protocol")),
-    ];
-    for other in others {
-        let error = restore_on(&w, other, fault.clone() as Arc<dyn StateStore>, &backup)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&error, AppError::InvalidData(why) if why.contains("another protocol's")),
-            "{error:?}"
-        );
-    }
+    // A layer named for a protocol the restore doesn't register isn't any registered
+    // protocol's: the restore is refused rather than drop it.
+    let mut bytes: serde_json::Value = serde_json::from_slice(&backup.to_bytes().unwrap()).unwrap();
+    bytes["layers"][0]["name"] = serde_json::Value::String("other".into());
+    let foreign = AppBackup::from_bytes(&serde_json::to_vec(&bytes).unwrap()).unwrap();
+    let error = restore_on(&w, protocol, fault.clone() as Arc<dyn StateStore>, &foreign)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::InvalidData(why) if why.contains("of no registered protocol")),
+        "{error:?}"
+    );
     assert_eq!(fault.commits(), 0);
     assert_eq!(snapshot(&store, &app.app_id()), before);
 }
@@ -1399,10 +1411,13 @@ async fn test_restore_layer_of_a_protocol_not_registered_is_refused() {
 async fn test_restore_without_a_layer_by_a_protocol_that_takes_none() {
     let w = World::new();
     let mut app = w.join("wallet").await;
-    app.protocol_commit(&[LocalWrite::Put {
-        key: JOURNAL_KEY.to_vec(),
-        value: b"not in the backup".to_vec(),
-    }])
+    app.protocol_commit(
+        "sample",
+        &[LocalWrite::Put {
+            key: JOURNAL_KEY.to_vec(),
+            value: b"not in the backup".to_vec(),
+        }],
+    )
     .await
     .unwrap();
     let backup = AppBackup::from_bytes(&app.backup().await.unwrap().to_bytes().unwrap()).unwrap();
@@ -1421,7 +1436,10 @@ async fn test_restore_without_a_layer_by_a_protocol_that_takes_none() {
     )
     .await
     .unwrap();
-    assert_eq!(restored.protocol_get(JOURNAL_KEY).await.unwrap(), None);
+    assert_eq!(
+        restored.protocol_get("sample", JOURNAL_KEY).await.unwrap(),
+        None
+    );
 }
 
 // -------------------------------------------------------------------------------------
@@ -1447,6 +1465,10 @@ fn count_of(value: Option<Vec<u8>>) -> u64 {
 }
 
 impl Protocol for CounterProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -1523,11 +1545,6 @@ impl Protocol for CounterProtocol {
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
-
-    /// Backs up its count, as the default hooks write and read it.
-    fn backup_name(&self) -> Option<String> {
-        Some("counter".into())
-    }
 }
 
 #[tokio::test]
@@ -1537,7 +1554,7 @@ async fn test_receive_context_reads_the_local_writes_of_earlier_entries_in_the_r
         sample: SampleProtocol::default(),
         fails: Mutex::new(1),
     });
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap();
@@ -1546,9 +1563,15 @@ async fn test_receive_context_reads_the_local_writes_of_earlier_entries_in_the_r
     w.note(app.app_id(), "two");
     app.receive(None).await.unwrap();
     // Both notes counted in one read; the retried step's write stays unseen.
-    assert_eq!(count_of(app.protocol_get(COUNT).await.unwrap()), 2);
+    assert_eq!(
+        count_of(app.protocol_get("sample", COUNT).await.unwrap()),
+        2
+    );
     app.receive(None).await.unwrap();
-    assert_eq!(count_of(app.protocol_get(COUNT).await.unwrap()), 3);
+    assert_eq!(
+        count_of(app.protocol_get("sample", COUNT).await.unwrap()),
+        3
+    );
 }
 
 // -------------------------------------------------------------------------------------
@@ -1565,7 +1588,7 @@ async fn test_backup_after_a_failed_commit_is_refused_until_the_store_is_read_ag
         sample: SampleProtocol::default(),
         fails: Mutex::new(0),
     });
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap();
@@ -1592,7 +1615,7 @@ async fn test_backup_after_a_failed_commit_is_refused_until_the_store_is_read_ag
     assert_eq!(error, AppError::Store(StoreError::Unavailable));
     assert!(app.cursor().seq >= seq, "memory is ahead");
     assert_eq!(
-        app.protocol_get(COUNT).await.unwrap(),
+        app.protocol_get("sample", COUNT).await.unwrap(),
         None,
         "the store isn't"
     );
@@ -1603,7 +1626,10 @@ async fn test_backup_after_a_failed_commit_is_refused_until_the_store_is_read_ag
     );
     // The next call reads the store again and processes the note; then it backs up.
     app.receive(None).await.unwrap();
-    assert_eq!(count_of(app.protocol_get(COUNT).await.unwrap()), 1);
+    assert_eq!(
+        count_of(app.protocol_get("sample", COUNT).await.unwrap()),
+        1
+    );
     let backup = app.backup().await.unwrap();
     let restored = App::restore(
         w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
@@ -1623,7 +1649,7 @@ async fn test_backup_layered_after_a_failed_commit_is_of_the_store_not_memory() 
         sample: SampleProtocol::default(),
         fails: Mutex::new(0),
     });
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap();
@@ -1659,10 +1685,13 @@ async fn test_backup_layered_after_a_failed_commit_is_of_the_store_not_memory() 
     .await
     .unwrap();
     assert!(restored.cursor().seq < seq);
-    assert_eq!(restored.protocol_get(COUNT).await.unwrap(), None);
+    assert_eq!(restored.protocol_get("sample", COUNT).await.unwrap(), None);
     // So the restored app applies the note.
     restored.receive(None).await.unwrap();
-    assert_eq!(count_of(restored.protocol_get(COUNT).await.unwrap()), 1);
+    assert_eq!(
+        count_of(restored.protocol_get("sample", COUNT).await.unwrap()),
+        1
+    );
 }
 
 /// What a restore must bring back of an app: its protocol's local state, its cursor, the
@@ -1679,7 +1708,7 @@ async fn restorable(app: &App) -> Restorable {
     let processed: Vec<(String, crate::app::state::Processed)> =
         app.reader().scan("proc/").await.unwrap();
     (
-        app.protocol_scan(b"").await.unwrap(),
+        app.protocol_scan("sample", b"").await.unwrap(),
         app.cursor(),
         app.state.seen.clone(),
         app.stored_seqs(),
@@ -2080,6 +2109,10 @@ impl CertCheckProtocol {
 }
 
 impl Protocol for CertCheckProtocol {
+    fn name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| "sample".into())
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -2116,10 +2149,6 @@ impl Protocol for CertCheckProtocol {
         self.sample.missed(missed)
     }
 
-    fn backup_name(&self) -> Option<String> {
-        self.name.clone()
-    }
-
     fn restore_layer(
         &self,
         layer: Option<&ProtocolLayer>,
@@ -2150,7 +2179,7 @@ async fn cert_checked(
     protocol: &Arc<CertCheckProtocol>,
     store: &Arc<MemoryStore>,
 ) -> App {
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(
         w.env_on(Arc::clone(store) as Arc<dyn StateStore>),
         protocol.clone(),
@@ -2159,10 +2188,13 @@ async fn cert_checked(
     )
     .await
     .unwrap();
-    app.protocol_commit(&[LocalWrite::Put {
-        key: b"note".to_vec(),
-        value: b"kept".to_vec(),
-    }])
+    app.protocol_commit(
+        "sample",
+        &[LocalWrite::Put {
+            key: b"note".to_vec(),
+            value: b"kept".to_vec(),
+        }],
+    )
     .await
     .unwrap();
     app
@@ -2184,7 +2216,7 @@ async fn refused_on_its_cert(
         Arc::clone(store) as Arc<dyn StateStore>,
         StoreFault::None,
     ));
-    let strict = CertCheckProtocol::new(name, Some("scope-b"));
+    let strict = CertCheckProtocol::new(name, Some("sample-b"));
     let error = restore_on(
         w,
         strict.clone(),
@@ -2194,7 +2226,7 @@ async fn refused_on_its_cert(
     .await
     .unwrap_err();
     assert!(
-        matches!(&error, AppError::InvalidData(why) if why.contains("doesn't hold scope-b")),
+        matches!(&error, AppError::InvalidData(why) if why.contains("doesn't hold sample-b")),
         "{error:?}"
     );
     assert_eq!(fault.commits(), 0);
@@ -2211,7 +2243,7 @@ async fn test_restore_refused_on_its_cert_from_a_plain_backup_writes_nothing() {
     let cert = app.cert().clone();
     refused_on_its_cert(&w, None, &Arc::new(MemoryStore::new()), &backup, &cert).await;
     // The same protocol, taking the certificate, restores it.
-    let taking = CertCheckProtocol::new(None, Some("scope-a"));
+    let taking = CertCheckProtocol::new(None, Some("sample-a"));
     let empty = Arc::new(MemoryStore::new());
     restore_on(&w, taking.clone(), empty as Arc<dyn StateStore>, &backup)
         .await
@@ -2260,11 +2292,11 @@ async fn test_backup_layered_check_gives_the_current_cert_and_a_refusal_refuses_
     app.backup_layered().await.unwrap();
     assert_eq!(protocol.given(), vec![app.cert().clone()]);
     // One the protocol wouldn't restore with refuses the backup, writing nothing.
-    *protocol.required.lock().unwrap() = Some("scope-b".into());
+    *protocol.required.lock().unwrap() = Some("sample-b".into());
     let before = snapshot(&store, &app.app_id());
     let error = app.backup_layered().await.unwrap_err();
     assert!(
-        matches!(&error, AppError::InvalidData(why) if why.contains("doesn't hold scope-b")),
+        matches!(&error, AppError::InvalidData(why) if why.contains("doesn't hold sample-b")),
         "{error:?}"
     );
     assert_eq!(snapshot(&store, &app.app_id()), before);
@@ -2347,7 +2379,7 @@ async fn test_restore_of_a_backup_whose_app_record_carries_another_cert_writes_n
     let other = crate::testing::issue_cert(
         &w.alice,
         &keys,
-        &crate::testing::AppSpec::new(&["scope-a", "scope-b"]),
+        &crate::testing::AppSpec::new(&["sample-a", "sample-b"]),
         w.clock.now_ms(),
     )
     .unwrap();
@@ -2369,7 +2401,7 @@ async fn test_restore_of_a_backup_whose_app_record_carries_another_cert_writes_n
             Arc::clone(target) as Arc<dyn StateStore>,
             StoreFault::None,
         ));
-        let checking = CertCheckProtocol::new(Some(JOURNAL), Some("scope-a"));
+        let checking = CertCheckProtocol::new(Some(JOURNAL), Some("sample-a"));
         let error = restore_on(
             &w,
             checking.clone(),

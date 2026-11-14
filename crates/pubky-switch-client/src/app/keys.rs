@@ -93,8 +93,8 @@ impl App {
                 let renewals: Vec<AppCert> = self.state.renewal.iter().cloned().collect();
                 let certs = reader_certs(&self.state.cert, &renewals, &self.state.own_doc);
                 let secret = self.state.keys.bundle_secret();
-                let protocol = std::sync::Arc::clone(&self.protocol);
-                let has_keys = |scope: &str| protocol.has_keys(scope);
+                let protocols = self.protocols.clone();
+                let has_keys = |scope: &str| protocols.has_keys(scope);
                 let reader = PartReader {
                     identity: self.state.meta.identity,
                     app_id: self.state.meta.app_id,
@@ -155,11 +155,11 @@ impl App {
     /// lacks any more, and return whether a key is missing up to the current epoch.
     pub(crate) fn update_keys_through(&mut self) -> bool {
         let epoch = self.state.own_doc.data_epoch();
-        let protocol = std::sync::Arc::clone(&self.protocol);
+        let protocols = self.protocols.clone();
         let missing = missing_keys(
             &self.state.scope_keys,
             &self.state.cert,
-            &|scope| protocol.has_keys(scope),
+            &|scope| protocols.has_keys(scope),
             epoch,
         );
         let through = missing
@@ -250,11 +250,11 @@ impl KeyGaps {
 impl App {
     /// The keys missing through `through`.
     fn key_gaps_through(&self, through: u64) -> KeyGaps {
-        let protocol = std::sync::Arc::clone(&self.protocol);
+        let protocols = self.protocols.clone();
         let gaps = missing_keys(
             &self.state.scope_keys,
             &self.state.cert,
-            &|scope| protocol.has_keys(scope),
+            &|scope| protocols.has_keys(scope),
             through,
         )
         .iter()

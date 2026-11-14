@@ -17,7 +17,7 @@ use pubky_switch_core::records::{AppCert, AppRecord, IdentityDoc, is_renewal};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
-use super::events::AppEvent;
+use super::events::{AppEvent, Duty};
 use super::state::{PendingRecord, Tx, key};
 use super::{App, AppError, Publication};
 use crate::client::Batch;
@@ -56,11 +56,15 @@ impl App {
         let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
         let mut body = old.body().clone();
         body.cert = renewal.signed().clone();
-        body.accepts = self.protocol.accepts(&renewal);
+        body.accepts = self.protocols.accepts(&renewal);
         body.updated_at = self.now().max(old.updated_at().saturating_add(1));
         let record = AppRecord::sign(&self.state.keys, body)?;
-        self.take_cert(renewal, record.signed().clone(), true, None)
-            .await?;
+        if !self
+            .take_cert(renewal, record.signed().clone(), true, None)
+            .await?
+        {
+            return Ok(false);
+        }
         self.deliver_record().await?;
         Ok(true)
     }
@@ -73,13 +77,22 @@ impl App {
     /// With `accepted`, a record the switch holds that carries `cert`, that record is noted
     /// as the newest the switch accepted, in the same commit, and the published copy is
     /// checked against it at the next publication check.
+    ///
+    /// A certificate the app's protocols can't run with, one holding a scope root no
+    /// registered protocol owns or one a protocol refuses, as a join or a load would, isn't
+    /// taken: the app would never load again with it ([`App::refuse_cert`]). Returns
+    /// whether `cert` was taken.
     async fn take_cert(
         &mut self,
         cert: AppCert,
         record: SignedDoc,
         deliver: bool,
         accepted: Option<SignedDoc>,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
+        if let Some(refusal) = self.protocols.certificate_refusal(&cert) {
+            self.refuse_cert(&cert, refusal).await?;
+            return Ok(false);
+        }
         let issued_at = cert.issued_at();
         // A later renewal the app holds, of the certificate taken, stays held: it is taken
         // in turn once its listing comes (`adopt_renewal`).
@@ -91,7 +104,7 @@ impl App {
         // Member by member: a scope of the new certificate that reads a collection's member,
         // its fixed read scope or a sub-scope of its family, and that the one before doesn't
         // hold (Switch spec 3.3).
-        let collections = self.protocol.collections();
+        let collections = self.protocols.collections();
         let widened = cert.scopes().iter().any(|scope| {
             !self.state.cert.holds_scope(scope)
                 && collections.iter().any(|c| c.read_by_scope(scope))
@@ -116,6 +129,7 @@ impl App {
         }
         tx.put(key::CERT, self.state.cert.signed())?;
         tx.put(key::RECORD, &record)?;
+        tx.delete(key::CERT_REFUSED)?;
         if !keep_renewal {
             tx.delete(key::CERT_RENEWAL)?;
         }
@@ -139,6 +153,52 @@ impl App {
             self.published_checked_ms = None;
         }
         self.events.push(AppEvent::CertificateTaken { issued_at });
+        Ok(true)
+    }
+
+    /// Refuse a renewed certificate the app's protocols can't run with: the app keeps the
+    /// certificate it presents, and a renewal held from `cert.put` that is `cert` goes, so
+    /// no read takes it. The host is told once, by a duty event for every protocol, in the
+    /// same commit as `cert/refused`, which names the certificate: a read that finds it
+    /// again, listed in the own record another device put, refuses it with no second
+    /// event. A later renewal is checked on its own.
+    async fn refuse_cert(
+        &mut self,
+        cert: &AppCert,
+        refusal: super::events::CertificateRefusal,
+    ) -> Result<(), AppError> {
+        let hash = pubky_switch_core::enc::b64(&cert.hash());
+        let told = self
+            .reader()
+            .get::<String>(key::CERT_REFUSED)
+            .await?
+            .is_some_and(|refused| refused == hash);
+        let held = self
+            .state
+            .renewal
+            .as_ref()
+            .is_some_and(|renewal| renewal.hash() == cert.hash());
+        if told && !held {
+            return Ok(());
+        }
+        let mut tx = self.tx()?;
+        if held {
+            tx.delete(key::CERT_RENEWAL)?;
+        }
+        if !told {
+            tx.put(key::CERT_REFUSED, &hash)?;
+            self.keep_duty(
+                &mut tx,
+                Duty::CertificateRefused {
+                    issued_at: cert.issued_at(),
+                    refusal,
+                },
+            )?;
+        }
+        self.commit(tx).await?;
+        if held {
+            self.state.renewal = None;
+        }
         Ok(())
     }
 
@@ -448,7 +508,7 @@ impl App {
                 let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
                 let mut body = old.body().clone();
                 body.cert = cert.signed().clone();
-                body.accepts = self.protocol.accepts(&cert);
+                body.accepts = self.protocols.accepts(&cert);
                 body.updated_at = self
                     .now()
                     .max(old.updated_at().saturating_add(1))
@@ -457,6 +517,8 @@ impl App {
             } else {
                 taken.clone()
             };
+            // One the protocols can't run with is refused, and the app goes on with the
+            // certificate it presents.
             self.take_cert(cert, record, kept, Some(taken)).await?;
         }
         Ok(Listed::Key(key))

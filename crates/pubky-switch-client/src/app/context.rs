@@ -43,6 +43,7 @@ use super::admission::{LISTS_AT, SenderDisposition, deny_key, flag_key};
 use super::claims::{ClaimOp, ClaimRead, KeptClaim, ObligationDeadline, claim_key_of};
 use super::error::Refusal;
 use super::protocol::{LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
+use super::protocols::{ProtocolSet, qualified_key, unqualify};
 use super::records::{
     Collection, HeldRecord, RecordTarget, SeenMark, SharedRecord, record_key_of, record_put,
     seen_key,
@@ -97,13 +98,15 @@ pub enum ClaimFetch {
 /// move, at most 7 operations beside it (Switch wire 6.4).
 pub struct ReceiveContext<'a> {
     state: &'a AppState,
-    protocol: &'a dyn super::Protocol,
+    protocols: &'a ProtocolSet,
+    /// The protocol whose receive step it serves.
+    name: &'a str,
     store: &'a dyn StateStore,
     ns: &'a str,
     may_attempt: bool,
     fetched: &'a [([u8; 32], ClaimFetch)],
     /// The local writes of the entries processed before this one in the same read, not yet
-    /// committed.
+    /// committed, qualified ([`super::protocols::qualify`]): every protocol's.
     pending: &'a [LocalWrite],
     /// Every write of the same read not yet committed, such as a deny list change the feed
     /// showed before this entry.
@@ -121,9 +124,14 @@ fn store_error(error: crate::error::StoreError) -> AppError {
     AppError::Store(error)
 }
 
-fn local_get(store: &dyn StateStore, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
+fn local_get(
+    store: &dyn StateStore,
+    ns: &str,
+    name: &str,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, AppError> {
     store
-        .get(ns, &[PROTOCOL_PREFIX, key].concat())
+        .get(ns, &[PROTOCOL_PREFIX, &qualified_key(name, key)].concat())
         .map_err(store_error)
 }
 
@@ -174,8 +182,14 @@ fn pending_scan(committed: Vec<KeyValue>, pending: &[LocalWrite], prefix: &[u8])
     values.into_iter().collect()
 }
 
-fn local_scan(store: &dyn StateStore, ns: &str, prefix: &[u8]) -> Result<Vec<KeyValue>, AppError> {
-    let full = [PROTOCOL_PREFIX, prefix].concat();
+fn local_scan(
+    store: &dyn StateStore,
+    ns: &str,
+    name: &str,
+    prefix: &[u8],
+) -> Result<Vec<KeyValue>, AppError> {
+    let own = [PROTOCOL_PREFIX, &qualified_key(name, b"")].concat();
+    let full = [own.as_slice(), prefix].concat();
     let mut out = Vec::new();
     let mut after: Option<Vec<u8>> = None;
     loop {
@@ -184,7 +198,7 @@ fn local_scan(store: &dyn StateStore, ns: &str, prefix: &[u8]) -> Result<Vec<Key
             .map_err(store_error)?;
         let more = page.len() >= usize::try_from(SCAN_PAGE).unwrap_or(usize::MAX);
         for (key, value) in page {
-            if let Some(rest) = key.get(PROTOCOL_PREFIX.len()..) {
+            if let Some(rest) = key.get(own.len()..) {
                 out.push((rest.to_vec(), value.clone()));
             }
             after = Some(key);
@@ -204,6 +218,8 @@ pub struct LocalView<'a> {
     app_id: [u8; 16],
     store: &'a dyn StateStore,
     ns: &'a str,
+    /// The protocol whose state it reads.
+    name: &'a str,
 }
 
 impl std::fmt::Debug for LocalView<'_> {
@@ -218,12 +234,14 @@ impl<'a> LocalView<'a> {
         app_id: [u8; 16],
         store: &'a dyn StateStore,
         ns: &'a str,
+        name: &'a str,
     ) -> Self {
         Self {
             identity,
             app_id,
             store,
             ns,
+            name,
         }
     }
 
@@ -243,7 +261,7 @@ impl<'a> LocalView<'a> {
     ///
     /// A store failure.
     pub fn local_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
-        local_get(self.store, self.ns, key)
+        local_get(self.store, self.ns, self.name, key)
     }
 
     /// Every value of the protocol's local state whose key starts with `prefix`, with its
@@ -253,7 +271,7 @@ impl<'a> LocalView<'a> {
     ///
     /// A store failure.
     pub fn local_scan(&self, prefix: &[u8]) -> Result<Vec<KeyValue>, AppError> {
-        local_scan(self.store, self.ns, prefix)
+        local_scan(self.store, self.ns, self.name, prefix)
     }
 }
 
@@ -334,7 +352,8 @@ impl<'a> ReceiveContext<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         state: &'a AppState,
-        protocol: &'a dyn super::Protocol,
+        protocols: &'a ProtocolSet,
+        name: &'a str,
         store: &'a dyn StateStore,
         ns: &'a str,
         may_attempt: bool,
@@ -344,7 +363,8 @@ impl<'a> ReceiveContext<'a> {
     ) -> Self {
         Self {
             state,
-            protocol,
+            protocols,
+            name,
             store,
             ns,
             may_attempt,
@@ -569,9 +589,9 @@ impl<'a> ReceiveContext<'a> {
     ///
     /// A store failure.
     pub fn local_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
-        match pending_get(self.pending, key) {
+        match pending_get(self.pending, &qualified_key(self.name, key)) {
             Some(value) => Ok(value),
-            None => local_get(self.store, self.ns, key),
+            None => local_get(self.store, self.ns, self.name, key),
         }
     }
 
@@ -583,8 +603,12 @@ impl<'a> ReceiveContext<'a> {
     ///
     /// A store failure.
     pub fn local_scan(&self, prefix: &[u8]) -> Result<Vec<KeyValue>, AppError> {
-        let committed = local_scan(self.store, self.ns, prefix)?;
-        Ok(pending_scan(committed, self.pending, prefix))
+        let committed = local_scan(self.store, self.ns, self.name, prefix)?;
+        Ok(pending_scan(
+            committed,
+            &unqualify(self.name, self.pending),
+            prefix,
+        ))
     }
 
     // ---------------------------------------------------------------------------------
@@ -664,7 +688,7 @@ impl<'a> ReceiveContext<'a> {
         // A value that isn't JSON is refused before the protocol marks it, as `record_op`
         // does: nothing is handed on first.
         super::records::refuse_non_json(value)?;
-        super::records::refuse_unmarkable(self.protocol, target, value)?;
+        super::records::refuse_unmarkable(self.protocols, target, value)?;
         let key = self.record_key(target)?;
         if self.writes.records.iter().any(|(k, _)| *k == key) {
             return Err(

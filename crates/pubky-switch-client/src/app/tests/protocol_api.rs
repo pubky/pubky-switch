@@ -113,6 +113,10 @@ fn text(result: Result<[u8; 32], AppError>) -> Result<(), String> {
 }
 
 impl Protocol for ApiProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.items.has_keys(scope)
     }
@@ -201,7 +205,7 @@ impl Protocol for ApiProtocol {
             }
             Mode::OtherWriteScope => {
                 let target = RecordTarget::new(
-                    Collection::new("sample.other", Policy::new("scope-a", &["scope-b"])),
+                    Collection::new("sample.other", Policy::new("sample-a", &["sample-b"])),
                     b"x",
                 );
                 seen.writes
@@ -273,10 +277,6 @@ impl Protocol for ApiProtocol {
     ) -> Option<Vec<u8>> {
         self.items.sent_record(job, sent, current)
     }
-
-    fn backup_name(&self) -> Option<String> {
-        Some("sample.api".into())
-    }
 }
 
 /// A cursor move that waits for the next batch as long as it may: one the switch holds came
@@ -307,7 +307,7 @@ async fn join(w: &World, protocol: &Arc<ApiProtocol>, name: &str) -> App {
         w,
         protocol,
         name,
-        &["scope-a"],
+        &["sample-a"],
         Arc::new(MemoryStore::new()),
     )
     .await
@@ -340,7 +340,12 @@ async fn test_receive_context_writes_the_record_with_the_cursor_move() {
     assert_eq!(ids(record.content.value()), vec![note.msg_id.clone()]);
     assert!(record.authenticated, "settled from the effect's proof");
     let local = format!("notes/{}", note.msg_id);
-    assert!(app.protocol_get(local.as_bytes()).await.unwrap().is_some());
+    assert!(
+        app.protocol_get("sample", local.as_bytes())
+            .await
+            .unwrap()
+            .is_some()
+    );
     // The message seen again writes nothing more.
     assert!(protocol.seen()[0].held.is_none());
 }
@@ -413,7 +418,7 @@ async fn conflict_reads_again_and_builds_again() {
     let w = World::new();
     let protocol = ApiProtocol::new(Mode::Record);
     let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
-    let mut wallet = join_on(&w, &protocol, "wallet", &["scope-a"], store).await;
+    let mut wallet = join_on(&w, &protocol, "wallet", &["sample-a"], store).await;
     let mut phone = join(&w, &protocol, "phone").await;
     wallet.receive(None).await.unwrap();
     let (_, note) = w.note(wallet.app_id(), "hello");
@@ -497,7 +502,7 @@ async fn test_receive_context_refuses_a_second_write_of_one_record() {
 #[tokio::test]
 async fn test_receive_context_without_a_write_scope_is_refused() {
     let w = World::new();
-    // The record's policy writes under `scope-b`, which the app doesn't hold.
+    // The record's policy writes under `sample-b`, which the app doesn't hold.
     let protocol = ApiProtocol::new(Mode::OtherWriteScope);
     let mut app = join(&w, &protocol, "wallet").await;
     let (seq, _) = w.note(app.app_id(), "hello");
@@ -555,7 +560,12 @@ async fn test_receive_context_writes_go_only_with_apply() {
     );
     assert_eq!(record_puts(&w), 0);
     let local = format!("notes/{}", note.msg_id);
-    assert!(app.protocol_get(local.as_bytes()).await.unwrap().is_none());
+    assert!(
+        app.protocol_get("sample", local.as_bytes())
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(app.cursor().seq, seq);
 }
 
@@ -616,7 +626,7 @@ async fn receive_scenario(
             Ok(app) => app,
             Err(AppError::Refused(Refusal::NotJoined)) => {
                 let request = approval
-                    .get_or_insert_with(|| w.approve(&keys, &["scope-a"]))
+                    .get_or_insert_with(|| w.approve(&keys, &["sample-a"]))
                     .clone();
                 App::join(env, protocol.clone(), config(), request).await?
             }
@@ -707,7 +717,12 @@ async fn test_receive_context_crash_at_each_commit_point_writes_each_effect_once
             assert!(app.cursor().seq >= sent[1].0, "commit {n} ({stop_after})");
             for (_, msg_id) in &sent {
                 let local = format!("notes/{msg_id}");
-                assert!(app.protocol_get(local.as_bytes()).await.unwrap().is_some());
+                assert!(
+                    app.protocol_get("sample", local.as_bytes())
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
             }
         }
     }
@@ -724,10 +739,13 @@ async fn test_protocol_commit_and_scan_in_key_order() {
         key: key.as_bytes().to_vec(),
         value: value.as_bytes().to_vec(),
     };
-    app.protocol_commit(&[put("a/2", "two"), put("b/1", "x"), put("a/1", "one")])
-        .await
-        .unwrap();
-    let scanned = app.protocol_scan(b"a/").await.unwrap();
+    app.protocol_commit(
+        "sample",
+        &[put("a/2", "two"), put("b/1", "x"), put("a/1", "one")],
+    )
+    .await
+    .unwrap();
+    let scanned = app.protocol_scan("sample", b"a/").await.unwrap();
     assert_eq!(
         scanned,
         vec![
@@ -735,13 +753,16 @@ async fn test_protocol_commit_and_scan_in_key_order() {
             (b"a/2".to_vec(), b"two".to_vec())
         ]
     );
-    app.protocol_commit(&[LocalWrite::DeletePrefix {
-        prefix: b"a/".to_vec(),
-    }])
+    app.protocol_commit(
+        "sample",
+        &[LocalWrite::DeletePrefix {
+            prefix: b"a/".to_vec(),
+        }],
+    )
     .await
     .unwrap();
-    assert!(app.protocol_scan(b"a/").await.unwrap().is_empty());
-    assert_eq!(app.protocol_scan(b"").await.unwrap().len(), 1);
+    assert!(app.protocol_scan("sample", b"a/").await.unwrap().is_empty());
+    assert_eq!(app.protocol_scan("sample", b"").await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -754,10 +775,13 @@ async fn test_protocol_commit_refused_once_the_keys_are_deleted() {
     .await
     .unwrap();
     let error = app
-        .protocol_commit(&[LocalWrite::Put {
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
-        }])
+        .protocol_commit(
+            "sample",
+            &[LocalWrite::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        )
         .await
         .unwrap_err();
     assert_eq!(error, AppError::Refused(Refusal::Left));
@@ -772,13 +796,18 @@ async fn test_batch_local_writes_commit_with_the_answer_only() {
         value: b"1".to_vec(),
     };
     app.submit_batch(
-        OpBatch::new()
+        OpBatch::for_protocol("sample")
             .op(OpKind::DenyPut { pubky: [9; 32] })
             .local(write("applied")),
     )
     .await
     .unwrap();
-    assert!(app.protocol_get(b"applied").await.unwrap().is_some());
+    assert!(
+        app.protocol_get("sample", b"applied")
+            .await
+            .unwrap()
+            .is_some()
+    );
     // A batch refused for good commits none of its local writes.
     let key = app.record_key(&inbox()).unwrap();
     let wrong = Condition::RecordVersion {
@@ -790,11 +819,20 @@ async fn test_batch_local_writes_commit_with_the_answer_only() {
         .await
         .unwrap();
     let error = app
-        .submit_batch(OpBatch::new().entry(entry).locals([write("refused")]))
+        .submit_batch(
+            OpBatch::for_protocol("sample")
+                .entry(entry)
+                .locals([write("refused")]),
+        )
         .await
         .unwrap_err();
     assert_eq!(error.code(), Some(ErrorCode::Conflict));
-    assert!(app.protocol_get(b"refused").await.unwrap().is_none());
+    assert!(
+        app.protocol_get("sample", b"refused")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // -------------------------------------------------------------------------------------
@@ -1055,7 +1093,7 @@ async fn test_highest_service_time_follows_verified_answers() {
 // A policy per sub-scope (Switch spec 3.3, 10.3)
 
 fn family() -> Collection {
-    Collection::with_sub_scopes("sample.items", Policy::new("scope-a", &["scope-a"]))
+    Collection::with_sub_scopes("sample.items", Policy::new("sample-a", &["sample-a"]))
 }
 
 #[tokio::test]
@@ -1068,7 +1106,7 @@ async fn test_policy_family_lists_and_takes_a_sub_scope_record() {
         &w,
         &protocol,
         "kiosk",
-        &["scope-a:kiosk"],
+        &["sample-a:kiosk"],
         Arc::new(MemoryStore::new()),
     )
     .await;
@@ -1104,7 +1142,7 @@ async fn test_policy_family_fixed_collection_flags_a_sub_scope_record() {
         &w,
         &protocol,
         "kiosk",
-        &["scope-a:kiosk"],
+        &["sample-a:kiosk"],
         Arc::new(MemoryStore::new()),
     )
     .await;
@@ -1148,8 +1186,8 @@ fn test_policy_family_members_follow_the_scope_rule() {
 #[test]
 fn test_policy_family_readable_by_a_sub_scope_holder() {
     let alice = identity("alice");
-    let sub = cert_for(alice.key(), &app_keys("kiosk"), START, &["scope-a:kiosk"]);
-    let other = cert_for(alice.key(), &app_keys("other"), START, &["scope-b"]);
+    let sub = cert_for(alice.key(), &app_keys("kiosk"), START, &["sample-a:kiosk"]);
+    let other = cert_for(alice.key(), &app_keys("other"), START, &["sample-b"]);
     assert!(family().readable_by(&sub));
     assert!(!items().readable_by(&sub));
     assert!(!family().readable_by(&other));
@@ -1218,7 +1256,7 @@ impl Pair {
         permissions: &[Permission],
     ) -> App {
         let keys = signer.identity().app_keys(name);
-        let app = AppSpec::new(&["scope-a"]).with_permissions(permissions);
+        let app = AppSpec::new(&["sample-a"]).with_permissions(permissions);
         let request = signer.approve(&keys, &app).unwrap();
         App::join(self.env(signer, store), protocol, config(), request)
             .await
@@ -1227,6 +1265,24 @@ impl Pair {
 
     fn env(&self, signer: &TestSigner, store: Arc<dyn StateStore>) -> AppEnv {
         signer.env_with(store, Arc::clone(&self.router) as Arc<dyn Transport>)
+    }
+
+    /// `name` of `signer`'s identity on a store of its own, with every permission, running
+    /// `protocols` with the scopes `scopes`.
+    pub(super) async fn join_set(
+        &self,
+        signer: &TestSigner,
+        name: &str,
+        protocols: crate::app::ProtocolSet,
+        scopes: &[&str],
+    ) -> App {
+        let keys = signer.identity().app_keys(name);
+        let app = AppSpec::new(scopes).with_permissions(&Permission::ALL);
+        let request = signer.approve(&keys, &app).unwrap();
+        let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
+        App::join(self.env(signer, store), protocols, config(), request)
+            .await
+            .unwrap()
     }
 
     async fn join(&self, signer: &TestSigner, name: &str, protocol: &Arc<ApiProtocol>) -> App {
@@ -2717,7 +2773,7 @@ async fn signed_scenario(
         match App::load(env.clone(), protocol.clone(), config(), keys.app_id_bytes()).await {
             Ok(app) => app,
             Err(AppError::Refused(Refusal::NotJoined)) => {
-                let app = AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL);
+                let app = AppSpec::new(&["sample-a"]).with_permissions(&Permission::ALL);
                 let request = approval
                     .get_or_insert_with(|| p.alice.approve(&keys, &app).unwrap())
                     .clone();
@@ -3058,7 +3114,7 @@ async fn test_sender_disposition_lists_as_of_is_service_time() {
         .bob
         .approve(
             &keys,
-            &AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL),
+            &AppSpec::new(&["sample-a"]).with_permissions(&Permission::ALL),
         )
         .unwrap();
     let mut env = p.env(&p.bob, Arc::new(MemoryStore::new()));
@@ -3501,13 +3557,13 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
         let cert = p.bob.register_app(&keys, &spec).unwrap();
         (keys, cert, switch.seq())
     };
-    let (_, plain_cert, _) = register("plain", &["scope-a"], &[]);
+    let (_, plain_cert, _) = register("plain", &["sample-a"], &[]);
     let (claims_keys, claims_cert, claims_put) =
-        register("claims", &["scope-b"], &[Permission::ClaimsRead]);
-    let (_, lists_cert, _) = register("lists", &["scope-b"], &[Permission::ListsRead]);
+        register("claims", &["sample-b"], &[Permission::ClaimsRead]);
+    let (_, lists_cert, _) = register("lists", &["sample-b"], &[Permission::ListsRead]);
     let (adder_keys, adder_cert, _) =
-        register("adder", &["scope-b"], &[Permission::ConversationAdd]);
-    let (renewing_keys, renewing_cert, _) = register("renewing", &["scope-b"], &[]);
+        register("adder", &["sample-b"], &[Permission::ConversationAdd]);
+    let (renewing_keys, renewing_cert, _) = register("renewing", &["sample-b"], &[]);
     let (plain, claims, lists, adder) = (
         plain_cert.app_id(),
         claims_cert.app_id(),
@@ -3523,7 +3579,7 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
         .await
         .unwrap();
     rows.push(("claim", switch.seq(), "op", vec![claims], vec![plain]));
-    // A record write: the read scope (`scope-a`), not another scope.
+    // A record write: the read scope (`sample-a`), not another scope.
     shop.put_record(&inbox(), &value(&["a"]), vec![])
         .await
         .unwrap();
@@ -3571,7 +3627,7 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
     ));
     // A key bundle part: its target only.
     let part = |cert: &AppCert| {
-        let sealed = seal_bundle_parts(bob.key(), cert, 1, 1, &|s: &str| s == "scope-a");
+        let sealed = seal_bundle_parts(bob.key(), cert, 1, 1, &|s: &str| s == "sample-a");
         OpKind::KeyBundlePut(KeyBundlePut {
             target_app_id: cert.app_id(),
             bundle: sealed.unwrap().remove(0).bundle,
@@ -3652,7 +3708,7 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
     rows.push(("app.put superseded", claims_put, "op", vec![], vec![plain]));
     // A renewed certificate: every app while stored; one the app's record carries is a stub.
     let renew = |keys: &AppKeys| {
-        let spec = AppSpec::new(&["scope-b"]);
+        let spec = AppSpec::new(&["sample-b"]);
         let renewed = issue_cert(bob.key(), keys, &spec, p.clock.now_ms()).unwrap();
         switch
             .signer_op(OpKind::CertPut {
@@ -4097,7 +4153,7 @@ async fn test_backup_outbox_deadline_starts_at_the_verified_service_time() {
         .alice
         .approve(
             &keys,
-            &AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL),
+            &AppSpec::new(&["sample-a"]).with_permissions(&Permission::ALL),
         )
         .unwrap();
     let mut env = p.env(&p.alice, Arc::new(MemoryStore::new()));

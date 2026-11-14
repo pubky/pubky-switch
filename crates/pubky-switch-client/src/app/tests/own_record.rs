@@ -40,7 +40,7 @@ fn record_of(app: &App) -> AppRecord {
 
 impl World {
     async fn join_publishing(&self, name: &str) -> App {
-        let request = self.approve(&app_keys(name), &["scope-a"]);
+        let request = self.approve(&app_keys(name), &["sample-a"]);
         App::join(self.env(), self.protocol.clone(), publishing(), request)
             .await
             .unwrap()
@@ -149,7 +149,7 @@ async fn test_own_record_load_publishing_needs_a_writer() {
 #[tokio::test]
 async fn test_own_record_publishing_needs_a_writer() {
     let w = World::new();
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let env = AppEnv {
         homeserver_writer: None,
         ..w.env()
@@ -284,14 +284,14 @@ async fn test_own_record_renewal_signs_again_with_the_same_members() {
     let before = record_of(&app);
     w.clock.advance_ms(1_000);
     // The same expiry still renews: a new updated_at.
-    app.renew_record(Some(expires)).await.unwrap();
+    app.renew_record(PROTO, Some(expires)).await.unwrap();
     let renewed = record_of(&app);
     assert!(renewed.updated_at() > before.updated_at());
     assert_eq!(renewed.body().protocols, before.body().protocols);
     assert_eq!(w.held(id).as_ref(), Some(app.record()));
     assert_eq!(w.published(id), Some(bytes_of(app.record())));
     // A record that doesn't expire.
-    app.renew_record(None).await.unwrap();
+    app.renew_record(PROTO, None).await.unwrap();
     assert_eq!(record_of(&app).expires_at(), None);
     assert_eq!(w.held(id).as_ref(), Some(app.record()));
 }
@@ -316,7 +316,7 @@ async fn test_own_record_updated_at_later_than_the_held_one_on_a_clock_behind() 
         path: "/ops".into(),
         after: 0,
     });
-    app.renew_record(None).await.unwrap_err();
+    app.renew_record(PROTO, None).await.unwrap_err();
     assert_eq!(record_of(&app).updated_at(), before.updated_at() + 1);
     app.publish_record().await.unwrap();
     assert_eq!(record_of(&app).updated_at(), before.updated_at() + 1);
@@ -627,6 +627,10 @@ struct Narrowing {
 }
 
 impl Protocol for Narrowing {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -658,7 +662,7 @@ impl Protocol for Narrowing {
 async fn test_own_record_accepts_follow_the_protocol() {
     let w = World::new();
     let protocol = Arc::new(Narrowing::default());
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(w.env(), protocol.clone(), publishing(), request)
         .await
         .unwrap();
@@ -691,7 +695,7 @@ async fn test_own_record_changes_refused_once_left() {
         app.set_protocol_member(PROTO, member(json!({})), None)
             .await
             .unwrap_err(),
-        app.renew_record(None).await.unwrap_err(),
+        app.renew_record(PROTO, None).await.unwrap_err(),
         app.publish_record().await.unwrap_err(),
         app.sign_protocol("sample/v1/grant", &[b"x"]).unwrap_err(),
     ] {
@@ -747,7 +751,7 @@ async fn test_own_record_renewed_certificate_is_republished() {
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms() + 1000,
-        &["scope-a"],
+        &["sample-a"],
     );
     w.switch
         .signer_op(OpKind::CertPut {
@@ -1747,7 +1751,7 @@ fn store_renewal_unlisted(w: &World, app: &App) -> pubky_switch_core::records::A
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms(),
-        &["scope-a"],
+        &["sample-a"],
     );
     let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
     let epoch = w.switch.identity_doc().unwrap().data_epoch();
@@ -1861,7 +1865,7 @@ async fn test_own_record_superseded_by_an_unlisted_record_publishes_nothing_of_i
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms(),
-        &["scope-a"],
+        &["sample-a"],
     );
     let accepts = w.protocol.accepts(&unlisted);
     let shown = AppRecordBody::new(&unlisted, accepts, w.clock.now_ms());
@@ -2112,7 +2116,7 @@ async fn test_own_record_listed_renewal_not_in_the_directory_is_looked_for_again
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms(),
-        &["scope-a"],
+        &["sample-a"],
     );
     list_renewal(&w, id, &old, &renewed);
     app.refresh_identity().await.unwrap();
@@ -2253,7 +2257,7 @@ async fn test_take_listed_renewal_keeps_a_later_held_renewal() {
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms(),
-        &["scope-a"],
+        &["sample-a"],
     );
     w.switch
         .signer_batch(vec![OpKind::CertPut {
@@ -2295,7 +2299,7 @@ async fn test_own_record_listed_certificate_that_doesnt_renew_is_not_taken() {
         &w.alice,
         &app_keys("wallet"),
         old.issued_at() - 1_000,
-        &["scope-a"],
+        &["sample-a"],
     );
     list_renewal(&w, id, &old, &earlier);
     w.clock.advance_ms(1_000);
@@ -2334,7 +2338,7 @@ async fn test_own_record_look_that_brings_the_apps_removal_stops_the_read() {
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms(),
-        &["scope-a"],
+        &["sample-a"],
     );
     list_renewal(&w, id, &old, &renewed);
     app.refresh_identity().await.unwrap();
@@ -2368,7 +2372,7 @@ async fn test_own_record_look_that_fails_lets_the_read_go_on() {
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms(),
-        &["scope-a"],
+        &["sample-a"],
     );
     list_renewal(&w, id, &old, &renewed);
     app.refresh_identity().await.unwrap();
@@ -2404,7 +2408,7 @@ async fn test_take_listed_renewal_removal_with_an_epoch_rise_stops_the_read() {
         &w.alice,
         &app_keys("wallet"),
         w.clock.now_ms(),
-        &["scope-a"],
+        &["sample-a"],
     );
     list_renewal(&w, id, &old, &renewed);
     app.refresh_identity().await.unwrap();

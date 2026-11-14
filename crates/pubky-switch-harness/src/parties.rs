@@ -19,7 +19,7 @@ use crate::HarnessError;
 pub const NOTES: &str = "notes";
 
 /// The message kind the notes apps accept.
-pub const NOTE_KIND: &str = "example.note";
+pub const NOTE_KIND: &str = "notes.note";
 
 /// A scope of the [`Notes`] protocol without keys, whose apps hold `lists.manage` alone:
 /// they change the lists and can't read them.
@@ -101,9 +101,50 @@ impl Protocol for Notes {
     }
 }
 
+/// The spec's sample protocol `tasks`, beside [`CHAT`] for an app running two protocols.
+pub const TASKS: &str = "tasks";
+
+/// A second neutral protocol, `chat`, beside [`TASKS`].
+pub const CHAT: &str = "chat";
+
+/// The signer's side of a neutral protocol of one keyed scope, its name, whose apps hold
+/// every switch permission: [`TASKS`] and [`CHAT`].
+#[derive(Clone, Copy, Debug)]
+pub struct Sample(pub &'static str);
+
+impl Protocol for Sample {
+    fn name(&self) -> &str {
+        self.0
+    }
+
+    fn scopes(&self) -> Vec<ScopeDef> {
+        vec![ScopeDef::keyed(self.0)]
+    }
+
+    fn check_scopes(&self, _: &[&str]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn permissions(&self, _: &[&str]) -> Vec<Permission> {
+        Permission::ALL.to_vec()
+    }
+}
+
+/// The app's side of the [`Sample`] protocol `name`: it takes `<name>.item` and keeps the
+/// kind of each message it receives in its local state, under the message's `msg_id`.
+pub fn sample_protocol(name: &str) -> Arc<TestProtocol> {
+    Arc::new(TestProtocol::keeping(ProtocolSpec {
+        name: name.to_owned(),
+        keyed_scopes: vec![name.to_owned()],
+        accepts: vec![format!("{name}.item")],
+        ..ProtocolSpec::default()
+    }))
+}
+
 /// The app's side of the [`Notes`] protocol: a protocol that records what it receives.
 pub fn notes_protocol() -> Arc<TestProtocol> {
     Arc::new(TestProtocol::new(ProtocolSpec {
+        name: NOTES.to_owned(),
         keyed_scopes: vec![NOTES.to_owned()],
         accepts: vec![NOTE_KIND.to_owned()],
         ..ProtocolSpec::default()
@@ -129,6 +170,7 @@ pub fn journal_collection() -> Collection {
 /// holds the keyed scopes `keyed`: it lists, when it joins, the collections it may read.
 pub fn notes_protocol_with_both_collections(keyed: &[&str]) -> Arc<TestProtocol> {
     Arc::new(TestProtocol::new(ProtocolSpec {
+        name: NOTES.to_owned(),
         keyed_scopes: keyed.iter().map(|scope| (*scope).to_owned()).collect(),
         accepts: vec![NOTE_KIND.to_owned()],
         collections: vec![notes_collection(), journal_collection()],
@@ -139,6 +181,7 @@ pub fn notes_protocol_with_both_collections(keyed: &[&str]) -> Arc<TestProtocol>
 /// lists the collection's records when it joins.
 pub fn notes_protocol_with_records() -> Arc<TestProtocol> {
     Arc::new(TestProtocol::new(ProtocolSpec {
+        name: NOTES.to_owned(),
         keyed_scopes: vec![NOTES.to_owned()],
         accepts: vec![NOTE_KIND.to_owned()],
         collections: vec![notes_collection()],

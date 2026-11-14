@@ -50,8 +50,9 @@
 //! let clock = Arc::new(TestClock::new(START_MS));
 //! let homeserver = Arc::new(TestHomeserver::new());
 //! let spec = ProtocolSpec {
+//!     name: "notes".into(),
 //!     keyed_scopes: vec!["notes".into()],
-//!     accepts: vec!["example.note".into()],
+//!     accepts: vec!["notes.note".into()],
 //!     ..ProtocolSpec::default()
 //! };
 //! let alice = TestSigner::new(
@@ -445,6 +446,7 @@ mod tests {
     #[test]
     fn test_protocol_spec_keys_listed_scopes_and_their_sub_scopes_only() {
         let spec = ProtocolSpec {
+            name: "notes".into(),
             keyed_scopes: vec!["notes".into()],
             ..ProtocolSpec::default()
         };
@@ -463,14 +465,7 @@ mod tests {
         let switch = ScriptedSwitch::new(alice.key(), alice.service_secret(), clock);
         let keys = bob.app_keys("shop");
         let cert = issue_cert(bob.key(), &keys, &AppSpec::new(&["notes"]), START_MS).unwrap();
-        let sent = switch.send(
-            bob.key(),
-            &keys,
-            &cert,
-            "example.note",
-            json!({}),
-            &[[1; 16]],
-        );
+        let sent = switch.send(bob.key(), &keys, &cert, "notes.note", json!({}), &[[1; 16]]);
         assert!(matches!(sent, Err(ScriptError::Missing(_))), "{sent:?}");
         assert_eq!(switch.seq(), 0);
     }
@@ -592,7 +587,7 @@ mod tests {
         let bob = TestIdentity::new(&seeds, "bob");
         let peer = PeerSwitch::new(bob.clone(), PEER_ORIGIN, clock, Arc::clone(&homeserver));
         let shop = peer
-            .add_app("shop", &AppSpec::new(&["notes"]), &["example.note"], false)
+            .add_app("shop", &AppSpec::new(&["notes"]), &["notes.note"], false)
             .unwrap();
         let doc = homeserver.identity_doc(&bob.public()).unwrap();
         assert!(doc.listed_cert(&shop).is_some());
