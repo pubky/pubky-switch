@@ -1395,6 +1395,36 @@ async fn test_protocol_set_record_expiry_lapsed_refuses_the_renewal_naming_its_p
 }
 
 #[tokio::test]
+async fn test_protocol_set_record_expiries_both_lapsed_renew_in_turn() {
+    // Both protocols' expiries lapse: each renewal is refused while the other's has
+    // lapsed, but its own ask is kept, so the second renewal signs the record, across a
+    // reload too; an ask cleared to none is kept the same way.
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let now = p.w.clock.now_ms();
+    let day = pubky_switch_core::records::DAY_MS;
+    app.renew_record("tasks", Some(now + day)).await.unwrap();
+    app.renew_record("chat", Some(now + 2 * day)).await.unwrap();
+    p.w.clock.advance_ms(3 * day);
+    let record = app.record().clone();
+    let later = p.w.clock.now_ms() + 10 * day;
+    usage(app.renew_record("tasks", Some(later)).await, "`chat`");
+    assert_eq!(app.record(), &record, "nothing signed yet");
+    let me = app.app_id();
+    drop(app);
+    let mut app = p.load(me).await.unwrap();
+    app.renew_record("chat", None).await.unwrap();
+    assert_eq!(record_expiry(&app), Some(later));
+    // `tasks`'s lapses again: `chat`'s later ask is kept, and `tasks` clearing its own
+    // signs the record with `chat`'s.
+    p.w.clock.advance_ms(11 * day);
+    let far = p.w.clock.now_ms() + 30 * day;
+    usage(app.renew_record("chat", Some(far)).await, "`tasks`");
+    app.renew_record("tasks", None).await.unwrap();
+    assert_eq!(record_expiry(&app), Some(far));
+}
+
+#[tokio::test]
 async fn test_protocol_set_record_expiries_go_with_a_backup_and_one_of_no_protocol_refuses() {
     let p = Pair::new();
     let mut app = p.join().await;
@@ -2039,4 +2069,43 @@ async fn test_protocol_set_call_every_protocol_owes_stops_the_read() {
     assert_eq!(*p.chat.missed.lock().unwrap(), [seq]);
     assert_eq!(kinds(&p.chat), ["chat.item"]);
     assert!(p.tasks.missed.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_protocol_set_restored_gap_waits_behind_a_call_a_protocol_owes() {
+    // `tasks` owes a missed call it keeps failing when the backup is taken: the restore
+    // carries the call and owes a gap at its cursor, and the gap waits behind the call, for
+    // every protocol, until `tasks` takes it.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let seq = p.w.switch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    let backup = app.backup_layered().await.unwrap();
+    drop(app);
+    p.tasks.gaps.lock().unwrap().clear();
+    p.chat.gaps.lock().unwrap().clear();
+    let env =
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>);
+    let mut restored = App::restore(env, p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    read(&mut restored, 3).await;
+    assert!(p.tasks.missed.lock().unwrap().is_empty());
+    assert!(p.tasks.gaps.lock().unwrap().is_empty(), "the gap waits");
+    assert!(p.chat.gaps.lock().unwrap().is_empty());
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    read(&mut restored, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 1);
+    assert_eq!(p.chat.gaps.lock().unwrap().len(), 1);
 }

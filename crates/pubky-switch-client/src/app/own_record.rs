@@ -199,33 +199,51 @@ impl App {
     /// The expiry each protocol asked of the record (`rexp`), with `protocol`'s now
     /// `expires_at`.
     ///
+    /// Each protocol's ask is its own: one that is later than now is kept, in a commit of
+    /// its own, even while another protocol's has lapsed and the record can't be signed, so
+    /// two protocols whose expiries lapsed each renew in turn, and the record is signed
+    /// once neither is lapsed. The host may renew for a protocol that doesn't.
+    ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] when the earliest of them is at or before now, naming the
-    /// protocol that asked for it: a record signed with it would have lapsed already, so
-    /// nothing is signed or sent until that protocol asks for a later one.
+    /// [`Refusal::Usage`] when `expires_at` is at or before now, naming `protocol`, with
+    /// nothing kept; or when another protocol's is, naming it, with `protocol`'s ask kept:
+    /// a record signed with it would have lapsed already, so nothing is signed or sent until
+    /// that protocol asks for a later one.
     async fn asked_expiries(
-        &self,
+        &mut self,
         protocol: &str,
         expires_at: Option<u64>,
     ) -> Result<BTreeMap<String, Option<u64>>, AppError> {
+        let now = self.now();
+        let lapsed_ask = |name: &str| {
+            Refusal::Usage(format!(
+                "the record expiry `{name}` asked for is at or before now: `{name}` asks for \
+                 a later one before the record is signed"
+            ))
+        };
+        if expires_at.is_some_and(|at| at <= now) {
+            return Err(lapsed_ask(protocol).into());
+        }
         let mut expiries: BTreeMap<String, Option<u64>> = self
             .reader()
             .get(key::RECORD_EXPIRIES)
             .await?
             .unwrap_or_default();
+        let changed = expiries.get(protocol) != Some(&expires_at);
         expiries.insert(protocol.to_owned(), expires_at);
         let lapsed = expiries
             .iter()
-            .filter_map(|(name, at)| at.map(|at| (name, at)))
+            .filter_map(|(name, at)| at.map(|at| (name.clone(), at)))
             .min_by_key(|(_, at)| *at)
-            .filter(|(_, at)| *at <= self.now());
+            .filter(|(_, at)| *at <= now);
         if let Some((name, _)) = lapsed {
-            return Err(Refusal::Usage(format!(
-                "the record expiry `{name}` asked for is at or before now: `{name}` asks for \
-                 a later one before the record is signed"
-            ))
-            .into());
+            if changed {
+                let mut tx = self.tx()?;
+                tx.put(key::RECORD_EXPIRIES, &expiries)?;
+                self.commit(tx).await?;
+            }
+            return Err(lapsed_ask(&name).into());
         }
         Ok(expiries)
     }
