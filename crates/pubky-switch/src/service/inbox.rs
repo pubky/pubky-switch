@@ -243,8 +243,9 @@ impl Service {
         }
 
         // Check 5: every kid the current receive key of a current app, and every app added
-        // since `apps_version` among the targets.
-        let targets = self
+        // since `apps_version` among the targets. The current apps it judged by serve both
+        // lagging judgments below: nothing between them changes an app.
+        let (targets, current) = self
             .targets(
                 txn,
                 held,
@@ -258,10 +259,6 @@ impl Service {
         // The append brings the pressure: marks first, so a lagging app stops holding the
         // quota before it is judged (Switch wire 7.4.4).
         if trusted {
-            let current = super::batch::load_apps(txn, held, time_ms)
-                .await
-                .map_err(|e| store_error(&e))?
-                .current_app_ids();
             self.release(true)
                 .mark(txn, &current)
                 .await
@@ -344,10 +341,6 @@ impl Service {
         // An append brings the pressure lagging marks answer, with trusted time (Switch wire
         // 7.4.4).
         if trusted {
-            let current = super::batch::load_apps(txn, held, time_ms)
-                .await
-                .map_err(|e| store_error(&e))?
-                .current_app_ids();
             self.release(true)
                 .mark(txn, &current)
                 .await
@@ -375,7 +368,8 @@ impl Service {
     /// The target apps of an envelope whose header wraps to `header`'s kids, or `409
     /// stale_key` (Switch wire 7.4.3 check 5, 7.6): each kid the current receive key of a
     /// current app, and every app reachable since `sealed_for` among them (an own app
-    /// appending, `own`, needn't wrap to itself).
+    /// appending, `own`, needn't wrap to itself); with the account's current apps, by the
+    /// same load.
     async fn targets(
         &self,
         txn: &mut AccountTxn,
@@ -384,7 +378,7 @@ impl Service {
         sealed_for: u64,
         own: Option<[u8; 16]>,
         time_ms: u64,
-    ) -> Result<Vec<[u8; 16]>, ApiError> {
+    ) -> Result<(Vec<[u8; 16]>, Vec<[u8; 16]>), ApiError> {
         // Current by the service's one rule, as the entries' release and the directory judge
         // it (Switch spec 3.4).
         let (state, apps) = super::batch::load_apps_and_rows(txn, held, time_ms)
@@ -476,7 +470,7 @@ impl Service {
                 "apps_version": apps_version,
             })));
         }
-        Ok(targets)
+        Ok((targets, state.current_app_ids()))
     }
 
     /// Use the invite code `code`, write the service's conversation entry for `sender` and
