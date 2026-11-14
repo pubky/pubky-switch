@@ -787,40 +787,6 @@ async fn test_missed_entries_last_time_unparsable_asks_for_nothing() {
     assert!(!app.listing_owed().await.unwrap());
 }
 
-/// A missed-entries call kept owed in the form written before, without the item's last
-/// acceptance time, still reads and is made, with no end.
-#[tokio::test]
-async fn test_missed_entries_owed_call_of_the_earlier_form_is_made_without_an_end() {
-    let w = World::new();
-    let mut app = w.join("wallet").await;
-    let me = app.app_id();
-    app.receive(None).await.unwrap();
-    let now = w.clock.now_ms();
-    // Owed at the cursor, as a call is when its item is passed.
-    let at = app.cursor().seq;
-    let mut tx = app.tx().unwrap();
-    tx.put(
-        &crate::app::state::key::owed(1, at),
-        &json!({ "Missed": { "seq": at, "entries": 2, "accepted_from_ms": now } }),
-    )
-    .unwrap();
-    app.commit(tx).await.unwrap();
-    drop(app);
-    let mut app = w.load(me).await;
-    app.receive(None).await.unwrap();
-    let missed = w.protocol.missed.lock().unwrap().clone();
-    assert_eq!(missed.len(), 1);
-    assert_eq!(
-        (
-            missed[0].seq,
-            missed[0].accepted_from_ms,
-            missed[0].accepted_until_ms
-        ),
-        (at, now, u64::MAX)
-    );
-    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
-}
-
 #[tokio::test]
 async fn test_app_owed_call_failing_for_good_holds_the_later_ones() {
     // Switch spec 8.3: every notice the protocol can't take yet is kept in feed order, and
@@ -1719,7 +1685,7 @@ async fn test_kept_effect_window_holds_with_the_device_clock_ahead_at_the_keep()
     }
     assert!(app.state.pending_effect.is_some());
     // Kept in service time, whatever the device read.
-    let kept = app.state.pending_effect.as_ref().unwrap().kept_ms.unwrap();
+    let kept = app.state.pending_effect.as_ref().unwrap().kept_ms;
     assert!(kept <= w.clock.now_ms(), "{kept}");
     // The clock is set right. 30 days and half an hour after the service applied it, its
     // proofs are gone and a retry would be answered `409 conflict`.
@@ -2160,7 +2126,7 @@ async fn test_parked_retry_effect_is_kept_at_a_fresh_service_time() {
     let _ = app.receive(None).await;
     let pending = app.state.pending_effect.as_ref().unwrap();
     assert_eq!(pending.seq, seq);
-    let age = w.clock.now_ms() - pending.kept_ms.unwrap();
+    let age = w.clock.now_ms() - pending.kept_ms;
     assert!(age < HOUR, "kept {age} ms before now");
 }
 

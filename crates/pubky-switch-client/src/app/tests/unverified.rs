@@ -195,8 +195,8 @@ fn dropped(events: &[AppEvent]) -> Vec<(u64, DropReason)> {
         .collect()
 }
 
-/// An entry stored as `reason` by a build before the bounds, written to the store as it
-/// is: a note signed by `peer`, accepted at `accepted_at_ms`.
+/// An entry stored as `reason`, to be written to the store as it is, whatever the bounds:
+/// a note signed by `peer`, accepted at `accepted_at_ms`.
 fn entry_of(
     w: &World,
     peer: &Peer,
@@ -230,7 +230,7 @@ fn entry_of(
     }
 }
 
-/// Write `entries` to `app`'s store, as an earlier build left them, under the next IDs.
+/// Write `entries` to `app`'s store as they are, past any bound, under the next IDs.
 async fn write_stored(app: &mut App, entries: Vec<ParkedEntry>) -> Vec<u64> {
     let mut ids = Vec::new();
     for chunk in entries.chunks(64) {

@@ -1737,21 +1737,6 @@ async fn test_own_record_superseded_by_a_record_under_a_renewal_takes_the_renewa
     assert_eq!(w.held(id).as_ref(), Some(later.signed()));
 }
 
-/// A leave kept by a store written before the mode stopped being kept still loads: its
-/// `two_step` member is ignored.
-#[test]
-fn test_own_record_leave_state_with_a_two_step_member_loads() {
-    let leave: crate::app::state::LeaveState = serde_json::from_value(json!({
-        "left_at_ms": null,
-        "two_step": true,
-        "removed_seen_ms": null,
-        "keys_deleted_ms": null,
-        "compromise": false,
-    }))
-    .unwrap();
-    assert_eq!(leave, crate::app::state::LeaveState::default());
-}
-
 /// The signer's renewal reaches the app's feed as a `cert.put` before the `identity.json`
 /// that lists it: the app holds the renewal and keeps presenting the old certificate.
 fn store_renewal_unlisted(w: &World, app: &App) -> pubky_switch_core::records::AppCert {

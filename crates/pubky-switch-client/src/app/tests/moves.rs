@@ -3779,7 +3779,7 @@ async fn test_kept_effect_window_is_measured_against_the_verified_service_time()
     // The device clock reads as when the effect was kept, but the app has verified a
     // service time past the window: the window is closed.
     app.ready_local().await.unwrap();
-    let kept = app.state.pending_effect.as_ref().unwrap().kept_ms;
+    let kept = Some(app.state.pending_effect.as_ref().unwrap().kept_ms);
     assert_eq!(app.state.pending_effect.as_ref().map(|p| p.seq), Some(seq));
     assert!(app.answer_decides(kept));
     let past = w.clock.now_ms() + crate::app::provider::KEPT_BATCH_ANSWER_MS;
@@ -3959,7 +3959,7 @@ async fn test_loss_reports_the_attempts_of_a_kept_effect_it_drops() {
         generation: 1,
         stored: None,
         deadlines: Vec::new(),
-        kept_ms: Some(lost.note_at_ms),
+        kept_ms: lost.note_at_ms,
         forget: Vec::new(),
         entry: crate::app::state::KeptEntry {
             cert: app.cert().signed().clone(),
@@ -4027,7 +4027,7 @@ async fn keep_an_effect(
         generation: 1,
         stored: parked.then_some(seq),
         deadlines: Vec::new(),
-        kept_ms: Some(w.clock.now_ms()),
+        kept_ms: w.clock.now_ms(),
         forget: Vec::new(),
         entry: entry.clone(),
     };
