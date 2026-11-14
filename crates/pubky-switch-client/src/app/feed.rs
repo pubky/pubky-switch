@@ -815,9 +815,15 @@ impl App {
             let mut after = self.state.cursor.seq;
             let mut blocked = None;
             let resumed: Option<FeedAt> = self.reader().get(FEED_AT).await?;
+            // Not from at or past a call owed ahead of the cursor: the feed stops at that
+            // call, so a read going on from there would never come back to the entries held
+            // before it, and the cursor would never reach the call. From the cursor, the
+            // read hands them once their protocols take what they owe, and the cursor gets
+            // to the call (Switch spec 8.3).
             if let Some(at) = resumed
                 && at.generation == self.state.cursor.generation
                 && at.after >= after
+                && self.owed_ahead.is_none_or(|ahead| at.after < ahead)
             {
                 after = at.after;
                 blocked = at.blocked;

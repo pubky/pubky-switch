@@ -52,6 +52,8 @@ struct Named {
     holding: Mutex<bool>,
     /// The kinds of the outbox messages it was asked about.
     asked_send: Mutex<Vec<String>>,
+    /// The `seq` of each feed item it took, a message or a missed item, in the order taken.
+    taken: Mutex<Vec<u64>>,
 }
 
 fn named(name: &str) -> Named {
@@ -115,6 +117,7 @@ impl Protocol for Named {
             .lock()
             .unwrap()
             .push((message.seq, message.message.kind.clone()));
+        self.taken.lock().unwrap().push(message.seq);
         let local = if message.message.kind.ends_with(".clear") {
             vec![LocalWrite::DeletePrefix { prefix: Vec::new() }]
         } else {
@@ -146,6 +149,7 @@ impl Protocol for Named {
             return Err(StoreError::Unavailable.into());
         }
         self.missed.lock().unwrap().push(missed.seq);
+        self.taken.lock().unwrap().push(missed.seq);
         let value = if self.huge_missed {
             vec![0; MAX_STEP_LOCAL_BYTES]
         } else {
@@ -1209,4 +1213,50 @@ async fn test_protocol_set_record_expiries_go_with_a_backup_and_one_of_no_protoc
         "{error:?}"
     );
     assert!(store.is_empty(&crate::store::client_namespace(&app.app_id())));
+}
+
+#[tokio::test]
+async fn test_protocol_set_owed_call_never_lets_the_cursor_pass_what_its_protocol_must_see() {
+    let p = Pair::new();
+    // `tasks` fails every missed call until it is let through.
+    *p.tasks.failing_missed.lock().unwrap() = u32::MAX;
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let now = p.w.clock.now_ms();
+    let first_gap = p.w.switch.push_missed(3, now, now);
+    let held = p.send(me, "tasks.item");
+    let chat_first = p.send(me, "chat.item");
+    let second_gap = p.w.switch.push_missed(2, now, now);
+    let chat_second = p.send(me, "chat.item");
+    read(&mut app, 4).await;
+    // `chat` took what comes before the second call, in feed order; `tasks` owes the first
+    // call, its entry is held, and the second call is owed to it behind the first. The
+    // second call is past the cursor, which stays before the held entry, so the feed
+    // stops at it: `chat`'s later entry waits until the cursor gets there.
+    assert_eq!(
+        *p.chat.taken.lock().unwrap(),
+        [first_gap, chat_first, second_gap]
+    );
+    assert!(p.tasks.taken.lock().unwrap().is_empty());
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 2);
+    // The cursor stays before the held entry, past the call owed before it.
+    assert!(
+        app.cursor().seq >= first_gap && app.cursor().seq < held,
+        "{:?}",
+        app.cursor()
+    );
+    // Once `tasks` takes the calls, it gets the rest in feed order, each once; `chat`
+    // gets its later entry, and nothing again, and the cursor goes on.
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    read(&mut app, 4).await;
+    assert_eq!(
+        *p.tasks.taken.lock().unwrap(),
+        [first_gap, held, second_gap]
+    );
+    assert_eq!(
+        *p.chat.taken.lock().unwrap(),
+        [first_gap, chat_first, second_gap, chat_second]
+    );
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+    assert!(app.cursor().seq >= chat_second, "{:?}", app.cursor());
 }
