@@ -986,6 +986,61 @@ async fn test_app_restore_in_place_leaves_behind_what_doesnt_read_and_says_so() 
 }
 
 #[tokio::test]
+async fn test_app_restore_in_place_leaves_behind_an_owed_call_that_isnt_whole() {
+    // Owed calls that decode but fail the queue's own checks, a key naming no feed
+    // position and a change not checked yet whose operation doesn't parse, would fail
+    // every read: a restore in place doesn't carry them, says so, and the store reads.
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let backup = app.backup().await.unwrap();
+    app.receive(None).await.unwrap();
+    let missed = crate::app::feed::OwedCall::Missed {
+        seq: 1,
+        entries: 1,
+        accepted_from_ms: 5,
+        accepted_until_ms: 6,
+    };
+    let unchecked = crate::app::feed::OwedCall::DenyUnverified {
+        generation: 1,
+        seq: 1,
+        pubky: [7; 32],
+        added: true,
+        at_ms: 5,
+        op: pubky_switch_core::sig::SignedDoc {
+            body: "not an operation".into(),
+            sig: String::new(),
+        },
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(
+        &format!("{}not-a-position", crate::app::state::key::OWED_PREFIX),
+        &missed,
+    )
+    .unwrap();
+    tx.put(&crate::app::state::key::owed(1, 1), &unchecked)
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 2);
+    drop(app);
+    let mut restored = App::restore(w.env(), w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    let events = restored.take_events();
+    assert!(
+        has(&events, |e| e.is_duty()
+            && matches!(
+                e,
+                AppEvent::RestoreLeftBehind { owed_calls: 2, .. }
+            )),
+        "{events:?}"
+    );
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    restored.receive(None).await.unwrap();
+    assert!(w.protocol.missed.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_app_restore_in_place_over_a_damaged_epoch_starts_a_new_one() {
     let w = World::new();
     let mut app = w.join("wallet").await;
@@ -5964,6 +6019,207 @@ async fn carried_deny_change_reads(app: &mut App) -> Result<(), AppError> {
     Ok(())
 }
 
+/// A reader, on `store`, restored in place from an older backup, where the deny list
+/// change at seq b for `x` fails and is owed, then from a newer backup, taken after b and a
+/// later change c for `x`: the newer backup's cursor is past both, and the owed call is
+/// carried behind it. With `denied_at_end`, b undenies and c denies again; without, b
+/// denies and c undenies. The restored app, its reconcile ended, not read yet; the
+/// protocol's log is cleared.
+async fn restored_from_a_newer_backup(
+    w: &World,
+    store: &Arc<MemoryStore>,
+    kinds: &Arc<KindsProtocol>,
+    x: [u8; 32],
+    denied_at_end: bool,
+) -> App {
+    let mut manager = manager_of(w).await;
+    let mut reader = join_with(
+        w,
+        "reader",
+        &[Permission::ListsRead],
+        Arc::clone(store),
+        Arc::clone(kinds) as Arc<dyn Protocol>,
+    )
+    .await;
+    reader.receive(None).await.unwrap();
+    manager.deny(&x).await.unwrap();
+    if !denied_at_end {
+        manager.undeny(&x).await.unwrap();
+    }
+    reader.receive(None).await.unwrap();
+    let older = reader.backup().await.unwrap();
+    if denied_at_end {
+        manager.undeny(&x).await.unwrap();
+        manager.deny(&x).await.unwrap();
+    } else {
+        manager.deny(&x).await.unwrap();
+        manager.undeny(&x).await.unwrap();
+    }
+    reader.receive(None).await.unwrap();
+    assert_eq!(
+        reader.lists_copy().await.unwrap().deny.contains(&x),
+        denied_at_end
+    );
+    let newer = reader.backup().await.unwrap();
+    drop(reader);
+    let restore = async |backup: &crate::app::AppBackup| {
+        let mut restored = App::restore(
+            w.env_on(Arc::clone(store) as Arc<dyn StateStore>),
+            Arc::clone(kinds) as Arc<dyn Protocol>,
+            World::config(),
+            backup,
+        )
+        .await
+        .unwrap();
+        restored.end_reconcile(UserConfirmed::new()).await.ok();
+        restored
+    };
+    let mut restored = restore(&older).await;
+    *kinds.sample.failing_deny.lock().unwrap() = 1;
+    for _ in 0..4 {
+        let _ = restored.receive(None).await;
+        if restored.owed_protocol_calls().await.unwrap() == 1 {
+            break;
+        }
+    }
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 1);
+    drop(restored);
+    kinds.log.lock().unwrap().clear();
+    restore(&newer).await
+}
+
+/// After the reads of a reader restored from the newer backup: nothing owed, no deny list
+/// change handed, the copy of the lists as the service has `x`, and the protocol's latest
+/// deny list gap with the same.
+async fn assert_behind_the_cursor_taken_as_a_gap(
+    restored: &App,
+    kinds: &KindsProtocol,
+    x: [u8; 32],
+    denied_at_end: bool,
+) {
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+    let log = kinds.log.lock().unwrap().clone();
+    assert!(
+        !log.iter().any(|(kind, _)| *kind == "deny"),
+        "the older change is handed after the newer one: {log:?}"
+    );
+    assert_eq!(
+        restored.lists_copy().await.unwrap().deny.contains(&x),
+        denied_at_end,
+        "the copy of the lists; log {log:?}"
+    );
+    let gaps = kinds.sample.deny_gaps.lock().unwrap().clone();
+    assert_eq!(
+        gaps.last().map(|gap| gap.denied.contains(&x)),
+        Some(denied_at_end),
+        "{log:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_deny_list_owed_undeny_behind_a_newer_backup_keeps_the_copy_denied() {
+    // The owed undeny is older than the deny the newer backup's cursor is past: the copy,
+    // which admission works from, still denies, and the protocol learns the list by a
+    // gap, never the older change after the newer one.
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let kinds = Arc::new(KindsProtocol::default());
+    let x = [7; 32];
+    let mut restored = restored_from_a_newer_backup(&w, &store, &kinds, x, true).await;
+    for _ in 0..4 {
+        restored.receive(None).await.unwrap();
+    }
+    assert_behind_the_cursor_taken_as_a_gap(&restored, &kinds, x, true).await;
+}
+
+#[tokio::test]
+async fn test_deny_list_owed_deny_behind_a_newer_backup_keeps_the_copy_undenied() {
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let kinds = Arc::new(KindsProtocol::default());
+    let x = [7; 32];
+    let mut restored = restored_from_a_newer_backup(&w, &store, &kinds, x, false).await;
+    for _ in 0..4 {
+        restored.receive(None).await.unwrap();
+    }
+    assert_behind_the_cursor_taken_as_a_gap(&restored, &kinds, x, false).await;
+}
+
+#[tokio::test]
+async fn test_deny_list_owed_change_behind_the_cursor_crash_at_each_commit_point_ends_right() {
+    // A crash at each commit of the reads after the newer restore, before or after it,
+    // then a restart on what the store holds: the change behind the cursor becomes the gap
+    // once, and the copy and the protocol end as the service has it.
+    let x = [7; 32];
+    for denied_at_end in [false, true] {
+        let commits = {
+            let w = World::new();
+            let store = Arc::new(MemoryStore::new());
+            let kinds = Arc::new(KindsProtocol::default());
+            let restored = restored_from_a_newer_backup(&w, &store, &kinds, x, denied_at_end).await;
+            let id = restored.app_id();
+            drop(restored);
+            let counting = Arc::new(FaultStore::new(
+                Arc::clone(&store) as Arc<dyn StateStore>,
+                StoreFault::None,
+            ));
+            let mut app = App::load(
+                w.env_on(Arc::clone(&counting) as Arc<dyn StateStore>),
+                Arc::clone(&kinds) as Arc<dyn Protocol>,
+                World::config(),
+                id,
+            )
+            .await
+            .unwrap();
+            carried_deny_change_reads(&mut app).await.unwrap();
+            counting.commits()
+        };
+        assert!(commits > 2, "the reads commit {commits} times");
+        for stop_after in [false, true] {
+            for n in 1..=commits {
+                let w = World::new();
+                let store = Arc::new(MemoryStore::new());
+                let kinds = Arc::new(KindsProtocol::default());
+                let restored =
+                    restored_from_a_newer_backup(&w, &store, &kinds, x, denied_at_end).await;
+                let id = restored.app_id();
+                drop(restored);
+                let fault = Arc::new(FaultStore::new(
+                    Arc::clone(&store) as Arc<dyn StateStore>,
+                    if stop_after {
+                        StoreFault::StopAfter(n)
+                    } else {
+                        StoreFault::StopBefore(n)
+                    },
+                ));
+                if let Ok(mut app) = App::load(
+                    w.env_on(Arc::clone(&fault) as Arc<dyn StateStore>),
+                    Arc::clone(&kinds) as Arc<dyn Protocol>,
+                    World::config(),
+                    id,
+                )
+                .await
+                {
+                    let _ = carried_deny_change_reads(&mut app).await;
+                }
+                assert!(fault.stopped(), "commit {n} of {commits} is reached");
+                let mut app = App::load(
+                    w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+                    Arc::clone(&kinds) as Arc<dyn Protocol>,
+                    World::config(),
+                    id,
+                )
+                .await
+                .unwrap();
+                carried_deny_change_reads(&mut app)
+                    .await
+                    .unwrap_or_else(|e| panic!("restart after commit {n} ({stop_after}): {e}"));
+                assert_behind_the_cursor_taken_as_a_gap(&app, &kinds, x, denied_at_end).await;
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_deny_list_carried_change_crash_at_each_commit_point_keeps_the_copy_right() {
     // A crash at each commit of the restored reader's reads, before or after it, then a
@@ -6501,9 +6757,10 @@ async fn test_deny_list_gap_waits_no_longer_than_the_lists_refresh() {
 
 #[tokio::test]
 async fn test_deny_list_gap_told_after_an_older_owed_change() {
-    // A deny list change owed from before a gap, as a provider loss leaves it (the loss
-    // notes the gap whatever is owed): the gap's list is the newer state, so the older
-    // change goes to the protocol before it, never after.
+    // A deny list change owed from before a gap, behind the cursor, as a provider loss
+    // leaves it once the cursor follows the next sequence (the loss notes the gap whatever
+    // is owed): the gap's list is the newer state, so the older change is never handed
+    // after it. Behind the cursor, it is covered by the gap and not handed at all.
     let w = World::new();
     let mut manager = manager_of(&w).await;
     let store = Arc::new(MemoryStore::new());
@@ -6565,12 +6822,9 @@ async fn test_deny_list_gap_told_after_an_older_owed_change() {
     .unwrap();
     reader.receive(None).await.unwrap();
     let log = kinds.log.lock().unwrap().clone();
-    let gap_at = log.iter().position(|(kind, _)| *kind == "gap");
-    let deny_at = log.iter().position(|(kind, _)| *kind == "deny");
-    assert!(
-        matches!((deny_at, gap_at), (Some(d), Some(g)) if d < g),
-        "{log:?}"
-    );
+    assert_eq!(log, [("gap", through.seq)]);
+    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 0);
+    assert!(!reader.lists_copy().await.unwrap().deny.contains(&a));
 }
 
 #[tokio::test]

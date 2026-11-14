@@ -741,7 +741,10 @@ pub trait Protocol: Send + Sync {
     ///   among themselves in the order (generation, seq): two of one lost sequence owed at
     ///   different generations, as across a key change in place, may come out of feed
     ///   order. The gap the loss leaves follows them, with the full list
-    ///   ([`Protocol::deny_list_gap`]).
+    ///   ([`Protocol::deny_list_gap`]). A change owed that the app's position is already
+    ///   past, as after a restore in place from a newer backup, or one of a lost sequence
+    ///   once the app reads the next, isn't made: it would come after later changes, so
+    ///   the protocol is told a gap at that position instead.
     /// - **Again:** a change may come twice, after a crash before its commit and after a
     ///   restore, whose feed hands it again; its writes commit once. A protocol keys what it
     ///   keeps by the change's place, or takes it as setting a state.

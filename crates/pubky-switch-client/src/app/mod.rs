@@ -2361,7 +2361,13 @@ impl App {
             }
         }
         for (rest, bytes) in reader.scan_raw(key::OWED_PREFIX).await? {
-            let read = state::decode::<feed::OwedCall>(&bytes)
+            // Carried only when whole, as the queue reads it: a key that names a feed
+            // position, and a change not checked yet that keeps its own operation. One that
+            // isn't would fail every read of the restored store; it is counted as left
+            // behind instead, so the restore repairs the store.
+            let read = feed::owed_place(&rest)
+                .and_then(|_| state::decode::<feed::OwedCall>(&bytes))
+                .and_then(|call| call.kept_op_body())
                 .and_then(|_| state::decode::<serde_json::Value>(&bytes));
             match read {
                 Ok(value) => carried

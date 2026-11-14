@@ -262,7 +262,45 @@ impl From<&ResendNeeded> for OwedCall {
     }
 }
 
+/// The feed position an owed call's key names (`owed/<generation>/<seq>`, given without
+/// its prefix). Every call is keyed so: a key that names none has no place in feed order,
+/// and the store is corrupt.
+pub(crate) fn owed_place(rest: &str) -> Result<(u64, u64), AppError> {
+    let (generation, seq) = rest
+        .split_once('/')
+        .ok_or(AppError::Store(crate::error::StoreError::Corrupt))?;
+    Ok((
+        super::state::parse_num(generation)?,
+        super::state::parse_num(seq)?,
+    ))
+}
+
 impl OwedCall {
+    /// The operation a deny list change not checked yet keeps, as the feed showed it, read
+    /// for its check; `None` for any other call. The change kept beside it is read from that
+    /// operation: one that doesn't parse, or isn't that change, is a corrupt store.
+    pub(crate) fn kept_op_body(&self) -> Result<Option<pubky_switch_core::ops::OpBody>, AppError> {
+        let Self::DenyUnverified {
+            pubky, added, op, ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        let body = SignedOp::peek(op)
+            .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?
+            .body()
+            .clone();
+        let kept = match body.kind {
+            OpKind::DenyPut { pubky } => Some((pubky, true)),
+            OpKind::DenyDelete { pubky } => Some((pubky, false)),
+            _ => None,
+        };
+        if kept != Some((*pubky, *added)) {
+            return Err(AppError::Store(crate::error::StoreError::Corrupt));
+        }
+        Ok(Some(body))
+    }
+
     /// The call, made again.
     fn make(&self, protocol: &dyn Protocol) -> Result<Vec<LocalWrite>, StoreFailure> {
         match self.refused(0) {
@@ -3160,6 +3198,7 @@ impl App {
     /// commit. One that fails again holds every later one back, of any kind, and the read
     /// hands nothing after it (Switch spec 8.3). A deny list change owed for its check is
     /// checked again first: handed, refused with an event, owed still, or noted as a gap.
+    /// A deny list change behind the cursor is noted as a gap at the cursor instead.
     async fn retry_owed(&mut self) -> Result<(), AppError> {
         let owed = self.reader().scan::<OwedCall>(key::OWED_PREFIX).await?;
         let mut held = false;
@@ -3174,13 +3213,7 @@ impl App {
         let mut owed = owed
             .into_iter()
             .map(|(rest, call)| {
-                let (generation, seq) = rest
-                    .split_once('/')
-                    .ok_or(AppError::Store(crate::error::StoreError::Corrupt))?;
-                let place = (
-                    super::state::parse_num(generation)?,
-                    super::state::parse_num(seq)?,
-                );
+                let place = owed_place(&rest)?;
                 let order = self.feed_order(place.0, place.1);
                 Ok((order, place, rest, call))
             })
@@ -3196,7 +3229,28 @@ impl App {
                 }
                 break;
             }
+            // Neither dropped nor handed while the store is corrupt (fail closed).
+            let kept_body = call.kept_op_body()?;
             let mut tx = self.tx()?;
+            // A deny list change behind the cursor, as a restore in place from a newer
+            // backup carries one, or one of a sequence a provider loss ended once the
+            // cursor follows the next: the feed handed the later changes before it, and
+            // won't hand them again. Handed now, or applied to the copy of the lists, it
+            // would set an older state over them, so it is a gap in the deny list's
+            // history at the cursor instead: the protocol and the copy both take the list
+            // as it stands (Switch spec 8.3).
+            if order < cursor_at
+                && matches!(
+                    call,
+                    OwedCall::Deny { .. } | OwedCall::DenyUnverified { .. }
+                )
+            {
+                self.note_deny_gap(cursor.generation, cursor.seq, &mut tx)
+                    .await?;
+                tx.delete(&at)?;
+                self.commit(tx).await?;
+                continue;
+            }
             let call = match call {
                 OwedCall::DenyUnverified {
                     generation,
@@ -3206,21 +3260,9 @@ impl App {
                     at_ms,
                     op,
                 } => {
-                    // The operation is kept as the feed showed it, and the change is read
-                    // from it: one that doesn't parse, or isn't that change, is a corrupt
-                    // store. It is neither dropped nor handed (fail closed).
-                    let body = SignedOp::peek(&op)
-                        .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?
-                        .body()
-                        .clone();
-                    let kept = match body.kind {
-                        OpKind::DenyPut { pubky } => Some((pubky, true)),
-                        OpKind::DenyDelete { pubky } => Some((pubky, false)),
-                        _ => None,
-                    };
-                    if kept != Some((pubky, added)) {
+                    let Some(body) = kept_body else {
                         return Err(AppError::Store(crate::error::StoreError::Corrupt));
-                    }
+                    };
                     match self.check_deny_op(&op, &body, at_ms, &tx).await? {
                         DenyCheck::Genuine => {
                             self.note_list_op(&body, &mut tx)?;
@@ -3260,12 +3302,12 @@ impl App {
                         }
                     }
                 }
-                // The copy of the lists takes the change in the commit that hands it to
-                // the protocol, so the two never disagree after a crash. Where the feed
-                // applied it when the call was owed, this sets the same state again; after
-                // a restore in place, whose feed passes the carried call's item without
-                // applying it, this is where the copy takes it, after the changes the feed
-                // handed before it (Switch spec 8.3).
+                // At the cursor: the copy of the lists takes the change in the commit that
+                // hands it to the protocol, so the two never disagree after a crash. Where
+                // the feed applied it when the call was owed, this sets the same state
+                // again; after a restore in place, whose feed passes the carried call's
+                // item without applying it, this is where the copy takes it, after the
+                // changes the feed handed before it (Switch spec 8.3).
                 call @ OwedCall::Deny { pubky, added, .. } => {
                     self.note_deny_change(&pubky, added, &mut tx)?;
                     call
