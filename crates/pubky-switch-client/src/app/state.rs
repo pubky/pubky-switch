@@ -93,6 +93,10 @@ pub(crate) mod key {
     pub(crate) const KEYS: &str = "keys";
     pub(crate) const CERT: &str = "cert";
     pub(crate) const CERT_RENEWAL: &str = "cert/renewal";
+    /// The hash of the newest renewed certificate the app's protocols refused
+    /// (`cert/refused`, [`super::events::AppEvent::CertificateRefused`]): never taken, and
+    /// never refused with a second event.
+    pub(crate) const CERT_REFUSED: &str = "cert/refused";
     pub(crate) const RECORD: &str = "record";
     pub(crate) const NAMING: &str = "naming";
     pub(crate) const BUNDLE: &str = "bundle";

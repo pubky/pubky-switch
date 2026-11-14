@@ -12,7 +12,8 @@
 //! (Switch spec 12.5 "Kept batches", 12.6 step 5); a kept batch refused for good, with its
 //! local writes and outbox messages (Switch spec 6.4); a message deleted from the outbox
 //! undelivered (Switch spec 11), or the record write a sent message named given up; a
-//! shared record a view first shows divergent after a provider loss (Switch spec 12.6); the
+//! shared record a view first shows divergent after a provider loss (Switch spec 12.6); a
+//! renewed certificate the app's protocols can't run with, not taken (Switch spec 3.2); the
 //! account taken as erased (Switch spec 12.7). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
 //! the two. It is reported once that commit is done, or, for a commit whose answer can't
@@ -499,6 +500,20 @@ pub enum AppEvent {
         /// The new certificate's `issued_at`.
         issued_at: u64,
     },
+    /// A renewed certificate the app's protocols can't run with wasn't taken: the app
+    /// keeps presenting the one it holds, which still loads, and the certificate refused
+    /// is never taken (Switch spec 3.2 step 3). The signer renews again with a certificate
+    /// they run with, or the host registers the protocol it names at a restore. A duty
+    /// event, for every protocol: raised once per certificate refused.
+    #[non_exhaustive]
+    CertificateRefused {
+        /// The duty event's ID.
+        id: EventId,
+        /// The refused certificate's `issued_at`.
+        issued_at: u64,
+        /// Why it was refused.
+        refusal: CertificateRefusal,
+    },
     /// The switch holds the app's record and its Homeserver write failed: it stays owed,
     /// and goes again at the next read or with the next change (Switch spec 4.2). Or the
     /// delete of an immediate leave, or of a leave after a compromise, failed: the app left
@@ -903,6 +918,7 @@ impl AppEvent {
             | Self::RecordUncheckable { id, .. }
             | Self::RecordDivergent { id, .. }
             | Self::LocalWritesRefused { id, .. }
+            | Self::CertificateRefused { id, .. }
             | Self::AccountGone { id } => Some(*id),
             _ => None,
         }
@@ -942,6 +958,23 @@ pub enum RefusedCall {
     /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at this loss;
     /// the loss went on without them.
     ProviderLost(ProviderLoss),
+}
+
+/// Why a renewed certificate wasn't taken ([`AppEvent::CertificateRefused`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum CertificateRefusal {
+    /// It holds a scope of this root, which no registered protocol owns: an app with it
+    /// would never load with its protocols (Switch wire 3.1 "Scope roots").
+    UnownedRoot(String),
+    /// The registered protocol `protocol` refused it
+    /// ([`super::Protocol::check_own_certificate`]).
+    Protocol {
+        /// The protocol's name.
+        protocol: String,
+        /// Its reason, without content.
+        reason: String,
+    },
 }
 
 /// A [`RefusedCall`] as a duty event keeps it.
@@ -1101,6 +1134,10 @@ pub(crate) enum Duty {
         #[serde(with = "serde_b64")]
         key: [u8; 32],
     },
+    CertificateRefused {
+        issued_at: u64,
+        refusal: CertificateRefusal,
+    },
 }
 
 impl Duty {
@@ -1241,6 +1278,11 @@ impl Duty {
                 owed_calls,
             },
             Self::AccountGone => AppEvent::AccountGone { id },
+            Self::CertificateRefused { issued_at, refusal } => AppEvent::CertificateRefused {
+                id,
+                issued_at,
+                refusal,
+            },
         }
     }
 }

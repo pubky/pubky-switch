@@ -31,6 +31,7 @@ use pubky_switch_core::records::AppCert;
 use pubky_switch_core::scopes::{is_protocol_name, owns_root};
 
 use super::error::{AppError, Refusal};
+use super::events::CertificateRefusal;
 use super::protocol::{LocalWrite, OpaqueRule, Protocol, ReceivedMessage, WriteBase};
 use super::records::Collection;
 use super::send::{RecordJob, SentMessage};
@@ -222,6 +223,23 @@ impl ProtocolSet {
                 })?;
         }
         Ok(())
+    }
+
+    /// Why the app can't take `cert` as its own, if it can't: a scope root no registered
+    /// protocol owns ([`ProtocolSet::check_cert`]), or a protocol's refusal
+    /// ([`ProtocolSet::check_own_certificate`]), in that order, as at a join or a load.
+    pub(crate) fn certificate_refusal(&self, cert: &AppCert) -> Option<CertificateRefusal> {
+        if let Some(root) = self.unowned_root(cert) {
+            return Some(CertificateRefusal::UnownedRoot(root));
+        }
+        self.protocols.iter().find_map(|r| {
+            r.protocol.check_own_certificate(cert).err().map(|reason| {
+                CertificateRefusal::Protocol {
+                    protocol: r.name.clone(),
+                    reason,
+                }
+            })
+        })
     }
 
     /// Whether `scope` has keys, by its root's protocol; `false` for a root none owns.

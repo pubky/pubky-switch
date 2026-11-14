@@ -12,8 +12,9 @@ use serde_json::json;
 
 use super::*;
 use crate::app::{
-    AppBackup, AppError, AppEvent, Delivery, MAX_STEP_LOCAL_BYTES, OpBatch, OutgoingMessage,
-    ProtocolLayer, ProtocolSet, Refusal, RestoreContext, StoreFailure, UserConfirmed,
+    AppBackup, AppError, AppEvent, CertificateRefusal, Delivery, MAX_STEP_LOCAL_BYTES, OpBatch,
+    OutgoingMessage, ProtocolLayer, ProtocolSet, Refusal, RestoreContext, StoreFailure,
+    UserConfirmed,
 };
 use crate::error::StoreError;
 use crate::testing::Fault;
@@ -49,7 +50,7 @@ struct Named {
     /// Its effects carry a conversation entry for the sender.
     with_ops: bool,
     /// It refuses every own certificate.
-    refuse_cert: bool,
+    refuse_cert: Mutex<bool>,
     /// Whether each restore step was handed a layer.
     restored: Mutex<Vec<bool>>,
     /// It holds its outbox messages back.
@@ -193,7 +194,7 @@ impl Protocol for Named {
     }
 
     fn check_own_certificate(&self, _cert: &AppCert) -> Result<(), String> {
-        if self.refuse_cert {
+        if *self.refuse_cert.lock().unwrap() {
             Err("named: a certificate it doesn't run with".into())
         } else {
             Ok(())
@@ -816,7 +817,7 @@ async fn test_protocol_set_join_refuses_a_certificate_a_protocol_refuses() {
     let p = Pair::with(
         named("tasks"),
         Named {
-            refuse_cert: true,
+            refuse_cert: Mutex::new(true),
             ..named("chat")
         },
     );
@@ -1541,6 +1542,134 @@ async fn test_protocol_set_check_8_refuses_a_kind_no_protocol_owns_and_asks_only
         .unwrap();
     assert_eq!(*p.chat.checked.lock().unwrap(), ["chat.item"]);
     assert!(p.tasks.checked.lock().unwrap().is_empty());
+}
+
+/// `p`'s app running `tasks` alone, its certificate holding only `tasks`'s scopes.
+async fn tasks_alone(p: &Pair) -> App {
+    let request =
+        p.w.signer
+            .approve(&app_keys("wallet"), &AppSpec::new(&["tasks"]))
+            .unwrap();
+    App::join(
+        p.env(),
+        Arc::clone(&p.tasks) as Arc<dyn Protocol>,
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap()
+}
+
+/// The signer renews `app`'s certificate with `scopes` (Switch spec 3.2 steps 1 and 2):
+/// `app` reads its `cert.put`, then the own `identity.json` listing it.
+async fn renewed_and_listed(p: &Pair, app: &mut App, scopes: &[&str]) -> AppCert {
+    let me = app.app_id();
+    let old = app.cert().clone();
+    let renewed = issue_cert(
+        &p.w.alice,
+        &app_keys("wallet"),
+        &AppSpec::new(scopes),
+        p.w.clock.now_ms() + 1000,
+    )
+    .unwrap();
+    p.w.switch
+        .signer_op(OpKind::CertPut {
+            target_app_id: me,
+            cert: renewed.signed().clone(),
+        })
+        .unwrap();
+    app.receive(None).await.unwrap();
+    p.w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(pubky_switch_core::records::ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.retain(|r| r.app_id != me);
+        body.renewed.push(pubky_switch_core::records::RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+    app.receive(None).await.unwrap();
+    renewed
+}
+
+/// The certificate refusals `app` keeps, with the refused certificates' `issued_at`.
+async fn cert_refusals(app: &mut App) -> Vec<(u64, CertificateRefusal)> {
+    app.unacknowledged_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            AppEvent::CertificateRefused {
+                issued_at, refusal, ..
+            } => Some((issued_at, refusal)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_protocol_set_renewal_with_a_root_no_protocol_owns_is_not_taken() {
+    // The signer renews an app running `tasks` alone with `chat`'s scopes too: taken, the
+    // app would never load again, with `tasks` (an unowned root) or with both (another
+    // set). It keeps its certificate, and the host is told once, naming the root.
+    let p = Pair::new();
+    let mut app = tasks_alone(&p).await;
+    let me = app.app_id();
+    let old = app.cert().clone();
+    let renewed = renewed_and_listed(&p, &mut app, &["tasks", "chat"]).await;
+    assert_eq!(app.cert().hash(), old.hash());
+    assert_eq!(
+        cert_refusals(&mut app).await,
+        [(
+            renewed.issued_at(),
+            CertificateRefusal::UnownedRoot("chat".into())
+        )]
+    );
+    // Later reads, a look in the directory among them, neither take it nor tell it again.
+    p.w.clock.advance_ms(crate::app::identity::DOC_CACHE_MS + 1);
+    read(&mut app, 2).await;
+    assert_eq!(app.cert().hash(), old.hash());
+    assert_eq!(cert_refusals(&mut app).await.len(), 1);
+    drop(app);
+    let app = App::load(
+        p.env(),
+        Arc::clone(&p.tasks) as Arc<dyn Protocol>,
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.cert().hash(), old.hash());
+}
+
+#[tokio::test]
+async fn test_protocol_set_renewal_a_protocol_refuses_is_not_taken_and_a_later_one_is() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let old = app.cert().clone();
+    *p.chat.refuse_cert.lock().unwrap() = true;
+    let refused = renewed_and_listed(&p, &mut app, &["tasks", "chat"]).await;
+    assert_eq!(app.cert().hash(), old.hash());
+    let refusals = cert_refusals(&mut app).await;
+    let [(issued_at, CertificateRefusal::Protocol { protocol, .. })] = refusals.as_slice() else {
+        panic!("not a protocol's refusal");
+    };
+    assert_eq!(
+        (*issued_at, protocol.as_str()),
+        (refused.issued_at(), "chat")
+    );
+    // A later renewal both protocols run with is taken, and the app loads with it.
+    *p.chat.refuse_cert.lock().unwrap() = false;
+    p.w.clock.advance_ms(2000);
+    let taken = renewed_and_listed(&p, &mut app, &["tasks", "chat"]).await;
+    assert_eq!(app.cert().hash(), taken.hash());
+    drop(app);
+    assert_eq!(p.load(me).await.unwrap().cert().hash(), taken.hash());
 }
 
 #[tokio::test]

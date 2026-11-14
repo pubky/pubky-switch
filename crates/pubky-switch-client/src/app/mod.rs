@@ -74,8 +74,8 @@ mod tests;
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
-    AppEvent, BackupRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId, EventIdError,
-    ParkReason, RefusedCall,
+    AppEvent, BackupRefusal, CertificateRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId,
+    EventIdError, ParkReason, RefusedCall,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
 pub use held_cursor::HeldCursor;
