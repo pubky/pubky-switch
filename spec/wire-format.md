@@ -1800,7 +1800,7 @@ Table 3, what each event does to the mark:
 | An abort at a staged account (10.6) | none: a mark an activation moved stays, and bounds the next import |
 | An erasure (7.4.16) | the erasure's record is written durably once its checks have passed and before the deletion commits, and removed again if the deletion doesn't commit; the mark is deleted after both. At a lost identity: the record, then the mark |
 | An account erased again by the first row of Table 1 | only a mark created at or before the erasure's record is deleted; a later account's mark stays |
-| The operator retires a generation (spec 6.5) | none: the retirement is recorded for that identity and generation beside the mark, also where the mark is lost, and is never undone. Only a failing account or a lost one can be retired |
+| The operator retires a generation (spec 6.5) | none: the retirement is recorded for that identity and generation beside the mark, also where the mark is lost, and is never undone. Only a failing account that its newest `identity.json` names (serving or frozen), or a lost one, can be retired, and only at a generation above 0. A staged account, such as a move's target, isn't retired: its ways out stay the abort and the erasure (Table 2) |
 | The operator drops an erasure's record | first deletes the leftover marks the record covers |
 | The operator changes the service key (spec 12.5) | none: each mark keeps its key until a generation start at its account names the new one |
 | A restore of the state, or a failover | none: the mark stays, and Table 1 judges the restored state against it |
