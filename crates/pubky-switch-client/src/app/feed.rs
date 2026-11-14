@@ -3129,30 +3129,65 @@ impl App {
             .put(&key::owed(self.state.cursor.generation, seq), &call)
     }
 
-    /// The calls the protocol couldn't answer before, made again in feed order, which their
-    /// keys keep, each answered one committing its writes and going in one commit. One
-    /// that fails again holds every later one back, of any kind, and the read hands nothing
-    /// after it (Switch spec 8.3). A deny list change owed for its check is checked again
-    /// first: handed, refused with an event, owed still, or noted as a gap.
+    /// Where the item at (`generation`, `seq`) stands in feed order (Switch spec 8.3). A
+    /// cooperative move and a key change in place continue the sequence, so the positions
+    /// of the current sequence compare by `seq` alone, whatever generation names them. A
+    /// position of a sequence a provider loss ended comes before all of them, by
+    /// generation, then `seq`. One of a generation past the newest own `identity.json` the
+    /// app holds, as a restore in place may carry, is of a sequence it doesn't know yet:
+    /// it comes after everything it knows, and waits until the app follows it.
+    fn feed_order(&self, generation: u64, seq: u64) -> (u8, u64, u64) {
+        if generation > self.state.own_doc.generation() {
+            (2, generation, seq)
+        } else if self.current_sequence(generation) {
+            (1, 0, seq)
+        } else {
+            (0, generation, seq)
+        }
+    }
+
+    /// Whether positions of the two generations are of one sequence, as far as the app
+    /// knows ([`App::feed_order`]).
+    fn same_sequence(&self, a: u64, b: u64) -> bool {
+        a == b || (self.feed_order(a, 0).0 == 1 && self.feed_order(b, 0).0 == 1)
+    }
+
+    /// The calls the protocol couldn't answer before, made again in feed order
+    /// ([`App::feed_order`]), each answered one committing its writes and going in one
+    /// commit. One that fails again holds every later one back, of any kind, and the read
+    /// hands nothing after it (Switch spec 8.3). A deny list change owed for its check is
+    /// checked again first: handed, refused with an event, owed still, or noted as a gap.
     async fn retry_owed(&mut self) -> Result<(), AppError> {
         let owed = self.reader().scan::<OwedCall>(key::OWED_PREFIX).await?;
         let mut held = false;
-        let cursor = (self.state.cursor.generation, self.state.cursor.seq);
+        let cursor = self.state.cursor;
+        let cursor_at = self.feed_order(cursor.generation, cursor.seq);
         self.owed_ahead = None;
-        for (rest, call) in owed {
+        // In feed order, not key order: the keys name the generation each item was read
+        // at, and a restore in place carries calls of a generation the sequence went on
+        // from. A key that doesn't parse goes first, as one behind the cursor.
+        let mut owed: Vec<_> = owed
+            .into_iter()
+            .map(|(rest, call)| {
+                let place = rest.split_once('/').and_then(|(generation, seq)| {
+                    Some((
+                        super::state::parse_num(generation).ok()?,
+                        super::state::parse_num(seq).ok()?,
+                    ))
+                });
+                let order = place.map(|(generation, seq)| self.feed_order(generation, seq));
+                (order, place, rest, call)
+            })
+            .collect();
+        owed.sort_by_key(|(order, ..)| *order);
+        for (order, place, rest, call) in owed {
             let at = format!("{}{rest}", key::OWED_PREFIX);
             // A call past the cursor, as a restore in place carries one, waits for the
             // feed to reach its item: the feed stops before anything later.
-            let place = rest.split_once('/').and_then(|(generation, seq)| {
-                Some((
-                    super::state::parse_num(generation).ok()?,
-                    super::state::parse_num(seq).ok()?,
-                ))
-            });
-            if let Some((generation, seq)) = place
-                && (generation, seq) > cursor
+            if let (Some(order), Some((generation, seq))) = (order, place)
+                && order > cursor_at
             {
-                if generation == cursor.0 {
+                if self.same_sequence(generation, cursor.generation) {
                     self.owed_ahead = Some(seq);
                 }
                 break;

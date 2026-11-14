@@ -639,8 +639,9 @@ pub struct App {
     /// How many reads in a row stopped at an owed call or deny list gap the protocol didn't
     /// take ([`AppEvent::OwedCallHeld`]). In memory only.
     owed_held_reads: u32,
-    /// The first owed call past the cursor, by its item's `seq` in the cursor's generation,
-    /// as a restore in place carries it: the feed stops before any later item, so the call
+    /// The first owed call past the cursor, by its item's `seq` in the cursor's sequence,
+    /// which a move or a key change in place continues under the next generation, as a
+    /// restore in place carries it: the feed stops before any later item, so the call
     /// goes in feed order, once. Set at each read's start. In memory only.
     owed_ahead: Option<u64>,
     /// The read (by [`App::receive`]'s count) the own directory was read in for a deny list

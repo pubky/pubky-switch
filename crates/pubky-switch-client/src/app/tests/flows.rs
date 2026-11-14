@@ -5834,6 +5834,146 @@ async fn test_deny_list_owed_calls_at_a_restore_in_place_keep_feed_order() {
     assert!(log.windows(2).all(|pair| pair[0].1 <= pair[1].1), "{log:?}");
 }
 
+/// A reader that owes a missed-entries call past its backup's cursor, after a deny list
+/// change it was handed, restored in place from that backup and then following `changes`
+/// key changes in place, read after each; the first `failing_deny` deny list changes its
+/// protocol is handed after the restore fail. The protocol's log since the restore.
+async fn owed_across_a_restore_and_key_changes(
+    changes: u64,
+    failing_deny: u32,
+) -> Vec<(&'static str, u64)> {
+    let w = World::new();
+    let router = super::moves::Router::of(&w);
+    let mut manager = manager_of(&w).await;
+    let store = Arc::new(MemoryStore::new());
+    let kinds = Arc::new(KindsProtocol::default());
+    let request = w
+        .signer
+        .approve(
+            &app_keys("reader"),
+            &AppSpec::new(&["scope-a"]).with_permissions(&[Permission::ListsRead]),
+        )
+        .unwrap();
+    let mut reader = App::join(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&kinds) as Arc<dyn Protocol>,
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    reader.receive(None).await.unwrap();
+    let backup = reader.backup().await.unwrap();
+    manager.deny(&[7; 32]).await.unwrap();
+    let now = w.clock.now_ms();
+    w.switch.push_missed(2, now, now);
+    *kinds.sample.failing.lock().unwrap() = 1;
+    reader.receive(None).await.unwrap();
+    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
+    drop(reader);
+    kinds.log.lock().unwrap().clear();
+    let mut restored = App::restore(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&kinds) as Arc<dyn Protocol>,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    *kinds.sample.failing_deny.lock().unwrap() = failing_deny;
+    let mut switch = Arc::clone(&w.switch);
+    for n in 0..changes {
+        let generation = n + 2;
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed(&format!("service/change/{n}")));
+        let changed = switch.change_key_into(key.to_bytes());
+        router.add(crate::testing::SWITCH_ORIGIN, &changed);
+        super::moves::publish_at(
+            &w,
+            &changed,
+            Inbox::new(
+                crate::testing::SWITCH_ORIGIN,
+                key.verifying_key().to_bytes(),
+            ),
+            generation,
+            None,
+        );
+        switch = changed;
+        for _ in 0..3 {
+            let _ = restored.receive(None).await;
+        }
+        assert_eq!(restored.cursor().generation, generation);
+    }
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+    kinds.log.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn test_deny_list_owed_calls_keep_feed_order_across_a_restore_and_a_key_change() {
+    // A key change in place continues the sequence: the call carried past the backup's
+    // cursor still waits for the feed to reach its item at the next generation.
+    let log = owed_across_a_restore_and_key_changes(1, 0).await;
+    assert_eq!(
+        log.iter().map(|e| e.0).collect::<Vec<_>>(),
+        ["deny", "missed"]
+    );
+    assert!(log.windows(2).all(|pair| pair[0].1 < pair[1].1), "{log:?}");
+}
+
+#[tokio::test]
+async fn test_deny_list_owed_calls_keep_feed_order_across_a_restore_and_two_key_changes() {
+    let log = owed_across_a_restore_and_key_changes(2, 0).await;
+    assert_eq!(
+        log.iter().map(|e| e.0).collect::<Vec<_>>(),
+        ["deny", "missed"]
+    );
+    assert!(log.windows(2).all(|pair| pair[0].1 < pair[1].1), "{log:?}");
+}
+
+#[tokio::test]
+async fn test_deny_list_owed_calls_of_two_generations_are_made_in_feed_order() {
+    // The deny list change fails at the next generation and is owed there, before the call
+    // carried from the earlier one: the queue makes them in feed order, not by generation.
+    let log = owed_across_a_restore_and_key_changes(1, 1).await;
+    assert_eq!(
+        log.iter().map(|e| e.0).collect::<Vec<_>>(),
+        ["deny", "missed"]
+    );
+    assert!(log.windows(2).all(|pair| pair[0].1 < pair[1].1), "{log:?}");
+}
+
+#[tokio::test]
+async fn test_deny_list_owed_call_of_a_generation_not_followed_yet_waits() {
+    // A call keyed at a generation past the newest identity.json the app holds, as a
+    // restore in place may carry from a store that went further: its sequence isn't known
+    // yet, so it isn't taken as behind the cursor and made early; it waits.
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let kinds = Arc::new(KindsProtocol::default());
+    let mut reader = join_with(
+        &w,
+        "reader",
+        &[Permission::ListsRead],
+        Arc::clone(&store),
+        Arc::clone(&kinds) as Arc<dyn Protocol>,
+    )
+    .await;
+    reader.receive(None).await.unwrap();
+    assert!(reader.cursor().seq > 1);
+    let call = crate::app::feed::OwedCall::Missed {
+        seq: 1,
+        entries: 1,
+        accepted_from_ms: 5,
+        accepted_until_ms: 6,
+    };
+    let mut tx = reader.tx().unwrap();
+    tx.put(&crate::app::state::key::owed(5, 1), &call).unwrap();
+    reader.commit(tx).await.unwrap();
+    let _ = reader.receive(None).await;
+    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
+    assert!(kinds.log.lock().unwrap().is_empty());
+}
+
 /// A reader restored from `backup` into a store of its own, with `protocol`, read twice.
 async fn restored_reader(
     w: &World,
