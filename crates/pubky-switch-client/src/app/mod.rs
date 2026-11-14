@@ -1948,8 +1948,8 @@ impl App {
                 // the backup's cursor passed. So every restore by an app holding
                 // `lists.read` notes a gap in the deny list's history at the restored
                 // cursor, in this commit, and the protocol is told the full list after the
-                // carried calls (Switch spec 8.3). The namespace's delete above takes every
-                // `dgap` and `dgapt` the store held, so no earlier mark skips or moves it.
+                // carried calls (Switch spec 8.3). The namespace's delete above takes the
+                // `dgap` the store held, so no earlier gap moves it.
                 if app.state.cert.has_permission(Permission::ListsRead) {
                     tx.put(
                         feed::DENY_GAP,

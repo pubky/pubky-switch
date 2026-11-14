@@ -5660,12 +5660,15 @@ async fn test_deny_list_changes_dropped_behind_a_checkpoint_tell_the_restored_pr
     }
     assert!(restored.reconcile_mode());
     // The protocol is told the gap, with the deny list as it stands now, before any
-    // change after it.
+    // change after it: the restore's, then the checkpoint's at the same position, each
+    // told with the full list.
     let gaps = restored_protocol.deny_gaps.lock().unwrap().clone();
-    assert_eq!(gaps.len(), 1, "gaps {gaps:?}, events {events:?}");
-    assert!(gaps[0].denied.contains(&[1; 32]), "{gaps:?}");
-    assert!(gaps[0].denied.contains(&[0xef; 32]), "{gaps:?}");
-    assert_eq!(gaps[0].generation, backup.cursor.generation);
+    assert_eq!(gaps.len(), 2, "gaps {gaps:?}, events {events:?}");
+    for gap in &gaps {
+        assert!(gap.denied.contains(&[1; 32]), "{gaps:?}");
+        assert!(gap.denied.contains(&[0xef; 32]), "{gaps:?}");
+        assert_eq!(gap.generation, backup.cursor.generation);
+    }
 }
 
 // -------------------------------------------------------------------------------------
@@ -6425,6 +6428,8 @@ async fn test_deny_list_owed_call_of_a_generation_not_followed_yet_waits() {
     .await;
     reader.receive(None).await.unwrap();
     assert!(reader.cursor().seq > 1);
+    // The join's gap is told by that first read.
+    kinds.log.lock().unwrap().clear();
     let call = crate::app::feed::OwedCall::Missed {
         seq: 1,
         entries: 1,
@@ -6602,6 +6607,8 @@ async fn reader_owing_an_unchecked_deny_change(
         ),
         "{owed:?}"
     );
+    // The join's own gap was told by the first read.
+    protocol.deny_gaps.lock().unwrap().clear();
     (reader, protocol)
 }
 
@@ -6913,10 +6920,13 @@ async fn test_deny_list_gap_answered_unavailable_waits_for_the_list() {
     for _ in 0..3 {
         let _ = restored.receive(None).await;
     }
+    // The restore's gap, then the checkpoint's, which waited for a list.
     let gaps = protocol.deny_gaps.lock().unwrap().clone();
-    assert_eq!(gaps.len(), 1, "{gaps:?}");
-    assert!(gaps[0].list_read, "{gaps:?}");
-    assert!(gaps[0].denied.contains(&[1; 32]), "{gaps:?}");
+    assert_eq!(gaps.len(), 2, "{gaps:?}");
+    for gap in &gaps {
+        assert!(gap.list_read, "{gaps:?}");
+        assert!(gap.denied.contains(&[1; 32]), "{gaps:?}");
+    }
 }
 
 /// A protocol whose layer keeps the deny state it was told: `x/<first byte>` set to 1 for a
@@ -7230,27 +7240,6 @@ async fn test_deny_list_restore_tells_a_gap_owed_when_the_backup_was_taken() {
     assert_eq!(gaps.last().map(|gap| gap.seq), Some(cursor.seq));
 }
 
-#[tokio::test]
-async fn test_deny_list_restore_in_place_tells_a_gap_where_one_was_told() {
-    // The store restored in place told a gap at the very position the backup's cursor
-    // names: that mark doesn't skip the restore's gap.
-    let w = World::new();
-    let store = Arc::new(MemoryStore::new());
-    let protocol = Arc::new(LayeredDenyProtocol::default());
-    let x = [7; 32];
-    let backup =
-        backup_taken_while_a_deny_change_is_owed(&w, &store, &protocol, x, false, true).await;
-    put_position(
-        &store,
-        crate::app::feed::DENY_GAP_TOLD,
-        (backup.cursor.generation, backup.cursor.seq),
-    );
-    *protocol.gaps.lock().unwrap() = 0;
-    let restored = Box::pin(restored_and_read(&w, &store, &protocol, &backup)).await;
-    assert_eq!(*protocol.gaps.lock().unwrap(), 1);
-    assert!(!layer_denies(&restored, &x).await);
-}
-
 /// The steps after a restore that commit: its reconcile ended, then four reads.
 async fn restore_steps(app: &mut App) -> Result<(), AppError> {
     let _ = app.end_reconcile(UserConfirmed::new()).await;
@@ -7362,14 +7351,11 @@ async fn test_deny_list_restore_crash_at_each_commit_point_tells_the_list() {
                 assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
                 let reader = app.reader();
                 assert!(!reader.exists(crate::app::feed::DENY_GAP).await.unwrap());
+                let gaps = protocol.sample.deny_gaps.lock().unwrap().clone();
                 assert_eq!(
-                    reader
-                        .get::<(u64, u64)>(crate::app::feed::DENY_GAP_TOLD)
-                        .await
-                        .unwrap(),
+                    gaps.last().map(|gap| (gap.generation, gap.seq)),
                     Some((backup.cursor.generation, backup.cursor.seq))
                 );
-                assert!(*protocol.gaps.lock().unwrap() >= 1);
             }
         }
     }
@@ -7719,6 +7705,8 @@ async fn reader_owing_a_gap(
     tx.put(crate::app::feed::DENY_GAP, &(cursor.generation, cursor.seq))
         .unwrap();
     reader.commit(tx).await.unwrap();
+    // The join's own gap was told by the first read.
+    protocol.deny_gaps.lock().unwrap().clear();
     reader
 }
 
@@ -7841,6 +7829,8 @@ async fn router_reader_owing_an_unchecked_change_behind(
     let _ = reader.receive(None).await;
     assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
     unchecked_deny_change_behind_the_cursor(&mut reader, |_| {}).await;
+    // The join's own gap was told by the first read.
+    protocol.deny_gaps.lock().unwrap().clear();
     (reader, protocol)
 }
 
@@ -7897,12 +7887,13 @@ async fn test_deny_list_unverifiable_change_after_a_restores_gap_is_not_lost() {
     .unwrap();
     restored.end_reconcile(UserConfirmed::new()).await.ok();
     restored.receive(None).await.unwrap();
-    let told = restored
-        .reader()
-        .get::<(u64, u64)>(crate::app::feed::DENY_GAP_TOLD)
-        .await
-        .unwrap();
-    assert_eq!(told, Some((backup.cursor.generation, backup.cursor.seq)));
+    let told = protocol.deny_gaps.lock().unwrap().clone();
+    assert_eq!(
+        told.iter()
+            .map(|gap| (gap.generation, gap.seq))
+            .collect::<Vec<_>>(),
+        [(backup.cursor.generation, backup.cursor.seq)]
+    );
     assert_eq!(restored.cursor().seq, backup.cursor.seq);
     let x = [7; 32];
     manager.deny(&x).await.unwrap();
@@ -8262,4 +8253,273 @@ async fn test_deny_list_unchecked_change_whose_writer_read_is_refused_for_good_i
         "{read:?}"
     );
     assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
+}
+
+/// A reader with `lists.read`, restored on a fresh store from a backup taken after one
+/// deny, its first read telling the restore's gap and then failing at the feed call, before
+/// any page. Then `y` and five more pubkys are denied, `away_ms` passes, and two more.
+/// With retention that checkpoints behind 3 items and holds the cursor `cursor_hold_ms`
+/// (`None`: the service's own hold), the stubs of `y` and the five go behind a checkpoint
+/// at the restore's position. The restored app and its protocol after four more reads.
+async fn restore_gap_then_a_checkpoint(
+    cursor_hold_ms: Option<u64>,
+    away_ms: u64,
+    y: [u8; 32],
+) -> (World, App, Arc<SampleProtocol>) {
+    let w = World::new();
+    let mut retention = crate::testing::Retention {
+        checkpoint_behind: 3,
+        ..crate::testing::Retention::default()
+    };
+    if let Some(hold) = cursor_hold_ms {
+        retention.cursor_hold_ms = hold;
+    }
+    w.switch.set_retention(Some(retention));
+    let mut manager = manager_of(&w).await;
+    let mut reader = join_holding(&w, "reader", &[Permission::ListsRead]).await;
+    manager.deny(&[1; 32]).await.unwrap();
+    reader.receive(None).await.unwrap();
+    let backup = reader.backup().await.unwrap();
+    drop(reader);
+    let protocol = Arc::new(SampleProtocol::default());
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    assert!(restored.receive(None).await.is_err());
+    assert_eq!(protocol.deny_gaps.lock().unwrap().len(), 1);
+    manager.deny(&y).await.unwrap();
+    for i in 0..5u8 {
+        manager.deny(&[0xa0 + i; 32]).await.unwrap();
+    }
+    w.clock.advance_ms(away_ms);
+    manager.deny(&[0xb0; 32]).await.unwrap();
+    manager.deny(&[0xb1; 32]).await.unwrap();
+    for _ in 0..4 {
+        let _ = restored.receive(None).await;
+    }
+    (w, restored, protocol)
+}
+
+/// The protocol and the copy of the lists both have `y` denied, as the service does.
+async fn assert_learned_as_the_service_has_it(
+    app: &mut App,
+    protocol: &SampleProtocol,
+    y: [u8; 32],
+) {
+    assert!(
+        learned_denied(protocol, y),
+        "the protocol never learns it: gaps {:?}",
+        protocol.deny_gaps.lock().unwrap()
+    );
+    assert!(app.lists_copy().await.unwrap().deny.contains(&y));
+    assert!(app.allow_list().await.unwrap().deny.contains(&y));
+}
+
+#[tokio::test]
+async fn test_deny_list_restore_gap_then_a_checkpoint_at_its_position_tells_a_later_change() {
+    // The checkpoint's gap is at the very position the restore's gap was told at, but its
+    // list predates `y`: it is told too.
+    let y = [0xee; 32];
+    let (_w, mut restored, protocol) =
+        Box::pin(restore_gap_then_a_checkpoint(Some(60_000), 120_000, y)).await;
+    assert_learned_as_the_service_has_it(&mut restored, &protocol, y).await;
+}
+
+#[tokio::test]
+async fn test_deny_list_restore_gap_then_a_month_offline_tells_a_later_change() {
+    let y = [0xee; 32];
+    let (_w, mut restored, protocol) =
+        Box::pin(restore_gap_then_a_checkpoint(None, 31 * 24 * 3_600_000, y)).await;
+    assert_learned_as_the_service_has_it(&mut restored, &protocol, y).await;
+}
+
+#[tokio::test]
+async fn test_deny_list_loss_at_a_told_gaps_position_tells_the_new_list() {
+    // The restore's gap is told at the cursor; a loss then notes its gap at the same
+    // position. The new service's list, rebuilt from the uploads, holds the app's own deny
+    // made since, which no feed change brings: the loss's gap tells it.
+    let w = World::new();
+    let router = super::moves::Router::of(&w);
+    let mut manager = manager_of(&w).await;
+    let kinds = Arc::new(KindsProtocol::default());
+    let request = w
+        .signer
+        .approve(
+            &app_keys("reader"),
+            &AppSpec::new(&["scope-a"])
+                .with_permissions(&[Permission::ListsRead, Permission::ListsManage]),
+        )
+        .unwrap();
+    let mut reader = App::join(
+        router.env(&w, Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        Arc::clone(&kinds) as Arc<dyn Protocol>,
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    manager.deny(&[1; 32]).await.unwrap();
+    reader.receive(None).await.unwrap();
+    let backup = reader.backup().await.unwrap();
+    drop(reader);
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        Arc::clone(&kinds) as Arc<dyn Protocol>,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    restored.receive(None).await.unwrap();
+    let z = [0x5a; 32];
+    restored.deny(&z).await.unwrap();
+    let _next = super::moves::third_recovering(&w, &router, 2, 1);
+    w.switch.lock().erased = true;
+    restored.refresh_identity().await.unwrap();
+    for _ in 0..5 {
+        let _ = restored.receive(None).await;
+    }
+    assert_eq!(restored.cursor().generation, 2);
+    assert_learned_as_the_service_has_it(&mut restored, &kinds.sample, z).await;
+}
+
+#[tokio::test]
+async fn test_deny_list_reader_joined_after_a_deny_learns_it() {
+    // A joined app follows the feed from its registration: the deny made before it comes
+    // as no change, so its first read tells a gap with the list its copy is taken from.
+    let w = World::new();
+    let mut manager = manager_of(&w).await;
+    let x = [7; 32];
+    manager.deny(&x).await.unwrap();
+    let protocol = Arc::new(SampleProtocol::default());
+    let mut reader = join_with(
+        &w,
+        "reader",
+        &[Permission::ListsRead],
+        Arc::new(MemoryStore::new()),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+    )
+    .await;
+    for _ in 0..3 {
+        reader.receive(None).await.unwrap();
+    }
+    assert_eq!(protocol.deny_gaps.lock().unwrap().len(), 1);
+    assert_learned_as_the_service_has_it(&mut reader, &protocol, x).await;
+}
+
+#[tokio::test]
+async fn test_deny_list_reader_given_lists_read_by_a_renewal_learns_the_list() {
+    // The feed showed the deny as a stub to an app without `lists.read`: once a renewal
+    // gives it, the next read tells a gap with the list.
+    let w = World::new();
+    let mut manager = manager_of(&w).await;
+    let protocol = Arc::new(SampleProtocol::default());
+    let mut reader = join_with(
+        &w,
+        "reader",
+        &[],
+        Arc::new(MemoryStore::new()),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+    )
+    .await;
+    reader.receive(None).await.unwrap();
+    let x = [7; 32];
+    manager.deny(&x).await.unwrap();
+    reader.receive(None).await.unwrap();
+    assert!(protocol.deny_gaps.lock().unwrap().is_empty());
+    assert!(denies(&protocol).is_empty());
+    renew_with(&w, &mut reader, &[Permission::ListsRead]).await;
+    for _ in 0..3 {
+        reader.receive(None).await.unwrap();
+    }
+    assert_learned_as_the_service_has_it(&mut reader, &protocol, x).await;
+}
+
+/// `app`, alice's app "reader", renewed with `permissions` and the renewal taken.
+async fn renew_with(w: &World, app: &mut App, permissions: &[Permission]) {
+    let me = app.app_id();
+    let old = app.cert().clone();
+    let renewed = issue_cert(
+        &w.alice,
+        &app_keys("reader"),
+        &AppSpec::new(&["scope-a"]).with_permissions(permissions),
+        w.clock.now_ms() + 1000,
+    )
+    .unwrap();
+    w.switch
+        .signer_op(OpKind::CertPut {
+            target_app_id: me,
+            cert: renewed.signed().clone(),
+        })
+        .unwrap();
+    app.receive(None).await.unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cert().hash(), renewed.hash());
+}
+
+#[tokio::test]
+async fn test_deny_list_owed_change_after_lists_read_is_removed_is_not_handed() {
+    // A renewal removed `lists.read`: an owed deny list change at the cursor goes, as a
+    // change checked then does, never handed.
+    let w = World::new();
+    let mut manager = manager_of(&w).await;
+    let protocol = Arc::new(SampleProtocol::default());
+    let store = Arc::new(MemoryStore::new());
+    let mut reader = join_with(
+        &w,
+        "reader",
+        &[Permission::ListsRead],
+        Arc::clone(&store),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+    )
+    .await;
+    let x = [7; 32];
+    manager.deny(&x).await.unwrap();
+    for _ in 0..2 {
+        reader.receive(None).await.unwrap();
+    }
+    let change = protocol.denies.lock().unwrap()[0].clone();
+    renew_with(&w, &mut reader, &[]).await;
+    let cursor = reader.cursor();
+    let call = crate::app::feed::OwedCall::Deny {
+        generation: change.generation,
+        seq: cursor.seq,
+        pubky: x,
+        added: true,
+        at_ms: change.at_ms,
+    };
+    let mut tx = reader.tx().unwrap();
+    tx.put(
+        &crate::app::state::key::owed(cursor.generation, cursor.seq),
+        &call,
+    )
+    .unwrap();
+    reader.commit(tx).await.unwrap();
+    protocol.denies.lock().unwrap().clear();
+    reader.receive(None).await.unwrap();
+    assert!(denies(&protocol).is_empty());
+    assert_eq!(reader.owed_protocol_calls().await.unwrap(), 0);
 }

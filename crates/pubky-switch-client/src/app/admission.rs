@@ -30,6 +30,7 @@ use serde_json::Value;
 
 use super::batch::OpBatch;
 use super::error::Refusal;
+use super::feed::DENY_GAP;
 use super::state::Tx;
 use super::{App, AppError};
 use crate::client::answers::{AllowList, ChainItem, ConnectList};
@@ -337,28 +338,45 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             self.need(Permission::ListsRead)?;
-            self.refresh_lists().await
+            // A copy not known complete is one the protocol has no baseline for either: the
+            // refresh owes it a deny list gap at the cursor, told by the next read with a
+            // list read then, so the copy and the protocol never part (Switch spec 8.3).
+            let baseline_owed = !self.reader().exists(LISTS_AT).await?;
+            let list = self.refresh_lists().await?;
+            if baseline_owed {
+                // The copy just taken stays complete; only the protocol's gap is owed, the
+                // earliest kept, as `App::note_deny_gap` keeps it.
+                let cursor = (self.state.cursor.generation, self.state.cursor.seq);
+                let at = match self.reader().get::<(u64, u64)>(DENY_GAP).await? {
+                    Some(owed) => owed.min(cursor),
+                    None => cursor,
+                };
+                let mut tx = self.tx()?;
+                tx.put(DENY_GAP, &at)?;
+                self.commit(tx).await?;
+            }
+            Ok(list)
         })
         .await
     }
 
     /// The refresh a read owes when the copy of the lists isn't known to be complete
-    /// (`lc/lists_at` absent: never refreshed, restored, or after a provider loss) and the
-    /// app holds `lists.read`: [`App::allow_list`], before the read hands any entry over.
-    /// Not while a move or a provider loss is in progress, whose steps read and upload the
-    /// copy as the app kept it. Best effort: a refused or failed call, or a copy too large
-    /// for one commit, leaves the copy as it was, still owed, and the read goes on; an alarm
-    /// or a store failure stops it. After lists too large for one commit (`lc/too_large`),
-    /// not before [`LISTS_TOO_LARGE_RETRY_MS`] of service time has passed.
+    /// (`lc/lists_at` absent: never refreshed, as after a join, restored, after a provider
+    /// loss, or after a renewal that added `lists.read`) and the app holds `lists.read`.
+    /// The protocol then has no baseline either, so the refresh is a deny list gap at the
+    /// cursor (Switch spec 8.3): the read tells it after the owed calls, with the lists read
+    /// for it, and takes the copy from the same answer (`App::tell_deny_gap_if_owed`), so
+    /// the copy and the protocol are set from one list. Not while a gap is owed already,
+    /// nor while a move or a provider loss is in progress, whose steps read and upload the
+    /// copy as the app kept it. After lists too large for one commit (`lc/too_large`), not
+    /// before [`LISTS_TOO_LARGE_RETRY_MS`] of service time has passed.
     pub(crate) async fn refresh_lists_if_owed(&mut self) -> Result<(), AppError> {
         if !self.state.cert.has_permission(Permission::ListsRead) {
             return Ok(());
         }
         let reader = self.reader();
-        // A deny list gap owed reads the lists itself, once the owed calls are made, and
-        // takes the copy from that answer (`App::tell_deny_gap_if_owed`).
         if reader.exists(LISTS_AT).await?
-            || reader.exists(super::feed::DENY_GAP).await?
+            || reader.exists(DENY_GAP).await?
             || reader.exists(super::provider::keys::MOVE).await?
             || self.loss_record().await?.is_some_and(|loss| !loss.done())
         {
@@ -375,14 +393,11 @@ impl App {
         {
             return Ok(());
         }
-        match self.refresh_lists().await {
-            Ok(_) => Ok(()),
-            // A copy too large for one commit is refused the same way every time: the
-            // refresh failed, not the store, and the read goes on (Switch spec 8.2).
-            Err(AppError::Store(StoreError::TooLarge { .. })) => Ok(()),
-            Err(error @ (AppError::Alarm(_) | AppError::Store(_))) => Err(error),
-            Err(_) => Ok(()),
-        }
+        let cursor = self.state.cursor;
+        let mut tx = self.tx()?;
+        self.note_deny_gap(cursor.generation, cursor.seq, &mut tx)
+            .await?;
+        self.commit(tx).await
     }
 
     /// `GET /allow`, and the copy of the lists replaced from it in one commit.

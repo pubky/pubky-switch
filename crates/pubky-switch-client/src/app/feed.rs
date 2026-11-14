@@ -118,8 +118,6 @@ const FEED_AT: &str = "feed_at";
 /// `dgap`: a gap in the deny list's history the protocol isn't told of yet, the position it
 /// is complete through ([`App::note_deny_gap`]).
 pub(crate) const DENY_GAP: &str = "dgap";
-/// `dgapt`: the last such gap told, so a gap shown again at every page isn't owed again.
-pub(crate) const DENY_GAP_TOLD: &str = "dgapt";
 
 /// What one read did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -702,8 +700,9 @@ impl App {
                 ..ReceiveReport::default()
             });
         }
-        // A copy of the lists not known to be complete is refreshed before any entry, the
-        // ones stored locally included, is handed over.
+        // A copy of the lists not known to be complete owes the protocol a deny list gap,
+        // which this read tells after the owed calls and before any entry, the ones stored
+        // locally included, is handed over, the copy taken from the same answer.
         self.refresh_lists_if_owed().await?;
         self.resume_pending_effect().await?;
         // The batches kept from earlier calls go before the feed, and before anything the
@@ -2945,45 +2944,20 @@ impl App {
 
     /// Note a gap in the deny list's history after `generation` and `seq`, in `tx`, for an
     /// app holding `lists.read`: the protocol is told of it, with the lists read after it,
-    /// before anything later ([`Protocol::deny_list_gap`]). The earliest gap owed is kept;
-    /// one told already at the same position, as a checkpoint a page shows again, isn't
-    /// noted again. Whether one was noted now.
+    /// before anything later ([`Protocol::deny_list_gap`]). The earliest gap owed is kept.
+    /// Every gap noted is told, also at a position a gap was told at before: that gap's list
+    /// may predate what this one covers, and a gap told again only sets the same state.
+    /// Whether one was noted now.
     pub(crate) async fn note_deny_gap(
         &self,
         generation: u64,
         seq: u64,
         tx: &mut Tx,
     ) -> Result<bool, AppError> {
-        self.note_gap_at(generation, seq, true, tx).await
-    }
-
-    /// [`App::note_deny_gap`] for a change that can't be checked, at the position before
-    /// it, noted even where a gap was told at that very position: that gap's list may have
-    /// been read before the change was accepted, so it may lack it. The protocol is then
-    /// told the full list once more, which only sets the same state again.
-    async fn note_unverifiable_gap(
-        &self,
-        generation: u64,
-        seq: u64,
-        tx: &mut Tx,
-    ) -> Result<bool, AppError> {
-        self.note_gap_at(generation, seq, false, tx).await
-    }
-
-    async fn note_gap_at(
-        &self,
-        generation: u64,
-        seq: u64,
-        skip_told: bool,
-        tx: &mut Tx,
-    ) -> Result<bool, AppError> {
         if !self.state.cert.has_permission(Permission::ListsRead) {
             return Ok(false);
         }
         let reader = self.reader();
-        if skip_told && reader.get::<(u64, u64)>(DENY_GAP_TOLD).await? == Some((generation, seq)) {
-            return Ok(false);
-        }
         let at = match reader.get::<(u64, u64)>(DENY_GAP).await? {
             Some(owed) => owed.min((generation, seq)),
             None => (generation, seq),
@@ -3049,7 +3023,6 @@ impl App {
             tx.local(&writes)?;
         }
         tx.delete(DENY_GAP)?;
-        tx.put(DENY_GAP_TOLD, &(generation, seq))?;
         self.commit(tx).await?;
         // The copy from the same answer, best effort: one too large for a commit keeps its
         // mark, and the read goes on, the gap told.
@@ -3185,7 +3158,7 @@ impl App {
             }
             DenyCheck::Unverifiable => {
                 if self
-                    .note_unverifiable_gap(
+                    .note_deny_gap(
                         change.generation,
                         change.seq.saturating_sub(1),
                         &mut read.tx,
@@ -3376,7 +3349,7 @@ impl App {
                             break;
                         }
                         DenyCheck::Unverifiable => {
-                            self.note_unverifiable_gap(generation, seq.saturating_sub(1), &mut tx)
+                            self.note_deny_gap(generation, seq.saturating_sub(1), &mut tx)
                                 .await?;
                             tx.delete(&at)?;
                             self.commit(tx).await?;
@@ -3390,8 +3363,16 @@ impl App {
                 // again; after a restore in place, whose feed passes the carried call's
                 // item without applying it, this is where the copy takes it, after the
                 // changes the feed handed before it (Switch spec 8.3).
+                // An app that no longer holds `lists.read`, a renewal having removed it, is
+                // handed no deny list change (Switch spec 8.3): the copy still takes it, and
+                // the call is gone, as for a change checked here.
                 call @ OwedCall::Deny { pubky, added, .. } => {
                     self.note_deny_change(&pubky, added, &mut tx)?;
+                    if !self.state.cert.has_permission(Permission::ListsRead) {
+                        tx.delete(&at)?;
+                        self.commit(tx).await?;
+                        continue;
+                    }
                     call
                 }
                 call => call,
