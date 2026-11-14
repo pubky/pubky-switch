@@ -5,7 +5,7 @@
 //! routing, the body caps, the refusals before the handler, and the handler's processing
 //! order (Switch wire 7.1 to 7.4). No socket is opened.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -15,7 +15,7 @@ use pubky_switch::changes::{ChangeHub, ChangeListener};
 use pubky_switch::http::source::ProxyConfig;
 use pubky_switch::keys::{FileKeyStore, FixedKeys};
 use pubky_switch::limits::Limits;
-use pubky_switch::service::Service;
+use pubky_switch::service::{Resolver, Service};
 use pubky_switch::store::Store;
 use pubky_switch::store::testing::{
     REQUIRE_DB_ENV, TEST_DATABASE_URL_ENV, TestDatabase, test_database,
@@ -34,6 +34,17 @@ const MAX_ANSWER_BYTES: usize = 256 * 1024 * 1024;
 /// The address requests seem to come from: the service's source-based limits count them as
 /// one network source (Switch wire 9.4).
 const PEER: ([u8; 4], u16) = ([127, 0, 0, 1], 4000);
+
+/// The address every relay host resolves to at the service: a public one, as a relay URL
+/// must resolve only to public addresses (Switch wire 8.1, 8.2). Nothing connects to it: no
+/// world runs the service's webhook delivery.
+const RELAY_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14));
+
+/// A resolver that answers [`RELAY_ADDRESS`] for every host, so a flow's relay URL needs no
+/// DNS name.
+fn relay_resolver() -> Resolver {
+    Arc::new(|_host: String| Box::pin(async { Ok(vec![RELAY_ADDRESS]) }))
+}
 
 /// The service's clock, read from the test clock the client and the signer use, so one clock
 /// moves every party.
@@ -204,7 +215,8 @@ impl RealSwitch {
             keys,
             time.clone(),
             limits,
-        );
+        )
+        .with_resolver(relay_resolver());
         let listener = ChangeListener::connect(database.store())
             .await
             .map_err(|error| HarnessError::Setup(error.to_string()))?;

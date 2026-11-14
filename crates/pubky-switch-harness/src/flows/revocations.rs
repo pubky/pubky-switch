@@ -2,6 +2,8 @@
 //! time a removal counts from, the cleanup after it, the purge of its entry, and a
 //! revocation that goes out although the signer can't read the switch first.
 
+use std::collections::BTreeMap;
+
 use pubky_switch_client::app::LeaveMode;
 use pubky_switch_core::records::{IdentityDoc, app_record_path};
 use pubky_switch_signer::{Signer, UserConfirmed};
@@ -48,9 +50,10 @@ fn distrust_from(doc: &IdentityDoc, app_id: [u8; 16]) -> Option<u64> {
         .map(|removed| removed.distrust_from)
 }
 
-/// Fail the flow unless the signer's last read of the apps (`GET /v1/{id}/apps`) reports
-/// alice's app `name` as revoked at `at` (Switch wire 7.4.12 `revoked_at`).
-fn expect_revoked_at(world: &World, name: &str, at: u64) -> FlowResult {
+/// What the signer's last read of the apps (`GET /v1/{id}/apps`) reports of alice's app
+/// `name`: each member of its status, by name, as the trace keeps it (Switch wire 7.4.12).
+/// Empty when the read doesn't report the app.
+fn reported(world: &World, name: &str) -> Result<BTreeMap<String, String>, String> {
     let trace = world.trace();
     let line = trace
         .lines
@@ -59,12 +62,25 @@ fn expect_revoked_at(world: &World, name: &str, at: u64) -> FlowResult {
         .find(|line| line.label == "{alice} GET /v1/{alice}/apps")
         .ok_or("the signer read no apps")?;
     let app = format!("id {{alice/{name}}}");
-    let reported = line.facts.iter().find_map(|(fact, value)| {
+    let Some(index) = line.facts.iter().find_map(|(fact, value)| {
         let index = fact.strip_prefix("body.apps[")?.strip_suffix("].app_id")?;
-        (*value == app)
-            .then(|| line.facts.get(&format!("body.apps[{index}].revoked_at")))
-            .flatten()
-    });
+        (*value == app).then_some(index)
+    }) else {
+        return Ok(BTreeMap::new());
+    };
+    let member = format!("body.apps[{index}].");
+    Ok(line
+        .facts
+        .iter()
+        .filter_map(|(fact, value)| Some((fact.strip_prefix(&member)?.to_owned(), value.clone())))
+        .collect())
+}
+
+/// Fail the flow unless the signer's last read of the apps (`GET /v1/{id}/apps`) reports
+/// alice's app `name` as revoked at `at` (Switch wire 7.4.12 `revoked_at`).
+fn expect_revoked_at(world: &World, name: &str, at: u64) -> FlowResult {
+    let status = reported(world, name)?;
+    let reported = status.get("revoked_at");
     let expected = format!("time {}", pubky_switch_core::time::rfc3339(at));
     if reported == Some(&expected) {
         Ok(())
@@ -73,6 +89,41 @@ fn expect_revoked_at(world: &World, name: &str, at: u64) -> FlowResult {
             format!("the apps read reports the {name} revoked at {reported:?}, not {expected}")
                 .into(),
         )
+    }
+}
+
+/// What a status shows of a purged app, freed down to its App ID and the time it was
+/// revoked (Switch wire 9.1 "Departure, revoked app", 7.4.12): no record, certificate,
+/// cursor, last-seen time or key bundle part, and nothing unread.
+const FREED: [(&str, &str); 10] = [
+    ("current", "bool false"),
+    ("last_seen", "null"),
+    ("record_cert", "null"),
+    ("record_at", "null"),
+    ("cert_expires_at", "null"),
+    ("keys_through", "null"),
+    ("full_bundle_requested", "null"),
+    ("bundle_ranges", "array of 0"),
+    ("unread_entries", "number 0"),
+    ("lagging", "bool false"),
+];
+
+/// Fail the flow unless the signer's last read of the apps reports alice's app `name` as
+/// [`FREED`] (`freed`), or as still holding its record and certificate (`!freed`).
+fn expect_freed(world: &World, name: &str, freed: bool) -> FlowResult {
+    let status = reported(world, name)?;
+    if status.is_empty() {
+        return Err(format!("the apps read doesn't report the {name}").into());
+    }
+    let shows = |member: &str, value: &str| status.get(member).is_some_and(|held| held == value);
+    let held = ["record_cert", "record_at", "cert_expires_at", "last_seen"]
+        .iter()
+        .all(|member| !shows(member, "null"));
+    let all_freed = FREED.iter().all(|(member, value)| shows(member, value));
+    if (freed && all_freed) || (!freed && held) {
+        Ok(())
+    } else {
+        Err(format!("the apps read reports the {name} as {status:?}").into())
     }
 }
 
@@ -199,18 +250,22 @@ pub async fn departure_time(world: &World) -> FlowResult {
 /// its host wrote it. Her signer revokes the phone; the Homeserver fails the record's
 /// deletion once. The removal stands, delivered and published, and the record stays until
 /// the signer's next run deletes it. The signer then purges the phone's `removed` entry in
-/// a new version. The phone's App ID stays refused: asked again with the same keys, the
-/// signer doesn't approve it, the switch refuses the phone's call, and the apps the switch
-/// reports still hold the phone with the time it was revoked.
+/// a new version, and the switch frees what it held of the phone: its record and
+/// certificate, its last-seen time and its key bundle parts (Switch wire 9.1). The phone's
+/// App ID stays refused: asked again with the same keys, the signer doesn't approve it,
+/// the switch refuses the phone's call, and the apps the switch reports still hold the
+/// phone with the time it was revoked.
 ///
 /// Calls: `POST /v1/{id}/apps/{app_id}/revoke`, `PUT /v1/{id}/identity` with the removing
-/// version and with the version that purges the entry.
+/// version and with the version that purges the entry, and `GET /v1/{id}/apps` showing the
+/// phone's status before and after it.
 ///
 /// # Errors
 ///
 /// When a step that should succeed against any switch fails, the record is deleted or
-/// kept against what its step says, the purged App ID is approved again or served, or
-/// the switch no longer reports it as revoked.
+/// kept against what its step says, the switch frees the phone's record before the purge
+/// or keeps it after, the purged App ID is approved again or served, or the switch no
+/// longer reports it as revoked.
 pub async fn revocation_cleanup(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -264,6 +319,8 @@ pub async fn revocation_cleanup(world: &World) -> FlowResult {
     if held(world) {
         return Err("the removed app's record is still on the Homeserver".into());
     }
+    // Listed in `removed`, the phone is kept whole at the switch.
+    expect_freed(world, "phone", false)?;
     world.advance_ms(STEP_MS);
 
     let purged = signer.purge_removed(phone.app_id()).await?;
@@ -274,6 +331,9 @@ pub async fn revocation_cleanup(world: &World) -> FlowResult {
     if !purged.body().removed.is_empty() || published(world) != Some(purged.version()) {
         return Err("the purged version still removes an app, or isn't published".into());
     }
+    // The delivery that lists it in neither list frees it (Switch wire 9.1 "Sweeps"); the
+    // signer's read after the delivery shows it so.
+    expect_freed(world, "phone", true)?;
     world.advance_ms(STEP_MS);
 
     // The App ID is kept for good: the same keys are never approved again.
@@ -308,6 +368,7 @@ pub async fn revocation_cleanup(world: &World) -> FlowResult {
         &json!({ "signer": status(&signer)? }),
     );
     expect_revoked_at(world, "phone", revoked_at)?;
+    expect_freed(world, "phone", true)?;
     world.advance_ms(STEP_MS);
     follow(world, &mut wallet, "the wallet at the end").await?;
     Ok(())

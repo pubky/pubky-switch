@@ -79,7 +79,10 @@ before, 24 hours after the first. Both erasure flows run that wait, and a read s
 
 The flows send every call the service serves, each at both switches. What they leave out:
 
-- **`PUT /push`**, served, which no flow sends yet.
+- **Push webhooks.** The `push registration` flow registers apps at a relay, has a list
+  refused past the limit at one relay host, and frees the registration with its app. The
+  webhooks a `notify` entry queues aren't compared: the scripted switch sends none
+  (`FAKES.md`), and no world runs the service's delivery.
 - **Calls the service doesn't serve yet**, seven of the thirty-three of Switch wire 7.4:
   `POST /freeze` and `/unfreeze`, `GET /export` and its chunks, and `POST /import` with
   its chunks and activation. So no flow moves an account or changes its key in place, and
@@ -160,7 +163,7 @@ The flows send every call the service serves, each at both switches. What they l
   at a restore, a Homeserver that holds another body at a restore, and a restore in place
   below the signer's mark.
 - **More of a removal.** The removal flows date a revocation and a departure, clean up
-  after one, purge its entry, and send a revocation past a read that failed or during a
+  after one, purge its entry and free what the switch held of the app, and send a revocation past a read that failed or during a
   recovery. A removal time a switch reports before the app was listed or after its own
   answer, and a switch's copy that doesn't verify, take a switch that misbehaves: they
   stay with the signer's tests on the scripted switch.
@@ -169,7 +172,7 @@ Not this crate's to cover: refusals, limits, rates, quotas and retention, which 
 service's own tests hold, and a faulty or hostile switch, which stays on the scripted
 switch. Around the service, the flows don't touch TLS, the listener, the proxy's
 client-address header, the client's HTTPS transport, the time source (trusted time comes
-from the test clock), key generation (accounts take keys from fixed seeds), or more than one
+from the test clock), name resolution (every relay host resolves to one public address), key generation (accounts take keys from fixed seeds), or more than one
 instance on a database. Of a service's limits, a world carries only the inbox quota, the
 app limit and the hourly limit of recovery uploads to the scripted switch
 (`World::add_switch_with`): a flow that leaned on
@@ -190,7 +193,7 @@ Each flow's run against the service makes one test database and drops it, also w
 test panics; the flows run one after another. Each run is on a thread of its own with 16 MiB
 of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flow used
 1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
-that ran the flows had less left. Eighty-one flows take about three minutes in a
+that ran the flows had less left. Eighty-three flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.
 

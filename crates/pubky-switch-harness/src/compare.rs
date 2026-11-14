@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::allowed::{Allowed, EVERY_FLOW};
+use crate::allowed::Allowed;
 use crate::trace::{Trace, VIOLATION, string_number};
 
 /// One fact the two runs disagree on.
@@ -169,8 +169,7 @@ pub struct Verdict {
     /// The differences no entry allows.
     pub unlisted: Vec<Difference>,
     /// The entries of this flow that allowed no difference: the list says the two differ
-    /// where they no longer do. An entry for every flow isn't counted here: it must show in
-    /// one flow at least, which the flows' test checks over all of them.
+    /// where they no longer do.
     pub unused: Vec<&'static Allowed>,
     /// The differences an entry allows, each with its entry.
     pub allowed: Vec<(Difference, &'static Allowed)>,
@@ -216,9 +215,10 @@ pub fn judge(flow: &str, differences: Vec<Difference>, list: &'static [Allowed])
     let mut verdict = Verdict::default();
     let mut used = BTreeSet::new();
     for difference in differences {
-        let entry = list.iter().enumerate().find(|(_, entry)| {
-            (entry.flow == flow || entry.flow == EVERY_FLOW) && entry.allows(&difference)
-        });
+        let entry = list
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.flow == flow && entry.allows(&difference));
         match entry {
             Some((index, entry)) => {
                 used.insert(index);
@@ -258,16 +258,7 @@ mod tests {
         Trace { lines }
     }
 
-    static LIST: [Allowed; 3] = [
-        Allowed {
-            flow: EVERY_FLOW,
-            label: "*",
-            fact: "* (member order)",
-            service: "*",
-            scripted: "*",
-            reason: "everywhere",
-            reference: "nowhere",
-        },
+    static LIST: [Allowed; 2] = [
         Allowed {
             flow: "example",
             label: "{alice} GET /v1/{alice}/apps",
@@ -521,22 +512,6 @@ mod tests {
         assert_eq!(verdict.unlisted.len(), 2, "{verdict}");
         assert!(verdict.unused.is_empty());
         assert!(!verdict.agrees());
-    }
-
-    #[test]
-    fn test_judge_takes_an_entry_for_every_flow_in_any_flow() {
-        let order = Difference {
-            line: 0,
-            label: "{alice} GET /v1/{alice}/apps".into(),
-            fact: "body (member order)".into(),
-            service: Some("identity, apps".into()),
-            scripted: Some("apps, identity".into()),
-        };
-        for flow in ["example", "a flow the list doesn't name"] {
-            let verdict = judge(flow, vec![order.clone()], &LIST);
-            assert_eq!(verdict.allowed.len(), 1, "{flow}");
-            assert!(verdict.unlisted.is_empty(), "{flow}");
-        }
     }
 
     #[test]

@@ -122,7 +122,7 @@ pub(crate) async fn follow(world: &World, app: &mut App, name: &str) -> FlowResu
 
 /// How a call ended, for the trace: the error's kind and its code at the switch, never its
 /// text.
-fn result<T>(result: &Result<T, AppError>) -> Value {
+pub(crate) fn result<T>(result: &Result<T, AppError>) -> Value {
     match result {
         Ok(_) => json!({ "ok": true }),
         Err(error) => {
