@@ -27,7 +27,7 @@
 
 ## Project structure
 - Workspace root `Cargo.toml` holds shared package settings, lints and dependency versions; members live under `crates/`.
-- Schema migrations live in the repo, next to the storage code, and run in order; never edit a migration that has been merged.
+- Schema migrations live in the repo, next to the storage code, and run in order. Until the first live release the schema is one initial migration, edited in place; from that release on, a merged migration is never edited.
 
 ## Service rules
 These are the conditions of a consistent Switch (Switch spec 6.5). Breaking one makes the service non-compliant.

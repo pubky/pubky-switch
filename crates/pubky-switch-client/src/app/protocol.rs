@@ -743,6 +743,11 @@ pub trait Protocol: Send + Sync {
     ///   past, as after a restore in place from a newer backup, or one of a lost sequence
     ///   once the app reads the next, isn't made: it would come after later changes, so
     ///   the protocol is told a gap at that position instead.
+    /// - **After a restore:** a backup holds the protocol's layer as committed when it was
+    ///   taken, and none of the changes or gaps owed then. So every restore tells the
+    ///   protocol a gap at the backup's position, with the full list, whatever the backup
+    ///   held, after the owed calls the restore carries up to that position; the
+    ///   changes after it come as the feed hands them.
     /// - **Again:** a change may come twice, after a crash before its commit and after a
     ///   restore, whose feed hands it again; its writes commit once. A protocol keys what it
     ///   keeps by the change's place, or takes it as setting a state.
@@ -763,9 +768,24 @@ pub trait Protocol: Send + Sync {
     }
 
     /// A gap in the deny list's history, with the list as it stands now ([`DenyListGap`]):
-    /// the protocol starts again from it, or fails closed for what the gap covers. Made
-    /// once the app has read the list after the gap, before any later change or item is
-    /// handed, its writes committed with that copy of the lists. Nothing by default.
+    /// the protocol starts again from it, or fails closed for what the gap covers
+    /// (Switch spec 8.3). Made by a read, after the owed calls and before any later change
+    /// or item is handed, once the app has read the list for the gap (`GET /allow`).
+    ///
+    /// A gap comes after a restore, a provider loss, a checkpoint past the cursor, a change
+    /// whose writer the directory no longer lists, a join, a renewal that adds `lists.read`
+    /// and every [`super::App::allow_list`]: whenever the app's copy of
+    /// the lists is taken whole from a list read, the protocol is given that list as a gap.
+    /// The writes are committed on their own, with the owed gap deleted; the copy of the
+    /// lists is then replaced from the same answer in a commit of its own, best effort,
+    /// which lists too large for one commit leave as it was, not known complete.
+    ///
+    /// A gap may be told again at the same position, each time with the full list, which
+    /// sets the same state. One told with `list_read` false, the answer not readable, is
+    /// owed again at the next read, as long as the answer can't be read. Writes over
+    /// [`MAX_STEP_LOCAL_BYTES`] aren't committed: the gap is refused with
+    /// [`super::AppEvent::LocalWritesRefused`] and counts as told, and no further gap
+    /// follows for it. Nothing by default.
     ///
     /// # Errors
     ///

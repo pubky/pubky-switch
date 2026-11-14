@@ -272,8 +272,9 @@ impl AccountTxn {
     /// without trusted time, so entries then wait for every current target, 7.4.4):
     /// - an entry goes once every current target that isn't lagging has its cursor, in the
     ///   generation the account serves, at or past it. An entry with no current target
-    ///   stays, for the unreadable item that replaces it ([`Self::convert_unreadable`]). A
-    ///   lagging target that hadn't read an entry that goes gets a `missed` item for it;
+    ///   stays: a departure turns it into an unreadable item ([`Self::convert_unreadable`]),
+    ///   and until then it waits for a target to be current again. A lagging target that
+    ///   hadn't read an entry that goes gets a `missed` item for it;
     /// - an unreadable item goes once every current app, lagging ones included, has passed
     ///   it;
     /// - a `missed` item goes once its app has passed it, or isn't current.

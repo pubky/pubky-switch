@@ -1722,7 +1722,6 @@ dependencies = [
  "pubky-switch-client",
  "pubky-switch-core",
  "pubky-switch-signer",
- "serde",
  "serde_json",
  "sqlx",
  "tempfile",

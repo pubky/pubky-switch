@@ -1074,7 +1074,7 @@ pub async fn capture_documents(
 }
 
 /// Put back the documents `from` holds into account `account`'s chain items that lost
-/// theirs, as a service from before deleted documents left them; the number put back.
+/// theirs; the number put back.
 pub async fn restore_documents(
     replay: &Replay,
     account: &str,
@@ -1118,21 +1118,4 @@ pub async fn sql_on(replay: &Replay, account: &str, sql: &str) -> u64 {
         .rows_affected();
     conn.close().await.expect("close");
     changed
-}
-
-/// `documents_checked_seq` and `documents_check_end` of account `account`.
-pub async fn documents_check(replay: &Replay, account: &str) -> (i64, i64) {
-    use sqlx::Connection;
-    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
-        .await
-        .expect("conn");
-    let row: (i64, i64) = sqlx::query_as(
-        "SELECT documents_checked_seq, documents_check_end FROM accounts WHERE id = $1",
-    )
-    .bind(account)
-    .fetch_one(&mut conn)
-    .await
-    .expect("check");
-    conn.close().await.expect("close");
-    row
 }

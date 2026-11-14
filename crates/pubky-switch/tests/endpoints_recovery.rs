@@ -3358,48 +3358,6 @@ async fn test_upload_after_the_lost_generation_deleted_a_superseded_document() {
 }
 
 #[tokio::test]
-async fn test_recovery_in_place_old_documents_check_runs_on_over_the_new_sequence() {
-    // The check of older documents half done when a recovery in place empties the chain:
-    // it runs on to its end over the new generation's seqs and deletes none of their
-    // documents, which are all current; requests succeed throughout.
-    let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
-    let id = alice_id();
-    sql_on(
-        &replay,
-        &id,
-        "UPDATE accounts SET documents_checked_seq = 0, documents_check_end = 200 \
-         WHERE id = $1",
-    )
-    .await;
-    let before = held(&replay).await;
-    let recovery = next_generation(&before, pending, Some(1));
-    let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
-    assert_eq!(answer.status, 200);
-    let (checked, end) = documents_check(&replay, &id).await;
-    assert!(checked < end, "{checked} of {end}");
-    let (status, body) = wallet_registers(&replay, 77, 2, 3, true, at).await;
-    assert_eq!(status, 200, "{body}");
-    let mut reads = 0;
-    while documents_check(&replay, &id).await.0 < end {
-        wallet_get(&replay, "feed?limit=500", at).await;
-        reads += 1;
-        assert!(reads < 10, "the check ends");
-    }
-    let items = chain(&replay).await;
-    assert!(items.iter().all(|(generation, ..)| *generation == 2));
-    for (_, seq, kind) in &items {
-        let kept = chain_document_kept(&replay, &id, u64::try_from(*seq).expect("seq")).await;
-        assert!(kept.0, "seq {seq} ({kind}) keeps its document");
-    }
-    let feed = wallet_get(&replay, "feed?limit=500", at).await;
-    for item in feed["items"].as_array().expect("items") {
-        assert_ne!(item["type"], json!("stub"), "{item}");
-    }
-    replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
 async fn test_upload_reopened_tombstone_shows_its_earlier_entries_as_stubs() {
     // The wallet's attempt and its `done` compact the claim to a tombstone, which keeps no
     // entries (Switch wire 7.4.8). An upload then adds an attempt of the lost generation and

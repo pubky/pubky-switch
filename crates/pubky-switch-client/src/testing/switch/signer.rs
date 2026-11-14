@@ -391,16 +391,12 @@ impl Inner {
             &state,
             super::Readers::Every,
         )?;
-        // A first listing is kept, as the service keeps it, only for an app with no row and
-        // no stored part yet; any other's holdings start unknown (Switch wire 7.4.12).
+        // The first listing's epoch is kept; a later listing never dates it again (Switch
+        // wire 7.4.12).
         for app in &doc.body().apps {
-            let fresh = !self.apps.contains_key(&app.app_id)
-                && self.bundles.get(&app.app_id).is_none_or(Vec::is_empty);
-            if fresh {
-                self.listed_at_epoch
-                    .entry(app.app_id)
-                    .or_insert(doc.data_epoch());
-            }
+            self.listed_at_epoch
+                .entry(app.app_id)
+                .or_insert(doc.data_epoch());
         }
         // A departure's rotation is done once a version removes the app at a higher data
         // epoch than at its departure, and stays done, also after a purge (Switch wire 7.4.12).
