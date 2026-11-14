@@ -944,6 +944,7 @@ impl App {
             let mut withdrawn = Vec::new();
             for item in items {
                 let msg_id = item.msg_id.clone();
+                let to = self.owners_of_kind(&item.kind);
                 let (kept, duty) = item.give_up_delivery();
                 let mut tx = self.tx()?;
                 match &kept {
@@ -952,7 +953,7 @@ impl App {
                     None => tx.delete(&out_key(&msg_id))?,
                 }
                 note_given_up(&mut tx, &msg_id, now)?;
-                self.keep_duty(&mut tx, duty)?;
+                self.keep_duty_for(&mut tx, to, duty)?;
                 self.commit(tx).await?;
                 withdrawn.push(msg_id);
             }
@@ -967,8 +968,10 @@ impl App {
                     }
                     let mut tx = self.tx()?;
                     note_given_up(&mut tx, &msg_id, now)?;
-                    self.keep_duty(
+                    let to = self.owners_of_kind(&item.kind);
+                    self.keep_duty_for(
                         &mut tx,
+                        to,
                         Duty::MessageUndelivered {
                             msg_id: msg_id.clone(),
                             resend: false,
@@ -1663,8 +1666,10 @@ impl App {
             } else {
                 tx.put(&out_key(msg_id), &item)?;
             }
-            self.keep_duty(
+            let to = self.owners_of_kind(&item.kind);
+            self.keep_duty_for(
                 &mut tx,
+                to,
                 Duty::MessageUndelivered {
                     msg_id: msg_id.to_owned(),
                     resend,
@@ -1708,6 +1713,7 @@ impl App {
                 }
             }
             if self.kept_window_now() > deadline {
+                let to = self.owners_of_kind(&item.kind);
                 let (kept, duty) = item.give_up_delivery();
                 let mut tx = self.tx()?;
                 match &kept {
@@ -1717,7 +1723,7 @@ impl App {
                         note_given_up(&mut tx, msg_id, self.now())?;
                     }
                 }
-                self.keep_duty(&mut tx, duty)?;
+                self.keep_duty_for(&mut tx, to, duty)?;
                 self.commit(tx).await?;
                 return Ok(true);
             }
@@ -1820,9 +1826,12 @@ impl App {
         } else {
             tx.put(&out_key(&item.msg_id), &*item)?;
         }
-        // A duty event, kept in the commit that gives the delivery up.
-        self.keep_duty(
+        // A duty event for the protocol of the message's kind, kept in the commit that
+        // gives the delivery up.
+        let to = self.owners_of_kind(&item.kind);
+        self.keep_duty_for(
             &mut tx,
+            to,
             Duty::MessageUndelivered {
                 msg_id: item.msg_id.clone(),
                 resend,
@@ -1913,8 +1922,10 @@ impl App {
         } else {
             tx.put(&out_key(&item.msg_id), &item)?;
         }
-        self.keep_duty(
+        let to = self.owners_of_kind(&item.kind);
+        self.keep_duty_for(
             &mut tx,
+            to,
             Duty::RecordJobDropped {
                 msg_id: item.msg_id.clone(),
                 batch_id: item.record_batch.clone(),

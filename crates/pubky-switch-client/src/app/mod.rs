@@ -779,6 +779,16 @@ fn union_owners(
     serde_json::to_value(&owed).map_err(|_| corrupt())
 }
 
+/// A carried owed call `value`, owed to every protocol of `names`.
+fn owed_to_every(
+    value: &serde_json::Value,
+    names: &[String],
+) -> Result<serde_json::Value, AppError> {
+    let mut owed = serde_json::from_value::<feed::Owed>(value.clone()).map_err(|_| corrupt())?;
+    owed.to = names.to_vec();
+    serde_json::to_value(&owed).map_err(|_| corrupt())
+}
+
 /// The entry a kept effect belongs to, as a backup holds it: stored as
 /// [`ParkReason::Uncertain`], under its local ID if it was stored before (its flags kept),
 /// else under `reserved`, the ID the live store reserved for it, built from what the kept
@@ -2109,6 +2119,13 @@ impl App {
                         Some(kept) => {
                             tx.put(stored, &union_owners(kept, value, &protocols_names)?)?;
                         }
+                        // A call only the store holds, past the backup's cursor, came after
+                        // the backup: every layer is put back to a moment before it, so a
+                        // protocol that took it lost its writes with that state and is owed
+                        // it again. Every registered protocol is (Switch spec 8.3).
+                        None if app.owed_after(stored, backup.cursor) => {
+                            tx.put(stored, &owed_to_every(value, &protocols_names)?)?;
+                        }
                         None => tx.put(stored, value)?,
                     }
                 }
@@ -2757,6 +2774,24 @@ impl App {
 
     /// The protocols a duty event is for: the protocol of the kind it names, or of the
     /// message of the entry stored locally it names; every protocol otherwise.
+    /// The protocols a duty event about an item of `kind` is for: the kind's owner, or
+    /// every protocol when none owns it.
+    pub(crate) fn owners_of_kind(&self, kind: &str) -> Vec<String> {
+        match self.protocols.of_kind(kind) {
+            Some(owner) => vec![owner.name.clone()],
+            None => self.protocols.names(),
+        }
+    }
+
+    /// The protocols a duty event about a record of the collection `name` is for: the
+    /// collection's owner, or every protocol when none owns it.
+    pub(crate) fn owners_of_collection(&self, name: &str) -> Vec<String> {
+        match self.protocols.of_collection(name) {
+            Some(owner) => vec![owner.name.clone()],
+            None => self.protocols.names(),
+        }
+    }
+
     fn duty_to(&self, duty: &events::Duty) -> Vec<String> {
         let kind = match duty {
             events::Duty::EffectRefused { kind, .. }
