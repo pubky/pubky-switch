@@ -172,9 +172,13 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let _key_dir_lock = FileKeyStore::lock_dir(&key_dir)?;
     let keys = FileKeyStore::open(&key_dir)?;
     let store = Store::connect(&config.database).await?;
-    let instance = store.hold_instance_lock().await?;
-    // The database's lock lives with its connection: once another process holds it, after
-    // a database restart or a failover, this one stops at once.
+    let instance = store
+        .hold_instance_lock(std::time::Duration::from_millis(
+            config.database.connect_retry_ms,
+        ))
+        .await?;
+    // The database's lock lives with its session: once another process holds it, or it
+    // can't be confirmed, this one stops (docs/configuration.md, "Topology").
     tokio::spawn(async move {
         let lost = instance.keep(std::time::Duration::from_secs(5)).await;
         tracing::error!(failure = %lost, "the instance lock: stopping");

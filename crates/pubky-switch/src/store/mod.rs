@@ -227,9 +227,10 @@ pub enum StoreError {
     /// No database URL is configured.
     #[error("no database URL: set database.url or {DATABASE_URL_ENV}")]
     NoUrl,
-    /// Another process serves this database ([`Store::hold_instance_lock`]).
-    #[error("another process serves this database")]
-    InUse,
+    /// Another process serves this database ([`Store::hold_instance_lock`]): the session
+    /// that holds its lock.
+    #[error("another process serves this database: {0}")]
+    InUse(String),
 }
 
 /// PostgreSQL's code for a lock that wasn't free within `lock_timeout`.
