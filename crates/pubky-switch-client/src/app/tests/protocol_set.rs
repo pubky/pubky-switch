@@ -1110,3 +1110,103 @@ async fn test_protocol_set_provider_loss_call_one_protocol_fails_is_made_again_f
     assert_eq!(*chat.losses.lock().unwrap(), sample);
     both_answered(&lost, &app).await;
 }
+
+/// The `expires_at` of `app`'s record.
+fn record_expiry(app: &App) -> Option<u64> {
+    pubky_switch_core::records::AppRecord::verify(app.record(), &app.identity())
+        .unwrap()
+        .expires_at()
+}
+
+fn a_member() -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut member = serde_json::Map::new();
+    member.insert("a".into(), json!(1));
+    Some(member)
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_expiry_is_the_earliest_any_protocol_asked_for() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let now = p.w.clock.now_ms();
+    let day = pubky_switch_core::records::DAY_MS;
+    app.set_protocol_member("tasks", a_member(), Some(now + 30 * day))
+        .await
+        .unwrap();
+    assert_eq!(record_expiry(&app), Some(now + 30 * day));
+    // `chat` asks for an earlier one: the record takes it.
+    app.set_protocol_member("chat", a_member(), Some(now + 10 * day))
+        .await
+        .unwrap();
+    assert_eq!(record_expiry(&app), Some(now + 10 * day));
+    // `tasks` renewing for later doesn't move it past `chat`'s, across a load too.
+    app.renew_record("tasks", Some(now + 60 * day))
+        .await
+        .unwrap();
+    assert_eq!(record_expiry(&app), Some(now + 10 * day));
+    let id = app.app_id();
+    drop(app);
+    let mut app = p.load(id).await.unwrap();
+    // `chat` asks for none: `tasks`'s is the record's.
+    app.renew_record("chat", None).await.unwrap();
+    assert_eq!(record_expiry(&app), Some(now + 60 * day));
+    // Neither asks for one: the record doesn't expire.
+    app.set_protocol_member("tasks", None, None).await.unwrap();
+    assert_eq!(record_expiry(&app), None);
+    let record = app.record().clone();
+    // The member and the expiry of a protocol not registered are refused, nothing signed.
+    usage(
+        app.set_protocol_member("news", a_member(), Some(now)).await,
+        "no protocol `news`",
+    );
+    usage(
+        app.renew_record("news", Some(now)).await,
+        "no protocol `news`",
+    );
+    assert_eq!(app.record(), &record);
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_expiries_go_with_a_backup_and_one_of_no_protocol_refuses() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let now = p.w.clock.now_ms();
+    let day = pubky_switch_core::records::DAY_MS;
+    app.set_protocol_member("chat", a_member(), Some(now + 10 * day))
+        .await
+        .unwrap();
+    app.renew_record("tasks", Some(now + 60 * day))
+        .await
+        .unwrap();
+    let backup = app.backup().await.unwrap();
+    let mut restored = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    // The restore kept both: `chat` asking for none leaves `tasks`'s.
+    restored.renew_record("chat", None).await.unwrap();
+    assert_eq!(record_expiry(&restored), Some(now + 60 * day));
+    // An expiry of a protocol not registered refuses the restore, which writes nothing.
+    let mut bytes: serde_json::Value = serde_json::from_slice(&backup.to_bytes().unwrap()).unwrap();
+    bytes["record_expiries"][0][0] = json!("news");
+    let foreign = AppBackup::from_bytes(&serde_json::to_vec(&bytes).unwrap()).unwrap();
+    let store = Arc::new(MemoryStore::new());
+    let error = App::restore(
+        p.w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &foreign,
+    )
+    .await
+    .map(|app| app.app_id())
+    .unwrap_err();
+    assert!(
+        matches!(&error, AppError::InvalidData(why) if why.contains("`news`")),
+        "{error:?}"
+    );
+    assert!(store.is_empty(&crate::store::client_namespace(&app.app_id())));
+}

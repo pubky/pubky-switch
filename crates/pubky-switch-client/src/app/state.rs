@@ -87,6 +87,9 @@ pub(crate) mod key {
     /// The protocols that ended the reconcile mode under way (`rcd`,
     /// [`super::App::end_reconcile_for`]); the mode ends when the last of them does.
     pub(crate) const RECONCILED: &str = "rcd";
+    /// The expiry each protocol asked of the app's record (`rexp`), by name, `None` for none:
+    /// the record's `expires_at` is the earliest.
+    pub(crate) const RECORD_EXPIRIES: &str = "rexp";
     pub(crate) const KEYS: &str = "keys";
     pub(crate) const CERT: &str = "cert";
     pub(crate) const CERT_RENEWAL: &str = "cert/renewal";

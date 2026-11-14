@@ -284,14 +284,14 @@ async fn test_own_record_renewal_signs_again_with_the_same_members() {
     let before = record_of(&app);
     w.clock.advance_ms(1_000);
     // The same expiry still renews: a new updated_at.
-    app.renew_record(Some(expires)).await.unwrap();
+    app.renew_record(PROTO, Some(expires)).await.unwrap();
     let renewed = record_of(&app);
     assert!(renewed.updated_at() > before.updated_at());
     assert_eq!(renewed.body().protocols, before.body().protocols);
     assert_eq!(w.held(id).as_ref(), Some(app.record()));
     assert_eq!(w.published(id), Some(bytes_of(app.record())));
     // A record that doesn't expire.
-    app.renew_record(None).await.unwrap();
+    app.renew_record(PROTO, None).await.unwrap();
     assert_eq!(record_of(&app).expires_at(), None);
     assert_eq!(w.held(id).as_ref(), Some(app.record()));
 }
@@ -316,7 +316,7 @@ async fn test_own_record_updated_at_later_than_the_held_one_on_a_clock_behind() 
         path: "/ops".into(),
         after: 0,
     });
-    app.renew_record(None).await.unwrap_err();
+    app.renew_record(PROTO, None).await.unwrap_err();
     assert_eq!(record_of(&app).updated_at(), before.updated_at() + 1);
     app.publish_record().await.unwrap();
     assert_eq!(record_of(&app).updated_at(), before.updated_at() + 1);
@@ -695,7 +695,7 @@ async fn test_own_record_changes_refused_once_left() {
         app.set_protocol_member(PROTO, member(json!({})), None)
             .await
             .unwrap_err(),
-        app.renew_record(None).await.unwrap_err(),
+        app.renew_record(PROTO, None).await.unwrap_err(),
         app.publish_record().await.unwrap_err(),
         app.sign_protocol("sample/v1/grant", &[b"x"]).unwrap_err(),
     ] {

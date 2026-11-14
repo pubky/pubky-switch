@@ -426,6 +426,11 @@ pub struct AppBackup {
     /// a restore holds them too, so it delivers none of their messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     held_counterparties: Vec<String>,
+    /// The expiry each protocol asked of the app's record (`rexp`), by name, `None` for
+    /// none: a restore keeps them, so the record's next `expires_at` is still the earliest
+    /// of them. Absent while no protocol asked for one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    record_expiries: Vec<(String, Option<u64>)>,
     /// The protocols' layers of a layered backup ([`App::backup_layered`]), one per
     /// protocol, in registration order; absent from a plain backup's bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1350,6 +1355,7 @@ impl App {
             outbox: Vec::new(),
             outbox_left_out: Vec::new(),
             held_counterparties: Vec::new(),
+            record_expiries: Vec::new(),
             layers: Vec::new(),
             beyond_cursor: None,
         })
@@ -1395,6 +1401,7 @@ impl App {
     /// Put the outbox in `backup`, as `reader` holds it (Switch spec 11): every message the
     /// app still owes a job, so a restore delivers what was queued before the backup with
     /// the same `msg_id` and bytes.
+    /// The expiries the protocols asked of the record go with it.
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
         let carried = send::carried_outbox(reader).await?;
         backup.outbox = carried.items;
@@ -1404,6 +1411,12 @@ impl App {
             .await?
             .into_iter()
             .map(|(rest, _)| rest)
+            .collect();
+        backup.record_expiries = reader
+            .get::<std::collections::BTreeMap<String, Option<u64>>>(key::RECORD_EXPIRIES)
+            .await?
+            .unwrap_or_default()
+            .into_iter()
             .collect();
         Ok(())
     }
@@ -1756,6 +1769,16 @@ impl App {
                     layer.protocol
                 )));
             }
+            // So is an expiry of the record a protocol not registered here asked for.
+            if let Some((name, _)) = backup
+                .record_expiries
+                .iter()
+                .find(|(name, _)| !protocols.contains(name))
+            {
+                return Err(invalid(&format!(
+                    "its record expiry of `{name}` is of no registered protocol"
+                )));
+            }
             if !layers.is_empty() && backup.beyond_cursor.is_none() {
                 return Err(invalid(
                     "its layers come without the feed beyond its cursor",
@@ -1974,6 +1997,11 @@ impl App {
                 }
                 tx.local(&layer_writes)?;
                 tx.put(key::PROTOCOLS, &protocols_names)?;
+                if !backup.record_expiries.is_empty() {
+                    let expiries: std::collections::BTreeMap<String, Option<u64>> =
+                        backup.record_expiries.iter().cloned().collect();
+                    tx.put(key::RECORD_EXPIRIES, &expiries)?;
+                }
                 tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
                 carrying = true;
