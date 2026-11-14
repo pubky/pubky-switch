@@ -2581,6 +2581,10 @@ impl App {
     /// by [`App::take_events`] or a call's report, are removed: one kept but not yet taken,
     /// such as one queued after a reload, stays until it is taken and acknowledged.
     ///
+    /// It acknowledges for every protocol at once: each event goes for all the protocols
+    /// it is for, whichever of them acted on it. A host that hands its protocols their
+    /// events apart acknowledges each protocol's with [`App::ack_events_for`] instead.
+    ///
     /// The host must call this once it has handed the events to its protocol and the
     /// protocol has kept what they say: nothing else removes a kept duty event, so a host
     /// that never acknowledges keeps them all, without limit (`events` module, "Duty

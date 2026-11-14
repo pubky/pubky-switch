@@ -136,7 +136,7 @@ pub struct ReceivedMessage {
 /// 32 MiB per commit):
 ///
 /// - **Kept, in base64:** each write is kept qualified, its key or prefix after the
-///   protocol's name and `/` (at most 33 bytes), as `{"Put":{"key":"…","value":"…"}},`,
+///   protocol's name and `/` (at most 33 bytes), as `{"Put":{"key":"...","value":"..."}},`,
 ///   its key and value in base64url: at most `4/3 (k + 33 + v) + 40 = 4/3 (k + v) + 84`
 ///   bytes, which is under `4/3 (k + v + 72)` since 4/3 x 72 = 96. So writes at the bound
 ///   keep in at most 4/3 x 4 MiB = 5.34 MiB.
