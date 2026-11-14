@@ -96,6 +96,9 @@ const DUE_CLAIMS_PER_REQUEST: u64 = 64;
 /// checks at most (Switch wire 7.5); the rest go with the next requests.
 const OLD_DOCUMENTS_PER_REQUEST: u64 = 64;
 
+/// How many accounts' mark refusals one process logs, each once.
+const MARK_REFUSALS_LOGGED: usize = 1024;
+
 /// The service.
 pub struct Service {
     origin: String,
@@ -123,6 +126,13 @@ pub struct Service {
     /// Recovery uploads whose items were judged before the account's lock, and under it.
     judged_before_lock: std::sync::atomic::AtomicU64,
     judged_under_lock: std::sync::atomic::AtomicU64,
+    /// Requests refused because the account's state is behind its service key's mark, or
+    /// beside it (Switch wire 7.3 step 10), and the accounts whose refusal was logged.
+    mark_refusals: std::sync::atomic::AtomicU64,
+    mark_refused_accounts: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Requests refused because they depend on the service's time and trusted time is
+    /// missing (Switch spec 10.1).
+    time_refusals: std::sync::atomic::AtomicU64,
     /// The sweeps a retried erasure of an account gone may run (Switch wire 7.4.16): only
     /// the signer's, verified with the identity key, and bounded per account, since anyone
     /// who saw one can replay it within its timestamp window.
@@ -353,6 +363,9 @@ impl Service {
             upload_judging: parking_lot::Mutex::default(),
             judged_before_lock: std::sync::atomic::AtomicU64::new(0),
             judged_under_lock: std::sync::atomic::AtomicU64::new(0),
+            mark_refusals: std::sync::atomic::AtomicU64::new(0),
+            mark_refused_accounts: parking_lot::Mutex::default(),
+            time_refusals: std::sync::atomic::AtomicU64::new(0),
             erasure_sweeps: KeyedWindows::default(),
             changes: ChangeHub::new(),
             entry_ids: Arc::new(random_entry_id),
@@ -417,6 +430,67 @@ impl Service {
             self.judged_before_lock.load(Relaxed),
             self.judged_under_lock.load(Relaxed),
         )
+    }
+
+    /// How many requests were refused because the account's state is behind its service
+    /// key's mark, or beside it (`pubky_switch_mark_refusals_total`).
+    pub fn mark_refusals(&self) -> u64 {
+        self.mark_refusals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many requests were refused for lack of trusted time
+    /// (`pubky_switch_time_refusals_total`).
+    pub fn time_refusals(&self) -> u64 {
+        self.time_refusals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Note a request to `account` refused because its state is behind its service key's
+    /// mark, or beside it (Switch wire 7.3 step 10). Any such refusal means state the
+    /// service committed was lost (Switch spec 6.5), so it is counted for an alert, by how
+    /// the state compares with the mark, and logged with the account, once for each account
+    /// while the process runs: `pubky-switch check-marks` lists them all.
+    pub(super) fn note_mark_refusal(&self, account: &str, check: MarkCheck) {
+        let state = match check {
+            MarkCheck::Fork => "fork",
+            MarkCheck::OtherGeneration => "other_generation",
+            MarkCheck::Behind | MarkCheck::Unmarked | MarkCheck::Current => "behind",
+        };
+        metrics::counter!("pubky_switch_mark_refusals_total", "state" => state).increment(1);
+        self.mark_refusals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut logged = self.mark_refused_accounts.lock();
+        if logged.len() >= MARK_REFUSALS_LOGGED || !logged.insert(account.to_string()) {
+            return;
+        }
+        tracing::error!(
+            alert = "behind_mark",
+            account,
+            state,
+            "the account's state is behind its service key's mark: committed state was lost, \
+             and the account is refused until its signer starts a new generation"
+        );
+        if logged.len() == MARK_REFUSALS_LOGGED {
+            tracing::error!(
+                alert = "behind_mark",
+                "more accounts are behind their marks than this process logs: check-marks \
+                 lists them all"
+            );
+        }
+    }
+
+    /// The refusal of a request that depends on the service's time while trusted time is
+    /// missing (Switch spec 10.1), counted by `call` apart from every other `503`.
+    pub(super) fn refused_without_trusted_time(
+        &self,
+        call: &'static str,
+        message: &'static str,
+    ) -> ApiError {
+        metrics::counter!("pubky_switch_time_refusals_total", "call" => call).increment(1);
+        self.time_refusals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ApiError::unavailable(message)
     }
 
     /// How many counts of its rate limits and of failed authentications the service keeps
@@ -1349,7 +1423,7 @@ impl Service {
         let mut behind = false;
         if serving && *call != Call::Erase {
             match txn.mark_check(self.keys.as_ref()).await {
-                Ok(MarkCheck::Behind | MarkCheck::Fork) => {
+                Ok(check @ (MarkCheck::Behind | MarkCheck::Fork)) => {
                     // The signer's own delivery only: an own app or another identity's has
                     // no app or certificate of its own here.
                     let by_signer = verified.is_none() && other.is_none();
@@ -1357,6 +1431,10 @@ impl Service {
                         && by_signer
                         && self.delivers_a_recovery(txn, request, held.as_ref()).await)
                     {
+                        self.note_mark_refusal(
+                            request.route.account.as_deref().unwrap_or_default(),
+                            check,
+                        );
                         return Err(behind_mark());
                     }
                     behind = true;

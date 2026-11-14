@@ -479,6 +479,7 @@ async fn test_ops_without_trusted_time() {
         (503, Some("unavailable")),
         "{body}"
     );
+    assert_eq!(replay.service.time_refusals(), 1);
     // A list change doesn't.
     let (status, body) = post_app(
         &replay,
