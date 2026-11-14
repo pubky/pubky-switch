@@ -314,6 +314,15 @@ impl App {
     /// conversation entries, deny list, flagged senders and its own invite codes, with the
     /// answer's service time ([`SenderDisposition::lists_as_of_ms`]).
     ///
+    /// The copy is taken whole, so the protocol is given the same list (Switch spec 8.3):
+    /// once the answer is read, a deny list gap at the cursor is committed first, on its own,
+    /// and the copy replaced after it. The next read tells that gap after the owed calls,
+    /// with the lists read for it, and takes the copy again from the same answer
+    /// ([`super::Protocol::deny_list_gap`]): a crash between the two commits, or lists too large
+    /// for one, leaves the gap owed, and the copy and the protocol end set from one list.
+    /// The gap is told by a read, not by this call, so it comes after what the protocol is
+    /// owed, in feed order.
+    ///
     /// Each list is kept whole, as the answer holds it, the flagged senders included. The
     /// copy is bounded as the other lists are: by the transport's cap on an answer's size
     /// and the store's batch size. At the default limits the flagged senders are at most
@@ -322,12 +331,14 @@ impl App {
     ///
     /// The whole copy is replaced in one commit, which must fit the store's batch size,
     /// [`crate::store::MAX_BATCH_BYTES`]. Lists that don't fit, as they may at raised
-    /// limits, fail this call with [`StoreError::TooLarge`] and leave the copy as it was:
-    /// such an app can't refresh its copy today. The refusal is kept with the answer's
-    /// service time: the reads go on, and don't fetch the lists again for the refresh they
-    /// owe until [`LISTS_TOO_LARGE_RETRY_MS`] later, a provider change or a restore, so
-    /// [`SenderDisposition::lists_as_of_ms`] stays as it was, `None` when the copy was
-    /// never refreshed. This call always fetches them.
+    /// limits, fail this call with [`StoreError::TooLarge`], the gap committed: the copy's
+    /// lists stay as they were, not known complete, so
+    /// [`SenderDisposition::lists_as_of_ms`] is `None`, and such an app can't refresh its
+    /// copy today. The refusal is kept with the answer's service time. The gap's read still
+    /// tells the protocol the list and tries the copy once more; after that, the reads go
+    /// on and don't fetch the lists again for the refresh they owe until
+    /// [`LISTS_TOO_LARGE_RETRY_MS`] later, a provider change, a restore or a renewal that
+    /// adds `lists.read`. This call always fetches them.
     ///
     /// # Errors
     ///
@@ -338,31 +349,25 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             self.need(Permission::ListsRead)?;
-            // A copy not known complete is one the protocol has no baseline for either: the
-            // refresh owes it a deny list gap at the cursor, told by the next read with a
-            // list read then, so the copy and the protocol never part (Switch spec 8.3).
-            let baseline_owed = !self.reader().exists(LISTS_AT).await?;
-            let list = self.refresh_lists().await?;
-            if baseline_owed {
-                // The copy just taken stays complete; only the protocol's gap is owed, the
-                // earliest kept, as `App::note_deny_gap` keeps it.
-                let cursor = (self.state.cursor.generation, self.state.cursor.seq);
-                let at = match self.reader().get::<(u64, u64)>(DENY_GAP).await? {
-                    Some(owed) => owed.min(cursor),
-                    None => cursor,
-                };
-                let mut tx = self.tx()?;
-                tx.put(DENY_GAP, &at)?;
-                self.commit(tx).await?;
-            }
-            Ok(list)
+            let result = self.client.allow().await;
+            let list = self.take(result).await?;
+            // The gap before the copy, each in its own commit: whatever stops between them,
+            // the protocol is owed the list the copy is then taken from (Switch spec 8.3).
+            // The gap deletes `lc/lists_at`, which the copy's commit writes again.
+            let cursor = self.state.cursor;
+            let mut tx = self.tx()?;
+            self.note_deny_gap(cursor.generation, cursor.seq, &mut tx)
+                .await?;
+            self.commit(tx).await?;
+            self.take_lists(&list).await.map(|()| list)
         })
         .await
     }
 
     /// The refresh a read owes when the copy of the lists isn't known to be complete
     /// (`lc/lists_at` absent: never refreshed, as after a join, restored, after a provider
-    /// loss, or after a renewal that added `lists.read`) and the app holds `lists.read`.
+    /// loss, after a renewal that added `lists.read`, or after a gap told without the list)
+    /// and the app holds `lists.read`.
     /// The protocol then has no baseline either, so the refresh is a deny list gap at the
     /// cursor (Switch spec 8.3): the read tells it after the owed calls, with the lists read
     /// for it, and takes the copy from the same answer (`App::tell_deny_gap_if_owed`), so
@@ -398,16 +403,6 @@ impl App {
         self.note_deny_gap(cursor.generation, cursor.seq, &mut tx)
             .await?;
         self.commit(tx).await
-    }
-
-    /// `GET /allow`, and the copy of the lists replaced from it in one commit.
-    async fn refresh_lists(&mut self) -> Result<AllowList, AppError> {
-        Box::pin(async move {
-            let result = self.client.allow().await;
-            let list = self.take(result).await?;
-            self.take_lists(&list).await.map(|()| list)
-        })
-        .await
     }
 
     /// The copy of the lists replaced from `list`, the answer just read, in one commit: too

@@ -100,7 +100,8 @@ impl App {
         // before it as stubs, so neither the copy of the lists nor the protocol follows
         // from them. The copy is marked not complete, in the same commit, and the next
         // read tells the protocol a deny list gap with the list it takes the copy from
-        // (`App::refresh_lists_if_owed`, Switch spec 8.3).
+        // (`App::refresh_lists_if_owed`, Switch spec 8.3). A refusal of lists too large is
+        // removed with it, so that read doesn't wait out its day for the baseline.
         let lists_read_added = cert.has_permission(Permission::ListsRead)
             && !self.state.cert.has_permission(Permission::ListsRead);
         self.state.cert = cert;
@@ -111,6 +112,7 @@ impl App {
         }
         if lists_read_added {
             tx.delete(super::admission::LISTS_AT)?;
+            tx.delete(super::admission::LISTS_TOO_LARGE)?;
         }
         tx.put(key::CERT, self.state.cert.signed())?;
         tx.put(key::RECORD, &record)?;

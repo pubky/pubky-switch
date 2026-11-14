@@ -2973,7 +2973,10 @@ impl App {
     /// deny list they give, in a commit of its own. The copy of the lists is then replaced
     /// from the same answer, best effort. A read that fails or is refused leaves the gap
     /// owed and the read held; only an answer that verifies but can't be read tells the gap
-    /// without the list (`list_read` false).
+    /// without the list (`list_read` false), and deletes `lc/lists_at` in the telling
+    /// commit, so the next read owes a gap again (`App::refresh_lists_if_owed`): such a
+    /// protocol is told `list_read` false at each read for as long as the answer can't be
+    /// read, and the list once it can.
     /// Whether a gap is still owed.
     async fn tell_deny_gap_if_owed(&mut self) -> Result<bool, AppError> {
         if !self.state.cert.has_permission(Permission::ListsRead) {
@@ -3023,6 +3026,11 @@ impl App {
             tx.local(&writes)?;
         }
         tx.delete(DENY_GAP)?;
+        if list.is_none() {
+            // The protocol has no baseline yet: the copy isn't known complete either, so a
+            // later read owes the gap again, with the list once it reads.
+            tx.delete(super::admission::LISTS_AT)?;
+        }
         self.commit(tx).await?;
         // The copy from the same answer, best effort: one too large for a commit keeps its
         // mark, and the read goes on, the gap told.

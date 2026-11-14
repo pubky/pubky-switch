@@ -5508,6 +5508,17 @@ async fn join_with(
     store: Arc<MemoryStore>,
     protocol: Arc<dyn Protocol>,
 ) -> App {
+    join_on(w, name, permissions, store as Arc<dyn StateStore>, protocol).await
+}
+
+/// [`join_with`], in any store, such as one that injects faults.
+async fn join_on(
+    w: &World,
+    name: &str,
+    permissions: &[Permission],
+    store: Arc<dyn StateStore>,
+    protocol: Arc<dyn Protocol>,
+) -> App {
     let request = w
         .signer
         .approve(
@@ -5515,14 +5526,9 @@ async fn join_with(
             &AppSpec::new(&["scope-a"]).with_permissions(permissions),
         )
         .unwrap();
-    App::join(
-        w.env_on(store as Arc<dyn StateStore>),
-        protocol,
-        World::config(),
-        request,
-    )
-    .await
-    .unwrap()
+    App::join(w.env_on(store), protocol, World::config(), request)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -8420,30 +8426,280 @@ async fn test_deny_list_reader_joined_after_a_deny_learns_it() {
 
 #[tokio::test]
 async fn test_deny_list_reader_given_lists_read_by_a_renewal_learns_the_list() {
-    // The feed showed the deny as a stub to an app without `lists.read`: once a renewal
-    // gives it, the next read tells a gap with the list.
+    // A reader whose copy of the lists is complete loses `lists.read`: the feed shows the
+    // deny made then as a stub, so neither the copy nor the protocol follows it. Once a
+    // renewal gives `lists.read` back, the next read tells a gap with the list.
     let w = World::new();
     let mut manager = manager_of(&w).await;
     let protocol = Arc::new(SampleProtocol::default());
     let mut reader = join_with(
         &w,
         "reader",
-        &[],
+        &[Permission::ListsRead],
         Arc::new(MemoryStore::new()),
         Arc::clone(&protocol) as Arc<dyn Protocol>,
     )
     .await;
-    reader.receive(None).await.unwrap();
+    for _ in 0..2 {
+        reader.receive(None).await.unwrap();
+    }
+    assert_eq!(protocol.deny_gaps.lock().unwrap().len(), 1);
+    assert!(
+        reader
+            .reader()
+            .exists(crate::app::admission::LISTS_AT)
+            .await
+            .unwrap()
+    );
+    renew_with(&w, &mut reader, &[]).await;
     let x = [7; 32];
     manager.deny(&x).await.unwrap();
     reader.receive(None).await.unwrap();
-    assert!(protocol.deny_gaps.lock().unwrap().is_empty());
-    assert!(denies(&protocol).is_empty());
+    assert!(!learned_denied(&protocol, x));
+    w.clock.advance_ms(1000);
     renew_with(&w, &mut reader, &[Permission::ListsRead]).await;
     for _ in 0..3 {
         reader.receive(None).await.unwrap();
     }
     assert_learned_as_the_service_has_it(&mut reader, &protocol, x).await;
+}
+
+#[tokio::test]
+async fn test_deny_list_renewal_adding_lists_read_after_lists_too_large_tells_the_list() {
+    // Lists refused as too large less than a day ago, then a renewal that adds
+    // `lists.read`: the next read tells the gap with the list, without waiting out the day.
+    let w = World::new();
+    let mut manager = manager_of(&w).await;
+    let protocol = Arc::new(SampleProtocol::default());
+    let store = Arc::new(MemoryStore::new());
+    let mut reader = join_with(
+        &w,
+        "reader",
+        &[],
+        Arc::clone(&store),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+    )
+    .await;
+    reader.receive(None).await.unwrap();
+    let ns = crate::store::client_namespace(&reader.app_id());
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(
+            &ns,
+            b"lc/too_large".to_vec(),
+            crate::app::state::encode(&w.clock.now_ms()).unwrap(),
+        )
+        .unwrap();
+    store.commit(batch).unwrap();
+    let x = [7; 32];
+    manager.deny(&x).await.unwrap();
+    renew_with(&w, &mut reader, &[Permission::ListsRead]).await;
+    for _ in 0..3 {
+        reader.receive(None).await.unwrap();
+    }
+    assert_learned_as_the_service_has_it(&mut reader, &protocol, x).await;
+}
+
+#[tokio::test]
+async fn test_deny_list_allow_list_crash_at_each_commit_point_tells_the_list() {
+    // `allow_list` on a copy not known complete, a crash before or after each of its
+    // commits, then a restart: the protocol is told the list the copy is taken from.
+    let x = [7; 32];
+    let setup = async |fault: StoreFault| {
+        let w = World::new();
+        let mut manager = manager_of(&w).await;
+        manager.deny(&x).await.unwrap();
+        let store = Arc::new(FaultStore::new(
+            Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+            fault,
+        ));
+        let protocol = Arc::new(SampleProtocol::default());
+        let reader = join_on(
+            &w,
+            "reader",
+            &[Permission::ListsRead],
+            Arc::clone(&store) as Arc<dyn StateStore>,
+            Arc::clone(&protocol) as Arc<dyn Protocol>,
+        )
+        .await;
+        (w, store, protocol, reader)
+    };
+    let (joined, commits) = {
+        let (_w, store, _protocol, mut reader) = setup(StoreFault::None).await;
+        let joined = store.commits();
+        reader.allow_list().await.unwrap();
+        (joined, store.commits())
+    };
+    assert!(commits > joined, "allow_list commits nothing");
+    for stop_after in [false, true] {
+        for n in joined + 1..=commits {
+            let (w, store, protocol, mut reader) = setup(if stop_after {
+                StoreFault::StopAfter(n)
+            } else {
+                StoreFault::StopBefore(n)
+            })
+            .await;
+            let _ = reader.allow_list().await;
+            assert!(store.stopped(), "commit {n} of {commits} is reached");
+            drop(reader);
+            let mut app = App::load(
+                w.env_on(store.inner()),
+                Arc::clone(&protocol) as Arc<dyn Protocol>,
+                World::config(),
+                app_keys("reader").app_id_bytes(),
+            )
+            .await
+            .unwrap();
+            for _ in 0..3 {
+                app.receive(None).await.unwrap();
+            }
+            assert!(
+                !app.reader()
+                    .exists(crate::app::feed::DENY_GAP)
+                    .await
+                    .unwrap(),
+                "a gap is still owed after commit {n} (after: {stop_after})"
+            );
+            assert!(
+                learned_denied(&protocol, x),
+                "commit {n} (after: {stop_after}): gaps {:?}",
+                protocol.deny_gaps.lock().unwrap()
+            );
+            assert!(app.lists_copy().await.unwrap().deny.contains(&x));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_deny_list_allow_list_too_large_still_tells_the_list() {
+    // Lists too large for one commit fail `allow_list`; the protocol is still told the
+    // list at the next read, without waiting out the day the copy waits.
+    let w = World::new();
+    let mut manager = manager_of(&w).await;
+    let x = [7; 32];
+    manager.deny(&x).await.unwrap();
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    let protocol = Arc::new(SampleProtocol::default());
+    let mut reader = join_on(
+        &w,
+        "reader",
+        &[Permission::ListsRead],
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+    )
+    .await;
+    store.refuse_puts_as_too_large_once(b"lc/deny/");
+    let refused = reader.allow_list().await;
+    assert!(
+        matches!(
+            refused,
+            Err(AppError::Store(crate::error::StoreError::TooLarge { .. }))
+        ),
+        "{refused:?}"
+    );
+    for _ in 0..3 {
+        reader.receive(None).await.unwrap();
+    }
+    let gaps = protocol.deny_gaps.lock().unwrap().clone();
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert!(gaps[0].list_read && gaps[0].denied.contains(&x), "{gaps:?}");
+    assert_learned_as_the_service_has_it(&mut reader, &protocol, x).await;
+}
+
+#[tokio::test]
+async fn test_deny_list_allow_list_on_a_complete_copy_tells_the_protocol_the_list() {
+    // A change the feed never hands the protocol, refused as not genuine, while the
+    // service's lists hold it: `allow_list` takes the copy whole from those lists, so the
+    // protocol is told them as a gap, and the two agree.
+    let w = World::new();
+    let x = [7; 32];
+    let (mut reader, protocol) = reader_owing_an_unchecked_deny_change(&w, x).await;
+    unchecked_deny_change_behind_the_cursor(&mut reader, |op| {
+        op.sig = pubky_switch_core::enc::b64(&[0; 64]);
+    })
+    .await;
+    for _ in 0..2 {
+        reader.receive(None).await.unwrap();
+    }
+    assert!(!learned_denied(&protocol, x));
+    assert!(
+        reader
+            .reader()
+            .exists(crate::app::admission::LISTS_AT)
+            .await
+            .unwrap()
+    );
+    assert!(reader.allow_list().await.unwrap().deny.contains(&x));
+    for _ in 0..2 {
+        reader.receive(None).await.unwrap();
+    }
+    assert!(
+        learned_denied(&protocol, x),
+        "gaps {:?}",
+        protocol.deny_gaps.lock().unwrap()
+    );
+    assert!(reader.lists_copy().await.unwrap().deny.contains(&x));
+}
+
+#[tokio::test]
+async fn test_deny_list_gap_told_without_the_list_is_owed_again() {
+    // An answer that verifies but can't be read tells the gap without the list, and owes
+    // a gap again: told without the list at each read while the answer can't be read,
+    // then with the list.
+    let w = World::new();
+    let protocol = Arc::new(SampleProtocol::default());
+    let mut reader = join_with(
+        &w,
+        "reader",
+        &[Permission::ListsRead],
+        Arc::new(MemoryStore::new()),
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+    )
+    .await;
+    for _ in 0..2 {
+        reader.receive(None).await.unwrap();
+    }
+    reader.allow_list().await.unwrap();
+    assert!(
+        reader
+            .reader()
+            .exists(crate::app::admission::LISTS_AT)
+            .await
+            .unwrap()
+    );
+    for _ in 0..2 {
+        w.switch.fail_next(Fault::LeaveOut {
+            path: "/allow".into(),
+            member: "deny".into(),
+        });
+        reader.receive(None).await.unwrap();
+    }
+    assert!(
+        !reader
+            .reader()
+            .exists(crate::app::admission::LISTS_AT)
+            .await
+            .unwrap()
+    );
+    reader.receive(None).await.unwrap();
+    let read: Vec<bool> = protocol
+        .deny_gaps
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|gap| gap.list_read)
+        .collect();
+    assert_eq!(read, [true, false, false, true]);
+    assert!(
+        reader
+            .reader()
+            .exists(crate::app::admission::LISTS_AT)
+            .await
+            .unwrap()
+    );
 }
 
 /// `app`, alice's app "reader", renewed with `permissions` and the renewal taken.

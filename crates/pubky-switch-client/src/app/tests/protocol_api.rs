@@ -3081,6 +3081,8 @@ async fn test_sender_disposition_answer_without_flagged_replaces_nothing() {
     let alice = p.alice.identity().public();
     p.bob.switch().lock().shared.flagged.insert(alice, 3);
     shop.allow_list().await.unwrap();
+    // The read tells the gap `allow_list` owes, the copy taken again from its answer.
+    shop.receive(None).await.unwrap();
     let as_of = shop.highest_service_time();
     // A faulty answer leaves `flagged` out: malformed, so the copy stays as it was.
     p.clock.advance_ms(MINUTE);
