@@ -336,6 +336,14 @@ impl Service {
         time: Arc<TrustedTime>,
         limits: Limits,
     ) -> Self {
+        // The refusal counters start at 0, each label there from the start, so a rule on
+        // their increase sees the first refusal too.
+        for state in ["behind", "fork", "other_generation"] {
+            metrics::counter!("pubky_switch_mark_refusals_total", "state" => state).increment(0);
+        }
+        for call in ["ops", "append", "directory", "put_peers"] {
+            metrics::counter!("pubky_switch_time_refusals_total", "call" => call).increment(0);
+        }
         let failed_auth = FailedAuthentications::new(limits.auth_failures_per_source_per_min);
         let push_holds = tokio::sync::Semaphore::new(
             usize::try_from(store.max_connections() / 4)

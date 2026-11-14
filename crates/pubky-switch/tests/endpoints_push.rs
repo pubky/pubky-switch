@@ -922,8 +922,11 @@ async fn test_push_minted_key_of_a_cancelled_start_is_deleted() {
     let minted = keys.minted();
     assert_eq!(minted.len(), 1);
     drop(held);
+    // The key is deleted first and its owed row dropped after: wait for both.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while exists(&keys, &minted[0]).await && std::time::Instant::now() < deadline {
+    while (exists(&keys, &minted[0]).await || !owed(&replay).await.is_empty())
+        && std::time::Instant::now() < deadline
+    {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(!exists(&keys, &minted[0]).await, "no key left to a sweep");
