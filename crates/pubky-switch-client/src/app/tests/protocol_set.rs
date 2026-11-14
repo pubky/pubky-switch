@@ -12,8 +12,8 @@ use serde_json::json;
 
 use super::*;
 use crate::app::{
-    AppBackup, AppError, AppEvent, MAX_STEP_LOCAL_BYTES, OpBatch, ProtocolLayer, ProtocolSet,
-    Refusal, RestoreContext, StoreFailure, UserConfirmed,
+    AppBackup, AppError, AppEvent, Delivery, MAX_STEP_LOCAL_BYTES, OpBatch, OutgoingMessage,
+    ProtocolLayer, ProtocolSet, Refusal, RestoreContext, StoreFailure, UserConfirmed,
 };
 use crate::error::StoreError;
 use crate::testing::Fault;
@@ -48,6 +48,10 @@ struct Named {
     refuse_cert: bool,
     /// Whether each restore step was handed a layer.
     restored: Mutex<Vec<bool>>,
+    /// It holds its outbox messages back.
+    holding: Mutex<bool>,
+    /// The kinds of the outbox messages it was asked about.
+    asked_send: Mutex<Vec<String>>,
 }
 
 fn named(name: &str) -> Named {
@@ -162,6 +166,11 @@ impl Protocol for Named {
         }
         self.denies.lock().unwrap().push(change.pubky);
         Ok(Vec::new())
+    }
+
+    fn may_send(&self, message: &Message) -> bool {
+        self.asked_send.lock().unwrap().push(message.kind.clone());
+        !*self.holding.lock().unwrap()
     }
 
     fn check_own_certificate(&self, _cert: &AppCert) -> Result<(), String> {
@@ -869,4 +878,125 @@ async fn test_protocol_set_kept_effect_lost_answer_lands_both_protocols_writes_o
         app.protocol_scan("chat", b"").await.unwrap(),
         [(chat.msg_id.into_bytes(), b"chat".to_vec())]
     );
+}
+
+/// alice's wallet and bob's shop, each running its own `tasks` and `chat`, on two switches;
+/// the wallet's protocols come back with it.
+async fn senders() -> (super::protocol_api::Pair, Arc<Named>, Arc<Named>, App, App) {
+    let p = super::protocol_api::Pair::new();
+    let tasks = Arc::new(named("tasks"));
+    let chat = Arc::new(named("chat"));
+    let set = |tasks: Arc<Named>, chat: Arc<Named>| {
+        ProtocolSet::new(vec![tasks as Arc<dyn Protocol>, chat as Arc<dyn Protocol>]).unwrap()
+    };
+    let wallet = p
+        .join_set(
+            &p.alice,
+            "wallet",
+            set(Arc::clone(&tasks), Arc::clone(&chat)),
+            &["tasks", "chat"],
+        )
+        .await;
+    let shop = p
+        .join_set(
+            &p.bob,
+            "shop",
+            set(Arc::new(named("tasks")), Arc::new(named("chat"))),
+            &["tasks", "chat"],
+        )
+        .await;
+    (p, tasks, chat, wallet, shop)
+}
+
+fn untried(delivery: &Option<Delivery>) -> bool {
+    matches!(
+        delivery,
+        Some(Delivery::Queued {
+            tries: 0,
+            undeliverable_since_ms: None,
+            ..
+        })
+    )
+}
+
+#[tokio::test]
+async fn test_protocol_set_may_send_holds_its_own_messages_on_every_path() {
+    let (p, tasks, chat, mut wallet, mut shop) = senders().await;
+    let alice = p.alice.identity().public();
+    let to = p.bob.identity().public();
+    let message = |kind: &str| OutgoingMessage::new(to, kind, serde_json::Map::new());
+    shop.invite(&alice).await.unwrap();
+    *tasks.holding.lock().unwrap() = true;
+    // `send`: `tasks`'s message stays queued untried, `chat`'s goes.
+    let (sent, delivery) = wallet.send(message("tasks.item")).await.unwrap();
+    assert!(untried(&Some(delivery.clone())), "{delivery:?}");
+    let (other, delivery) = wallet.send(message("chat.item")).await.unwrap();
+    assert!(
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    // `flush_message` and `flush_outbox`: still held.
+    let queued = wallet.queue(message("tasks.item")).await.unwrap();
+    assert!(untried(&wallet.flush_message(&queued).await.unwrap()));
+    let report = wallet.flush_outbox().await.unwrap();
+    assert!(report.queued.contains(&sent) && report.queued.contains(&queued));
+    assert!(untried(&wallet.delivery(&sent).await.unwrap()));
+    assert_eq!(p.bob.switch().entries_from(&alice), 1);
+    // Each protocol is asked only about its own messages.
+    assert!(
+        tasks
+            .asked_send
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|k| k == "tasks.item")
+    );
+    assert!(
+        chat.asked_send
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|k| k == "chat.item")
+    );
+    assert!(!chat.asked_send.lock().unwrap().is_empty());
+    // Once `tasks` lets them go, both go; a re-send it holds waits, `chat`'s goes.
+    *tasks.holding.lock().unwrap() = false;
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 3);
+    *tasks.holding.lock().unwrap() = true;
+    wallet.resend(&sent).await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 3);
+    wallet.resend(&other).await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 4);
+    *tasks.holding.lock().unwrap() = false;
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 5);
+}
+
+#[tokio::test]
+async fn test_protocol_set_may_send_hold_is_no_try_when_the_recipient_refuses() {
+    // bob doesn't admit alice: `chat`'s message is tried and answered `403 not_admitted`,
+    // its wait begun; `tasks`'s, held, is never tried, so its wait doesn't start.
+    let (p, tasks, _chat, mut wallet, _shop) = senders().await;
+    let to = p.bob.identity().public();
+    let message = |kind: &str| OutgoingMessage::new(to, kind, serde_json::Map::new());
+    *tasks.holding.lock().unwrap() = true;
+    let (held, _) = wallet.send(message("tasks.item")).await.unwrap();
+    let (refused, delivery) = wallet.send(message("chat.item")).await.unwrap();
+    assert!(
+        matches!(
+            delivery,
+            Delivery::Queued {
+                undeliverable_since_ms: Some(_),
+                ..
+            }
+        ),
+        "{delivery:?}"
+    );
+    for _ in 0..3 {
+        wallet.flush_outbox().await.unwrap();
+    }
+    assert!(untried(&wallet.delivery(&held).await.unwrap()));
+    assert!(!untried(&wallet.delivery(&refused).await.unwrap()));
+    assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
 }

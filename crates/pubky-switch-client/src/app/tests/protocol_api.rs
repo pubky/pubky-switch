@@ -1267,6 +1267,24 @@ impl Pair {
         signer.env_with(store, Arc::clone(&self.router) as Arc<dyn Transport>)
     }
 
+    /// `name` of `signer`'s identity on a store of its own, with every permission, running
+    /// `protocols` with the scopes `scopes`.
+    pub(super) async fn join_set(
+        &self,
+        signer: &TestSigner,
+        name: &str,
+        protocols: crate::app::ProtocolSet,
+        scopes: &[&str],
+    ) -> App {
+        let keys = signer.identity().app_keys(name);
+        let app = AppSpec::new(scopes).with_permissions(&Permission::ALL);
+        let request = signer.approve(&keys, &app).unwrap();
+        let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
+        App::join(self.env(signer, store), protocols, config(), request)
+            .await
+            .unwrap()
+    }
+
     async fn join(&self, signer: &TestSigner, name: &str, protocol: &Arc<ApiProtocol>) -> App {
         self.join_on(signer, name, protocol.clone(), Arc::new(MemoryStore::new()))
             .await

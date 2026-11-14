@@ -1562,12 +1562,6 @@ impl App {
                     report.queued.push(msg_id);
                     continue;
                 }
-                // A message its protocol holds back now stays queued, with its bytes, and
-                // the others go on ([`super::Protocol::may_send`]).
-                if !self.may_send(&item) {
-                    report.queued.push(msg_id);
-                    continue;
-                }
                 // At most OUTBOX_TRIES_PER_FLUSH a flush, and no unit past its time but its
                 // first: the next flush goes on from here.
                 if tried >= OUTBOX_TRIES_PER_FLUSH || (units > 0 && self.spent(&budget)) {
@@ -1577,8 +1571,7 @@ impl App {
                 }
                 // A held message makes no request for its delivery: it doesn't count towards
                 // the four.
-                let held =
-                    item.delivery_owed() && self.reader().exists(&hold_key(&item.to)).await?;
+                let held = self.delivery_waits(&item).await?;
                 if !held {
                     tried += 1;
                 }
@@ -1698,9 +1691,10 @@ impl App {
         if item.failed.is_some() {
             return Ok(false);
         }
-        // A delivery to a counterparty the host holds isn't tried, a first one or a re-send
-        // ([`App::hold_queued`]); its replay deadline still runs, and its record job goes.
-        let held = item.delivery_owed() && self.reader().exists(&hold_key(&item.to)).await?;
+        // A delivery to a counterparty the host holds, or one its protocol holds back, isn't
+        // tried, a first one or a re-send ([`App::hold_queued`], [`super::Protocol::may_send`]);
+        // its replay deadline still runs, and its record job goes.
+        let held = self.delivery_waits(&item).await?;
         // A delivery with a replay deadline, one a restore put back, one `queue_stored`
         // queued, or a re-send of either, goes only by it, judged at the later of the device
         // clock and a service time verified in this call (Switch spec 11).
@@ -2192,6 +2186,16 @@ impl App {
                 Err(error) => return failed(error),
             }
         }
+    }
+
+    /// Whether the delivery of an outbox message waits: one is owed, and the host holds its
+    /// counterparty ([`App::hold_queued`]) or its protocol holds it back
+    /// ([`super::Protocol::may_send`]). Every call that tries a delivery ([`App::send`],
+    /// [`App::flush_message`], [`App::resend`], [`App::flush_outbox`]) goes through
+    /// `try_item`, which asks this, so no call passes either hold.
+    async fn delivery_waits(&self, item: &OutboxItem) -> Result<bool, AppError> {
+        Ok(item.delivery_owed()
+            && (!self.may_send(item) || self.reader().exists(&hold_key(&item.to)).await?))
     }
 
     /// Whether the protocol of an outbox message's kind lets it go out now

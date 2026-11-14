@@ -691,10 +691,14 @@ pub trait Protocol: Send + Sync {
         Ok(())
     }
 
-    /// Whether a message of the protocol's that the outbox holds goes out now
-    /// ([`super::App::flush_outbox`]): `false` keeps it queued, with its `msg_id` and bytes,
-    /// for a later flush, while the messages of the app's other protocols go on. Asked only
-    /// about the protocol's own messages; every message by default.
+    /// Whether a message of the protocol's that the outbox holds goes out now: asked before
+    /// every try of its delivery, a first one or a re-send, whichever call makes it
+    /// ([`super::App::send`], [`super::App::flush_message`], [`super::App::resend`],
+    /// [`super::App::flush_outbox`]). `false` keeps it queued, with its `msg_id` and bytes,
+    /// for a later try, as a hold of its counterparty does ([`super::App::hold_queued`]):
+    /// its conversation entry waits with it, its replay deadline still runs, and the
+    /// messages of the app's other protocols go on. Asked only about the protocol's own
+    /// messages; every message by default.
     fn may_send(&self, message: &Message) -> bool {
         let _ = message;
         true
