@@ -56,8 +56,6 @@ pub use webhooks::PushRound;
 #[cfg(any(test, feature = "test-util"))]
 pub use webhooks::RelayRoute;
 
-pub use enroll::announced_limits;
-
 use std::sync::Arc;
 
 use pubky_switch_core::{
@@ -91,10 +89,6 @@ const ERASURE_SWEEPS_PER_MIN: u32 = 6;
 /// How many claims whose time has passed one request deletes at most (Switch wire 7.3
 /// step 4); the rest go with the next requests.
 const DUE_CLAIMS_PER_REQUEST: u64 = 64;
-
-/// How many of the documents chained before superseded documents were deleted one request
-/// checks at most (Switch wire 7.5); the rest go with the next requests.
-const OLD_DOCUMENTS_PER_REQUEST: u64 = 64;
 
 /// How many accounts' mark refusals one process logs, each once.
 const MARK_REFUSALS_LOGGED: usize = 1024;
@@ -1050,13 +1044,11 @@ impl Service {
             }
         };
         // Step 4, with trusted time only, for a caller that has verified: a bounded batch of
-        // the claims whose time has passed goes, by the time base (Switch wire 7.3), a
-        // bounded batch of the documents chained before superseded documents were deleted
-        // is checked (Switch wire 7.5), and the sweeps of 9.1 run (`sweeps.rs`). It comes
-        // before the endpoint, so a refusal doesn't undo it; an unauthenticated request, or
-        // the public read, pays for none of it. A claim a request reads or writes goes when
-        // it is due, whatever the batch reached. Chain stub retention comes last
-        // (`retention.rs`).
+        // the claims whose time has passed goes, by the time base (Switch wire 7.3), and the
+        // sweeps of 9.1 run (`sweeps.rs`). It comes before the endpoint, so a refusal doesn't
+        // undo it; an unauthenticated request, or the public read, pays for none of it. A
+        // claim a request reads or writes goes when it is due, whatever the batch reached.
+        // Chain stub retention comes last (`retention.rs`).
         if let (Some(base), Some(_)) = (due, caller)
             && let Err(error) = match self.step_four(&mut txn, base).await {
                 Ok(()) => self.retain_chain(&mut txn, &signer, base).await,

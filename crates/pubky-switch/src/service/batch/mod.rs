@@ -441,9 +441,8 @@ pub(super) struct CurrentApps {
     pub changed: bool,
 }
 
-/// How a request releases inbox entries (Switch wire 7.4.4, 9.1): lagging marks count, and
-/// entries left with no current target from before a departure converted them are
-/// converted, only with trusted time; an unreadable item counts `overhead`.
+/// How a request releases inbox entries (Switch wire 7.4.4, 9.1): lagging marks count only
+/// with trusted time; an unreadable item counts `overhead`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Release {
     /// The request has trusted time.
@@ -474,17 +473,12 @@ impl Release {
             .collect())
     }
 
-    /// Release what the current apps `current` passed, after a cursor moved: with trusted
-    /// time, entries a departure before this service converted none of become unreadable
-    /// items first.
+    /// Release what the current apps `current` passed, after a cursor moved.
     pub(super) async fn passed(
         &self,
         txn: &mut AccountTxn,
         current: &[[u8; 16]],
     ) -> Result<(), StoreError> {
-        if self.trusted {
-            txn.convert_unreadable(current, self.overhead).await?;
-        }
         let lagging = self.lagging(txn, current).await?;
         txn.delete_passed_entries(current, &lagging).await?;
         Ok(())

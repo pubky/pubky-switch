@@ -185,9 +185,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     });
     if config.database.migrate_on_start {
-        store
-            .migrate(&pubky_switch::service::announced_limits(&config.limits))
-            .await?;
+        store.migrate().await?;
         tracing::info!("database schema up to date");
     }
 

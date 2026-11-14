@@ -424,7 +424,8 @@ async fn test_retention_a_removed_apps_cursor_holds_nothing() {
         let id =
             hex::decode(app(&keys, name)["app_id_bytes_hex"].as_str().expect("hex")).expect("hex");
         sqlx::query(
-            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) VALUES ($1, $2, $3, 0)",
+            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms, data_epoch) \
+             VALUES ($1, $2, $3, 0, 1)",
         )
         .bind(alice_id())
         .bind(id)

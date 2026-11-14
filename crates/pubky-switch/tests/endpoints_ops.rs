@@ -2312,60 +2312,6 @@ async fn test_ops_replaced_app_record_loses_its_document() {
     replay.db.drop_database().await.expect("drop");
 }
 
-#[tokio::test]
-async fn test_ops_app_record_from_before_the_rule_is_found_once_checked() {
-    // An `app.put` chained before documents were deleted carries no `doc_app`. The check of
-    // older documents notes which app it concerns, so the record that later replaces it
-    // finds it and deletes its document (Switch wire 7.5).
-    let Some(replay) = registered(Limits::default(), false).await else {
-        return;
-    };
-    let (keys, cert) = wallet_keys(&replay).await;
-    let earlier = u64::try_from(app_documents(&replay, &cert.app_id()).await[0]).expect("seq");
-    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
-        .await
-        .expect("conn");
-    sqlx::query("UPDATE chain_items SET doc_app = NULL WHERE account_id = $1")
-        .bind(alice_id())
-        .execute(&mut conn)
-        .await
-        .expect("as before the rule");
-    sqlx::query(
-        "UPDATE accounts SET documents_checked_seq = 0, documents_check_end = last_seq \
-         WHERE id = $1",
-    )
-    .bind(alice_id())
-    .execute(&mut conn)
-    .await
-    .expect("unchecked");
-    conn.close().await.expect("close");
-    let (status, _) = read_claim(&replay, AT).await;
-    assert_eq!(status, 404, "a request runs the check");
-    assert_eq!(
-        app_documents(&replay, &cert.app_id()).await,
-        vec![i64::try_from(earlier).expect("seq")]
-    );
-    let record = AppRecord::sign(&keys, AppRecordBody::new(&cert, Vec::new(), ms(AT) + 1_000))
-        .expect("record");
-    let ops = wallet_batch(
-        64,
-        1,
-        vec![(
-            Vec::new(),
-            OpKind::AppPut {
-                record: record.signed().clone(),
-            },
-        )],
-    );
-    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(
-        chain_document_kept(&replay, &alice_id(), earlier).await,
-        (false, false)
-    );
-    replay.db.drop_database().await.expect("drop");
-}
-
 /// The wallet's feed from the start, in one page: its items.
 async fn wallet_feed(replay: &Replay, at: &str) -> Vec<Value> {
     let keys = vectors("keys.json");

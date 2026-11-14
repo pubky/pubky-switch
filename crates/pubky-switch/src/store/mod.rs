@@ -407,32 +407,14 @@ impl Store {
     }
 
     /// Apply pending schema migrations. Safe to run from several processes at once.
-    ///
-    /// `announced` is what the service announces at enrollment now: an account enrolled
-    /// before the schema kept its announced limits inherits these (migration 0002).
-    pub async fn migrate(
-        &self,
-        announced: &pubky_switch_core::records::Limits,
-    ) -> Result<(), StoreError> {
-        let announced = serde_json::to_string(announced)
-            .map_err(|_| StoreError::Corrupt("the announced limits don't encode"))?;
+    pub async fn migrate(&self) -> Result<(), StoreError> {
         let mut conn = self.pool.acquire().await.map_err(StoreError::from_db)?;
-        sqlx::query("SELECT set_config('pubky_switch.announced_limits', $1, false)")
-            .bind(&announced)
-            .execute(&mut *conn)
-            .await
-            .map_err(StoreError::from_db)?;
         if let Err(error) = MIGRATIONS.run(&mut *conn).await {
             // A failed run keeps the migrator's lock on its connection: close it rather
             // than hand it back to the pool.
             let _ = conn.detach().close().await;
             return Err(error.into());
         }
-        // The connection goes back to the pool without the setting.
-        sqlx::query("RESET pubky_switch.announced_limits")
-            .execute(&mut *conn)
-            .await
-            .map_err(StoreError::from_db)?;
         Ok(())
     }
 
