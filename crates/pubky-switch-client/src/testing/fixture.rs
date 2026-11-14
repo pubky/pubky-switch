@@ -341,10 +341,12 @@ impl TestSigner {
 /// A [`Protocol`] built from a [`ProtocolSpec`], for tests that need one without a
 /// protocol of their own. It accepts the spec's kinds from any app, sends none between own
 /// apps, and records every message it receives; a received message has no lasting effect
-/// beyond the cursor move.
+/// beyond the cursor move, but for one built with [`TestProtocol::keeping`].
 #[derive(Debug, Default)]
 pub struct TestProtocol {
     spec: ProtocolSpec,
+    /// It keeps each message it receives in its local state.
+    keeps: bool,
     received: Mutex<Vec<ReceivedMessage>>,
     resends: Mutex<Vec<ResendNeeded>>,
     missed: Mutex<Vec<MissedEntries>>,
@@ -355,6 +357,16 @@ impl TestProtocol {
     pub fn new(spec: ProtocolSpec) -> Self {
         Self {
             spec,
+            ..Self::default()
+        }
+    }
+
+    /// The protocol `spec` describes, keeping the kind of each message it receives in its
+    /// local state, under the message's `msg_id`, so its backup layer holds them.
+    pub fn keeping(spec: ProtocolSpec) -> Self {
+        Self {
+            spec,
+            keeps: true,
             ..Self::default()
         }
     }
@@ -420,7 +432,18 @@ impl Protocol for TestProtocol {
         _: &mut crate::app::ReceiveContext<'_>,
     ) -> Outcome {
         lock(&self.received).push(message.clone());
-        Outcome::Apply(Effect::default())
+        let local = if self.keeps {
+            vec![LocalWrite::Put {
+                key: message.message.msg_id.clone().into_bytes(),
+                value: message.message.kind.clone().into_bytes(),
+            }]
+        } else {
+            Vec::new()
+        };
+        Outcome::Apply(Effect {
+            local,
+            ..Effect::default()
+        })
     }
 
     fn resend_needed(

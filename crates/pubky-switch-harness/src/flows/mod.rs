@@ -25,6 +25,7 @@ mod lists;
 mod messaging;
 mod own_record;
 mod pages;
+mod protocols;
 mod records;
 mod recovery;
 mod reduction;
@@ -68,6 +69,7 @@ pub use lists::lists_without_read;
 pub use messaging::messaging;
 pub use own_record::own_record;
 pub use pages::pages;
+pub use protocols::two_protocols;
 pub use records::records;
 pub use recovery::{
     provider_loss, provider_loss_in_place, provider_loss_in_place_restored,
@@ -186,6 +188,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
         Box::pin(rotation_given_up(world))
     }),
     ("two collections", |world| Box::pin(two_collections(world))),
+    ("two protocols", |world| Box::pin(two_protocols(world))),
     ("waiting read", |world| Box::pin(waiting_read(world))),
     ("lagging app", |world| Box::pin(lagging_app(world))),
     ("behind a checkpoint", |world| {

@@ -304,7 +304,8 @@ impl World {
     }
 
     /// The environment of `identity`'s signer on `store`: this world's transport and clock,
-    /// the identity's own Homeserver, and the [`crate::parties::Notes`] protocol.
+    /// the identity's own Homeserver, and the [`crate::parties::Notes`] protocol beside the
+    /// two [`crate::parties::Sample`] ones.
     ///
     /// # Errors
     ///
@@ -314,8 +315,12 @@ impl World {
         identity: &TestIdentity,
         store: Arc<dyn StateStore>,
     ) -> Result<SignerEnv, HarnessError> {
-        let protocols = Protocols::new(vec![Arc::new(crate::parties::Notes)])
-            .map_err(|error| HarnessError::Setup(error.to_string()))?;
+        let protocols = Protocols::new(vec![
+            Arc::new(crate::parties::Notes),
+            Arc::new(crate::parties::Sample(crate::parties::TASKS)),
+            Arc::new(crate::parties::Sample(crate::parties::CHAT)),
+        ])
+        .map_err(|error| HarnessError::Setup(error.to_string()))?;
         Ok(SignerEnv {
             store: StoreHandle::inline(store),
             clock: self.clock.clone() as Arc<dyn Clock>,
