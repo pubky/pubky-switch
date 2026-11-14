@@ -44,8 +44,9 @@ use crate::{
 /// The environment variable that names the replica `--replica` checks.
 pub const REPLICA_URL_ENV: &str = "PUBKY_SWITCH_REPLICA_URL";
 
-/// How many accounts one page reads.
-const PAGE: u32 = 500;
+/// How many accounts one page reads. A page holds each account's `identity.json`, so it
+/// stays small.
+const PAGE: u32 = 100;
 
 /// How many times an account whose service key keeps changing under the check is read
 /// again before the check gives up on it.
@@ -79,11 +80,15 @@ pub enum MarkState {
     /// A key with a mark that nothing in the database names: no account, no pending key,
     /// no deletion owed. The database lost an account the key signed for.
     AccountMissing,
+    /// The account's pending key has a mark: a pending key signs only once the delivery
+    /// that makes it the service key committed (Switch wire 3.3), so the database lost a
+    /// generation change the service acknowledged.
+    GenerationLost,
 }
 
 impl MarkState {
     /// Every state, in the order the summary lists them.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::ErasedInLedger,
         Self::KeyMissing,
         Self::Current,
@@ -94,6 +99,7 @@ impl MarkState {
         Self::Unmarked,
         Self::MarkLost,
         Self::AccountMissing,
+        Self::GenerationLost,
     ];
 }
 
@@ -111,6 +117,8 @@ pub struct Observed {
     pub key_present: bool,
     /// The service key's mark; `None` without a mark file.
     pub mark: Option<Mark>,
+    /// The mark of the account's pending key, if it has a pending key with a mark file.
+    pub pending_mark: Option<Mark>,
     /// The ledger's latest erasure of the identity, if any.
     pub erased_at_ms: Option<u64>,
 }
@@ -127,6 +135,9 @@ pub struct Verdict {
     pub ahead_by: Option<u64>,
     /// For [`MarkState::ErasedInLedger`]: the erasure's time.
     pub erased_at_ms: Option<u64>,
+    /// For [`MarkState::GenerationLost`]: the pending key's mark, whose generation and
+    /// `seq` the account's line reports.
+    pub pending_mark: Option<Mark>,
 }
 
 impl Verdict {
@@ -136,6 +147,7 @@ impl Verdict {
             lost: None,
             ahead_by: None,
             erased_at_ms: None,
+            pending_mark: None,
         }
     }
 }
@@ -152,6 +164,14 @@ pub fn classify(observed: &Observed) -> Verdict {
         return Verdict {
             erased_at_ms: Some(at),
             ..Verdict::of(MarkState::ErasedInLedger)
+        };
+    }
+    // Whatever the outgoing key's files say, the generation the database holds is not the
+    // newest one signed for.
+    if let Some(pending) = observed.pending_mark {
+        return Verdict {
+            pending_mark: Some(pending),
+            ..Verdict::of(MarkState::GenerationLost)
         };
     }
     if !observed.key_present {
@@ -215,18 +235,14 @@ pub fn judge_serving(
     names_this_service(Some(&held), origin, service_key)
 }
 
-/// Whether an account needs the operator: a serving one the service refuses on its mark,
-/// one the service erases again at start, one whose service key is gone, serving or not
-/// (without the key, whether the account serves can't be told, as its `identity.json` names
-/// the key's public half, and the account can sign nothing), and one the database lost.
-pub fn needs_attention(state: MarkState, serving: bool) -> bool {
-    match state {
-        MarkState::ErasedInLedger | MarkState::KeyMissing | MarkState::AccountMissing => true,
-        MarkState::Behind | MarkState::Fork | MarkState::OtherGeneration | MarkState::MarkLost => {
-            serving
-        }
-        MarkState::Current | MarkState::Ahead | MarkState::Unmarked => false,
-    }
+/// Whether an account needs the operator: every state but `current`, `ahead` and
+/// `unmarked`, serving or not. A database to fail over to must hold what the service
+/// acknowledged for every account, not only for those serving now (Switch spec 6.5).
+pub fn needs_attention(state: MarkState) -> bool {
+    !matches!(
+        state,
+        MarkState::Current | MarkState::Ahead | MarkState::Unmarked
+    )
 }
 
 /// Which database the check read.
@@ -310,15 +326,16 @@ pub enum CheckError {
 pub struct AccountReport {
     /// The identity's Pubky ID.
     pub account: String,
-    /// The generation the account serves.
+    /// The generation the account serves; for `generation_lost`, the pending key's mark's.
     pub generation: u64,
-    /// Whether the account serves ([`judge_serving`]).
+    /// Whether the account serves ([`judge_serving`]), for information: attention doesn't
+    /// depend on it.
     pub serving: bool,
     /// Its state.
     pub state: MarkState,
     /// The head's `seq`; `None` before the first chain item.
     pub head_seq: Option<u64>,
-    /// The mark's `seq`; `None` without a mark.
+    /// The mark's `seq`; `None` without a mark. For `generation_lost`, the pending key's.
     pub mark_seq: Option<u64>,
     /// For `behind`: the acknowledged chain positions missing.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -334,7 +351,7 @@ pub struct AccountReport {
 impl AccountReport {
     /// Whether the account needs attention ([`needs_attention`]).
     pub fn needs_attention(&self) -> bool {
-        needs_attention(self.state, self.serving)
+        needs_attention(self.state)
     }
 }
 
@@ -451,12 +468,15 @@ impl Report {
 struct KeyFiles {
     public: Option<[u8; 32]>,
     mark: Option<Mark>,
+    /// The mark of the account's pending key, once [`with_pending`] confirmed it.
+    pending_mark: Option<Mark>,
 }
 
 fn read_key_files(view: &KeyStoreView, key: &KeyId) -> Result<KeyFiles, KeyStoreError> {
     Ok(KeyFiles {
         public: view.public_key(key)?,
         mark: view.mark(key)?,
+        pending_mark: None,
     })
 }
 
@@ -514,8 +534,19 @@ async fn check(
             let Some((head, files)) = settled else {
                 continue;
             };
+            let Some((head, files)) = with_pending(conn, view, id, head, files).await? else {
+                continue;
+            };
             seen.insert(head.service_key.clone());
             let mut line = assess(&head, files, view, origin);
+            #[cfg(test)]
+            if let Some(hook) = BETWEEN_READINGS
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+            {
+                hook();
+            }
             if line.state == MarkState::MarkLost {
                 match read_again(conn, view, id, origin).await? {
                     Some(again) => line = again,
@@ -544,9 +575,56 @@ async fn read_again(
     id: &str,
     origin: &str,
 ) -> Result<Option<AccountReport>, CheckError> {
-    Ok(settle(conn, view, id)
+    let Some((head, files)) = settle(conn, view, id).await? else {
+        return Ok(None);
+    };
+    Ok(with_pending(conn, view, id, head, files)
         .await?
         .map(|(head, files)| assess(&head, files, view, origin)))
+}
+
+/// Runs once in [`check`], between an account's first reading and its reading again, for a
+/// test that lands a mark there.
+#[cfg(test)]
+static BETWEEN_READINGS: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+/// Read the mark of account `id`'s pending key, after its head: a pending key gets its
+/// first mark only once the delivery that makes it the service key committed (Switch wire
+/// 3.3, 7.3 step 10). If the database still names the key pending after its mark was read,
+/// it lost that change ([`MarkState::GenerationLost`]); if the head moved meanwhile, the
+/// account is read again. `None` once the account is gone.
+async fn with_pending(
+    conn: &mut PgConnection,
+    view: &KeyStoreView,
+    id: &str,
+    mut head: StoredHead,
+    mut files: KeyFiles,
+) -> Result<Option<(StoredHead, KeyFiles)>, CheckError> {
+    let ids = [id.to_string()];
+    for _ in 0..SETTLE_TRIES {
+        let Some(pending) = head.pending_key.clone() else {
+            return Ok(Some((head, files)));
+        };
+        let Some(mark) = view.mark(&pending)? else {
+            return Ok(Some((head, files)));
+        };
+        let Some(now) = heads::heads(conn, &ids).await?.into_iter().next() else {
+            return Ok(None);
+        };
+        if now.service_key == head.service_key && now.pending_key.as_ref() == Some(&pending) {
+            files.pending_mark = Some(mark);
+            return Ok(Some((head, files)));
+        }
+        match settle(conn, view, id).await? {
+            Some((again, again_files)) => {
+                head = again;
+                files = again_files;
+            }
+            None => return Ok(None),
+        }
+    }
+    Err(CheckError::Unsettled(id.to_string()))
 }
 
 /// The keys with a mark file that nothing in the database names, leaving out those in
@@ -611,11 +689,16 @@ fn assess(head: &StoredHead, files: KeyFiles, view: &KeyStoreView, origin: &str)
         chain: head.chain,
         key_present: files.public.is_some(),
         mark: files.mark,
+        pending_mark: files.pending_mark,
         erased_at_ms: view.erasure(&head.id),
     });
+    // A lost generation change reports the generation and `seq` the pending key signed.
+    let reported = verdict.pending_mark.or(files.mark);
     AccountReport {
         account: head.id.clone(),
-        generation: head.generation,
+        generation: verdict
+            .pending_mark
+            .map_or(head.generation, |mark| mark.generation),
         serving: judge_serving(
             head.identity_doc.as_deref(),
             &head.identity_key,
@@ -624,7 +707,7 @@ fn assess(head: &StoredHead, files: KeyFiles, view: &KeyStoreView, origin: &str)
         ),
         state: verdict.state,
         head_seq: head.chain.map(|(seq, _)| seq),
-        mark_seq: files.mark.map(|mark| mark.seq),
+        mark_seq: reported.map(|mark| mark.seq),
         lost: verdict.lost,
         ahead_by: verdict.ahead_by,
         erased_at_ms: verdict.erased_at_ms,
@@ -656,6 +739,7 @@ mod tests {
             chain: chain.map(|(seq, hash)| (seq, [hash; 32])),
             key_present: true,
             mark,
+            pending_mark: None,
             erased_at_ms: None,
         }
     }
@@ -738,22 +822,38 @@ mod tests {
 
     #[test]
     fn test_check_marks_needs_attention() {
-        for state in [
-            MarkState::Behind,
-            MarkState::Fork,
-            MarkState::OtherGeneration,
-            MarkState::MarkLost,
+        // Every state but the three that hold what the key signed, serving or not.
+        let fine = [MarkState::Current, MarkState::Ahead, MarkState::Unmarked];
+        for state in MarkState::ALL {
+            assert_eq!(needs_attention(state), !fine.contains(&state), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn test_check_marks_generation_lost_takes_precedence() {
+        // A marked pending key outranks the outgoing key's state, its absence included.
+        let pending = mark(2, 1, 7);
+        for base in [
+            Observed {
+                key_present: false,
+                ..observed(Some((3, 1)), None)
+            },
+            observed(Some((5, 1)), Some(mark(1, 5, 1))),
         ] {
-            assert!(needs_attention(state, true), "{state:?}");
-            assert!(!needs_attention(state, false), "{state:?}");
+            let verdict = classify(&Observed {
+                pending_mark: Some(pending),
+                ..base
+            });
+            assert_eq!(verdict.state, MarkState::GenerationLost);
+            assert_eq!(verdict.pending_mark, Some(pending));
         }
-        assert!(needs_attention(MarkState::ErasedInLedger, false));
-        // Without its key an account can't be told serving, and signs nothing.
-        assert!(needs_attention(MarkState::KeyMissing, false));
-        assert!(needs_attention(MarkState::AccountMissing, false));
-        for state in [MarkState::Current, MarkState::Ahead, MarkState::Unmarked] {
-            assert!(!needs_attention(state, true), "{state:?}");
-        }
+        // An erasure in the ledger outranks it.
+        let erased = Observed {
+            pending_mark: Some(pending),
+            erased_at_ms: Some(1_000),
+            ..observed(Some((5, 1)), Some(mark(1, 5, 1)))
+        };
+        assert_eq!(state(&erased), MarkState::ErasedInLedger);
     }
 
     #[test]
@@ -862,7 +962,7 @@ mod tests {
         assert_eq!(summary["states"]["mark_lost"], 0);
         assert_eq!(
             summary["states"].as_object().map(|states| states.len()),
-            Some(10)
+            Some(11)
         );
     }
 
@@ -900,27 +1000,32 @@ mod tests {
         txn.set_chain_head(seq, [1; 32]).expect("head");
         txn.commit().await.expect("commit");
 
+        // The mark lands between the check's first reading of the account, which finds no
+        // mark, and its reading again.
+        let mark_file = dir.path().join("marks").join(key.id.as_str());
+        let bytes = serde_json::to_vec(&mark(1, seq, 1)).expect("mark");
+        *BETWEEN_READINGS.lock().expect("hook") = Some(Box::new(move || {
+            fs_write(&mark_file, &bytes);
+        }));
+        let report = run(&CheckOptions {
+            database: db.options().clone(),
+            choice: DatabaseChoice::Configured,
+            key_dir: dir.path().to_path_buf(),
+            origin: ORIGIN.into(),
+            all: true,
+        })
+        .await
+        .expect("check");
+        assert!(BETWEEN_READINGS.lock().expect("hook").is_none(), "ran");
+        let line = &report.accounts[0];
+        assert_eq!((line.state, line.mark_seq), (MarkState::Current, Some(seq)));
+        assert!(!report.needs_attention());
+
+        // An account gone by the second reading isn't reported.
         let view = KeyStoreView::open(dir.path()).expect("view");
         let mut conn = heads::open_read_only_with(db.options())
             .await
             .expect("connect");
-        let first = read_again(&mut conn, &view, "fresh", ORIGIN)
-            .await
-            .expect("read")
-            .expect("account");
-        assert_eq!(first.state, MarkState::MarkLost);
-        keys.advance_mark(&key.id, mark(1, seq, 1))
-            .await
-            .expect("mark lands");
-        let again = read_again(&mut conn, &view, "fresh", ORIGIN)
-            .await
-            .expect("read")
-            .expect("account");
-        assert_eq!(
-            (again.state, again.mark_seq),
-            (MarkState::Current, Some(seq))
-        );
-        // An account gone by the second reading isn't reported.
         assert_eq!(
             read_again(&mut conn, &view, "absent", ORIGIN)
                 .await
@@ -929,5 +1034,9 @@ mod tests {
         );
         let _ = conn.close().await;
         db.drop_database().await.expect("drop");
+    }
+
+    fn fs_write(path: &std::path::Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).expect("write the mark");
     }
 }

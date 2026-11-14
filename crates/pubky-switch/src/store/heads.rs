@@ -23,6 +23,9 @@ pub struct StoredHead {
     pub generation: u64,
     /// The generation's service key.
     pub service_key: KeyId,
+    /// The next generation's pending key, once an enrollment answered one (Switch wire
+    /// 3.3).
+    pub pending_key: Option<KeyId>,
     /// The newest chain item's `seq` and the chain hash there; `None` before the first.
     pub chain: Option<(u64, [u8; 32])>,
     /// When the account was created, in service time.
@@ -96,8 +99,8 @@ pub async fn key_named(conn: &mut PgConnection, id: &KeyId) -> Result<bool, Stor
 /// The heads of the accounts `ids` names that are there now, in the order of their IDs.
 pub async fn heads(conn: &mut PgConnection, ids: &[String]) -> Result<Vec<StoredHead>, StoreError> {
     let rows = sqlx::query(
-        "SELECT id, identity_key, generation, service_key, chain_seq, chain_hash, \
-         created_at_ms, identity_doc FROM accounts WHERE id = ANY($1) ORDER BY id",
+        "SELECT id, identity_key, generation, service_key, pending_key, chain_seq, \
+         chain_hash, created_at_ms, identity_doc FROM accounts WHERE id = ANY($1) ORDER BY id",
     )
     .bind(ids)
     .fetch_all(conn)
@@ -107,6 +110,7 @@ pub async fn heads(conn: &mut PgConnection, ids: &[String]) -> Result<Vec<Stored
         .map(|row| {
             let identity_key: Vec<u8> = row.try_get("identity_key")?;
             let service_key: String = row.try_get("service_key")?;
+            let pending_key: Option<String> = row.try_get("pending_key")?;
             let chain_seq: Option<i64> = row.try_get("chain_seq")?;
             let chain_hash: Option<Vec<u8>> = row.try_get("chain_hash")?;
             let chain = match (chain_seq, chain_hash) {
@@ -125,6 +129,9 @@ pub async fn heads(conn: &mut PgConnection, ids: &[String]) -> Result<Vec<Stored
                 generation: from_db(row.try_get("generation")?, "generation")?,
                 service_key: KeyId::parse(&service_key)
                     .map_err(|_| StoreError::Corrupt("service_key"))?,
+                pending_key: pending_key
+                    .map(|key| KeyId::parse(&key).map_err(|_| StoreError::Corrupt("pending_key")))
+                    .transpose()?,
                 chain,
                 created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
                 identity_doc: row.try_get("identity_doc")?,

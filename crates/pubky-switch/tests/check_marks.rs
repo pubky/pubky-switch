@@ -277,7 +277,8 @@ async fn test_check_marks_reports_each_state() {
     let summary = &report.summary;
     assert_eq!(summary.accounts, 10);
     assert_eq!(summary.serving, 7);
-    assert_eq!(summary.needs_attention, 6);
+    // Attention doesn't depend on serving: the staged account behind its mark counts.
+    assert_eq!(summary.needs_attention, 7);
     assert_eq!(summary.states[&MarkState::Current], 1);
     assert_eq!(summary.states[&MarkState::Behind], 2);
     assert_eq!(summary.states[&MarkState::AccountMissing], 0);
@@ -301,7 +302,8 @@ async fn test_check_marks_reports_each_state() {
             "fork",
             "keymissing",
             "marklost",
-            "othergen"
+            "othergen",
+            "staged"
         ]
     );
     assert_eq!(report.summary.accounts, 10);
@@ -516,29 +518,14 @@ async fn test_check_marks_keys_the_database_names_are_not_missing() {
         ),
     )
     .await;
-    // A pending key the account names, with a mark file, and a push key with none.
-    let pending = create(db, keys, "pending", true).await;
+    // A pending key without a mark, as an enrollment makes it, and a push key with none.
+    create(db, keys, "pending", true).await;
     let next = keys.generate().await.expect("pending key");
-    write_mark(
-        dir,
-        &NewAccount {
-            service_key: next.id.clone(),
-            ..pending
-        },
-        Mark {
-            generation: 2,
-            seq: 1,
-            chain_hash: [1; 32],
-        },
-    );
-    write(
-        db,
-        &format!(
-            "UPDATE accounts SET pending_key = '{}' WHERE id = 'pending'",
-            next.id
-        ),
-    )
-    .await;
+    set_pending(db, "pending", &next.id).await;
+    // A pending key with a mark: named, so not missing, but reported on its account.
+    let marked = create(db, keys, "marked", true).await;
+    append(db, keys, "marked", &[1], true).await;
+    pend_marked(db, keys, dir, &marked).await;
     keys.generate().await.expect("push key");
 
     let report = check_marks::run(&options(db, dir, true))
@@ -546,6 +533,11 @@ async fn test_check_marks_keys_the_database_names_are_not_missing() {
         .expect("check");
     assert!(report.missing.is_empty(), "{:?}", report.missing);
     assert_eq!(report.summary.states[&MarkState::AccountMissing], 0);
+    assert_eq!(find(&report.accounts, "pending").state, MarkState::Unmarked);
+    assert_eq!(
+        find(&report.accounts, "marked").state,
+        MarkState::GenerationLost
+    );
 
     // An account created after the accounts were read, before the mark files are: the
     // database names its key by the time its mark is listed.
@@ -557,5 +549,73 @@ async fn test_check_marks_keys_the_database_names_are_not_missing() {
         .await
         .expect("missing");
     assert!(missing.is_empty(), "{missing:?}");
+    fx.db.drop_database().await.expect("drop");
+}
+
+/// Name `key` as account `id`'s pending key.
+async fn set_pending(db: &TestDatabase, id: &str, key: &pubky_switch::keys::KeyId) {
+    write(
+        db,
+        &format!("UPDATE accounts SET pending_key = '{key}' WHERE id = '{id}'"),
+    )
+    .await;
+}
+
+/// Give `account` a pending key that signed generation 2's first head, as a generation
+/// change the database then lost leaves it: the key named pending, with a mark.
+async fn pend_marked(
+    db: &TestDatabase,
+    keys: &FileKeyStore,
+    dir: &Path,
+    account: &NewAccount,
+) -> pubky_switch::keys::KeyId {
+    let next = keys.generate().await.expect("pending key");
+    write_mark(
+        dir,
+        &NewAccount {
+            service_key: next.id.clone(),
+            ..account.clone()
+        },
+        Mark {
+            generation: 2,
+            seq: 1,
+            chain_hash: [1; 32],
+        },
+    );
+    set_pending(db, &account.id, &next.id).await;
+    next.id
+}
+
+#[tokio::test]
+async fn test_check_marks_reports_a_lost_generation_change() {
+    let Some(fx) = fixture().await else { return };
+    let (db, keys, dir) = (&fx.db, &fx.keys, fx.key_dir.path());
+    // The outgoing key already retired and deleted: not `key_missing`.
+    let retired = create(db, keys, "retired", true).await;
+    append(db, keys, "retired", &[1, 2], true).await;
+    pend_marked(db, keys, dir, &retired).await;
+    keys.delete(&retired.service_key)
+        .await
+        .expect("delete the old key");
+    // The outgoing key still there, its mark at the head: not `current`.
+    let unswept = create(db, keys, "unswept", true).await;
+    append(db, keys, "unswept", &[1, 2], true).await;
+    pend_marked(db, keys, dir, &unswept).await;
+
+    let report = check_marks::run(&options(db, dir, false))
+        .await
+        .expect("check");
+    for id in ["retired", "unswept"] {
+        let line = find(&report.accounts, id);
+        assert_eq!(
+            (line.state, line.generation, line.mark_seq, line.head_seq),
+            (MarkState::GenerationLost, 2, Some(1), Some(2)),
+            "{id}"
+        );
+    }
+    assert!(report.missing.is_empty());
+    assert_eq!(report.summary.needs_attention, 2);
+    assert_eq!(report.summary.states[&MarkState::GenerationLost], 2);
+    assert!(report.needs_attention());
     fx.db.drop_database().await.expect("drop");
 }
