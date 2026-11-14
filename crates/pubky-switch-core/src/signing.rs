@@ -19,6 +19,18 @@ pub trait Signs {
     fn sign_fields(&self, label: &str, fields: &[&[u8]]) -> [u8; 64];
 }
 
+/// A key that signs requests only: `lp(label, fields...)` under the request label
+/// ([`crate::labels::sig::HTTP`]), the `Switch-Signature` of a request (Switch wire 2.1,
+/// 7.1), and nothing else, so whoever holds it signs no operation or document.
+pub trait SignsRequests {
+    /// The Ed25519 public key that verifies this key's signatures.
+    fn public_key(&self) -> [u8; 32];
+
+    /// Sign `lp(label, fields...)` under the request label ([`crate::labels::sig::HTTP`]):
+    /// `fields` are a request's signed fields ([`crate::http::request_fields`]).
+    fn sign_request_fields(&self, fields: &[&[u8]]) -> [u8; 64];
+}
+
 impl Signs for IdentityKey {
     fn public_key(&self) -> [u8; 32] {
         self.public()

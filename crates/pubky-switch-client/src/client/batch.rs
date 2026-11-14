@@ -118,8 +118,8 @@ impl SwitchClient {
     ///
     /// # Errors
     ///
-    /// [`ClientError::Usage`] for the next service's credentials, or at another identity's
-    /// account; [`ClientError::Core`] when the generator fails or an operation can't be
+    /// [`ClientError::Usage`] for the next service's credentials or the signer's request-only
+    /// credential ([`Credentials::SignerRequests`]), or at another identity's account; [`ClientError::Core`] when the generator fails or an operation can't be
     /// signed; otherwise as [`Batch::new`].
     pub fn sign_batch(
         &self,
@@ -170,6 +170,7 @@ impl SwitchClient {
                     "the next service writes no operations".into(),
                 ));
             }
+            Credentials::SignerRequests { .. } => return Err(super::request_only()),
         };
         Batch::new(signed, cursor)
     }

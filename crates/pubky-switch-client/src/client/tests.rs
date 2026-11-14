@@ -64,6 +64,27 @@ fn signer() -> Credentials {
     }
 }
 
+/// The identity key behind a request-only interface, as the signer's request credential
+/// holds it.
+struct RequestsOnly(IdentityKey);
+
+impl pubky_switch_core::signing::SignsRequests for RequestsOnly {
+    fn public_key(&self) -> [u8; 32] {
+        self.0.public()
+    }
+
+    fn sign_request_fields(&self, fields: &[&[u8]]) -> [u8; 64] {
+        self.0.sign(pubky_switch_core::labels::sig::HTTP, fields)
+    }
+}
+
+fn signer_requests() -> Credentials {
+    Credentials::SignerRequests {
+        identity: identity().public(),
+        key: Arc::new(RequestsOnly(identity())),
+    }
+}
+
 fn app() -> Credentials {
     Credentials::App {
         identity: identity().public(),
@@ -718,11 +739,62 @@ fn test_credentials_must_match_their_keys() {
     assert!(matches!(new(wrong_app), Err(ClientError::Usage(_))));
     assert!(new(app()).is_ok());
     assert!(new(signer()).is_ok());
+    assert!(new(signer_requests()).is_ok());
+    let wrong_requests = Credentials::SignerRequests {
+        identity: [1; 32],
+        key: Arc::new(RequestsOnly(identity())),
+    };
+    assert!(matches!(new(wrong_requests), Err(ClientError::Usage(_))));
+}
+
+#[test]
+fn test_signer_requests_credential_signs_a_request_that_verifies() {
+    let transport = fixed(service_key(), 200, json!({}));
+    let requests = client_with(
+        signer_requests(),
+        Some(service_public()),
+        Arc::clone(&transport),
+    );
+    requests.signer_only().unwrap();
+    let signed = requests
+        .sign_request("GET", "/v1/x/apps", Vec::new(), None)
+        .unwrap();
+    let signature = signed.signature.unwrap();
+    let target = http::RequestTarget {
+        method: "GET",
+        path_and_query: "/v1/x/apps",
+        body: &[],
+        origin: ORIGIN,
+    };
+    let headers = http::RequestHeaders {
+        timestamp: pubky_switch_core::time::rfc3339_seconds(NOW),
+        identity: pubky_id(&identity().public()),
+        ..http::RequestHeaders::default()
+    };
+    http::verify_request(&identity().public(), &target, &headers, &signature).unwrap();
+    // The same request, headers and signature as the signer's full credential gives.
+    let full = client_with(signer(), Some(service_public()), transport);
+    assert_eq!(
+        full.sign_request("GET", "/v1/x/apps", Vec::new(), None)
+            .unwrap(),
+        signed
+    );
+}
+
+#[test]
+fn test_signer_requests_credential_signs_no_batch() {
+    let transport = fixed(service_key(), 200, json!({}));
+    let requests = client_with(signer_requests(), Some(service_public()), transport);
+    let refused = requests.sign_batch(1, two_lists(), None).unwrap_err();
+    assert!(
+        matches!(&refused, ClientError::Usage(why) if why.contains("requests only")),
+        "{refused:?}"
+    );
 }
 
 #[test]
 fn test_credentials_debug_shows_no_key() {
-    let text = format!("{:?} {:?}", signer(), app());
+    let text = format!("{:?} {:?} {:?}", signer(), signer_requests(), app());
     assert!(text.contains(&pubky_id(&identity().public())), "{text}");
     for secret in [[1u8; 32], [2; 32], [3; 32]] {
         assert!(!text.contains(&b64(&secret)), "{text}");
