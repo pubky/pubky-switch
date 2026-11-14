@@ -136,8 +136,9 @@ impl SwitchClient {
     /// # Errors
     ///
     /// [`ClientError::Usage`] for the next service's credentials or the signer's request-only
-    /// credential ([`Credentials::SignerRequests`]), or at another identity's account; [`ClientError::Core`] when the generator fails or an operation can't be
-    /// signed; otherwise as [`Batch::new`].
+    /// credential ([`Credentials::SignerRequests`]), or at another identity's account;
+    /// [`ClientError::Core`] when the generator fails or an operation can't be signed;
+    /// otherwise as [`Batch::new`].
     pub fn sign_batch(
         &self,
         generation: u64,

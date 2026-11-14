@@ -66,7 +66,8 @@ pub enum TimeoutClass {
     /// A small request with a small answer: a write of a document or a setting, a read of
     /// one small value, the read of the signed service time (a feed page with no items,
     /// Switch wire 7.4.4), and a batch of operations that writes no shared record (its
-    /// answer is its proofs, or a refusal with at most a claim's view).
+    /// answer is its proofs, or a refusal that carries at most one small current value,
+    /// such as a claim's view or the held app record, Switch wire 7.6).
     #[default]
     Ordinary,
     /// A request or an answer that can carry about a mebibyte or more (Switch wire 7.1

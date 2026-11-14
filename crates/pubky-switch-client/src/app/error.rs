@@ -160,8 +160,10 @@ pub enum WontDeliver {
 pub struct KeptAhead {
     /// The oldest kept batch's ID ([`super::App::kept_batch`]).
     pub batch_id: [u8; 16],
-    /// When its first send left, service time in Unix milliseconds; `None` while it was
-    /// never sent.
+    /// The time its first send was stamped at, service time in Unix milliseconds: at or
+    /// before the send, and up to about a day before it, since a first send is stamped at a
+    /// held service time while one under a day old is held (Switch spec 12.5 "Kept
+    /// batches"). `None` while it was never sent.
     pub kept_since_ms: Option<u64>,
     /// When its answer window ends; `None` while it was never sent, which has no window.
     pub answer_until_ms: Option<u64>,

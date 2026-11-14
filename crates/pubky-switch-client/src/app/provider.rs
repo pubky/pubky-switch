@@ -344,9 +344,11 @@ pub(crate) const FRESH_SERVICE_TIME_MS: u64 = 10 * 60 * 1000;
 
 /// How old, by the device clock, the highest service time verified with the current key may
 /// be for a first send to be stamped without reading another
-/// ([`App::stamp_service_time`]): a day. The stamp is at most that much before the true
-/// time, so the kept copy's window ([`KEPT_BATCH_ANSWER_MS`]) ends at most a day sooner
-/// than it could, of its 30 days.
+/// ([`App::stamp_service_time`]): a day. With a device clock near the service's, the stamp
+/// is then at most about a day before the send, so the kept copy's window
+/// ([`KEPT_BATCH_ANSWER_MS`]) ends at most about a day sooner than it could, of its 30
+/// days. A device clock that runs ahead lets an older held time pass, and the window ends
+/// that much sooner still: never later than the service's.
 pub(crate) const RECENT_SERVICE_TIME_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// How many provider changes one follow takes in a row, each given up for a newer own
