@@ -163,7 +163,8 @@ impl Service {
             Admitted::InviteCode(hash) => {
                 // Admitted only by a code, whose expiry is a time (Switch wire 7.3).
                 if !trusted {
-                    return Err(ApiError::unavailable(
+                    return Err(self.refused_without_trusted_time(
+                        "put_peers",
                         "7.3: an invite code's expiry needs trusted time",
                     ));
                 }

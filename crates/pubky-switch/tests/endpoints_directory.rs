@@ -602,6 +602,7 @@ async fn test_directory_invite_code_admits_without_use_at_its_rate() {
     let untrusted = replay.without_trusted_time();
     let answer = untrusted.handle(from_shop(Some(CODE), &at)).await;
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
+    assert_eq!(untrusted.time_refusals(), 1);
     replay.db.drop_database().await.expect("drop");
 }
 
