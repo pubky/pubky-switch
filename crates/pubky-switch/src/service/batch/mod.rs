@@ -867,10 +867,12 @@ impl Service {
             )
         };
         if !self.time.read().trusted && depends_on_time(&ops, &outcome_depends) {
-            return Err(ApiError::unavailable(
-                "7.3: the batch depends on the service's time, and trusted time is missing",
-            )
-            .into());
+            return Err(self
+                .refused_without_trusted_time(
+                    "ops",
+                    "7.3: the batch depends on the service's time, and trusted time is missing",
+                )
+                .into());
         }
         if let (
             BatchEffect::Apply {

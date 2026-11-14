@@ -28,8 +28,10 @@ mod documents;
 mod enrollments;
 mod feed;
 mod handover;
+pub mod heads;
 mod identity;
 mod inbox;
+mod instance;
 mod keying;
 mod ops;
 mod peers;
@@ -62,6 +64,7 @@ pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
 pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
+pub use instance::{InstanceLock, InstanceLockLost, LockTiming};
 pub use keying::{Keyed, keying_lock_key};
 pub use ops::{
     DivergentUpload, ListName, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry,
@@ -224,6 +227,14 @@ pub enum StoreError {
     /// No database URL is configured.
     #[error("no database URL: set database.url or {DATABASE_URL_ENV}")]
     NoUrl,
+    /// No try at the instance lock got an answer within its wait
+    /// ([`Store::hold_instance_lock`]).
+    #[error("the database didn't answer a take of the instance lock in time")]
+    LockUnanswered,
+    /// Another process serves this database ([`Store::hold_instance_lock`]): the session
+    /// that holds its lock.
+    #[error("another process serves this database: {0}")]
+    InUse(String),
 }
 
 /// PostgreSQL's code for a lock that wasn't free within `lock_timeout`.
@@ -372,7 +383,14 @@ impl Store {
                     let settings = DurabilitySettings::read(conn).await?;
                     settings.check().map_err(|reason| {
                         sqlx::Error::Configuration(StoreError::NotDurable(reason).into())
-                    })
+                    })?;
+                    // READ COMMITTED whatever the database's default: a statement that waits
+                    // for a lock then reads what the holder committed, where a snapshot taken
+                    // before the wait would fail the request instead (Switch spec 6.5, order
+                    // per account).
+                    conn.execute("SET default_transaction_isolation = 'read committed'")
+                        .await?;
+                    Ok(())
                 })
             })
             .connect_with(options.clone())

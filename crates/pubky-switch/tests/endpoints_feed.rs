@@ -806,6 +806,7 @@ async fn test_feed_refuses_a_head_behind_the_mark() {
         (503, json!("unavailable"))
     );
     assert!(header_text(&answer, header::HEAD).is_none());
+    assert_eq!(replay.service.mark_refusals(), 1);
     replay.db.drop_database().await.expect("drop");
 }
 
