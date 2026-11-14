@@ -3188,7 +3188,10 @@ async fn test_sender_disposition_after_a_restore_without_lists_read_is_unknown()
 }
 
 #[tokio::test]
-async fn test_sender_disposition_failed_refresh_after_a_restore_leaves_it_unknown() {
+async fn test_sender_disposition_failed_refresh_after_a_restore_holds_the_read() {
+    // A restore with `lists.read` owes the protocol a deny list gap, told with the lists
+    // read for it: while that read fails, the read holds and hands nothing, so no entry is
+    // handed with the copy unknown. The next read tells the gap and takes the copy.
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
     let (mut shop, store) = shop_restored_after_a_deny(&p, &protocol, &Permission::ALL).await;
@@ -3197,13 +3200,13 @@ async fn test_sender_disposition_failed_refresh_after_a_restore_leaves_it_unknow
         code: ErrorCode::Unavailable,
         current: json!(null),
     });
-    // The read goes on without the refresh, and the copy stays unknown.
-    let seen = restored_disposition(&mut shop, &protocol).await;
-    assert_eq!(seen.lists_as_of_ms, None);
-    assert!(!seen.blocked, "{seen:?}");
+    let held = shop.receive(None).await.unwrap();
+    assert!(held.stopped);
+    assert!(protocol.seen().is_empty());
     assert!(!refreshed(&store, &shop));
-    // It is still owed: the next read refreshes.
-    shop.receive(None).await.unwrap();
+    let seen = restored_disposition(&mut shop, &protocol).await;
+    assert!(seen.blocked, "{seen:?}");
+    assert!(seen.lists_as_of_ms.is_some());
     assert!(refreshed(&store, &shop));
 }
 

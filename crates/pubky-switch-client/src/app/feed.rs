@@ -3238,13 +3238,44 @@ impl App {
             // won't hand them again. Handed now, or applied to the copy of the lists, it
             // would set an older state over them, so it is a gap in the deny list's
             // history at the cursor instead: the protocol and the copy both take the list
-            // as it stands (Switch spec 8.3).
+            // as it stands (Switch spec 8.3). A change not checked yet is checked first, as
+            // at the cursor: one that isn't genuine is refused with its event, never made a
+            // gap, and one that can't be checked yet stays owed and holds the rest.
             if order < cursor_at
                 && matches!(
                     call,
                     OwedCall::Deny { .. } | OwedCall::DenyUnverified { .. }
                 )
             {
+                if let OwedCall::DenyUnverified {
+                    generation,
+                    seq,
+                    at_ms,
+                    op,
+                    ..
+                } = &call
+                {
+                    let Some(body) = &kept_body else {
+                        return Err(AppError::Store(crate::error::StoreError::Corrupt));
+                    };
+                    match self.check_deny_op(op, body, *at_ms, &tx).await? {
+                        DenyCheck::NotGenuine(reason) => {
+                            self.events.push(AppEvent::DenyListChangeRefused {
+                                generation: *generation,
+                                seq: *seq,
+                                reason: reason.into(),
+                            });
+                            tx.delete(&at)?;
+                            self.commit(tx).await?;
+                            continue;
+                        }
+                        DenyCheck::NotYet => {
+                            held = true;
+                            break;
+                        }
+                        DenyCheck::Genuine | DenyCheck::Unverifiable => {}
+                    }
+                }
                 self.note_deny_gap(cursor.generation, cursor.seq, &mut tx)
                     .await?;
                 tx.delete(&at)?;

@@ -138,6 +138,7 @@ use pubky_switch_core::records::{
     AppCert, AppRecord, AppRecordBody, AppRequest, Approval, CLOCK_TOLERANCE_MS, DAY_MS,
     IdentityDoc, ReceiveKeyBody, ReceiveKeyRecord,
 };
+use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
@@ -1561,7 +1562,9 @@ impl App {
     /// not acknowledged, with their IDs, delivered again as after [`App::load`], and the
     /// protocol calls it couldn't answer, made again by the next read. A backup carries
     /// neither, so a restore on another device starts without them, under a new event epoch
-    /// ([`EventId`]).
+    /// ([`EventId`]). For an app holding `lists.read`, the commit also owes the protocol a
+    /// deny list gap at the backup's position, whatever the backup held, told by the next
+    /// read with the full list ([`Protocol::deny_list_gap`], Switch spec 8.3).
     ///
     /// # Errors
     ///
@@ -1896,6 +1899,20 @@ impl App {
                     }
                 }
                 tx.local(&layer_writes)?;
+                // The protocol's layer is its state as committed when the backup was taken,
+                // which may lack a deny list change or gap it was owed then: a backup
+                // carries no owed call, and the feed doesn't hand again what the backup's
+                // cursor passed. So every restore by an app holding `lists.read` notes a gap
+                // in the deny list's history at the restored cursor, in this commit, and the
+                // protocol is told the full list after the carried calls (Switch spec 8.3).
+                // The namespace's delete above takes every `dgap` and `dgapt` the store
+                // held, so no earlier mark skips or moves it.
+                if app.state.cert.has_permission(Permission::ListsRead) {
+                    tx.put(
+                        feed::DENY_GAP,
+                        &(backup.cursor.generation, backup.cursor.seq),
+                    )?;
+                }
                 tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
                 carrying = true;
