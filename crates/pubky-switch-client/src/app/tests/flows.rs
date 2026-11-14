@@ -8576,6 +8576,18 @@ async fn test_deny_list_loss_at_a_told_gaps_position_tells_the_new_list() {
         let _ = restored.receive(None).await;
     }
     assert_eq!(restored.cursor().generation, 2);
+    // The loss's own gap, at the lost sequence's position, carries the new list.
+    assert!(
+        kinds
+            .sample
+            .deny_gaps
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|gap| gap.generation == 1 && gap.denied.contains(&z)),
+        "{:?}",
+        kinds.sample.deny_gaps.lock().unwrap()
+    );
     assert_learned_as_the_service_has_it(&mut restored, &kinds.sample, z).await;
 }
 
@@ -8960,4 +8972,69 @@ async fn test_deny_list_owed_change_after_lists_read_is_removed_is_not_handed() 
     reader.receive(None).await.unwrap();
     assert!(denies(&protocol).is_empty());
     assert_eq!(reader.owed_protocol_calls().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_deny_list_gap_told_without_its_list_after_lists_too_large_is_owed_again() {
+    // Lists refused as too large for one commit wait a day before the copy is taken
+    // again; a gap told without its list is owed again at the next read all the same.
+    let w = World::new();
+    let mut manager = manager_of(&w).await;
+    let x = [7; 32];
+    manager.deny(&x).await.unwrap();
+    let protocol = Arc::new(SampleProtocol::default());
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    let mut reader = join_on(
+        &w,
+        "reader",
+        &[Permission::ListsRead],
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+    )
+    .await;
+    store.refuse_puts_as_too_large_once(b"lc/deny/");
+    reader.receive(None).await.unwrap();
+    assert!(
+        reader
+            .reader()
+            .exists(crate::app::admission::LISTS_TOO_LARGE)
+            .await
+            .unwrap()
+    );
+    // A later gap at the cursor, told with an answer that can't be read.
+    let cursor = reader.cursor();
+    let mut tx = reader.tx().unwrap();
+    reader
+        .note_deny_gap(cursor.generation, cursor.seq, &mut tx)
+        .await
+        .unwrap();
+    reader.commit(tx).await.unwrap();
+    w.switch.fail_next(Fault::LeaveOut {
+        path: "/allow".into(),
+        member: "deny".into(),
+    });
+    reader.receive(None).await.unwrap();
+    // Within the day, the next read tells the gap again, now with the list.
+    w.clock.advance_ms(60_000);
+    reader.receive(None).await.unwrap();
+    let read: Vec<bool> = protocol
+        .deny_gaps
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|gap| gap.list_read)
+        .collect();
+    assert_eq!(read, vec![true, false, true]);
+    let last = protocol.deny_gaps.lock().unwrap().last().cloned().unwrap();
+    assert!(last.denied.contains(&x), "{last:?}");
+    assert!(
+        reader
+            .reader()
+            .exists(crate::app::admission::LISTS_AT)
+            .await
+            .unwrap()
+    );
 }

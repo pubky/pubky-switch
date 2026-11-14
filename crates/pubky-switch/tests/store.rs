@@ -489,6 +489,59 @@ async fn test_store_serializes_one_account() {
 }
 
 #[tokio::test]
+async fn test_store_serializes_one_account_under_any_default_isolation() {
+    // A request waits for the one ahead of it and then sees its commit, whatever isolation
+    // level the database gives new sessions: the store's connections set their own (Switch
+    // spec 6.5).
+    for level in ["repeatable read", "serializable"] {
+        let Some(fx) = fixture().await else { return };
+        fx.account(ID_A).await;
+        let mut admin = fx.db.admin().await.expect("admin");
+        admin
+            .execute(
+                format!(
+                    "ALTER DATABASE {} SET default_transaction_isolation = '{level}'",
+                    fx.db.name()
+                )
+                .as_str(),
+            )
+            .await
+            .expect("default isolation");
+        admin.close().await.expect("close");
+        let store = Store::connect_with(fx.db.options().clone(), &DatabaseConfig::default())
+            .await
+            .expect("store");
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut txn = store
+                    .begin(ID_A)
+                    .await
+                    .unwrap_or_else(|error| panic!("{level}: begin: {error}"))
+                    .expect("account");
+                let before = txn.head().last_seq;
+                let seq = txn.next_seq().expect("seq");
+                assert_eq!(seq, before + 1, "{level}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                txn.commit()
+                    .await
+                    .unwrap_or_else(|error| panic!("{level}: commit: {error}"));
+                seq
+            }));
+        }
+        let mut seqs = Vec::new();
+        for task in tasks {
+            seqs.push(task.await.expect("task"));
+        }
+        seqs.sort_unstable();
+        assert_eq!(seqs, (1..=6).collect::<Vec<u64>>(), "{level}");
+        store.close().await;
+        fx.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn test_store_other_accounts_proceed_while_one_is_locked() {
     let Some(fx) = fixture().await else { return };
     fx.account(ID_A).await;

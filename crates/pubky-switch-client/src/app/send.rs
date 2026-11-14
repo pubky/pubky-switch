@@ -856,8 +856,7 @@ impl App {
     ///   hold doesn't carry it: restored on another store, the message isn't held. The client
     ///   delivers nothing during [`App::restore`], [`App::load`] or [`App::receive`], only in
     ///   [`App::flush_outbox`], [`App::flush_message`], [`App::send`] and [`App::resend`], so a
-    ///   host that holds again before it calls any of those leaves no window. A build older
-    ///   than holds reads such a backup and drops them.
+    ///   host that holds again before it calls any of those leaves no window.
     ///
     /// # Errors
     ///
@@ -1441,9 +1440,10 @@ impl App {
     ///     under the long timeout, and no retry once the budget has passed since the round
     ///     began, about 90 s;
     ///   - the own `identity.json` delivered after the acceptance asks for it, about 10 s;
-    ///   - its record job ([`super::App::update_record`], bounded the same way), about 40 s.
+    ///   - its record job ([`super::App::update_record`], bounded the same way), about 130 s
+    ///     on a switch that answers nothing in time.
     ///
-    ///   So about 3.5 to 4 minutes. A try against switches that answer takes seconds.
+    ///   So about 5 minutes. A try against switches that answer takes seconds.
     /// - It tries at most [`OUTBOX_TRIES_PER_FLUSH`] messages. What is left stays owed, and
     ///   [`OutboxReport::more`] says so: the host flushes again at once.
     /// - It sends one batch kept from an earlier call again, oldest first, as the first unit

@@ -391,8 +391,8 @@ impl App {
     ///
     /// `again` for a further try within one call ([`App::update_record`]): the service time
     /// the first try took still counts, and no kept batch is sent again, so the call reads
-    /// the service time at most once and resends at most one kept batch in all. With batches kept, this
-    /// one is kept behind them.
+    /// the service time at most once and resends at most one kept batch in all. With
+    /// batches kept, this one is kept behind them.
     pub(crate) async fn submit_checked(
         &mut self,
         batch: OpBatch,

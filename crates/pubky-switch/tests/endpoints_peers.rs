@@ -536,6 +536,7 @@ async fn test_peers_invite_code_expiry_and_trusted_time() {
         status_and_code(&bob_switch.service.handle(request).await),
         (503, json!("unavailable"))
     );
+    assert_eq!(bob_switch.service.time_refusals(), 1);
     bob_switch.db.drop_database().await.expect("drop");
 }
 

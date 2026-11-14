@@ -467,6 +467,8 @@ async fn test_state_behind_the_mark_fails_stop() {
             .any(|(name, _)| name.as_str() == header::HEAD),
         "no head behind the mark"
     );
+    // Each refusal is counted, for the operator's alert (Switch spec 6.5).
+    assert_eq!(replay.service.mark_refusals(), 2);
     replay.db.drop_database().await.expect("drop");
 }
 

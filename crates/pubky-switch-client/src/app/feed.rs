@@ -2247,14 +2247,7 @@ impl App {
             .stored
             .and_then(|id| self.state.parked.get(&id).cloned().map(|entry| (id, entry)));
         let (id, parked) = match stored {
-            Some((id, stored)) => (
-                id,
-                ParkedEntry {
-                    reason,
-                    released: stored.released,
-                    ..stored
-                },
-            ),
+            Some((id, stored)) => (id, ParkedEntry { reason, ..stored }),
             None => (
                 self.new_stored_id(tx)?,
                 ParkedEntry {
@@ -3119,9 +3112,11 @@ impl App {
         }
         tx.delete(DENY_GAP)?;
         if list.is_none() {
-            // The protocol has no baseline yet: the copy isn't known complete either, so a
-            // later read owes the gap again, with the list once it reads.
+            // The protocol has no baseline yet: the copy isn't known complete either, so the
+            // next read owes the gap again, with the list once it reads, whatever waits on
+            // the copy (one `GET /allow` a read while the answer can't be read).
             tx.delete(super::admission::LISTS_AT)?;
+            tx.delete(super::admission::LISTS_TOO_LARGE)?;
         }
         self.commit(tx).await?;
         // The copy from the same answer, best effort: one too large for a commit keeps its

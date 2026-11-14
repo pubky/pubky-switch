@@ -1,13 +1,13 @@
 //! Push delivery (Switch spec 9 step 4, Switch wire 8.2): the webhooks a `notify` entry
 //! owes its target apps' handles, sent from the queue the append filled (`store::push_queue`)
-//! by a worker in each instance, never during the append.
+//! by a worker of the service, never during the append.
 //!
 //! - **Fair across accounts:** at most `push.concurrency` attempts run at once, as a stream,
 //!   not in rounds: as one ends, the next due row is claimed, so a relay that never answers
 //!   holds one slot, not the others' turn. An account has at most 8 rows in flight at once,
-//!   across instances (`store::push_queue`), so one account's slow relay leaves the other
-//!   slots to the others.
-//! - **One attempt** claims a due row, leased so no other instance sends it meanwhile, and
+//!   (`store::push_queue`), so one account's slow relay leaves the other slots to the
+//!   others.
+//! - **One attempt** claims a due row, leased so no other process sends it in an overlap, and
 //!   holds its registration while the webhook is signed: the registration must still name the
 //!   row's push key and handle, the key must not be owed deleting, and the account must still
 //!   serve at this service (its newest `identity.json` names it). Otherwise the row goes
@@ -64,7 +64,7 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long an attempt may take from its claim, everything included: the first 10 s of its
 /// lease, while its row counts as in flight (`store::push_queue`), and 20 s before the lease
-/// ends, so no other instance claims the row while it runs.
+/// ends, so no other process claims the row while it runs in an overlap.
 const ATTEMPT_DEADLINE_MS: i64 = 10_000;
 const _: () = assert!(ATTEMPT_DEADLINE_MS <= PUSH_LEASE_MS - PUSH_RETRY_MS);
 const _: () = assert!(ATTEMPT_DEADLINE_MS <= PUSH_LEASE_MS - 5_000);
@@ -183,7 +183,8 @@ fn routed(
 impl Service {
     /// Send due webhooks until `shutdown` resolves (Switch wire 8.2): a run of
     /// [`Service::deliver_pushes`], then another a second after it finds nothing left.
-    /// Several instances may run it against one database: each row is sent by one at a time.
+    /// One process runs it per database. In an overlap in a restart or failover, each row is
+    /// still sent by one at a time.
     /// Run by the service's binary while `push.enabled` is on.
     pub async fn deliver_pushes_until(self: Arc<Self>, shutdown: impl Future<Output = ()>) {
         tokio::pin!(shutdown);
