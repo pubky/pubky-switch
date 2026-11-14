@@ -190,6 +190,9 @@ pub enum KeyStoreError {
     /// No key with this ID.
     #[error("no such service key")]
     NotFound,
+    /// Another process holds the key store's directory ([`FileKeyStore::lock_dir`]).
+    #[error("the key store at {0} is in use by another process")]
+    InUse(String),
     /// A key ID or identity that isn't well formed.
     #[error("invalid key ID or identity")]
     InvalidId,
@@ -383,6 +386,9 @@ struct Inner {
     /// Pauses a mark write before it lands, for tests.
     #[cfg(test)]
     pause: Mutex<Option<PauseGate>>,
+    /// Pauses a first read of a key's mark after it read the file, for tests.
+    #[cfg(test)]
+    read_pause: Mutex<Option<ReadPauseGate>>,
     /// Fails directory syncs and tracks what a crash would undo, for tests.
     #[cfg(test)]
     faults: Arc<Mutex<Faults>>,
@@ -442,6 +448,15 @@ impl Faults {
     }
 }
 
+/// Pauses a first read of `id`'s mark once, after it read the file: it says so on `paused`,
+/// then waits on `release`.
+#[cfg(test)]
+struct ReadPauseGate {
+    id: KeyId,
+    paused: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 /// Pauses the mark write for `seq` once: it says so on `paused`, then waits on `release`.
 #[cfg(test)]
 struct PauseGate {
@@ -499,6 +514,45 @@ impl FileKeyStore {
     pub fn root(&self) -> &Path {
         &self.inner.root
     }
+
+    /// Hold the directory `root` for this process alone, as long as the lock lives: an
+    /// exclusive lock on its `lock` file, which the operating system releases when the
+    /// process ends. The directory is created if it doesn't exist. The service's binary takes
+    /// the lock at start, before it opens the store, so a second process on the same
+    /// directory refuses to start having read and written nothing in it
+    /// (docs/configuration.md, "Topology").
+    ///
+    /// # Errors
+    ///
+    /// [`KeyStoreError::InUse`] while another process holds it; [`KeyStoreError::Io`] when
+    /// the directory or the file can't be opened.
+    pub fn lock_dir(root: impl AsRef<Path>) -> Result<KeyDirLock, KeyStoreError> {
+        let root = root.as_ref();
+        create_private_dir(root)?;
+        let path = root.join("lock");
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(KeyDirLock { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => {
+                Err(KeyStoreError::InUse(root.display().to_string()))
+            }
+            Err(fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+}
+
+/// A key store directory held by this process alone ([`FileKeyStore::lock_dir`]); dropped,
+/// the directory is free again.
+#[derive(Debug)]
+pub struct KeyDirLock {
+    _file: File,
 }
 
 impl Inner {
@@ -512,6 +566,8 @@ impl Inner {
             operator: Mutex::new(None),
             #[cfg(test)]
             pause: Mutex::new(None),
+            #[cfg(test)]
+            read_pause: Mutex::new(None),
             #[cfg(test)]
             faults: Arc::default(),
         }
@@ -583,42 +639,33 @@ impl Inner {
         Ok(self.root.join("erasures").join(identity))
     }
 
+    /// The key `id`, from memory or from its file. The cache's lock is held from the miss
+    /// through the read to the insert, so a deletion that lands meanwhile can't be undone in
+    /// memory by a read of the file from before it.
     fn load_key(&self, id: &KeyId) -> Result<Arc<SigningKey>, KeyStoreError> {
-        if let Some(key) = self.keys.lock().get(id) {
+        let mut keys = self.keys.lock();
+        if let Some(key) = keys.get(id) {
             return Ok(key.clone());
         }
-        let mut seed = Zeroizing::new([0u8; 32]);
-        let mut file = match File::open(self.key_path(id)) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(KeyStoreError::NotFound);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let mut rest = [0u8; 1];
-        file.read_exact(seed.as_mut())
-            .map_err(|_| KeyStoreError::Corrupt(format!("key {id}: too short")))?;
-        if file.read(&mut rest)? != 0 {
-            return Err(KeyStoreError::Corrupt(format!("key {id}: too long")));
-        }
-        let key = Arc::new(SigningKey::from_bytes(&seed));
-        self.keys.lock().insert(id.clone(), key.clone());
+        let key = Arc::new(read_key_file(&self.key_path(id), id)?);
+        keys.insert(id.clone(), key.clone());
         Ok(key)
     }
 
+    /// The mark of `id`, from memory or from its file. The cache's lock is held from the
+    /// miss through the read to the insert: a mark write takes the same lock to put its
+    /// mark in, so a first read racing a write can't put an older mark over the newer one,
+    /// nor take up a file whose write failed before its directory sync, either of which
+    /// would let the key sign behind its mark (Switch spec 6.5).
     fn load_mark(&self, id: &KeyId) -> Result<Option<Mark>, KeyStoreError> {
-        if let Some(mark) = self.marks.lock().get(id) {
+        let mut marks = self.marks.lock();
+        if let Some(mark) = marks.get(id) {
             return Ok(*mark);
         }
-        let mark = match fs::read(self.mark_path(id)) {
-            Ok(bytes) => Some(
-                serde_json::from_slice::<Mark>(&bytes)
-                    .map_err(|error| KeyStoreError::Corrupt(format!("mark {id}: {error}")))?,
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        self.marks.lock().insert(id.clone(), mark);
+        let mark = read_mark_file(&self.mark_path(id), id)?;
+        #[cfg(test)]
+        self.pause_after_mark_read(id);
+        marks.insert(id.clone(), mark);
         Ok(mark)
     }
 
@@ -699,6 +746,22 @@ impl Inner {
                 Ok(check)
             }
             MarkCheck::Fork | MarkCheck::OtherGeneration => Err(KeyStoreError::Refused(check)),
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_mark_read(&self, id: &KeyId) {
+        let gate = {
+            let mut pause = self.read_pause.lock();
+            if pause.as_ref().is_some_and(|gate| gate.id == *id) {
+                pause.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            let _ = gate.paused.send(());
+            let _ = gate.release.recv();
         }
     }
 
@@ -1011,6 +1074,132 @@ mod hex_bytes {
     }
 }
 
+/// Read the key file of `id` at `path`: its 32-byte secret seed. [`KeyStoreError::NotFound`]
+/// when there is no such file.
+fn read_key_file(path: &Path, id: &KeyId) -> Result<SigningKey, KeyStoreError> {
+    let mut seed = Zeroizing::new([0u8; 32]);
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(KeyStoreError::NotFound);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut rest = [0u8; 1];
+    file.read_exact(seed.as_mut())
+        .map_err(|_| KeyStoreError::Corrupt(format!("key {id}: too short")))?;
+    if file.read(&mut rest)? != 0 {
+        return Err(KeyStoreError::Corrupt(format!("key {id}: too long")));
+    }
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+/// Read the mark file of `id` at `path`; `None` when there is no such file.
+fn read_mark_file(path: &Path, id: &KeyId) -> Result<Option<Mark>, KeyStoreError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice::<Mark>(&bytes).map_err(
+            |error| KeyStoreError::Corrupt(format!("mark {id}: {error}")),
+        )?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A read-only view of a [`FileKeyStore`]'s directory, for an operator's check beside a
+/// running service: it creates, writes and locks nothing, and caches nothing but the
+/// erasure ledger, read once when it opens. Each read finds the files as they are then,
+/// so a mark the service moves meanwhile is read as moved (Switch spec 6.5).
+///
+/// It hands out public keys and marks only: a key's seed is read to derive its public key
+/// and dropped.
+#[derive(Debug)]
+pub struct KeyStoreView {
+    root: PathBuf,
+    ledger: HashMap<String, u64>,
+}
+
+impl KeyStoreView {
+    /// Open the view of the key store at `root`.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyStoreError::Io`] when one of its directories (`keys`, `marks`, `erasures`) isn't
+    /// there or doesn't read; [`KeyStoreError::Corrupt`] when the erasure ledger doesn't
+    /// read whole, as the service refuses to start on it.
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, KeyStoreError> {
+        let root = root.into();
+        for dir in ["keys", "marks"] {
+            fs::read_dir(root.join(dir)).map_err(|error| {
+                KeyStoreError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("the key store's {dir} directory: {error}"),
+                ))
+            })?;
+        }
+        let ledger = read_ledger(&root.join("erasures")).map_err(|error| match error {
+            KeyStoreError::Io(error) => KeyStoreError::Io(std::io::Error::new(
+                error.kind(),
+                format!("the key store's erasures directory: {error}"),
+            )),
+            other => other,
+        })?;
+        Ok(Self { root, ledger })
+    }
+
+    /// The directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The mark of `id` as its file holds it now; `None` when there is no mark file.
+    pub fn mark(&self, id: &KeyId) -> Result<Option<Mark>, KeyStoreError> {
+        read_mark_file(&self.root.join("marks").join(id.as_str()), id)
+    }
+
+    /// The public key of `id`; `None` when there is no key file.
+    pub fn public_key(&self, id: &KeyId) -> Result<Option<[u8; 32]>, KeyStoreError> {
+        match read_key_file(&self.root.join("keys").join(id.as_str()), id) {
+            Ok(key) => Ok(Some(key.verifying_key().to_bytes())),
+            Err(KeyStoreError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// When `identity`'s account was last erased, as the ledger held it when the view
+    /// opened.
+    pub fn erasure(&self, identity: &str) -> Option<u64> {
+        self.ledger.get(identity).copied()
+    }
+
+    /// The IDs of the keys with a mark file now, in order. A write's temporary file, left by
+    /// a crash, isn't a mark.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyStoreError::Corrupt`] for any other file whose name isn't a key ID;
+    /// [`KeyStoreError::Io`] when the directory doesn't read.
+    pub fn marked_keys(&self) -> Result<Vec<KeyId>, KeyStoreError> {
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(self.root.join("marks"))? {
+            let name = entry?.file_name();
+            let Some(name) = name.to_str() else {
+                return Err(KeyStoreError::Corrupt(
+                    "mark: a file name isn't UTF-8".into(),
+                ));
+            };
+            if name.starts_with('.') && name.ends_with(".tmp") {
+                continue;
+            }
+            ids.push(
+                KeyId::parse(name)
+                    .map_err(|_| KeyStoreError::Corrupt(format!("mark: {name} names no key")))?,
+            );
+        }
+        ids.sort_unstable();
+        Ok(ids)
+    }
+}
+
 /// A key store whose new keys are given seeds, in order, for tests that replay the
 /// vectors' fixed service keys; everything else is the file store's.
 #[cfg(any(test, feature = "test-util"))]
@@ -1191,6 +1380,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_key_store_first_mark_read_racing_a_write_never_caches_the_older_mark() {
+        // A first read of a key's mark reads the file, then a write of a newer mark lands
+        // before the read puts what it found in memory: what the store holds after both is
+        // the newer mark, so the key never signs behind it (Switch spec 6.5).
+        let (dir, store) = open();
+        let key = store.generate().await.expect("generate");
+        store
+            .advance_mark(&key.id, mark(1, 1))
+            .await
+            .expect("first");
+        drop(store);
+        let store = FileKeyStore::open(dir.path()).expect("reopen");
+        let (paused_tx, paused) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *store.inner.read_pause.lock() = Some(ReadPauseGate {
+            id: key.id.clone(),
+            paused: paused_tx,
+            release: release_rx,
+        });
+        let reader = tokio::spawn({
+            let (store, id) = (store.clone(), key.id.clone());
+            async move { store.mark(&id).await }
+        });
+        tokio::task::spawn_blocking(move || paused.recv())
+            .await
+            .expect("join")
+            .expect("the read paused");
+        let writer = tokio::spawn({
+            let (store, id) = (store.clone(), key.id.clone());
+            async move { store.advance_mark(&id, mark(2, 2)).await }
+        });
+        // The write waits for the read to finish; let it have its chance to land first.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            while !writer.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        release.send(()).expect("release");
+        assert_eq!(reader.await.expect("join").expect("read"), Some(mark(1, 1)));
+        assert_eq!(
+            writer.await.expect("join").expect("advance"),
+            MarkCheck::Current
+        );
+        assert_eq!(store.mark(&key.id).await.expect("mark"), Some(mark(2, 2)));
+        // The head the key signed last moves on from 2, not from 1.
+        assert!(matches!(
+            store.advance_mark(&key.id, mark(2, 9)).await,
+            Err(KeyStoreError::Refused(MarkCheck::Fork))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_key_store_cancelled_advance_keeps_marks_in_order() {
         let (dir, store) = open();
         let key = store.generate().await.expect("generate");
@@ -1244,6 +1486,24 @@ mod tests {
             store.operator().await.expect("operator").public_key(),
             first
         );
+    }
+
+    #[test]
+    fn test_key_store_directory_is_held_by_one_lock_at_a_time() {
+        // A second lock on a held directory is refused, as a second process's is; once the
+        // first is dropped the directory is free again.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let held = FileKeyStore::lock_dir(dir.path()).expect("lock");
+        assert!(matches!(
+            FileKeyStore::lock_dir(dir.path()),
+            Err(KeyStoreError::InUse(_))
+        ));
+        drop(held);
+        let _again = FileKeyStore::lock_dir(dir.path()).expect("free again");
+        // A directory that isn't there yet is created and held.
+        let new = dir.path().join("new");
+        let _held = FileKeyStore::lock_dir(&new).expect("lock");
+        assert!(new.join("lock").exists());
     }
 
     #[tokio::test]
@@ -1717,6 +1977,81 @@ mod tests {
             FileKeyStore::open(dir.path()),
             Err(KeyStoreError::Corrupt(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_view_reads_what_the_store_wrote() {
+        let (dir, store) = open();
+        let key = store.generate().await.expect("generate");
+        let unmarked = store.generate().await.expect("generate");
+        store.advance_mark(&key.id, mark(5, 1)).await.expect("mark");
+        store.record_erasure("aaa", 1_000).await.expect("record");
+        let view = KeyStoreView::open(dir.path()).expect("view");
+        assert_eq!(view.mark(&key.id).expect("mark"), Some(mark(5, 1)));
+        assert_eq!(view.public_key(&key.id).expect("public"), Some(key.public));
+        assert_eq!(view.mark(&unmarked.id).expect("mark"), None);
+        assert_eq!(view.erasure("aaa"), Some(1_000));
+        assert_eq!(view.erasure("bbb"), None);
+        // A mark moved after the view opened is read as moved.
+        store.advance_mark(&key.id, mark(6, 2)).await.expect("mark");
+        assert_eq!(view.mark(&key.id).expect("mark"), Some(mark(6, 2)));
+        // A key file that isn't there is no key, its mark file left or not.
+        store.delete(&key.id).await.expect("delete");
+        assert_eq!(view.public_key(&key.id).expect("public"), None);
+        let id = KeyId::parse("00112233445566778899aabbccddeeff").expect("id");
+        fs::write(dir.path().join("keys").join(id.as_str()), [1u8; 31]).expect("write");
+        assert!(matches!(
+            view.public_key(&id),
+            Err(KeyStoreError::Corrupt(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_view_lists_marked_keys() {
+        let (dir, store) = open();
+        let marked = store.generate().await.expect("generate");
+        let unmarked = store.generate().await.expect("generate");
+        store
+            .advance_mark(&marked.id, mark(5, 1))
+            .await
+            .expect("mark");
+        let marks = dir.path().join("marks");
+        // A write's temporary file, as a crash before its rename leaves it, isn't a mark.
+        fs::write(marks.join(".x.0011223344556677.tmp"), "{}").expect("temp");
+        let view = KeyStoreView::open(dir.path()).expect("view");
+        let listed = view.marked_keys().expect("list");
+        assert_eq!(listed, vec![marked.id.clone()]);
+        assert!(!listed.contains(&unmarked.id));
+        // Any other name that isn't a key ID is refused.
+        fs::write(marks.join("stray"), "{}").expect("stray");
+        assert!(matches!(view.marked_keys(), Err(KeyStoreError::Corrupt(_))));
+    }
+
+    #[test]
+    fn test_key_store_view_open_refuses_a_missing_directory_and_creates_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("absent");
+        assert!(matches!(
+            KeyStoreView::open(&root),
+            Err(KeyStoreError::Io(_))
+        ));
+        assert!(!root.exists());
+        // One directory missing of three is refused too, and isn't made.
+        fs::create_dir_all(root.join("keys")).expect("keys");
+        fs::create_dir_all(root.join("marks")).expect("marks");
+        assert!(matches!(
+            KeyStoreView::open(&root),
+            Err(KeyStoreError::Io(_))
+        ));
+        assert!(!root.join("erasures").exists());
+        fs::create_dir_all(root.join("erasures")).expect("erasures");
+        let view = KeyStoreView::open(&root).expect("view");
+        assert_eq!(view.root(), root.as_path());
+        let listing: Vec<_> = fs::read_dir(&root)
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(listing.len(), 3, "{listing:?}");
     }
 
     #[test]

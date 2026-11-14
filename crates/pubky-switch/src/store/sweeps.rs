@@ -116,7 +116,7 @@ impl AccountTxn {
 
     /// Whether the once-a-minute sweep is due at service time `now_ms` (Switch wire 9.1): a
     /// minute of service time since the last, or none yet. When it is, the time is noted
-    /// in this transaction, so the sweep runs once in the minute whatever the instance. A
+    /// in this transaction, so the sweep runs once in the minute, even in an overlap in a restart or failover. A
     /// mark ahead of `now_ms`, left by a time base that has since stepped back, is due too,
     /// so the sweeps never wait for the clock to catch up with it.
     pub async fn minute_sweep_due(&mut self, now_ms: u64) -> Result<bool, StoreError> {

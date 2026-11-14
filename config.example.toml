@@ -132,4 +132,4 @@ connect_retry_ms = 30000               # keep trying to reach the database at st
 # Push (Switch wire 8): registrations, and the webhooks a notify entry sends to each handle.
 [push]
 enabled = true                         # off: every PUT /push is 400, nothing queued or sent
-concurrency = 16                       # the most webhooks this instance sends at once
+concurrency = 16                       # the most webhooks the service sends at once

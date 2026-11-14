@@ -1000,6 +1000,7 @@ async fn test_inbox_code_only_append_needs_trusted_time() {
     };
     let answer = untrusted.handle(append(Some(code))).await;
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
+    assert_eq!(untrusted.time_refusals(), 1);
     assert_eq!(
         sql_value(
             &replay,

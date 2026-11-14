@@ -81,7 +81,8 @@ impl Service {
                 Admitted::Listed => {}
                 Admitted::InviteCode(hash) => {
                     if !trusted {
-                        return Err(ApiError::unavailable(
+                        return Err(self.refused_without_trusted_time(
+                            "directory",
                             "7.3: an invite code's expiry needs trusted time",
                         ));
                     }

@@ -3,8 +3,8 @@
 //! A feed request with `wait` answers at once when there is something to read, and
 //! otherwise waits until its account changes or `wait` seconds pass. A request that changes
 //! an account sends a PostgreSQL notification naming it as part of its transaction, so the
-//! notification goes out only if the change commits. Every instance of the service listens,
-//! and wakes the requests waiting on that account, wherever the change was made. A waiting
+//! notification goes out only if the change commits. The service listens, and wakes
+//! the requests waiting on that account, whichever request made the change. A waiting
 //! request is woken by its own account's changes only.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};

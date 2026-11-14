@@ -890,7 +890,9 @@ impl Service {
         };
         // The head is signed only when the page is answered, inside its proof (keyed.rs);
         // the key's mark is checked here, so each read of the wait refuses a state behind it.
-        if !check_mark(mark.as_ref(), &Mark::from(tip)).allows_signing() {
+        let check = check_mark(mark.as_ref(), &Mark::from(tip));
+        if !check.allows_signing() {
+            self.note_mark_refusal(&read.account, check);
             return Err(FeedStop::refused(behind_the_mark(), false, time_ms));
         }
         match builder.refusal.take() {

@@ -3,20 +3,20 @@
 //!
 //! - **Timed by the database's clock:** every time a row holds (its entry, when it is due,
 //!   its lease) is the database's `statement_timestamp()` in milliseconds, read once by each
-//!   statement, never an instance's own clock, so instances whose clocks disagree still agree
-//!   on when a row is due, leased or past its minute. The service's trusted time is only the
+//!   statement, never the service host's own clock, so two processes whose clocks disagree in
+//!   an overlap still agree on when a row is due, leased or past its minute. The service's trusted time is only the
 //!   webhook's `ts`.
 //! - **Queued** in the append's transaction, one row per handle of each target app's
 //!   registration, at most [`PUSH_PER_HOST`] toward one relay host
 //!   ([`AccountTxn::queue_pushes`]), so a row exists only if its entry commits, and nothing is
 //!   sent during the append.
-//! - **Claimed** by one instance at a time ([`Store::claim_pushes`]): under one advisory lock
-//!   that every instance's claims take, so they run one at a time, and `FOR UPDATE SKIP
+//! - **Claimed** by one claim at a time ([`Store::claim_pushes`]): under one advisory lock
+//!   that every claim takes, so they run one at a time, and `FOR UPDATE SKIP
 //!   LOCKED`; then a lease of [`PUSH_LEASE_MS`], committed before anything is sent. An account
-//!   has at most [`PUSH_PER_ACCOUNT`] rows in flight at once, across instances. An attempt
-//!   ends within 10 s of its claim (`service::webhooks`), well inside the lease, so no two
-//!   instances send one row at once; an instance that dies mid-attempt leaves the row to be
-//!   retried when the lease ends.
+//!   has at most [`PUSH_PER_ACCOUNT`] rows in flight at once. An attempt
+//!   ends within 10 s of its claim (`service::webhooks`), well inside the lease, so in an
+//!   overlap in a restart or failover no two processes send one row at once; a process that
+//!   dies mid-attempt leaves the row to be retried when the lease ends.
 //! - **In flight or waiting:** a row's next attempt is more than [`PUSH_RETRY_MS`] away only
 //!   in the first 10 s of a lease, since a failure schedules its retry [`PUSH_RETRY_MS`] later
 //!   and a lease runs [`PUSH_LEASE_MS`]. So those are the rows that may be in flight, and a row
@@ -64,9 +64,9 @@ pub const PUSH_RETRY_MS: i64 = 20_000;
 /// row waiting for its retry is (the module's doc).
 pub const PUSH_LEASE_MS: i64 = 30_000;
 
-/// The most rows of one account in flight at once, across instances: one registration's
+/// The most rows of one account in flight at once: one registration's
 /// handles. With `push.concurrency` at its default of 16, one account takes at most half of
-/// an instance's attempts, so one whose relay never answers leaves the rest to the others.
+/// the attempts, so one whose relay never answers leaves the rest to the others.
 pub const PUSH_PER_ACCOUNT: i64 = 8;
 
 /// The most webhooks one entry queues toward one relay host: one registration's handles. An
@@ -83,7 +83,7 @@ pub const HOLD_LOCK_TIMEOUT_MS: u64 = 1_000;
 /// database picks. A claim cut short claims nothing and is tried again.
 pub const CLAIM_TIMEOUT_MS: u64 = 2_000;
 
-/// The advisory lock every instance's claims take (the module's doc), apart from every other
+/// The advisory lock every claim takes (the module's doc), apart from every other
 /// advisory lock of the service, as `store::keying` derives its keys.
 fn claims_lock_key() -> i64 {
     let digest = pubky_switch_core::enc::hash(b"pubky-switch/push-claims");
@@ -205,21 +205,21 @@ impl Store {
     }
 
     /// Claim at most `limit` due deliveries, each leased for [`PUSH_LEASE_MS`] with its
-    /// attempt counted: within its minute, under 3 attempts, not claimed by another instance,
+    /// attempt counted: within its minute, under 3 attempts, not leased to another claim,
     /// and with at most [`PUSH_PER_ACCOUNT`] of its account's rows in flight, those already
-    /// leased by any instance included. The least loaded accounts go first: a row's place is
+    /// leased by any claim included. The least loaded accounts go first: a row's place is
     /// its account's rows in flight plus its rank among that account's due rows, then its due
     /// time, so a free slot goes to an account with fewer webhooks in flight before an older
     /// row of a busier one, and accounts whose relays never answer can't hold every slot
-    /// while another account's webhooks wait behind theirs. Claims of every instance take
-    /// turns (the module's doc). The claim commits before anything is sent.
+    /// while another account's webhooks wait behind theirs. Claims take
+    /// turns, which keeps an overlap in a restart or failover safe (the module's doc). The claim commits before anything is sent.
     pub async fn claim_pushes(&self, limit: usize) -> Result<Vec<QueuedPush>, StoreError> {
         let mut tx = self.pool().begin().await.map_err(StoreError::from_db)?;
         // Statement 1: the claims' lock, in a READ COMMITTED transaction whatever the pool's
         // default, so the claim below, a statement of its own, sees every claim committed
         // while it waited. The numbers are formatted, as `SET` takes no bind parameters.
         // The claim counts each account's rows in flight once, by a join, never once per due
-        // row: those rows are at most `push.concurrency` per instance, so a claim reads the
+        // row: those rows are at most `push.concurrency`, so a claim reads the
         // due rows and the rows in flight, and an account with a large queue costs it no more
         // than as many rows of many accounts.
         tx.execute(

@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use pubky_switch::{
     admin::{self, AdminState},
     changes::ChangeListener,
+    check_marks::{self, CheckOptions},
     config::Config,
     http,
     keys::{FileKeyStore, KeyStoreReadiness},
@@ -33,6 +34,18 @@ enum Command {
     Run,
     /// Check the configuration, and print it with every default written out.
     CheckConfig,
+    /// Compare every account's chain head with its service key's mark, reading only:
+    /// prints JSON lines, and exits 2 when an account needs attention.
+    CheckMarks {
+        /// Read this database instead of the configured one, against the same key store.
+        /// Prefer the variable when the URL holds a password: a command line is visible to
+        /// other users of the host.
+        #[arg(long, env = "PUBKY_SWITCH_REPLICA_URL", hide_env_values = true)]
+        replica: Option<String>,
+        /// Report every account, not only those that need attention.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -59,7 +72,40 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::CheckMarks { replica, all } => {
+            check_marks_command(&config, replica.as_deref(), all)
+        }
         Command::Run => run(config),
+    }
+}
+
+fn check_marks_command(config: &Config, replica: Option<&str>, all: bool) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("pubky-switch: check-marks: starting the runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = CheckOptions::from_config(config, replica, all)
+        .and_then(|options| runtime.block_on(check_marks::run(&options)))
+        .and_then(|report| Ok((report.to_json_lines()?, report.needs_attention())));
+    match report {
+        Ok((text, attention)) => {
+            print!("{text}");
+            if attention {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => {
+            eprintln!("pubky-switch: check-marks: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -120,8 +166,24 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .path
         .clone()
         .ok_or("no key store: set keys.path")?;
+    // One process serves a key store and a database (docs/configuration.md, "Topology"):
+    // a second one refuses to start here, before it opens the key store, migrates or
+    // serves anything.
+    let _key_dir_lock = FileKeyStore::lock_dir(&key_dir)?;
     let keys = FileKeyStore::open(&key_dir)?;
     let store = Store::connect(&config.database).await?;
+    let instance = store
+        .hold_instance_lock(pubky_switch::store::LockTiming::SERVICE)
+        .await?;
+    // The database's lock lives with its session: once another session holds it, or it
+    // can't be confirmed, this one stops (docs/configuration.md, "Topology").
+    tokio::spawn(async move {
+        // Exits still holding the lock, if its session lives: a start elsewhere can't take
+        // it while this process could still answer.
+        let (lost, _held) = instance.keep().await;
+        tracing::error!(failure = %lost, "the instance lock: stopping");
+        std::process::exit(1);
+    });
     if config.database.migrate_on_start {
         store.migrate().await?;
         tracing::info!("database schema up to date");

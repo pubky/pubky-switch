@@ -18,6 +18,7 @@
 
 pub mod admin;
 pub mod changes;
+pub mod check_marks;
 pub mod config;
 pub mod http;
 pub mod keys;
