@@ -186,7 +186,51 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   kept-only original intent's origin without changing that batch; an existing reconstructed
   copy is never promoted by a later queue. The inventory scans every retained producer,
   not the latest message-status index, and uses dispatch's hold and protocol decisions.
-- **A backup doesn't carry `opq/`, `sent/` or `sentt/`.** A kept batch's messages go into
+- **A backup carries `sent/`** (Switch spec 12.4 "Sent messages"): every sent message whose
+  first acceptance is within `SENT_RETENTION_MS` (30 days) of the backup's device time (the
+  rule `sentt/` pruning applies), with its `outgone/` give-up mark, which stands while a
+  sent copy remains (`send::given_up`), in the same read as the outbox (`send::CarriedSent`).
+  They go within `MAX_CARRIED_SENT_BYTES` (8 MiB) of the restore's commit, every write
+  that installs one counted as the store counts it (`CarriedSent::commit_bytes`, the one
+  measure of the writer and the restore's check), the most recently accepted first
+  (`send::fit_sent`): first each one's record without its signed plaintext, until one
+  doesn't fit, it and every older one left out and counted (`AppBackup::sent_left_out`);
+  then the plaintext of each while the whole fits. A restore writes them back with their
+  `sentt/` index and marks, so `App::delivery` answers `Accepted` for a message accepted
+  before the backup, `App::queue_stored` queues nothing for it, no give-up tells it
+  undelivered with `resend: false`, and a delivery given up stays given up, a re-send
+  after a provider loss or by `App::resend` included. A record without its plaintext isn't
+  listed by `App::sent_to`; a re-send of it is given up at once with `MessageUndelivered`
+  (`resend: true`); an acceptance of an outbox copy gives it its plaintext again. A restore
+  refuses a backup whose records are over the bound, name a message twice, are past their
+  retention at the backup's time, aren't signed by this app, differ in recipient, kind,
+  bytes or origin from an outbox copy, or sit beside an outbox copy, or a message left out
+  past the outbox budget, never accepted: no store holds a sent record beside a message it
+  never saw accepted, since a message is queued alone only while it isn't kept as sent,
+  and the commit that records an acceptance writes both.
+- **A restore in place keeps the store's `sent/` and their marks beside the backup's**
+  (`send::restored_sent`): a store's copy of a message the backup holds, as sent or in its
+  outbox, takes the backup's origin (two devices of one app may hold one message under
+  different origins); a message both hold is one copy with every acceptance time of
+  either, the earliest the first, the earlier replay deadline, the plaintext either keeps
+  and the later give-up; the whole fits `MAX_CARRIED_SENT_BYTES` as a backup does. A
+  store's record of another message than the backup's of its `msg_id` (recipient, kind or
+  bytes) refuses the restore; one that doesn't read, or isn't signed by this app, is left
+  behind and counted in `RestoreLeftBehind`. An outbox item the backup puts back whose
+  store never saw it accepted, while the restored `sent/` holds it, takes that acceptance
+  (`RestoredSent::outbox`): no delivery owed, its hold ended, kept only for a record job
+  still owed; a message the backup left out of its outbox as never accepted that the
+  restore holds as sent is accepted, neither given up nor told. A store's `outgone/` mark of
+  a message the backup queues that still stands (`send::store_give_ups`) is kept: the
+  store told the protocol of that give-up, so the restore puts back no delivery of it, a
+  first delivery or a re-send (the item kept only for a record job still owed), and tells
+  nothing again of one the backup left out; a mark that doesn't read is left behind and
+  counted. `RestoreLeftBehind`
+  counts each message the restored app doesn't know were accepted once: a store's message
+  no newer than the oldest the backup carries, when the backup left some out, is taken as
+  one of those. The store's copies go after the backup's state in the commit, and count
+  towards `Refusal::CarriedTooLarge` (`sent_messages`).
+- **A backup doesn't carry `opq/`.** A kept batch's messages go into
   the outbox only with the batch's answer, so a restored app neither sends the batch nor
   delivers the messages it would have queued; the restore's reconcile mode reads the shared
   records and claims, and the protocol queues what it still owes again: a message such a
@@ -196,8 +240,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   tolerance (Switch spec 11). Nor does it carry
   the ends of kept batches and their indexes (`kb/`, `kbt/`, `kbm/`, `kba/`): a restored
   app's `App::kept_batch`, `App::kept_attempt` and `App::delivery` know nothing of a batch
-  kept before the restore. A restored app
-  answers re-send requests only for what it delivers after the restore.
+  kept before the restore. A restored app answers re-send requests for the sent messages
+  the backup carried whole and for what it delivers after the restore.
 
 ## Keys
 
@@ -335,12 +379,12 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | Key | Holds | Sensitive |
 |---|---|---|
 | `out/<msg_id>` | a queued message, queued alone, with the answer of the batch that carried it, or again from its stored signed plaintext (`App::queue_stored`, with a replay deadline): its signed plaintext, signed once, the envelope sealed for one try with its `apps_version` and retained content key (checked against its key commitment and exact signed plaintext before use), its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, which of the two the last answer was (`UndeliverableReason`), with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, and so does a record job still owed then, from the first acceptance, given up with a `RecordJobDropped` duty event in that commit; an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted, or at the first flush 45 days after it in any case | yes |
-| `sent/<msg_id>` | a message the recipient's inbox accepted, written in the commit that records the acceptance, kept 30 days from its first acceptance for re-sends, with the replay deadline of the outbox item it came from (a restore's put-back, `App::queue_stored`'s copy), the earliest of those it was accepted from: a re-send queued from it goes only by that deadline, and is given up past it | yes |
+| `sent/<msg_id>` | a message the recipient's inbox accepted, written in the commit that records the acceptance, kept 30 days from its first acceptance for re-sends, with the replay deadline of the outbox item it came from (a restore's put-back, `App::queue_stored`'s copy), the earliest of those it was accepted from: a re-send queued from it goes only by that deadline, and is given up past it. Carried by a backup, written back by a restore; its signed plaintext is `null` for a record a backup carried past `MAX_CARRIED_SENT_BYTES`, which can't be sent again | yes |
 | `outgone/<msg_id>` | a message whose delivery the app gave up, in the commit that gives it up and keeps `MessageUndelivered`, or that a restore left out: `App::queue_stored` and both explicit and provider-loss re-sends refuse it (`WontDeliver::GivenUp` for the public re-send) until the time it holds, 30 days on, and while an outbox item or sent copy still holds its plaintext; removed when pruning after that time once both copies are gone. This keeps a retained record job from recreating its ended delivery or reporting it undelivered again | |
 | `outnext` | where flushing the outbox stands, committed after each message's try and at the flush's end: the queue time and `msg_id` of the last message tried, from which the next flush goes on round the queue, so a message that keeps failing holds up none behind it; whether a pass a budget stopped is under way (`open`), and the first message it tried, so the next flush tries only the messages of the pass it hasn't reached. A try a failure or a crash cut short goes again first. The flush that ends the pass, and the deliveries' pass with it (`peers_doc`), says `more` false | |
 | `outhold/<pubky>` | a counterparty whose messages the host holds (`App::hold_queued`), until `App::release_queued`: no delivery of a message to it is tried, a first one or a re-send, those a kept batch puts in the outbox once it settles included; a held message's replay deadline still runs, and its record job goes. Carried by a backup; a restore in place also keeps the store's own; deleted on a leave. `App::withdraw_queued` gives those messages up instead, with `outgone/` marks, removing every retained queued copy and its delivery index in the same commit | |
 | `outheld/<msg_id>` | a message a protocol holds (`App::hold_message`, its own kinds only), written only while its delivery is owed (in the outbox, not refused for good, or in a kept batch's messages and neither known nor given up), until `App::release_message`: no delivery of it is tried, as for `outhold/`. Its life is the delivery's: deleted in the commit that ends it (the acceptance; a refusal for good; every commit that keeps its `MessageUndelivered`: a give-up, a withdrawal, a restore leaving it out past its budget; the drop of the kept batch that would queue it, unless the outbox or another kept batch the commit keeps holds it), and by nothing else, so a message queued again after its delivery ended starts unheld and one queued again while it is owed, by `App::queue_signed` or `App::queue_stored`, stays held. Carried by a backup for a message of its outbox owed a delivery, and a restore refuses a backup whose mark names another; a restore in place also keeps the store's own of the messages the restored outbox owes; deleted on a leave. `App::withdraw_message` gives the message up instead, removing its queued plaintext from every kept batch with its delivery index, while retaining the unrelated operations, local writes and messages; acceptance, permanent refusal and each give-up remove those producers too, before their temporary sent or give-up records can expire | |
-| `sentt/<time>/<msg_id>` | the time index for pruning sent messages | |
+| `sentt/<time>/<msg_id>` | the time index for pruning sent messages, by first acceptance; a restore writes it for each sent message it writes | |
 | `dir/<pubky>` | a counterparty's directory as signed, the switch, generation and `identity.json` version it was read under, its versions, and whether it is read again before the next send; for a directory over the store's value size, only its stub: the switch, generation, versions and read time, no apps, always stale, so each send reads it again and a provider loss since is still found | |
 | `rkn/<pubky>/<app_id>` | the highest receive key `n` seen for a counterparty's app | |
 | `peer/<pubky>` | the version of the own `identity.json` a counterparty's switch last named, and when the app last wrote there | |

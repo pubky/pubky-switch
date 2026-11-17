@@ -4,6 +4,7 @@
 //! service time, collections with a policy per sub-scope, and two identities messaging each
 //! other, each on its own scripted switch.
 
+mod backup_sent;
 mod delivery_inventory;
 mod delivery_lifecycle;
 

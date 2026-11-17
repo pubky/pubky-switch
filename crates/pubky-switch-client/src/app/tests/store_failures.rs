@@ -2372,6 +2372,7 @@ async fn test_restore_in_place_refused_for_what_it_carries_says_so_and_writes_no
         AppError::Refused(crate::app::Refusal::CarriedTooLarge {
             duty_events: carried_before + 3,
             owed_calls: 0,
+            sent_messages: 0,
         })
     );
     assert_eq!(fault.commits(), 0);

@@ -123,9 +123,9 @@ pub enum Refusal {
         reason: String,
     },
     /// A restore in place ([`super::App::restore`]) would carry more of what the store
-    /// still owes its protocol than one commit takes beside the backup, which fits on its
-    /// own: the duty events not acknowledged and the protocol calls owed, counted here.
-    /// Nothing was written. The host acknowledges the duty events it has acted on
+    /// holds than one commit takes beside the backup, which fits on its own: the duty events
+    /// not acknowledged, the protocol calls owed, and the sent messages the store adds or
+    /// holds more of (Switch spec 12.4 "Sent messages"), counted here. Nothing was written. The host acknowledges the duty events it has acted on
     /// ([`super::App::ack_events`]) through the app loaded on that store, lets the protocol
     /// answer the owed calls, or restores onto an empty store, then restores again. If the
     /// store can't be loaded, the host clears the app's namespace itself and restores onto
@@ -135,6 +135,8 @@ pub enum Refusal {
         duty_events: u64,
         /// The owed protocol calls it would carry.
         owed_calls: u64,
+        /// The sent messages it would carry that the store adds or holds more of.
+        sent_messages: u64,
     },
     /// [`super::App::queue_stored`] queued nothing: the message can no longer be delivered
     /// safely, or no longer fits. Nothing was written and no event raised.
@@ -237,10 +239,12 @@ impl std::fmt::Display for Refusal {
             Refusal::CarriedTooLarge {
                 duty_events,
                 owed_calls,
+                sent_messages,
             } => write!(
                 f,
-                "the restore in place would carry {duty_events} duty events not acknowledged \
-                 and {owed_calls} owed calls, more than one commit takes beside the backup"
+                "the restore in place would carry {duty_events} duty events not acknowledged, \
+                 {owed_calls} owed calls and {sent_messages} sent messages, more than one \
+                 commit takes beside the backup"
             ),
         }
     }

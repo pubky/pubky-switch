@@ -722,7 +722,8 @@ pub enum AppEvent {
     },
     /// A restore left behind kept duty events and owed protocol calls whose values didn't
     /// read, the store's at a restore in place, the backup's at every restore, and those
-    /// owed to no protocol it registers: what they said is lost, and the protocol learns
+    /// owed to no protocol it registers, and sent messages the backup left out past
+    /// [`super::MAX_CARRIED_SENT_BYTES`]: what they said is lost, and the protocol learns
     /// only how many (`STATE.md`, "What the app owes its protocol"). A duty event.
     #[non_exhaustive]
     RestoreLeftBehind {
@@ -732,6 +733,14 @@ pub enum AppEvent {
         duty_events: u64,
         /// The owed protocol calls left behind.
         owed_calls: u64,
+        /// The sent messages the restored app doesn't know were accepted, each counted once
+        /// (Switch spec 12.4 "Sent messages"): those the backup left out past
+        /// [`super::MAX_CARRIED_SENT_BYTES`], a record of the store restored in place no
+        /// newer than the oldest the backup carries taken as one of them; those this restore
+        /// left out past it; and those of that store, or their give-up marks, that didn't read
+        /// as this app's.
+        /// [`super::App::delivery`] answers `None` for each.
+        sent_messages: u64,
     },
     /// The account the app used is gone: the service answers as for an identity it doesn't
     /// host and the identity publishes no `identity.json`, at every try of the wait (Switch
@@ -777,7 +786,9 @@ pub enum AppEvent {
     /// Also a delivery with a replay deadline not made by it: one a restore put back, a copy
     /// [`super::App::queue_stored`] queued, or a re-send of either (Switch spec 11). Once a
     /// delivery is given up, `queue_stored` refuses the message
-    /// ([`super::WontDeliver::GivenUp`]), so a protocol hears of it once. A duty event.
+    /// ([`super::WontDeliver::GivenUp`]), so a protocol hears of it once. Also a re-send of
+    /// a message a backup carried without its signed plaintext, given up when asked for
+    /// (Switch spec 12.4 "Sent messages"). A duty event.
     #[non_exhaustive]
     MessageUndelivered {
         /// The duty event's ID.
@@ -785,9 +796,12 @@ pub enum AppEvent {
         /// The message ID.
         msg_id: String,
         /// Whether this app had the message accepted before, and only a re-send of it was
-        /// given up. `false` says that this app's store never saw it accepted: a message a
-        /// restore put back, or one queued again with `queue_stored`, may still have been
-        /// delivered by the device the backup came from.
+        /// given up. A give-up never says `false` for a message the store holds as sent,
+        /// those a restore installed from its backup included (Switch spec 12.4 "Sent
+        /// messages"). `false` says only that no acceptance of it is known here, not that
+        /// none happened: a message a restore put back, or one queued again with
+        /// `queue_stored`, may still have been delivered by the device the backup came from,
+        /// and so may one the backup left out past [`super::MAX_CARRIED_SENT_BYTES`].
         resend: bool,
     },
     /// The shared record write a sent message named ([`super::RecordJob`]) was given up:
@@ -1190,6 +1204,7 @@ pub(crate) enum Duty {
     RestoreLeftBehind {
         duty_events: u64,
         owed_calls: u64,
+        sent_messages: u64,
     },
     AccountGone,
     RecordDivergent {
@@ -1340,10 +1355,12 @@ impl Duty {
             Self::RestoreLeftBehind {
                 duty_events,
                 owed_calls,
+                sent_messages,
             } => AppEvent::RestoreLeftBehind {
                 id,
                 duty_events,
                 owed_calls,
+                sent_messages,
             },
             Self::AccountGone => AppEvent::AccountGone { id },
             Self::CertificateRefused { issued_at, refusal } => AppEvent::CertificateRefused {
