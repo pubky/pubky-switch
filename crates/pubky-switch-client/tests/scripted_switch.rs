@@ -121,10 +121,10 @@ impl Setup {
             policy,
             expected_version: RecordVersion::NONE,
             value_sealed: sealed,
-            id_inputs: Some(IdInputs {
+            id_inputs: IdInputs {
                 collection: "example.items".into(),
                 blinded_key: blinded,
-            }),
+            },
         }
     }
 }

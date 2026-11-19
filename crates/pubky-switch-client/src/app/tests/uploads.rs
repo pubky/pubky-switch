@@ -463,7 +463,6 @@ async fn test_upload_divergent_record_stays_through_the_write_it_conflicts_with(
             unreachable!("a record op");
         };
         put.expected_version = version;
-        put.id_inputs = None;
         let op = sign_batch(
             &app_keys("wallet"),
             &lost.w.alice.public(),
@@ -1151,7 +1150,6 @@ async fn test_upload_record_held_is_read_again_under_its_own_collection() {
         unreachable!("a record op");
     };
     put.expected_version = version;
-    put.id_inputs = None;
     let op = sign_batch(
         &app_keys("wallet"),
         &lost.w.alice.public(),
@@ -1359,7 +1357,6 @@ async fn test_upload_records_past_the_mark_cap_still_read_a_held_record_no_listi
         unreachable!("a record op");
     };
     put.expected_version = version;
-    put.id_inputs = None;
     let op = sign_batch(
         &app_keys("wallet"),
         &lost.w.alice.public(),

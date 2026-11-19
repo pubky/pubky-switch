@@ -84,6 +84,10 @@ pub mod derive {
     pub const POLICY: &str = "pubky-switch/v1/policy";
     /// Permanent policy hashes, the first part of their `lp()` (Switch wire 1.5, 6.2).
     pub const PERMANENT_POLICY: &str = "pubky-switch/v1/permanent-policy";
+    /// Policy hashes with a distinct scope for creation (Switch wire 1.5).
+    pub const CREATE_SCOPE_POLICY: &str = "pubky-switch/v1/create-scope-policy";
+    /// Permanent policy hashes with a distinct scope for creation (Switch wire 1.5).
+    pub const PERMANENT_CREATE_SCOPE_POLICY: &str = "pubky-switch/v1/permanent-create-scope-policy";
     /// A sealed value's AAD, the first part of its `lp()` (Switch wire 6.2).
     pub const SEALED: &str = "pubky-switch/v1/sealed";
     /// The Switch root, from the identity secret.

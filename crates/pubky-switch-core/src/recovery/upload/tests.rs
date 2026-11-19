@@ -10,9 +10,9 @@ use crate::claims::{
     Basis, ClaimFields, ClaimLimits, ClaimTally, ClaimType, EntryContext, apply_entry,
 };
 use crate::enc::{b64, pubky_id};
-use crate::ident::Policy;
+use crate::ident::{NamingKey, Policy, collection_id, record_key_from_blinded};
 use crate::keys::{AppKeys, IdentityKey};
-use crate::ops::{BatchRef, OpBody};
+use crate::ops::{BatchRef, IdInputs, OpBody};
 use crate::records::{AppCertBody, IdentityBody, IdentityPolicy, Inbox};
 use crate::recovery::merge_upload_claim;
 use crate::sealed::SealedValue;
@@ -87,12 +87,18 @@ fn op_at(generation: u64, kind: OpKind) -> SignedOp {
 }
 
 fn put(built_on: RecordVersion) -> RecordPut {
+    put_at(built_on, Policy::new(SCOPE, &[SCOPE]))
+}
+
+fn put_at(built_on: RecordVersion, policy: Policy) -> RecordPut {
     let id = identity();
-    let key = [30; 32];
+    let name = "sample.items";
+    let blinded_key = NamingKey::from_root(&id.switch_root()).blind(b"natural");
+    let key = record_key_from_blinded(name, &blinded_key, &policy.hash().unwrap());
     RecordPut {
         key,
-        collection: [31; 32],
-        policy: Policy::new(SCOPE, &[SCOPE]),
+        collection: collection_id(name, &id.public()),
+        policy,
         expected_version: built_on,
         value_sealed: SealedValue::seal(
             &id.scope_key(1, SCOPE),
@@ -103,7 +109,10 @@ fn put(built_on: RecordVersion) -> RecordPut {
             b"{}",
         )
         .unwrap(),
-        id_inputs: None,
+        id_inputs: IdInputs {
+            collection: name.into(),
+            blinded_key,
+        },
     }
 }
 
@@ -189,7 +198,10 @@ fn record_proof(op: &SignedOp, version: RecordVersion, time: u64) -> SignedDoc {
             item_hash: op.item_hash().unwrap(),
         },
     };
-    proof_of(op, version.version, time, b64(&[30; 32]), &state)
+    let OpKind::RecordPut(put) = &op.body().kind else {
+        panic!("record")
+    };
+    proof_of(op, version.version, time, b64(&put.key), &state)
 }
 
 /// The claim after `entries`, as the lost service would show it.
@@ -399,7 +411,10 @@ fn test_upload_out_of_range_proof_counts_as_none() {
                 item_hash: op.item_hash().unwrap(),
             },
         };
-        let proof = proof_of(&op, 60, NOW, b64(&[30; 32]), &state);
+        let OpKind::RecordPut(put) = &op.body().kind else {
+            panic!("record")
+        };
+        let proof = proof_of(&op, 60, NOW, b64(&put.key), &state);
         let checked = check(&body_with(vec![uploaded(&op, Some(proof))], vec![]), &[]);
         assert_eq!(version_of(&checked), bound, "{version:?}");
     }
@@ -590,6 +605,29 @@ fn test_upload_settled_proof_rebuilds_a_tombstone_only_for_nothing_held() {
 }
 
 #[test]
+fn test_upload_record_uses_the_signed_base_for_its_writer_scope() {
+    let policy = Policy::new(SCOPE, &["tasks_update"]).with_create_scope("tasks_create");
+    for (base, scope, accepted) in [
+        (RecordVersion::NONE, "tasks_create", true),
+        (RecordVersion::NONE, "tasks_update", false),
+        (RecordVersion::new(3, 10), "tasks_update", true),
+        (RecordVersion::new(3, 10), "tasks_create", false),
+    ] {
+        let put = put_at(base, policy.clone());
+        let key = put.key;
+        let op = op_at(LOST, OpKind::RecordPut(put));
+        let mut item = uploaded(&op, None);
+        item.cert = cert_with(&[scope], &[]).signed().clone();
+        let checked = check(&body_with(vec![item], vec![]), &[]);
+        assert_eq!(
+            checked.records.first().map(|r| r.put.key),
+            accepted.then_some(key)
+        );
+        assert_eq!(checked.unverified, u64::from(!accepted));
+    }
+}
+
+#[test]
 fn test_upload_record_of_another_collection_or_policy_is_divergent() {
     use crate::recovery::{HeldRecord, RecordMerge, merge_checked_record};
     use crate::shared::RecordState;
@@ -597,8 +635,8 @@ fn test_upload_record_of_another_collection_or_policy_is_divergent() {
     let checked = check(&body_with(vec![uploaded(&op, None)], vec![]), &[]);
     let upload = &checked.records[0];
     let state = RecordState {
-        key: [30; 32],
-        collection: [31; 32],
+        key: upload.put.key,
+        collection: upload.put.collection,
         policy: Policy::new(SCOPE, &[SCOPE]),
         version: RecordVersion::new(3, 5),
         deleted: false,
@@ -659,8 +697,10 @@ fn test_upload_record_that_changes_the_permanent_member_is_divergent() {
         divergent: &[],
     };
     let ordinary = Policy::new(SCOPE, &[SCOPE]);
-    let mut named = put(RecordVersion::new(3, 10));
-    named.policy = ordinary.clone().permanent(Some(1));
+    let named = put_at(
+        RecordVersion::new(3, 10),
+        ordinary.clone().permanent(Some(1)),
+    );
     let named = op_at(LOST, OpKind::RecordPut(named));
     for (op, policy) in [
         (record_op(LOST), ordinary.clone().permanent(None)),
@@ -671,8 +711,8 @@ fn test_upload_record_that_changes_the_permanent_member_is_divergent() {
         let checked = check(&body_with(vec![uploaded(&op, None)], vec![]), &[]);
         let upload = &checked.records[0];
         let state = RecordState {
-            key: [30; 32],
-            collection: [31; 32],
+            key: upload.put.key,
+            collection: upload.put.collection,
             policy: policy.clone(),
             version: RecordVersion::new(3, 5),
             deleted: false,

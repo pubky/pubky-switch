@@ -2770,63 +2770,30 @@ async fn test_upload_known_limit_an_inflated_bound_replaces_a_proved_record() {
 }
 
 #[tokio::test]
-async fn test_upload_known_limit_another_policy_uploaded_first_holds_the_key() {
-    // A known limit (Switch spec 19): at a key the service lacks, a proofless operation with
-    // another policy the uploader's certificate satisfies (an extra write scope; not a create,
-    // so no key derivation binds it) fills the record. The honest proved writes are then
-    // divergent, and a live write with the record's real policy is refused.
+async fn test_upload_preserves_the_named_policy_at_an_empty_key() {
     let Some(replay) = replay().await else { return };
     let (lost, at) = recovered_with_the_wallet(&replay).await;
     let (record, _) = record_and_claim_keys();
     let mut put = vector_record_put();
-    let real_policy = put.policy.clone();
     let mut scopes = put.policy.write_scopes.clone();
     scopes.push("zzz".into());
     scopes.sort();
     put.policy.write_scopes = scopes;
     let forged = wallet_batch(94, 1, vec![(Vec::new(), OpKind::RecordPut(put))]);
     let answer = upload(&replay, &json!({ "records": [proofless(&forged[0])] }), at).await;
-    assert_eq!(
-        json_of(&answer)["result"]["records"],
-        json!([record]),
-        "{}",
-        json_of(&answer)
-    );
+    let result = &json_of(&answer)["result"];
+    assert_eq!(result["records"], json!([]));
+    assert_eq!(result["unverified"], json!(1));
     let honest = json!({
         "lost_identity": lost.signed(),
         "records": [uploaded_op(6, Some(CREATED)), uploaded_op(8, Some(UPDATED))],
     });
     let answer = upload(&replay, &honest, at).await;
-    assert_eq!(
-        json_of(&answer)["result"]["divergent"],
-        json!([record]),
-        "{}",
-        json_of(&answer)
-    );
+    let result = &json_of(&answer)["result"];
+    assert_eq!(result["records"], json!([record]));
+    assert_eq!(result["divergent"], json!([]));
     let view = wallet_get(&replay, &format!("records/{record}"), at).await;
-    let mut write = vector_record_put();
-    write.policy = real_policy;
-    write.expected_version = RecordVersion::new(
-        view["generation"].as_u64().expect("generation"),
-        view["version"].as_u64().expect("version"),
-    );
-    let batch = |id: u8, write: &RecordPut| {
-        wallet_batch(id, 2, vec![(Vec::new(), OpKind::RecordPut(write.clone()))])
-    };
-    let mut answer = wallet_ops(&replay, &batch(95, &write), at).await;
-    if code(&answer).1 == "stale_epoch" {
-        let epoch = json_of(&answer)["current"]["data_epoch"]
-            .as_u64()
-            .expect("epoch");
-        write.value_sealed.data_epoch = epoch;
-        answer = wallet_ops(&replay, &batch(96, &write), at).await;
-    }
-    assert_eq!(
-        code(&answer),
-        (400, "bad_request".into()),
-        "{}",
-        String::from_utf8_lossy(&answer.body)
-    );
+    assert_eq!(view["op"], json!(vector_op(8).signed()));
     replay.db.drop_database().await.expect("drop");
 }
 

@@ -735,7 +735,10 @@ fn record_at_policy(
             &[4; 24],
         )
         .expect("sealed record"),
-        id_inputs: None,
+        id_inputs: pubky_switch_core::ops::IdInputs {
+            collection: "tasks.items".into(),
+            blinded_key: key,
+        },
     };
     let op = SignedOp::sign(
         &app,
@@ -1119,6 +1122,7 @@ async fn test_store_record_write_of_another_policy_is_refused() {
     // spec 10.3.1), is refused, and the row keeps what it held.
     let ordinary = Policy::new("tasks", &["tasks"]);
     for (collection, policy) in [
+        ([1; 32], ordinary.clone().with_create_scope("tasks_admin")),
         ([1; 32], ordinary.clone().permanent(None)),
         ([1; 32], ordinary.clone().permanent(Some(1))),
         ([1; 32], Policy::new("tasks", &["tasks", "tasks_people"])),

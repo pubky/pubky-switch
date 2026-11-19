@@ -140,6 +140,118 @@ fn test_vectors_operations() {
     check_permanent_policies(&keys, &identity, &by_name["record.put create"]);
 }
 
+/// A single permanent record created by one app and updated by another (Switch wire 6.2).
+#[test]
+fn test_vectors_record_create_scope() {
+    use pubky_switch_core::ident::{Policy, collection_id, record_key_from_blinded};
+    use pubky_switch_core::ops::{IdInputs, RecordPut, RecordVersion};
+    use pubky_switch_core::sealed::SealedValue;
+
+    let keys = keys();
+    let identity = keys.identity("alice");
+    let certs = certificates(&identity);
+    let policy = Policy::new("tasks", &["tasks_share_run"])
+        .with_create_scope("tasks_people_admin")
+        .permanent(None);
+    let ids = load("identifiers.json");
+    let share = arr(&ids, "record_keys")
+        .iter()
+        .find(|case| st(case, "name") == "shares record")
+        .unwrap();
+    let inputs = IdInputs {
+        collection: "share_counts".to_owned(),
+        blinded_key: b64n(st(share, "blinded_natural_key")),
+    };
+    let key = record_key_from_blinded(
+        &inputs.collection,
+        &inputs.blinded_key,
+        &policy.hash().unwrap(),
+    );
+    let scope_key =
+        IdentityKey::from_secret(keys.identity_secrets[&identity]).scope_key(2, "tasks");
+    let cases = [
+        ("wallet creates", "wallet", RecordVersion::NONE, 0, true),
+        (
+            "executor updates",
+            "executor",
+            RecordVersion::new(1, 6),
+            1,
+            true,
+        ),
+        (
+            "wallet updates",
+            "wallet",
+            RecordVersion::new(1, 6),
+            1,
+            false,
+        ),
+        (
+            "executor creates",
+            "executor",
+            RecordVersion::NONE,
+            0,
+            false,
+        ),
+    ];
+    let mut output = Vec::new();
+    for (name, writer, expected_version, value, allowed) in cases {
+        let app = keys.app(writer);
+        let app_id = app_id_decode(&app.app_id).unwrap();
+        let json = serde_json::to_vec(&json!({ "count": value })).unwrap();
+        let nonce = seed(&format!("operations/create-scope/{name}/nonce"))[..24]
+            .try_into()
+            .unwrap();
+        let value_sealed =
+            SealedValue::seal_with_nonce(&scope_key, &identity, 2, "tasks", &key, &json, &nonce)
+                .unwrap();
+        let put = RecordPut {
+            key,
+            collection: collection_id(&inputs.collection, &identity),
+            policy: policy.clone(),
+            expected_version,
+            value_sealed,
+            id_inputs: inputs.clone(),
+        };
+        let batch = seed(&format!("operations/create-scope/{name}/batch"))[..16]
+            .try_into()
+            .unwrap();
+        let signer = SwitchAppKeys::from_secrets(app.signing_secret, app.bundle_secret);
+        let signed = ops::sign_batch(
+            &signer,
+            &identity,
+            Some(app_id),
+            1,
+            batch,
+            vec![(Vec::new(), OpKind::RecordPut(put))],
+        )
+        .unwrap()
+        .remove(0);
+        let op = SignedOp::verify(
+            signed.signed(),
+            &app.signing_public,
+            &identity,
+            Some(&app_id),
+        )
+        .unwrap();
+        check_shape(op.body()).unwrap();
+        let permission = check_permission(&op.body().kind, Writer::App(&certs[&app_id]));
+        let expect = if allowed {
+            permission.unwrap();
+            json!({ "valid": true })
+        } else {
+            let refused = permission.unwrap_err();
+            assert_eq!(refused.status(), 403);
+            json!({ "status": refused.status(), "code": refused.code.as_str() })
+        };
+        let body = String::from_utf8(op.body().to_json().unwrap()).unwrap();
+        output.push(json!({"name": name, "writer": writer, "body": body, "signed": op.signed(), "expect": expect}));
+    }
+    generated(
+        "operations.json",
+        &[(Place::Member("/create_scope"), json!({"cases":output}))],
+    );
+}
+
 /// One case of `shape_rejections`: the operation `based_on` with each `(from, to)` of
 /// `changes` made in its signed body, signed again by its writer, so its signature verifies
 /// and only the shape check (Switch wire 6.4 step 9) decides.
@@ -416,7 +528,7 @@ fn check_permanent_policies(keys: &Keys, identity: &[u8; 32], create: &SignedOp)
     let OpKind::RecordPut(base) = &create.body().kind else {
         panic!("record.put create is a record.put");
     };
-    let inputs = base.id_inputs.as_ref().unwrap();
+    let inputs = &base.id_inputs;
     let sealed = &base.value_sealed;
     let scope_key = IdentityKey::from_secret(keys.identity_secrets[identity])
         .scope_key(sealed.data_epoch, &sealed.scope);

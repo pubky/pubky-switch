@@ -2,9 +2,7 @@
 
 **Status.** Complete; a review candidate, with the Pubky Switch spec. The wire format of `spec/spec.md` ("the spec"). The spec decides behaviour; this document decides bytes. It settles every wire detail the spec leaves open, taking the reference prototype as the source of truth, so that a second team can build an interoperable switch, signer or app without reading the prototype. Where this document had to choose something the prototype doesn't fix, Appendix A says so.
 
-**Named record authority.** Sections 1.5 and 6.2 specify the next record format. Until the client and service implement it and the corresponding vectors and examples are updated together, the executable examples use one set of write scopes and carry the address inputs on creation. A deployment adopts the new format as a whole.
-
-**Test vectors.** `spec/vectors/` holds the executable vectors for the current encodings, signatures, derivations, envelopes and state transitions. Its `README.md` lists the files. The runtime that adopts separate creation authority adds the corresponding record vectors. Every example in this document comes from those files and uses the fixed keys of `keys.json` (identities alice and bob, alice's apps `wallet`, `phone` and `executor`, bob's apps `shop` and `cap`), except the `429 quota_exceeded` body of 9.3, which is the reference prototype's answer and says so. The JSON samples in this document, like the test vectors and the prose, use the scopes, message kinds, collections and app record member of the spec's sample protocol, `tasks` (spec 1). The switch treats every protocol's names as opaque. The reference prototype, shared separately, computes every vector from its code, but for the cases the vectors README lists as `pubky-switch-core`'s, which that crate's tests compute.
+**Test vectors.** `spec/vectors/` holds the executable vectors for the current encodings, signatures, derivations, envelopes and state transitions. Its `README.md` lists the files. The signed `create_scope` cases in `operations.json` cover separate creation and update authority. Every example in this document comes from those files and uses the fixed keys of `keys.json` (identities alice and bob, alice's apps `wallet`, `phone` and `executor`, bob's apps `shop` and `cap`), except the `429 quota_exceeded` body of 9.3, which is the reference prototype's answer and says so. The JSON samples in this document, like the test vectors and the prose, use the scopes, message kinds, collections and app record member of the spec's sample protocol, `tasks` (spec 1). The switch treats every protocol's names as opaque. The reference prototype, shared separately, computes every vector from its code, but for the cases the vectors README lists as `pubky-switch-core`'s, which that crate's tests compute.
 
 **Conventions.**
 
@@ -123,7 +121,7 @@ Vectors: `encoding.json` `lp` and `u64_be`.
 
 - **Whose naming key.** Record keys, and a protocol's claim keys, are blinded with the naming key of the identity whose Pubky Switch holds them. Equal inputs give equal outputs within one identity, so all its apps find the same record and claim, and the stored keys name neither the counterparty nor the other inputs. That protects stored state and exports, not against a live operator, which links records and claims to senders through batches and timing (spec 15).
 
-Vectors: `encoding.json` `derive`; `keys.json` the Switch root, naming key and backup key of each identity, `scope_keys` and `sub_scope_keys`; `identifiers.json` contains the current policy hashes and record keys with their blinded inputs, using the collections and natural keys of `tasks`. The new hashes and record keys for policies with a `create_scope` arrive with the runtime that implements them.
+Vectors: `encoding.json` `derive`; `keys.json` the Switch root, naming key and backup key of each identity, `scope_keys` and `sub_scope_keys`; `identifiers.json` contains the current policy hashes and record keys with their blinded inputs, using the collections and natural keys of `tasks`. The `create_scope` cases cover both policy hashes and the permanent record address.
 
 ### 1.6 Times
 
@@ -1345,8 +1343,8 @@ A failed condition is `409 conflict`, with the current value the caller may read
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
-    "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
+    "chain_hash": "OBvFmm31EK6JGMWD0IHtEfEohrnSuy_2uZTI51dqTU4",
+    "sig": "WPcnWs86LNGf7rYwiDZyHm67uQlJGeqCb3DXPUbStQUBYhGZfwXOeYVRHsAAZs4Ik5tu3Glo820ntgMJMfIBCQ"
   }
 }
 ```
@@ -1521,11 +1519,11 @@ A signed head is a JSON object (not a signed document):
 
 ```json
 {
-  "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
+  "chain_hash": "OBvFmm31EK6JGMWD0IHtEfEohrnSuy_2uZTI51dqTU4",
   "chain_version": 1,
   "generation": 1,
   "seq": 9,
-  "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
+  "sig": "WPcnWs86LNGf7rYwiDZyHm67uQlJGeqCb3DXPUbStQUBYhGZfwXOeYVRHsAAZs4Ik5tu3Glo820ntgMJMfIBCQ"
 }
 ```
 
@@ -2004,12 +2002,12 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 8,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "L0v5_hmltlaZgDMwk4pDQeO0KqqDwXeRvtBGVY5z0Q4"
+        "chain_hash": "hmoUYsmVJfFs_P5k1-9LaZvv4a2T6OzpxXs8BnkD7C0"
       },
       "item_type": "op",
       "item": {
         "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-        "sig": "MJnPcjmxKygWKsQud4bULoc8pwfT6ISIr1kM6O_O4H_PnGkhcvoR5Wl2_sEB20B3-XEkueQS-p-ZKqi58HHRBg"
+        "sig": "T-NlzS4MOYVXPR-RxKkWcG76bIxOoYeWirNrSRFnJGuLQRiG_wYiipa6IVn0sfYBlWY-3rL3gfTSuamtvi8DCA"
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
@@ -2021,7 +2019,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 9,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA"
+        "chain_hash": "OBvFmm31EK6JGMWD0IHtEfEohrnSuy_2uZTI51dqTU4"
       },
       "item_type": "service",
       "item": {
@@ -2038,8 +2036,8 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
-    "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
+    "chain_hash": "OBvFmm31EK6JGMWD0IHtEfEohrnSuy_2uZTI51dqTU4",
+    "sig": "WPcnWs86LNGf7rYwiDZyHm67uQlJGeqCb3DXPUbStQUBYhGZfwXOeYVRHsAAZs4Ik5tu3Glo820ntgMJMfIBCQ"
   }
 }
 ```

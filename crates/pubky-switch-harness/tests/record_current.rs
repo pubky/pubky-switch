@@ -123,10 +123,10 @@ impl Writer {
                 value,
             )
             .unwrap(),
-            id_inputs: (expected == RecordVersion::NONE).then(|| IdInputs {
+            id_inputs: IdInputs {
                 collection: COLLECTION.into(),
                 blinded_key,
-            }),
+            },
         }
     }
 

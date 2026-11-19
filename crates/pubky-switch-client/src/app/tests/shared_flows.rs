@@ -3195,6 +3195,244 @@ async fn join_scoped(s: &Setup, name: &str, scopes: &[&str]) -> App {
         .unwrap()
 }
 
+fn split_role_target(s: &Setup) -> RecordTarget {
+    let collection = Collection::new(
+        "sample.items",
+        Policy::new("sample-a", &["sample-update"])
+            .with_create_scope("sample-create")
+            .permanent(None),
+    );
+    *s.protocol.collections.lock().unwrap() = Some(vec![collection.clone()]);
+    RecordTarget::new(collection, b"shared")
+}
+
+/// A creator and an updater operate on the same permanent named record. Both verify
+/// the original application on read, including the creator after reloading its store.
+#[tokio::test]
+async fn test_records_split_role_create_and_update_share_the_signed_address() {
+    let s = Setup::new();
+    let target = split_role_target(&s);
+    let mut creator = join_scoped(&s, "wallet", &["sample-a", "sample-create"]).await;
+    let mut updater = join_scoped(&s, "phone", &["sample-a", "sample-update"]).await;
+    assert!(matches!(
+        updater.put_record(&target, &value(&["a"]), vec![]).await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    creator
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = creator.record_key(&target).unwrap();
+    assert_eq!(updater.record_key(&target).unwrap(), key);
+    assert!(
+        matches!(updater.read_record_fresh(&target).await.unwrap(), RecordRead::Fresh(record)
+        if ids(record.content.value()) == ["a"])
+    );
+    assert!(matches!(
+        creator
+            .put_record(&target, &value(&["a", "b"]), vec![])
+            .await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    updater
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+
+    let mut creator = App::load(
+        s.env(),
+        s.protocol.clone(),
+        World::config(),
+        creator.app_id(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(creator.read_record_fresh(&target).await.unwrap(), RecordRead::Fresh(record)
+        if ids(record.content.value()) == ["a", "b"])
+    );
+    let ops = s.w.switch.applied();
+    let writes: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match &op.body().kind {
+            OpKind::RecordPut(put) if put.key == key => Some(put),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(writes.len(), 2);
+    assert!(writes[0].expected_version.is_none());
+    assert!(!writes[1].expected_version.is_none());
+    assert_eq!(writes[0].id_inputs, writes[1].id_inputs);
+    assert!(
+        writes
+            .iter()
+            .all(|put| put.check_address(&s.w.alice.public()).is_ok())
+    );
+}
+
+/// A reader has the signed original and its writer's valid certificate but has yet to
+/// authenticate when the original was applied. On reopen the proof settles that same item.
+#[tokio::test]
+async fn test_records_split_role_read_waits_for_the_original_write_time() {
+    let s = Setup::new();
+    let target = split_role_target(&s);
+    let mut writer = join_scoped(&s, "wallet", &["sample-a", "sample-create"]).await;
+    let mut reader = join_scoped(&s, "phone", &["sample-a"]).await;
+    writer
+        .put_record(&target, &value(&["original"]), vec![])
+        .await
+        .unwrap();
+    reader.refresh_identity().await.unwrap();
+    reader.refresh_own_apps().await.unwrap();
+    s.w.switch.lock().shared.hide_proofs = true;
+    assert!(matches!(
+        reader.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Kept { .. }
+    ));
+    let key = reader.record_key(&target).unwrap();
+    assert!(reader.shared_record(&key).await.unwrap().is_none());
+    let mut reader = App::load(
+        s.env(),
+        s.protocol.clone(),
+        World::config(),
+        reader.app_id(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        reader.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Kept { .. }
+    ));
+    s.w.switch.lock().shared.hide_proofs = false;
+    assert!(
+        matches!(reader.read_record_fresh(&target).await.unwrap(), RecordRead::Fresh(record)
+        if ids(record.content.value()) == ["original"])
+    );
+}
+
+/// A fresh installation of the original writer has the same signing key and a backup
+/// taken before the write. It needs a date to use that signed write under separate roles.
+#[tokio::test]
+async fn test_records_split_role_restored_own_key_waits_for_original_authority() {
+    let s = Setup::new();
+    let target = split_role_target(&s);
+    let mut writer = join_scoped(&s, "wallet", &["sample-a", "sample-create"]).await;
+    let backup = writer.backup().await.unwrap();
+    writer
+        .put_record(&target, &value(&["original"]), vec![])
+        .await
+        .unwrap();
+    let key = writer.record_key(&target).unwrap();
+    let id = writer.app_id();
+    drop(writer);
+
+    let fresh = Arc::new(MemoryStore::new());
+    let env = || s.env_on(fresh.clone());
+    let mut own = Box::pin(App::restore(
+        env(),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(own.app_id(), id);
+    s.w.switch.lock().shared.hide_proofs = true;
+    for reload in [false, true] {
+        if reload {
+            drop(own);
+            own = App::load(env(), s.protocol.clone(), World::config(), id)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            own.read_record_fresh(&target).await.unwrap(),
+            RecordRead::Kept {
+                reason: KeptReason::Refused,
+                ..
+            }
+        ));
+        assert!(own.shared_record(&key).await.unwrap().is_none());
+    }
+    s.w.switch.lock().shared.hide_proofs = false;
+    let RecordRead::Fresh(record) = own.read_record_fresh(&target).await.unwrap() else {
+        panic!("the dated original should qualify");
+    };
+    assert_eq!(record.writer, id);
+    assert_eq!(ids(record.content.value()), ["original"]);
+}
+
+/// When a writer renews the same signing key, both grants can hold the create scope.
+/// The later listed grant cannot stand in for the one in force at the verified write.
+#[tokio::test]
+async fn test_records_split_role_keeps_the_grant_issued_by_the_original_write_time() {
+    let s = Setup::new();
+    let target = split_role_target(&s);
+    let mut writer = join_scoped(&s, "wallet", &["sample-a", "sample-create"]).await;
+    let first = writer.cert().clone();
+    let mut reader = s.join("phone").await;
+    reader.receive(None).await.unwrap();
+    reader.refresh_own_apps().await.unwrap();
+    writer
+        .put_record(&target, &value(&["original"]), vec![])
+        .await
+        .unwrap();
+
+    s.w.clock.advance_ms(HOUR);
+    let renewed = renewed_cert(
+        &s,
+        "wallet",
+        &["sample-a", "sample-create", "sample-update"],
+    );
+    s.w.next_doc(|body| list_renewal(body, &first, &renewed, None));
+    writer.receive(None).await.unwrap();
+    assert_eq!(writer.cert().hash(), renewed.hash());
+    reader.refresh_identity().await.unwrap();
+    reader.refresh_own_apps().await.unwrap();
+    reader.receive(None).await.unwrap();
+
+    let key = reader.record_key(&target).unwrap();
+    let held = reader.shared_record(&key).await.unwrap().unwrap();
+    let written_at = held.written_at_ms.unwrap();
+    assert!(first.issued_at() <= written_at && written_at < renewed.issued_at());
+    assert_eq!(ids(held.content.value()), ["original"]);
+    let evidence = reader.shared_evidence().await.unwrap();
+    assert_eq!(evidence.ops.len(), 1);
+    assert_eq!(evidence.ops[0].cert, *first.signed());
+}
+
+/// A scope family admits only its exact create role as well as its read and update roles.
+#[test]
+fn test_records_split_role_fixed_and_family_members_keep_the_create_scope() {
+    let policy = Policy::new("sample-a", &["sample-update"]).with_create_scope("sample-a");
+    let fixed = Collection::new("sample.items", policy.clone());
+    assert!(fixed.admits(&policy));
+    assert!(!fixed.admits(&Policy::new("sample-a", &["sample-update"])));
+    let family = Collection::with_sub_scopes("sample.items", policy);
+    let shop = family.sub_scope_policy("shop").unwrap();
+    assert_eq!(shop.create_scope.as_deref(), Some("sample-a:shop"));
+    assert!(family.admits(&shop));
+    assert!(!family.admits(&shop.clone().with_create_scope("sample-a")));
+    let separate = Collection::with_sub_scopes(
+        "sample.items",
+        family.policy.clone().with_create_scope("sample-create"),
+    );
+    assert_eq!(
+        separate
+            .sub_scope_policy("shop")
+            .unwrap()
+            .create_scope
+            .as_deref(),
+        Some("sample-create")
+    );
+
+    let generations =
+        Collection::with_permanent_generations("sample.items", "sample-a", &["sample-update"]);
+    let member = generations.policy.clone().permanent(Some(2));
+    assert!(generations.admits(&member));
+    assert!(!generations.admits(&member.with_create_scope("sample-create")));
+}
+
 /// A certificate renewing `name`'s with `scopes`, issued now.
 fn renewal_of(s: &Setup, name: &str, scopes: &[&str]) -> AppCert {
     let app = AppSpec::new(scopes).with_permissions(&ALL_PERMISSIONS);

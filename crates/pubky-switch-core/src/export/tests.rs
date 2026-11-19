@@ -112,9 +112,12 @@ fn op_by(signer: &AppKeys, kind: OpKind, batch: BatchRef) -> SignedOp {
 }
 
 fn record_put() -> RecordPut {
+    record_at_policy(Policy::new(SCOPE, &[SCOPE]))
+}
+
+fn record_at_policy(policy: Policy) -> RecordPut {
     let id = identity();
     let naming = NamingKey::from_root(&id.switch_root());
-    let policy = Policy::new(SCOPE, &[SCOPE]);
     let blinded = naming.blind(b"natural");
     let key = record_key_from_blinded("sample.collection", &blinded, &policy.hash().unwrap());
     let sealed =
@@ -125,10 +128,10 @@ fn record_put() -> RecordPut {
         policy,
         expected_version: RecordVersion::NONE,
         value_sealed: sealed,
-        id_inputs: Some(crate::ops::IdInputs {
+        id_inputs: crate::ops::IdInputs {
             collection: "sample.collection".into(),
             blinded_key: blinded,
-        }),
+        },
     }
 }
 
@@ -381,8 +384,8 @@ fn fixture_of(write_signer: &AppKeys, attempt_signer: &AppKeys, put: RecordPut) 
     all.push(Part::Record(RecordEntry {
         key: put.key,
         collection: put.collection,
-        read_scope: SCOPE.into(),
-        write_scopes: vec![SCOPE.into()],
+        read_scope: put.policy.read_scope.clone(),
+        write_scopes: put.policy.write_scopes.clone(),
         generation: 1,
         version: 4,
         op: None,
@@ -1918,24 +1921,38 @@ fn test_activation_records() {
 }
 
 #[test]
+fn test_activation_records_require_the_original_role_and_named_address() {
+    for (base, create, update, accepted) in [
+        (RecordVersion::NONE, SCOPE, "tasks_update", true),
+        (RecordVersion::NONE, "tasks_create", SCOPE, false),
+        (RecordVersion::new(1, 1), "tasks_create", SCOPE, true),
+        (RecordVersion::new(1, 1), SCOPE, "tasks_update", false),
+    ] {
+        let mut put = record_at_policy(Policy::new(SCOPE, &[update]).with_create_scope(create));
+        put.expected_version = base;
+        let result = fixture_of(&app(), &app(), put).run();
+        if accepted {
+            result.unwrap();
+        } else {
+            refused(result, ErrorCode::Conflict, "scope for its signed base");
+        }
+    }
+    let mut put = record_put();
+    put.expected_version = RecordVersion::new(1, 1);
+    put.id_inputs.blinded_key[0] ^= 1;
+    refused(
+        fixture_of(&app(), &app(), put).run(),
+        ErrorCode::Conflict,
+        "derived from id_inputs",
+    );
+}
+
+#[test]
 fn test_activation_records_permanent_rule() {
     // The fixture's record is created in generation 1: at a policy naming generation 1 it
     // imports; at one naming generation 2 its create breaks the rule (Switch wire 6.2, 10.5).
     let at = |generation: u64| {
-        let mut put = record_put();
-        put.policy = put.policy.permanent(Some(generation));
-        let blinded = NamingKey::from_root(&identity().switch_root()).blind(b"natural");
-        put.key =
-            record_key_from_blinded("sample.collection", &blinded, &put.policy.hash().unwrap());
-        put.value_sealed = SealedValue::seal(
-            &identity().scope_key(1, SCOPE),
-            &identity().public(),
-            1,
-            SCOPE,
-            &put.key,
-            b"{}",
-        )
-        .unwrap();
+        let put = record_at_policy(Policy::new(SCOPE, &[SCOPE]).permanent(Some(generation)));
         fixture_of(&app(), &app(), put)
     };
     at(1).run().unwrap();

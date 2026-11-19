@@ -11,7 +11,7 @@ use super::read::{
 use crate::claims::ClaimFields;
 use crate::enc::{app_id_bytes, b64, lp, pubky_id, zbase32_encode};
 use crate::error::{Error, Result, invalid};
-use crate::ident::{Permanent, Policy};
+use crate::ident::{Permanent, Policy, collection_id, record_key_from_blinded};
 use crate::json::{Doc, parse_json_as};
 use crate::labels;
 use crate::records::KeyBundle;
@@ -374,7 +374,7 @@ impl AllowKind {
     }
 }
 
-/// The blinded inputs a creating `record.put` carries, from which the service recomputes the
+/// The blinded inputs each signed `record.put` carries, from which the service recomputes the
 /// record key (Switch wire 1.5, 6.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdInputs {
@@ -391,14 +391,39 @@ pub struct RecordPut {
     pub key: [u8; 32],
     /// The collection ID (Switch wire 1.5), not the name.
     pub collection: [u8; 32],
-    /// The policy: `read_scope` and `write_scopes`, fixed at creation.
+    /// The immutable read, create and update policy.
     pub policy: Policy,
     /// The version the writer read, or `{0, 0}` to create.
     pub expected_version: RecordVersion,
     /// The sealed value; a sealed empty plaintext is a delete.
     pub value_sealed: SealedValue,
-    /// The blinded inputs of the key, on a create, and only then.
-    pub id_inputs: Option<IdInputs>,
+    /// The named inputs of the collection ID and record key.
+    pub id_inputs: IdInputs,
+}
+
+impl RecordPut {
+    /// Verify the named collection and physical key against this signed write (Switch wire 1.5).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid policy or a derived identifier that differs.
+    pub fn check_address(&self, identity: &[u8; 32]) -> Result<()> {
+        let inputs = &self.id_inputs;
+        if collection_id(&inputs.collection, identity) != self.collection {
+            return invalid("Switch wire 6.2: collection isn't the ID of id_inputs.collection");
+        }
+        let key = record_key_from_blinded(
+            &inputs.collection,
+            &inputs.blinded_key,
+            &self.policy.hash()?,
+        );
+        if key != self.key {
+            return invalid(
+                "Switch wire 6.2: key isn't derived from id_inputs and the policy hash",
+            );
+        }
+        Ok(())
+    }
 }
 
 /// The members of an `invite_code.put` (Switch wire 6.2, Switch spec 7).
@@ -571,6 +596,7 @@ fn type_members(op: &str) -> Option<&'static [&'static str]> {
             "collection",
             "read_scope",
             "write_scopes",
+            "create_scope",
             "permanent",
             "expected_version",
             "value_sealed",
@@ -659,6 +685,9 @@ impl OpKind {
                     .str("collection", &b64(&put.collection))
                     .str("read_scope", &put.policy.read_scope)
                     .raw("write_scopes", &string_array(&put.policy.write_scopes));
+                if let Some(scope) = &put.policy.create_scope {
+                    o.str("create_scope", scope);
+                }
                 if let Some(permanent) = &put.policy.permanent {
                     let mut p = Obj::new();
                     match permanent.generation {
@@ -675,12 +704,11 @@ impl OpKind {
                     .str("nonce", &b64(&sealed.nonce))
                     .str("ct", &b64(&sealed.ct));
                 o.raw("value_sealed", &s.finish());
-                if let Some(inputs) = &put.id_inputs {
-                    let mut i = Obj::new();
-                    i.str("collection", &inputs.collection)
-                        .str("blinded_key", &b64(&inputs.blinded_key));
-                    o.raw("id_inputs", &i.finish());
-                }
+                let mut inputs = Obj::new();
+                inputs
+                    .str("collection", &put.id_inputs.collection)
+                    .str("blinded_key", &b64(&put.id_inputs.blinded_key));
+                o.raw("id_inputs", &inputs.finish());
             }
             OpKind::AllowPut { pubky, kind } | OpKind::AllowDelete { pubky, kind } => {
                 o.str("pubky", &pubky_id(pubky)).str("kind", kind.as_str());
@@ -793,16 +821,15 @@ fn read_record_put(v: &Value) -> Result<RecordPut> {
         None => None,
         Some(member) => Some(read_permanent(member)?),
     };
-    let id_inputs = match opt(v, "id_inputs") {
-        None => None,
-        Some(inputs) => {
-            let what = "id_inputs";
-            only(inputs, &["collection", "blinded_key"], what)?;
-            Some(IdInputs {
-                collection: req_str(inputs, "collection", what)?.to_owned(),
-                blinded_key: req_b64n::<32>(inputs, "blinded_key", what)?,
-            })
-        }
+    let create_scope = v
+        .get("create_scope")
+        .map(|scope| text(scope, "create_scope", what).map(str::to_owned))
+        .transpose()?;
+    let inputs = req(v, "id_inputs", what)?;
+    only(inputs, &["collection", "blinded_key"], "id_inputs")?;
+    let id_inputs = IdInputs {
+        collection: req_str(inputs, "collection", "id_inputs")?.to_owned(),
+        blinded_key: req_b64n::<32>(inputs, "blinded_key", "id_inputs")?,
     };
     Ok(RecordPut {
         key: req_b64n::<32>(v, "key", what)?,
@@ -810,6 +837,7 @@ fn read_record_put(v: &Value) -> Result<RecordPut> {
         policy: Policy {
             read_scope: req_str(v, "read_scope", what)?.to_owned(),
             write_scopes,
+            create_scope,
             permanent,
         },
         expected_version: RecordVersion::read(req(v, "expected_version", what)?, what)?,

@@ -121,9 +121,9 @@ impl Observation {
         .map_err(|_| super::corrupt())?;
         if !matches!((&op.body().kind, &deletion.body().kind), (OpKind::RecordPut(put), OpKind::RecordPut(d))
             if put.key == self.key && put.collection == d.collection && put.policy == d.policy
-            && put.policy.read_scope == put.value_sealed.scope
+            && put.check_address(identity).is_ok() && put.policy.read_scope == put.value_sealed.scope
             && !put.value_sealed.looks_like_delete()
-            && put.policy.write_scopes.iter().any(|scope| cert.holds_scope(scope)))
+            && put.policy.write_scopes_for(put.expected_version).iter().any(|scope| cert.holds_scope(scope)))
         {
             return Err(super::corrupt());
         }
@@ -218,6 +218,7 @@ impl Observation {
         };
         if signed.item_hash()? != self.delete.item_hash
             || deletion.key != self.key
+            || deletion.check_address(identity).is_err()
             || !deletion.value_sealed.looks_like_delete()
             || !owner.protocol.collections().iter().any(|c| {
                 c.name == self.collection
@@ -226,7 +227,7 @@ impl Observation {
             })
             || !deletion
                 .policy
-                .write_scopes
+                .write_scopes_for(deletion.expected_version)
                 .iter()
                 .any(|scope| cert.holds_scope(scope))
         {

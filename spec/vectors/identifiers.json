@@ -235,6 +235,29 @@
       "write_scopes": [
         "tasks_share"
       ]
+    },
+    {
+      "create_scope": "tasks_people_admin",
+      "hashed_bytes_hex": "000000237075626b792d7377697463682f76312f6372656174652d73636f70652d706f6c696379000000057461736b73000000127461736b735f70656f706c655f61646d696e0000000800000000000000010000000f7461736b735f73686172655f72756e",
+      "name": "share_counts, separate create scope",
+      "policy_hash": "nyOxrzQaZi2fw8danC5vY3dH4Dken9vgEkD2UFMhvqI",
+      "read_scope": "tasks",
+      "write_scopes": [
+        "tasks_share_run"
+      ]
+    },
+    {
+      "create_scope": "tasks_people_admin",
+      "hashed_bytes_hex": "0000002d7075626b792d7377697463682f76312f7065726d616e656e742d6372656174652d73636f70652d706f6c696379000000057461736b73000000127461736b735f70656f706c655f61646d696e0000000800000000000000010000000f7461736b735f73686172655f72756e000000080000000000000000",
+      "name": "share_counts, separate create scope and permanent",
+      "permanent": {
+        "generation": null
+      },
+      "policy_hash": "IwQnKWjdv3fAy7e9DYy167bW-k-2igQ-QeR6hYqj00s",
+      "read_scope": "tasks",
+      "write_scopes": [
+        "tasks_share_run"
+      ]
     }
   ],
   "record_keys": [
@@ -358,6 +381,17 @@
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130000000080000000000000001",
       "policy_hash": "79EzDI3YUYDYyzbUjMx4XIm-CCp5ElkGv2pza5t9PeY",
       "record_key": "pK0fJXxSiiIBxU29kRdkC9ouGC5qihwotrtl2CyVlf8"
+    },
+    {
+      "blinded_natural_key": "Oxopz3LACgMflA28iT70nXgVSE59SejhqurMR-L9CIA",
+      "collection": "share_counts",
+      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "key_material_hex": "0000000c73686172655f636f756e7473000000203b1a29cf72c00a031f940dbc893ef49d7815484e7d49e8e1aaeacc47e2fd0880000000202304272968ddbf77c0cbb7bd0d8cb5ebb6d6fa4fb68a043e41e47a858aa3d34b",
+      "name": "share_counts record with a separate create scope",
+      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
+      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "policy_hash": "IwQnKWjdv3fAy7e9DYy167bW-k-2igQ-QeR6hYqj00s",
+      "record_key": "9XkM8-cMjNmJrSiYJ578yPBf5lj_fdSsUGbenlEz8hw"
     }
   ]
 }

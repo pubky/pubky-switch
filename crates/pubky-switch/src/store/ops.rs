@@ -529,7 +529,7 @@ impl AccountTxn {
         let state = &record.state;
         // The write it replaces shows as its stub from now on (Switch wire 7.5).
         let replaced = sqlx::query(
-            "SELECT generation, version, collection, read_scope, write_scopes, permanent, \
+            "SELECT generation, version, collection, read_scope, write_scopes, create_scope, permanent, \
              permanent_generation FROM shared_records WHERE account_id = $1 AND key = $2",
         )
         .bind(&id)
@@ -539,19 +539,7 @@ impl AccountTxn {
         .map_err(db)?;
         if let Some(row) = replaced {
             let collection: Vec<u8> = row.try_get("collection")?;
-            let read_scope: String = row.try_get("read_scope")?;
-            let write_scopes: Vec<String> = row.try_get("write_scopes")?;
-            let permanent: bool = row.try_get("permanent")?;
-            let named: Option<i64> = row.try_get("permanent_generation")?;
-            let named = named
-                .map(|g| from_db(g, "permanent_generation"))
-                .transpose()?;
-            if collection != state.collection
-                || read_scope != state.policy.read_scope
-                || write_scopes != state.policy.write_scopes
-                || permanent != state.policy.permanent.is_some()
-                || named != state.policy.permanent.and_then(|p| p.generation)
-            {
+            if collection != state.collection || record_policy(&row)? != state.policy {
                 return Err(StoreError::Corrupt(
                     "a record write of another collection or policy than the record it replaces",
                 ));
@@ -582,9 +570,9 @@ impl AccountTxn {
              generation, version, deleted, value_bytes, writer, cert, op, proof, from_upload, \
              upload_seq, version_exact, upload_base_generation, upload_base_version, \
              upload_base_op_hash, application_generation, application_seq, application_item_hash, \
-             permanent, permanent_generation) \
+             permanent, permanent_generation, create_scope) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-             $17, $18, $19, $20, $21, $22, $23, $24) \
+             $17, $18, $19, $20, $21, $22, $23, $24, $25) \
              ON CONFLICT (account_id, key) DO UPDATE SET generation = $6, version = $7, \
              deleted = $8, value_bytes = $9, writer = $10, cert = $11, op = $12, proof = $13, \
              from_upload = $14, upload_seq = $15, version_exact = $16, \
@@ -623,6 +611,7 @@ impl AccountTxn {
                 .map(|g| to_db(g, "permanent_generation"))
                 .transpose()?,
         )
+        .bind(&state.policy.create_scope)
         .execute(self.conn())
         .await
         .map_err(db)?;
@@ -1217,7 +1206,7 @@ impl AccountTxn {
 }
 
 /// The columns [`record_of`] reads.
-pub(super) const RECORD_COLUMNS: &str = "key, collection, read_scope, write_scopes, permanent, \
+pub(super) const RECORD_COLUMNS: &str = "key, collection, read_scope, write_scopes, create_scope, permanent, \
      permanent_generation, generation, \
      version, deleted, value_bytes, writer, cert, op, proof, from_upload, upload_seq, \
      version_exact, upload_base_generation, upload_base_version, upload_base_op_hash, \
@@ -1242,6 +1231,18 @@ fn permanent_of(
                 .transpose()?,
         })),
     }
+}
+
+fn record_policy(row: &sqlx::postgres::PgRow) -> Result<Policy, StoreError> {
+    Ok(Policy {
+        read_scope: row.try_get("read_scope")?,
+        write_scopes: row.try_get("write_scopes")?,
+        create_scope: row.try_get("create_scope")?,
+        permanent: permanent_of(
+            row.try_get("permanent")?,
+            row.try_get("permanent_generation")?,
+        )?,
+    })
 }
 
 pub(super) fn record_of(row: &sqlx::postgres::PgRow) -> Result<StoredRecord, StoreError> {
@@ -1285,14 +1286,7 @@ pub(super) fn record_of(row: &sqlx::postgres::PgRow) -> Result<StoredRecord, Sto
         state: RecordState {
             key: array(&key, "record key")?,
             collection: array(&collection, "collection")?,
-            policy: Policy {
-                read_scope: row.try_get("read_scope")?,
-                write_scopes: row.try_get("write_scopes")?,
-                permanent: permanent_of(
-                    row.try_get("permanent")?,
-                    row.try_get("permanent_generation")?,
-                )?,
-            },
+            policy: record_policy(row)?,
             version: pubky_switch_core::ops::RecordVersion::new(
                 from_db(row.try_get("generation")?, "generation")?,
                 from_db(row.try_get("version")?, "version")?,

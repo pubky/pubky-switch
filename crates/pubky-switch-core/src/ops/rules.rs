@@ -8,7 +8,6 @@ use super::Refusal;
 use super::body::{InviteCodePut, KeyBundlePut, OpBody, OpKind, RecordPut, carrying};
 use crate::error::{Error, Result};
 use crate::http::ErrorCode;
-use crate::ident::{collection_id, record_key_from_blinded};
 use crate::json::parse_json;
 use crate::records::{
     AppCert, AppRecord, IdentityDoc, ReceiveKeyBody, ReceiveKeyRecord, check_suite_keys,
@@ -52,7 +51,9 @@ impl Need {
         use crate::ops::AllowKind;
         match kind {
             OpKind::Claim(_) => Need::Permission(Permission::ClaimsWrite),
-            OpKind::RecordPut(put) => Need::AnyScope(put.policy.write_scopes.clone()),
+            OpKind::RecordPut(put) => {
+                Need::AnyScope(put.policy.write_scopes_for(put.expected_version).to_vec())
+            }
             OpKind::AllowPut {
                 kind: AllowKind::Conversation,
                 ..
@@ -104,7 +105,7 @@ pub fn check_permission(kind: &OpKind, writer: Writer<'_>) -> std::result::Resul
 /// - `claim`: the malformed cases of Switch wire 6.8;
 /// - `record.put`: write scopes sorted ascending without duplicates and at least one; the
 ///   sealed value's scope is the read scope and its `ct` a length the rule allows (`413`
-///   past the cap); `id_inputs` on a create and only then, and at creation the key and the
+///   past the cap); on every write the key and the
 ///   collection recomputed from them, the policy hash and the identity; and, at a
 ///   permanent policy, its rule ([`check_permanent`]);
 /// - `invite_code.put`: at least one use, and its context at most 1024 bytes (`413`);
@@ -139,28 +140,11 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
             {
                 return bad("record.put: a write_scopes entry isn't a scope (wire 3.1)");
             }
-            let policy_hash = put.policy.hash()?;
+
             put.value_sealed.check_shape(&put.policy.read_scope)?;
             check_permanent(put, body.generation)?;
-            match (put.expected_version.is_none(), &put.id_inputs) {
-                (true, None) => bad("a create lacks id_inputs"),
-                (false, Some(_)) => bad("id_inputs on a write that isn't a create"),
-                (false, None) => Ok(()),
-                (true, Some(inputs)) => {
-                    if collection_id(&inputs.collection, identity) != put.collection {
-                        return bad("collection isn't the ID of id_inputs.collection");
-                    }
-                    let key = record_key_from_blinded(
-                        &inputs.collection,
-                        &inputs.blinded_key,
-                        &policy_hash,
-                    );
-                    if key != put.key {
-                        return bad("key isn't derived from id_inputs and the policy hash");
-                    }
-                    Ok(())
-                }
-            }
+            put.check_address(identity)?;
+            Ok(())
         }
         OpKind::InviteCodePut(put) => {
             if put.max_uses == 0 {
@@ -530,7 +514,7 @@ pub fn check_invite_code_put(
 mod tests {
     use super::*;
     use crate::claims::{ClaimFields, ClaimType};
-    use crate::ident::{NamingKey, Policy};
+    use crate::ident::{NamingKey, Policy, collection_id, record_key_from_blinded};
     use crate::keys::{AppKeys, ReceiveKey};
     use crate::ops::body::{BatchRef, IdInputs, InviteContext, RecordPut, RecordVersion};
     use crate::records::KeyBundle;
@@ -600,7 +584,7 @@ mod tests {
         }
     }
 
-    fn record_put(expected: RecordVersion, inputs: bool) -> RecordPut {
+    fn record_put(expected: RecordVersion) -> RecordPut {
         let id = identity();
         let naming = NamingKey::from_root(&id.switch_root());
         let policy = Policy::new("scope-a", &["scope-a"]);
@@ -615,10 +599,10 @@ mod tests {
             policy,
             expected_version: expected,
             value_sealed: sealed,
-            id_inputs: inputs.then(|| IdInputs {
+            id_inputs: IdInputs {
                 collection: "sample.collection".into(),
                 blinded_key: blinded,
-            }),
+            },
         }
     }
 
@@ -640,7 +624,7 @@ mod tests {
         let refused = check_permission(&claim, Writer::App(&reads)).unwrap_err();
         assert_eq!(refused.code, ErrorCode::PermissionMissing);
         assert!(check_permission(&claim, Writer::Signer).is_err());
-        let put = OpKind::RecordPut(record_put(RecordVersion::NONE, true));
+        let put = OpKind::RecordPut(record_put(RecordVersion::NONE));
         assert!(check_permission(&put, Writer::App(&writes)).is_ok());
         let cert_put = OpKind::CertPut {
             target_app_id: [1; 16],
@@ -703,7 +687,7 @@ mod tests {
         delete: bool,
     ) -> OpBody {
         let id = identity();
-        let mut put = record_put(expected, expected.is_none());
+        let mut put = record_put(expected);
         if let Some(named) = named {
             put.policy = put.policy.permanent(named);
         }
@@ -816,8 +800,13 @@ mod tests {
     #[test]
     fn test_shape_of_a_record_put_scopes() {
         let with = |read: &str, writes: &[&str]| {
-            let mut put = record_put(RecordVersion::new(1, 6), false);
+            let mut put = record_put(RecordVersion::new(1, 6));
             put.policy = Policy::new(read, writes);
+            put.key = record_key_from_blinded(
+                &put.id_inputs.collection,
+                &put.id_inputs.blinded_key,
+                &put.policy.hash().unwrap(),
+            );
             let id = identity();
             put.value_sealed = SealedValue::seal(
                 &id.scope_key(1, read),
@@ -846,37 +835,39 @@ mod tests {
     }
 
     #[test]
+    fn test_record_put_requires_named_inputs_and_a_valid_create_scope() {
+        let mut put = record_put(RecordVersion::NONE);
+        put.policy = put.policy.with_create_scope("tasks_create");
+        let op = body(OpKind::RecordPut(put));
+        let bytes = op.to_json().unwrap();
+        assert_eq!(OpBody::parse(&bytes).unwrap(), op);
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["create_scope"] = serde_json::Value::Null;
+        assert!(OpBody::parse(&serde_json::to_vec(&json).unwrap()).is_err());
+        json["create_scope"] = serde_json::json!("tasks_create");
+        json.as_object_mut().unwrap().remove("id_inputs");
+        assert!(OpBody::parse(&serde_json::to_vec(&json).unwrap()).is_err());
+    }
+
+    #[test]
     fn test_shape_of_a_record_put() {
-        assert!(
-            check_shape(&body(OpKind::RecordPut(record_put(
-                RecordVersion::NONE,
-                true
-            ))))
-            .is_ok()
-        );
-        let no_inputs = record_put(RecordVersion::NONE, false);
-        assert_eq!(
-            check_shape(&body(OpKind::RecordPut(no_inputs)))
-                .unwrap_err()
-                .status(),
-            400
-        );
-        let later = record_put(RecordVersion::new(1, 6), true);
-        assert!(check_shape(&body(OpKind::RecordPut(later))).is_err());
-        assert!(
-            check_shape(&body(OpKind::RecordPut(record_put(
-                RecordVersion::new(1, 6),
-                false
-            ))))
-            .is_ok()
-        );
-        let mut other_key = record_put(RecordVersion::NONE, true);
+        for expected in [RecordVersion::NONE, RecordVersion::new(1, 6)] {
+            let put = record_put(expected);
+            assert!(check_shape(&body(OpKind::RecordPut(put.clone()))).is_ok());
+            let mut wrong_name = put.clone();
+            wrong_name.id_inputs.collection.push('x');
+            assert!(check_shape(&body(OpKind::RecordPut(wrong_name))).is_err());
+            let mut wrong_blind = put;
+            wrong_blind.id_inputs.blinded_key[0] ^= 1;
+            assert!(check_shape(&body(OpKind::RecordPut(wrong_blind))).is_err());
+        }
+        let mut other_key = record_put(RecordVersion::NONE);
         other_key.key[0] ^= 1;
         assert!(check_shape(&body(OpKind::RecordPut(other_key))).is_err());
-        let mut unsorted = record_put(RecordVersion::new(1, 6), false);
+        let mut unsorted = record_put(RecordVersion::new(1, 6));
         unsorted.policy.write_scopes = vec!["scope-b".into(), "scope-a".into()];
         assert!(check_shape(&body(OpKind::RecordPut(unsorted))).is_err());
-        let mut big = record_put(RecordVersion::new(1, 6), false);
+        let mut big = record_put(RecordVersion::new(1, 6));
         big.value_sealed.ct = vec![0; crate::sealed::MAX_CT_LEN + 1];
         assert_eq!(
             check_shape(&body(OpKind::RecordPut(big)))
@@ -884,7 +875,7 @@ mod tests {
                 .status(),
             413
         );
-        let mut scope = record_put(RecordVersion::new(1, 6), false);
+        let mut scope = record_put(RecordVersion::new(1, 6));
         scope.value_sealed.scope = "scope-b".into();
         assert!(check_shape(&body(OpKind::RecordPut(scope))).is_err());
     }

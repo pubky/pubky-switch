@@ -172,10 +172,7 @@ pub fn version_holds<'a>(
 ///   with `current.data_epoch`;
 /// - a write over a record the service holds, live or deleted, a create included, repeats
 ///   the record's collection and policy, its `permanent` member included, else `400`, before
-///   the versions are compared: a create's key derives from its policy (Switch wire 1.5), so
-///   a record held at that key under another policy came in without a derivation, from a
-///   recovery upload or an import, and a permanent key is never created again over it
-///   (Switch spec 10.3.1);
+///   the versions are compared (Switch spec 10.3.1);
 /// - `expected_version` holds by [`version_holds`] against the held write (`current`, with
 ///   its application) and the operation's `conditions`; else `409 conflict`, whose `current`
 ///   carries `record` and the current write's `record_view` to a writer with the read scope
@@ -465,10 +462,10 @@ mod tests {
             expected_version: expected,
             value_sealed: SealedValue::seal(&scope_key, &id.public(), epoch, "scope-a", &key, json)
                 .unwrap(),
-            id_inputs: expected.is_none().then(|| IdInputs {
+            id_inputs: IdInputs {
                 collection: "sample.collection".into(),
                 blinded_key: blinded,
-            }),
+            },
         }
     }
 

@@ -870,9 +870,9 @@ fn check_records(
         let OpKind::RecordPut(put) = &op.body().kind else {
             return Err(fail("its op isn't a record.put"));
         };
-        if !put.policy.write_scopes.iter().any(|s| cert.holds_scope(s)) {
+        if crate::ops::check_permission(&op.body().kind, crate::ops::Writer::App(&cert)).is_err() {
             return Err(fail(
-                "the writer's certificate holds none of its write scopes",
+                "the writer's certificate lacks the scope for its signed base",
             ));
         }
         // A write at a permanent policy keeps its rule, by its own generation (Switch wire
@@ -880,6 +880,8 @@ fn check_records(
         if crate::ops::check_permanent(put, op.body().generation).is_err() {
             return Err(fail("its operation breaks its permanent policy's rule"));
         }
+        put.check_address(&identity)
+            .map_err(|e| fail(&e.to_string()))?;
         let deleted = put.value_sealed.looks_like_delete();
         let size = if deleted {
             0

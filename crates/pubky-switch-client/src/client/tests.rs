@@ -1598,19 +1598,23 @@ async fn test_last_server_time_ignores_the_public_read() {
 
 /// A batch of one shared record write.
 fn record_write() -> Vec<(Vec<Condition>, OpKind)> {
-    use pubky_switch_core::ident::{Policy, collection_id};
-    use pubky_switch_core::ops::{RecordPut, RecordVersion};
+    use pubky_switch_core::ident::{Policy, collection_id, record_key_from_blinded};
+    use pubky_switch_core::ops::{IdInputs, RecordPut, RecordVersion};
     use pubky_switch_core::sealed::SealedValue;
     let identity = identity().public();
     let policy = Policy::new("sample", &["sample"]);
-    let key = [2; 32];
+    let blinded_key = [2; 32];
+    let key = record_key_from_blinded("sample.items", &blinded_key, &policy.hash().unwrap());
     let put = RecordPut {
         key,
         collection: collection_id("sample.items", &identity),
         policy,
         expected_version: RecordVersion::new(1, 4),
         value_sealed: SealedValue::seal(&[3; 32], &identity, 1, "sample", &key, b"{}").unwrap(),
-        id_inputs: None,
+        id_inputs: IdInputs {
+            collection: "sample.items".into(),
+            blinded_key,
+        },
     };
     vec![(Vec::new(), OpKind::RecordPut(put))]
 }

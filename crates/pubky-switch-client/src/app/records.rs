@@ -8,7 +8,8 @@
 //! - **Keys** come from the naming key: `derive("pubky-switch/v1/record", collection,
 //!   blind(natural key), policy hash)` (Switch spec 13.3).
 //! - **Writes** are compare-and-swap on the version the app holds, a delete's included, and
-//!   `{0, 0}` with `id_inputs` only to create a record the switch holds nothing of; over a
+//!   `{0, 0}` only to create a record the switch holds nothing of. Every write carries its
+//!   collection name and blinded natural key; over a
 //!   write taken from a recovery upload they name it exactly; the value is sealed under the read
 //!   scope's key at the current data epoch, a sub-scope's key derived from its parent's
 //!   (Switch spec 3.5, 13.4). A delete is the sealed empty plaintext.
@@ -47,7 +48,7 @@ pub use inventory::CurrentCollection;
 use pubky_switch_core::chain::{ChainEnvelope, SignedHead, TransitionProof};
 use pubky_switch_core::enc::{b64, serde_b64, serde_b64_vec, unb64_array};
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::ident::{Policy, record_key_from_blinded};
+use pubky_switch_core::ident::Policy;
 use pubky_switch_core::ops::{
     Condition, IdInputs, OpKind, RecordPut, RecordVersion, SignedOp, check_permanent,
 };
@@ -1001,6 +1002,17 @@ fn counts_at(standing: Standing, time: Option<u64>) -> bool {
 fn in_force(doc: &IdentityDoc, cert: &AppCert, time: Option<u64>) -> bool {
     counts_at(doc.standing(&cert.app_id(), &cert.hash()), time)
         && time.is_none_or(|t| !cert.expired_at(t))
+}
+
+/// For a policy with separate roles the selected scope must already have been granted
+/// at the authenticated time of the signed operation (Switch wire 6.2, step 5).
+fn holds_write_role(cert: &AppCert, put: &RecordPut, time: Option<u64>) -> bool {
+    (put.policy.create_scope.is_none() || time.is_some_and(|t| cert.issued_at() <= t))
+        && put
+            .policy
+            .write_scopes_for(put.expected_version)
+            .iter()
+            .any(|scope| cert.holds_scope(scope))
 }
 
 /// The writer's certificates whose key verifies a write's operation (Switch wire 6.2
@@ -3157,8 +3169,8 @@ impl App {
         // the write, by the write's item hash, which its writer signed.
         //
         // One signed with this app's own key is the app's own write, under whichever of its
-        // certificates it was made: the app checked its scopes when it made it, so the checks
-        // of what it may write don't run again, but for the cutoff of its own removal (below).
+        // certificates it was made. A uniform policy can use its original local scope check;
+        // a distinct creation scope requires evidence of the role for this operation.
         // A check it fails otherwise leaves it ignored, naming no app: a flag would name the
         // app itself.
         let own = writer == self.state.meta.app_id
@@ -3169,6 +3181,7 @@ impl App {
                 Some(&writer),
             )
             .is_ok();
+        let uniform_own = own && put.policy.create_scope.is_none();
         let item_hash = certs.op.item_hash()?;
         // A view's revision names this signed operation, even when a recovery upload
         // changed its position (Switch wire 6.3). A mismatch invalidates the response,
@@ -3272,25 +3285,23 @@ impl App {
         // Step 4: standing at the write's time, of a certificate of the writer that counts
         // for it (`write_cert`).
         let mut doubtful = false;
-        let write_scopes = &put.policy.write_scopes;
-        let Some(mut cert) = self.write_cert(&certs, time, write_scopes) else {
+        let Some(mut cert) = self.write_cert(&certs, time, put) else {
             return Ok(Err(Refused::Ignored));
         };
         let mut standing = self.state.own_doc.standing(&writer, &cert.hash());
-        if !own
+        if !uniform_own
             && standing == Standing::None
             && matches!(
                 self.refresh_identity().await,
                 Ok(IdentityRefresh::Newer { .. } | IdentityRefresh::ClockMovedBack { newer: true })
             )
-            && let Some(again) = self.write_cert(&certs, time, write_scopes)
+            && let Some(again) = self.write_cert(&certs, time, put)
         {
             cert = again;
             standing = self.state.own_doc.standing(&writer, &cert.hash());
         }
-        let holds_write_scope =
-            |cert: &AppCert| write_scopes.iter().any(|scope| cert.holds_scope(scope));
-        let mut counts = in_force(&self.state.own_doc, &cert, time) && holds_write_scope(&cert);
+        let mut counts =
+            in_force(&self.state.own_doc, &cert, time) && holds_write_role(&cert, put, time);
         // No certificate of the writer the app holds counts for the write, while the newest
         // own `identity.json` names one in force at its time that the app doesn't hold: the
         // write may be the writer's under that one. Without a record view, the view decides
@@ -3300,7 +3311,7 @@ impl App {
         // failure of steps 4 and 5 is the service's word, and the write is ignored, naming no
         // app. A failed directory read marks nothing. A later write can trigger another
         // lookup once `SENDER_REREAD_MS` has passed.
-        let mut unheld = !own && !counts && self.unheld_in_force(&writer, &certs, time);
+        let mut unheld = !uniform_own && !counts && self.unheld_in_force(&writer, &certs, time);
         let now = self.now();
         let paced = self
             .directory_failed_ms
@@ -3321,12 +3332,13 @@ impl App {
             }
             if answered
                 && let Some(again) = self.writer_certs(evidence, &writer, tx).await?
-                && let Some(found) = self.write_cert(&again, time, write_scopes)
+                && let Some(found) = self.write_cert(&again, time, put)
             {
                 certs = again;
                 cert = found;
                 standing = self.state.own_doc.standing(&writer, &cert.hash());
-                counts = in_force(&self.state.own_doc, &cert, time) && holds_write_scope(&cert);
+                counts = in_force(&self.state.own_doc, &cert, time)
+                    && holds_write_role(&cert, put, time);
                 unheld = !counts && self.unheld_in_force(&writer, &certs, time);
             }
         }
@@ -3343,7 +3355,7 @@ impl App {
             // A removed app's key may be a lost device's (Switch spec 3.1, 12.2 step 3): its
             // own writes keep the `distrust_from` cutoff, ignored after it (`invalid` names
             // no app for an own write) and doubtful when nothing dates them.
-            _ if own && !matches!(standing, Standing::Removed { .. }) => {}
+            _ if uniform_own && !matches!(standing, Standing::Removed { .. }) => {}
             Standing::Listed | Standing::RenewedOpen => {}
             Standing::RenewedClosed { until } => match time {
                 Some(t) if t >= until => {
@@ -3371,11 +3383,16 @@ impl App {
                 return invalid("Switch wire 6.2 step 4: the writer has no standing");
             }
         }
-        if !own && time.is_some_and(|t| cert.expired_at(t)) {
+        if !uniform_own && time.is_some_and(|t| cert.expired_at(t)) {
             return invalid("Switch wire 6.2 step 4: the certificate had expired at the write");
         }
+        // A later certificate cannot establish which role this writer had at the
+        // original operation. Keep its revision until a dated, qualifying write arrives.
+        if put.policy.create_scope.is_some() && !counts {
+            return unnamed();
+        }
         // Step 5: a write scope.
-        if !own && !holds_write_scope(&cert) {
+        if !uniform_own && !holds_write_role(&cert, put, time) {
             return invalid("Switch wire 6.2 step 5: the writer holds none of the write scopes");
         }
         // Step 6: the version. It is the service's word, not the writer's: a write whose
@@ -3516,15 +3533,13 @@ impl App {
         &self,
         certs: &WriterCerts,
         time: Option<u64>,
-        write_scopes: &[String],
+        put: &RecordPut,
     ) -> Option<AppCert> {
         let doc = &self.state.own_doc;
-        let holds_write_scope =
-            |cert: &AppCert| write_scopes.iter().any(|scope| cert.holds_scope(scope));
         if let Some(cert) = certs
             .view
             .as_ref()
-            .filter(|cert| in_force(doc, cert, time) && holds_write_scope(cert))
+            .filter(|cert| in_force(doc, cert, time) && holds_write_role(cert, put, time))
         {
             return Some(cert.clone());
         }
@@ -3541,7 +3556,10 @@ impl App {
             .filter(|cert| in_force(doc, cert, time))
             .collect();
         counting.sort_by_key(|cert| (rank(cert), cert.issued_at()));
-        if let Some(cert) = counting.iter().find(|cert| holds_write_scope(cert)) {
+        if let Some(cert) = counting
+            .iter()
+            .find(|cert| holds_write_role(cert, put, time))
+        {
             return Some((*cert).clone());
         }
         if let Some(cert) = &certs.view {
@@ -4581,7 +4599,7 @@ impl App {
 
     /// The `record.put` of `value` at `target`, with `conditions`: built on the version the
     /// app holds, a delete's included, with the `record_current` that names it when it was
-    /// taken from a recovery upload, or a create (`{0, 0}` with `id_inputs`) for a record it
+    /// taken from a recovery upload, or a create (`{0, 0}`) for a record it
     /// holds nothing of or whose delete a read found forgotten, sealed under the read scope's
     /// key at the current data epoch (Switch spec 3.5, 10.3, 13.4). `None` writes a delete.
     /// To go in a batch ([`OpBatch::entry`]).
@@ -5018,7 +5036,7 @@ pub(crate) fn refuse_unmarkable(
 
 /// The `record.put` of `value` at `target` (`None` a delete), built on `held`, the write the
 /// app holds there ([`HeldRecord::base`]): on its version, a delete's included, or a create
-/// (`{0, 0}` with `id_inputs`) for a record it holds nothing of or whose delete the service
+/// (`{0, 0}`) for a record it holds nothing of or whose delete the service
 /// forgot, sealed under the read scope's key at the current data epoch (Switch spec 3.5,
 /// 10.3, 13.4). With it, the `record_current` the write must carry when its base names one.
 ///
@@ -5040,13 +5058,13 @@ pub(crate) fn record_put(
         &target.natural_key,
         &policy.hash()?,
     );
-    let sealed = seal_record(state, policy, &key, value)?;
     let lost = state.own_doc.body().recovery_from;
     let (base, named) = held.map_or((RecordVersion::NONE, None), |held| held.base(&key, lost));
-    let id_inputs = base.is_none().then(|| IdInputs {
+    let sealed = seal_record(state, policy, base, &key, value)?;
+    let id_inputs = IdInputs {
         collection: target.collection.name.clone(),
         blinded_key: state.naming.blind(&target.natural_key),
-    });
+    };
     let put = RecordPut {
         key,
         collection: target.collection.id(&identity),
@@ -5062,12 +5080,13 @@ pub(crate) fn record_put(
 pub(super) fn seal_record(
     state: &super::AppState,
     policy: &Policy,
+    base: RecordVersion,
     key: &[u8; 32],
     value: Option<&[u8]>,
 ) -> Result<SealedValue, AppError> {
     refuse_non_json(value)?;
     if !policy
-        .write_scopes
+        .write_scopes_for(base)
         .iter()
         .any(|scope| state.cert.holds_scope(scope))
     {
@@ -5286,7 +5305,7 @@ pub(crate) fn absence_is_rollback(
 
 /// Step 3's checks that need no state: the policy is one the collection fixes (its fixed
 /// policy, or a member of its family), the collection ID is the name's, the sealed value's
-/// scope is the read scope, and a create's key derives from its `id_inputs`.
+/// scope is the read scope, and both addresses derive from the signed inputs.
 fn check_shape(
     put: &RecordPut,
     collection: &Collection,
@@ -5298,19 +5317,8 @@ fn check_shape(
     if put.value_sealed.scope != put.policy.read_scope {
         return Some("Switch wire 6.2 step 3: the sealed value's scope isn't the read scope");
     }
-    if put.expected_version.is_none() {
-        let Some(inputs) = &put.id_inputs else {
-            return Some("Switch wire 6.2 step 3: a create without id_inputs");
-        };
-        let Ok(policy_hash) = put.policy.hash() else {
-            return Some("Switch wire 6.2 step 3: a policy that doesn't hash");
-        };
-        if inputs.collection != collection.name
-            || record_key_from_blinded(&inputs.collection, &inputs.blinded_key, &policy_hash)
-                != put.key
-        {
-            return Some("Switch wire 6.2 step 3: the key doesn't derive from its id_inputs");
-        }
+    if put.id_inputs.collection != collection.name || put.check_address(identity).is_err() {
+        return Some("Switch wire 6.2 step 3: the key doesn't derive from its id_inputs");
     }
     None
 }
@@ -5334,6 +5342,7 @@ pub(crate) fn cut_reason(mut reason: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pubky_switch_core::ident::record_key_from_blinded;
 
     /// A record view is current in the generation of the head its answer carries, at the
     /// page's `seq` for a list page (Switch spec 10.3).
@@ -5496,7 +5505,8 @@ mod tests {
     fn test_records_shape_refuses_another_policy() {
         let identity = [1; 32];
         let other = Collection::new("sample.items", Policy::new("scope-b", &["scope-b"]));
-        let key = [2; 32];
+        let blinded_key = [2; 32];
+        let key = record_key_from_blinded(&other.name, &blinded_key, &other.policy.hash().unwrap());
         let put = RecordPut {
             key,
             collection: other.id(&identity),
@@ -5504,14 +5514,17 @@ mod tests {
             expected_version: RecordVersion::new(1, 4),
             value_sealed: SealedValue::seal(&[3; 32], &identity, 1, "scope-b", &key, b"{}")
                 .unwrap(),
-            id_inputs: None,
+            id_inputs: IdInputs {
+                collection: other.name.clone(),
+                blinded_key,
+            },
         };
         assert!(check_shape(&put, &collection(), &identity).is_some());
         assert!(check_shape(&put, &other, &identity).is_none());
     }
 
     #[test]
-    fn test_records_shape_checks_a_creates_key_derivation() {
+    fn test_records_shape_checks_key_derivation_on_create_and_update() {
         let identity = [1; 32];
         let c = collection();
         let hash = c.policy.hash().unwrap();
@@ -5524,19 +5537,18 @@ mod tests {
             expected_version: RecordVersion::NONE,
             value_sealed: SealedValue::seal(&[3; 32], &identity, 1, "scope-a", &key, b"{}")
                 .unwrap(),
-            id_inputs: Some(IdInputs {
+            id_inputs: IdInputs {
                 collection: c.name.clone(),
                 blinded_key: blinded,
-            }),
+            },
         };
-        assert!(check_shape(&put, &c, &identity).is_none());
-        put.id_inputs = Some(IdInputs {
-            collection: c.name.clone(),
-            blinded_key: [8; 32],
-        });
-        assert!(check_shape(&put, &c, &identity).is_some());
-        put.id_inputs = None;
-        assert!(check_shape(&put, &c, &identity).is_some());
+        for base in [RecordVersion::NONE, RecordVersion::new(1, 4)] {
+            put.expected_version = base;
+            put.id_inputs.blinded_key = blinded;
+            assert!(check_shape(&put, &c, &identity).is_none());
+            put.id_inputs.blinded_key = [8; 32];
+            assert!(check_shape(&put, &c, &identity).is_some());
+        }
     }
 
     #[test]

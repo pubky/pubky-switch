@@ -246,6 +246,7 @@ CREATE TABLE shared_records (
     collection    BYTEA    NOT NULL CHECK (octet_length(collection) = 32),
     read_scope    TEXT     NOT NULL,
     write_scopes  TEXT[]   NOT NULL,
+    create_scope  TEXT,
     -- A permanent policy, and the generation it names, null for none (Switch wire 6.2): part
     -- of the policy every later write repeats.
     permanent     BOOLEAN  NOT NULL,

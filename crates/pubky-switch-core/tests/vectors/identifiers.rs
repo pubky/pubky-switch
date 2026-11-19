@@ -10,7 +10,7 @@ use crate::common::*;
 #[test]
 fn test_vectors_identifiers() {
     let keys = keys();
-    generated("identifiers.json", &permanent_cases(&keys));
+    generated("identifiers.json", &policy_cases(&keys));
     let v = load("identifiers.json");
     for c in arr(&v, "app_id") {
         let public = b64n::<32>(st(c, "signing_public"));
@@ -62,19 +62,15 @@ fn test_vectors_identifiers() {
         let policy = Policy {
             read_scope: st(c, "read_scope").to_owned(),
             write_scopes: write.clone(),
+            create_scope: c
+                .get("create_scope")
+                .map(|v| v.as_str().unwrap().to_owned()),
             permanent,
         };
-        let label: &[u8] = match permanent {
-            None => b"pubky-switch/v1/policy",
-            Some(_) => b"pubky-switch/v1/permanent-policy",
-        };
-        let mut hashed: Vec<&[u8]> = vec![label, policy.read_scope.as_bytes()];
-        let count = (write.len() as u64).to_be_bytes();
-        hashed.push(&count);
-        hashed.extend(write.iter().map(String::as_bytes));
-        let generation = permanent.map(|p| p.generation.unwrap_or(0).to_be_bytes());
-        hashed.extend(generation.as_ref().map(|g| &g[..]));
-        assert_eq!(hex::encode(lp(&hashed)), st(c, "hashed_bytes_hex"));
+        assert_eq!(
+            hex::encode(policy_bytes(&policy)),
+            st(c, "hashed_bytes_hex")
+        );
         let policy_hash = policy.hash().unwrap();
         assert_eq!(b64(&policy_hash), st(c, "policy_hash"));
         // Write scopes in another order, or twice, are refused rather than reordered.
@@ -149,13 +145,33 @@ fn test_vectors_identifiers() {
     );
 }
 
+/// Independent encoding of the policy inputs in wire 1.5.
+fn policy_bytes(policy: &Policy) -> Vec<u8> {
+    let label: &[u8] = match (policy.permanent, policy.create_scope.is_some()) {
+        (None, false) => b"pubky-switch/v1/policy",
+        (Some(_), false) => b"pubky-switch/v1/permanent-policy",
+        (None, true) => b"pubky-switch/v1/create-scope-policy",
+        (Some(_), true) => b"pubky-switch/v1/permanent-create-scope-policy",
+    };
+    let count = (policy.write_scopes.len() as u64).to_be_bytes();
+    let generation = policy
+        .permanent
+        .map(|p| p.generation.unwrap_or(0).to_be_bytes());
+    let mut parts = vec![label, policy.read_scope.as_bytes()];
+    parts.extend(policy.create_scope.as_ref().map(String::as_bytes));
+    parts.push(&count);
+    parts.extend(policy.write_scopes.iter().map(String::as_bytes));
+    parts.extend(generation.as_ref().map(|g| &g[..]));
+    lp(&parts)
+}
+
 /// The permanent policies and record keys `pubky-switch-core` generates (README "How the
 /// files were generated", wire 1.5, spec 10.3.1): `tasks`'s `task_closures`, under a
 /// permanent policy naming no generation, with the record of the task of `task_items record
 /// of a task done without an assignment`; and its `share_counts`, under a permanent policy
 /// naming generation 1, with the record whose natural key is that of `shares record`
 /// followed by `lp(u64(1))`, the generation it counts.
-fn permanent_cases(keys: &Keys) -> Vec<(Place<'static>, Value)> {
+fn policy_cases(keys: &Keys) -> Vec<(Place<'static>, Value)> {
     let v = load("identifiers.json");
     let record = |name: &str| -> Value {
         arr(&v, "record_keys")
@@ -164,23 +180,22 @@ fn permanent_cases(keys: &Keys) -> Vec<(Place<'static>, Value)> {
             .unwrap_or_else(|| panic!("no record key {name}"))
             .clone()
     };
-    let policy_case = |name: &str, read: &str, writes: &[&str], generation: Option<u64>| {
-        let policy = Policy::new(read, writes).permanent(generation);
-        let count = (writes.len() as u64).to_be_bytes();
-        let named = generation.unwrap_or(0).to_be_bytes();
-        let mut hashed: Vec<&[u8]> =
-            vec![b"pubky-switch/v1/permanent-policy", read.as_bytes(), &count];
-        hashed.extend(writes.iter().map(|w| w.as_bytes()));
-        hashed.push(&named);
-        let case = json!({
+    let policy_case = |name: &str, policy: &Policy| {
+        let policy_hash = policy.hash().unwrap();
+        let mut case = json!({
             "name": name,
-            "read_scope": read,
-            "write_scopes": writes,
-            "permanent": { "generation": generation },
-            "hashed_bytes_hex": hex::encode(lp(&hashed)),
-            "policy_hash": b64(&policy.hash().unwrap()),
+            "read_scope": policy.read_scope,
+            "write_scopes": policy.write_scopes,
+            "hashed_bytes_hex": hex::encode(policy_bytes(policy)),
+            "policy_hash": b64(&policy_hash),
         });
-        (case, policy.hash().unwrap())
+        if let Some(scope) = &policy.create_scope {
+            case["create_scope"] = json!(scope);
+        }
+        if let Some(permanent) = policy.permanent {
+            case["permanent"] = json!({"generation": permanent.generation});
+        }
+        (case, policy_hash)
     };
     let key_case =
         |name: &str, base: &Value, collection: &str, natural: Vec<u8>, policy: [u8; 32]| {
@@ -198,13 +213,19 @@ fn permanent_cases(keys: &Keys) -> Vec<(Place<'static>, Value)> {
                 "record_key": b64(&ident::record_key_from_blinded(collection, &blinded, &policy)),
             })
         };
-    let (closures, closures_hash) =
-        policy_case("task_closures, permanent", "tasks", &["tasks"], None);
+    let (closures, closures_hash) = policy_case(
+        "task_closures, permanent",
+        &Policy::new("tasks", &["tasks"]).permanent(None),
+    );
     let (counts, counts_hash) = policy_case(
         "share_counts, permanent for generation 1",
-        "tasks_share",
-        &["tasks_share"],
-        Some(1),
+        &Policy::new("tasks_share", &["tasks_share"]).permanent(Some(1)),
+    );
+    let roles = Policy::new("tasks", &["tasks_share_run"]).with_create_scope("tasks_people_admin");
+    let (separate, _) = policy_case("share_counts, separate create scope", &roles);
+    let (permanent_separate, separate_hash) = policy_case(
+        "share_counts, separate create scope and permanent",
+        &roles.permanent(None),
     );
     let task = record("task_items record of a task done without an assignment");
     let share = record("shares record");
@@ -213,6 +234,18 @@ fn permanent_cases(keys: &Keys) -> Vec<(Place<'static>, Value)> {
     vec![
         (Place::Case("/policies"), closures),
         (Place::Case("/policies"), counts),
+        (Place::Case("/policies"), separate),
+        (Place::Case("/policies"), permanent_separate),
+        (
+            Place::Case("/record_keys"),
+            key_case(
+                "share_counts record with a separate create scope",
+                &share,
+                "share_counts",
+                hx(st(&share, "natural_key_hex")),
+                separate_hash,
+            ),
+        ),
         (
             Place::Case("/record_keys"),
             key_case(

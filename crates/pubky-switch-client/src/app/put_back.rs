@@ -41,7 +41,7 @@ impl RecordHold {
     fn writable(&self, cert: &AppCert) -> Result<bool, AppError> {
         let policy = self.observation.put()?.policy;
         Ok(policy
-            .write_scopes
+            .write_scopes_for(self.observation.delete.version)
             .iter()
             .any(|scope| cert.holds_scope(scope)))
     }
@@ -164,7 +164,7 @@ fn checked_replacement(
         || !pending.queued.is_empty()
         || !pending.invites.is_empty()
         || !pending.deadlines.is_empty()
-        || !matches!(&op.body().kind, OpKind::RecordPut(put) if put.id_inputs.is_none() && !put.value_sealed.looks_like_delete())
+        || !matches!(&op.body().kind, OpKind::RecordPut(put) if !put.expected_version.is_none() && put.check_address(identity).is_ok() && !put.value_sealed.looks_like_delete())
     {
         return Err(super::corrupt());
     }
@@ -625,21 +625,25 @@ impl App {
         if hold.pending.is_some() {
             return Ok(false);
         }
-        put.value_sealed =
-            match records::seal_record(&self.state, &put.policy, &put.key, Some(value)) {
-                Ok(sealed) => sealed,
-                Err(
-                    AppError::InvalidData(_)
-                    | AppError::Refused(Refusal::Usage(_) | Refusal::NotNow(_)),
-                ) => return Ok(false),
-                Err(error) => return Err(error),
-            };
         put.expected_version = if deleted {
             hold.observation.delete.version
         } else {
             RecordVersion::new(at.generation, at.seq)
         };
-        put.id_inputs = None;
+        put.value_sealed = match records::seal_record(
+            &self.state,
+            &put.policy,
+            put.expected_version,
+            &put.key,
+            Some(value),
+        ) {
+            Ok(sealed) => sealed,
+            Err(
+                AppError::InvalidData(_)
+                | AppError::Refused(Refusal::Usage(_) | Refusal::NotNow(_)),
+            ) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         let batch = self.sign_ops(vec![(vec![when], OpKind::RecordPut(put))], None)?;
         hold.pending = Some(PendingBatch {
             body: batch.body().to_vec(),
